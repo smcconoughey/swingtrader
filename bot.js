@@ -2237,7 +2237,15 @@ async function main() {
   console.log("  ╚═══════════════════════════════════════════════╝\n");
 
   // Load or initialize state
-  let state = loadState() || { ...INIT_STATE };
+  let state;
+  if (process.env.FORCE_RESET_STATE === "true") {
+    state = { ...INIT_STATE };
+    if (process.env.FINNHUB_API_KEY) state.apiKey = process.env.FINNHUB_API_KEY;
+    saveState(state);
+    log("FORCE RESET: Started fresh with $" + STARTING_CASH + " cash.");
+  } else {
+    state = loadState() || { ...INIT_STATE };
+  }
 
   // Pre-populate Finnhub key from .env if not already saved in state
   if (!state.apiKey && process.env.FINNHUB_API_KEY) {
