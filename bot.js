@@ -1591,7 +1591,7 @@ function dashboardHTML(acct) {
       <td>${h.reason || "—"}</td></tr>`;
   }).join("") || '<tr><td colspan="7" style="opacity:.5">No trades yet</td></tr>';
 
-  const hints = activeHints.map(h => {
+  const hints = acct.activeHints.map(h => {
     const mins = Math.round((h.expiresAt - Date.now()) / 60_000);
     return `<span class="hint">${h.ticker} ${h.bias > 0 ? "+" : ""}${h.bias} (${h.direction}, ${mins}m left) — ${h.reasoning}</span>`;
   }).join("") || '<span style="opacity:.5">None active. Write to hint.txt to add.</span>';
