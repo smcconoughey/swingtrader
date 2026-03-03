@@ -271,10 +271,10 @@ const EOW_TRIM_HOUR = 14;      // Friday profit-taking starts at 2:00 PM ET
 const LOW_DTE_THRESHOLD = 3;   // Accelerate exits when DTE <= 3
 const CRITICAL_DTE = 2;        // Force-close when DTE <= 2
 
-const STARTING_CASH = 25_000;
+const STARTING_CASH = 200;
 const GOAL = 200_000;
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
-const INIT_STATE = { cash: 25_000, positions: [], history: [], dayTrades: [], apiKey: "" };
+const INIT_STATE = { cash: 200, positions: [], history: [], dayTrades: [], apiKey: "" };
 
 // ─── Logging ───
 
@@ -2232,7 +2232,7 @@ async function runAfterHoursScan(state, candleCache) {
 async function main() {
   console.log("\n  ╔═══════════════════════════════════════════════╗");
   console.log("  ║  SWINGERS — Auto-Trading Bot v1.0             ║");
-  console.log("  ║  $25,000 → $200,000 Challenge · PDT Enforced  ║");
+  console.log("  ║  $200 → $200,000 Challenge · PDT Enforced     ║");
   console.log("  ║  Headless · Finnhub · Aggressive Mode          ║");
   console.log("  ╚═══════════════════════════════════════════════╝\n");
 
