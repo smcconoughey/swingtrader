@@ -248,25 +248,101 @@ function optGreeks(spot, strike, dte, iv, type = "call") {
 
 // ─── Constants ───
 
-let TICKERS = ["SPY", "QQQ", "AAPL", "NVDA", "TSLA", "MSFT", "META", "AMZN", "GOOGL", "AMD"];
+let TICKERS = ["SPY", "QQQ"]; // anchor tickers for regime — watchlist is built dynamically
 
-// ─── Tiered Watchlists (by cash available) ───
-// Cheap options (premium <$2 = contract <$200)
-const BUDGET_TICKERS = ["SOFI", "PLTR", "RIOT", "MARA", "SQQQ", "SPXS", "F", "BAC", "HOOD", "GME"];
-// Mid-range options (premium $2-8 = contract $200-800)
-const MID_TICKERS = ["AMD", "NVDA", "TSLA", "AMZN", "GOOGL", "AAPL", "META", "MSFT"];
-// Full large-cap watchlist (premium $8+ = contract $800+)
-const LARGE_TICKERS = TICKERS;
+// ─── Dynamic Watchlist ───
+const WATCHLIST_REFRESH_MS = 4 * 60 * 60_000; // refresh every 4 hours
+let lastWatchlistRefresh = 0;
+let dynamicWatchlist = [];     // set by refreshWatchlist()
+
+// Stocks that are always included regardless of tier (needed for regime detection)
+const REGIME_TICKERS = ["SPY", "QQQ"];
+
+async function fetchDynamicWatchlist() {
+  const symbols = new Set(REGIME_TICKERS);
+  const headers = { "User-Agent": "Mozilla/5.0" };
+
+  // 1. Most active US stocks
+  try {
+    const r = await fetch(
+      "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=most_actives&count=30&lang=en-US&region=US",
+      { headers }
+    );
+    if (r.ok) {
+      const d = await r.json();
+      const quotes = d?.finance?.result?.[0]?.quotes || [];
+      for (const q of quotes) if (q.symbol && /^[A-Z]{1,5}$/.test(q.symbol)) symbols.add(q.symbol);
+    }
+  } catch { }
+
+  // 2. Trending tickers
+  try {
+    const r = await fetch(
+      "https://query1.finance.yahoo.com/v1/finance/trending/US?count=20&lang=en-US",
+      { headers }
+    );
+    if (r.ok) {
+      const d = await r.json();
+      const quotes = d?.finance?.result?.[0]?.quotes || [];
+      for (const q of quotes) if (q.symbol && /^[A-Z]{1,5}$/.test(q.symbol)) symbols.add(q.symbol);
+    }
+  } catch { }
+
+  // 3. Top gainers / losers (high momentum)
+  for (const scrId of ["day_gainers", "day_losers"]) {
+    try {
+      const r = await fetch(
+        `https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=${scrId}&count=15&lang=en-US&region=US`,
+        { headers }
+      );
+      if (r.ok) {
+        const d = await r.json();
+        const quotes = d?.finance?.result?.[0]?.quotes || [];
+        for (const q of quotes) if (q.symbol && /^[A-Z]{1,5}$/.test(q.symbol)) symbols.add(q.symbol);
+      }
+    } catch { }
+  }
+
+  return [...symbols];
+}
+
+async function refreshWatchlist(cash) {
+  const now = Date.now();
+  if (now - lastWatchlistRefresh < WATCHLIST_REFRESH_MS && dynamicWatchlist.length > 0) return;
+  lastWatchlistRefresh = now;
+
+  log("WATCHLIST: Refreshing from market data...");
+  const raw = await fetchDynamicWatchlist();
+
+  // Estimate max affordable option premium based on cash
+  // A contract = premium * 100. At 15% risk, riskAmt = cash * 0.15
+  // Affordable if: premium * 100 <= cash (single contract)
+  // Rough estimate: option premium ≈ 2-4% of stock price
+  // So max stock price where we can afford 1 contract: cash / (0.03 * 100) = cash / 3
+  const maxStockPrice = Math.max(cash / 2, 20); // always allow up to at least $20 stocks
+
+  // Filter: remove funds/ETFs that don't trade options well (except regime ETFs)
+  const blocked = new Set(["UVXY", "VIX", "VXX", "SVXY", "VIXY", "UVIX"]);
+
+  const filtered = raw.filter(sym =>
+    !blocked.has(sym) || REGIME_TICKERS.includes(sym)
+  );
+
+  // Always lead with regime tickers, then dynamic list, then hint tickers
+  const hinted = TICKERS.filter(t => !filtered.includes(t));
+  dynamicWatchlist = [...new Set([...REGIME_TICKERS, ...filtered, ...hinted])];
+
+  log(`WATCHLIST: ${dynamicWatchlist.length} tickers — ${dynamicWatchlist.slice(0, 15).join(", ")}${dynamicWatchlist.length > 15 ? "..." : ""}`);
+  TICKERS = [...dynamicWatchlist]; // keep TICKERS in sync for hint system
+}
 
 function getActiveTickers(cash) {
-  let base;
-  if (cash < 500) base = BUDGET_TICKERS;
-  else if (cash < 2000) base = [...BUDGET_TICKERS, ...MID_TICKERS];
-  else base = [...MID_TICKERS, ...LARGE_TICKERS];
-  // Merge any Claude-hinted tickers not already in the list
-  const hintedTickers = TICKERS.filter(t => !base.includes(t));
-  return [...new Set([...base, ...hintedTickers])];
+  // If we have a dynamic list, use it — otherwise fall back to TICKERS
+  const base = dynamicWatchlist.length > 0 ? dynamicWatchlist : TICKERS;
+  const hinted = TICKERS.filter(t => !base.includes(t));
+  return [...new Set([...base, ...hinted])];
 }
+
 const STATE_FILE = process.env.STATE_FILE || "state.json";
 const HINT_FILE = "hint.txt";
 const CYCLE_MS = 60_000;       // 60s between cycles
@@ -1983,6 +2059,9 @@ async function runCycle(state, candleCache) {
     }
   }
 
+  // Refresh dynamic watchlist from market data (every 4 hours)
+  await refreshWatchlist(state.cash);
+
   // Check for new hints from user (via hint.txt)
   await checkHints(state);
 
@@ -2194,6 +2273,9 @@ async function runAfterHoursScan(state, candleCache) {
       }
     }
   }
+
+  // Refresh dynamic watchlist from market data (every 4 hours)
+  await refreshWatchlist(state.cash);
 
   // Check hints
   await checkHints(state);
