@@ -1943,6 +1943,24 @@ function startDashboard(state) {
     const tickerMatch = req.url.match(/^\/ticker\/([A-Z]+)$/);
     if (tickerMatch) {
       const sym = tickerMatch[1];
+      // Fetch candles + quote on-demand if not cached (e.g. position tickers not in watchlist)
+      try {
+        if (!dashboard.candles[sym] && state.apiKey) {
+          dashboard.candles[sym] = await fetchCandles(sym, state.apiKey);
+        }
+        if (!dashboard.quotes[sym] && state.apiKey) {
+          dashboard.quotes[sym] = await fetchQuote(sym, state.apiKey);
+        }
+        // Run analysis on-demand if we have candles but no analysis
+        if (dashboard.candles[sym] && !dashboard.analyses[sym]) {
+          const a = runAnalysis(dashboard.candles[sym]);
+          if (a) dashboard.analyses[sym] = a;
+          const st = runShortTermAnalysis(dashboard.candles[sym]);
+          if (st) dashboard.shortTermAnalyses[sym] = st;
+        }
+      } catch (e) {
+        log(`WARN: On-demand fetch for ${sym} failed — ${e.message}`);
+      }
       res.writeHead(200, { "Content-Type": "text/html" });
       res.end(tickerDetailHTML(sym, state));
       return;
@@ -2027,9 +2045,12 @@ async function runCycle(state, candleCache) {
   const analyses = {};
 
   const activeTickers = getActiveTickers(state.cash);
+  // Include position tickers that may not be in the watchlist
+  const positionTickers = state.positions.map(p => p.ticker).filter(t => !activeTickers.includes(t));
+  const allTickers = [...activeTickers, ...positionTickers];
 
   // Fetch quotes for all tickers
-  for (const ticker of activeTickers) {
+  for (const ticker of allTickers) {
     try {
       quotes[ticker] = await fetchQuote(ticker, state.apiKey);
       await delay(API_DELAY);
@@ -2039,7 +2060,7 @@ async function runCycle(state, candleCache) {
   }
 
   // Fetch candles if not cached this session
-  for (const ticker of activeTickers) {
+  for (const ticker of allTickers) {
     if (!candleCache[ticker]) {
       try {
         candleCache[ticker] = await fetchCandles(ticker, state.apiKey);
@@ -2071,7 +2092,7 @@ async function runCycle(state, candleCache) {
   // Run dual-timeframe analysis on each ticker (with hint bias applied)
   const shortTermAnalyses = {};
   const decisions = [];
-  for (const ticker of activeTickers) {
+  for (const ticker of allTickers) {
     const candles = candleCache[ticker];
     if (!candles) { decisions.push({ ticker, action: "SKIP", reason: "No candle data" }); continue; }
     const a = runAnalysis(candles);          // 90-day long-term
@@ -2251,9 +2272,12 @@ async function runAfterHoursScan(state, candleCache) {
   const shortTermAnalyses = {};
 
   const activeTickers2 = getActiveTickers(state.cash);
+  // Include position tickers that may not be in the watchlist
+  const positionTickers2 = state.positions.map(p => p.ticker).filter(t => !activeTickers2.includes(t));
+  const allTickers2 = [...activeTickers2, ...positionTickers2];
 
   // Fetch quotes (Finnhub returns last close + change data even after hours)
-  for (const ticker of activeTickers2) {
+  for (const ticker of allTickers2) {
     try {
       quotes[ticker] = await fetchQuote(ticker, state.apiKey);
       await delay(API_DELAY);
@@ -2263,7 +2287,7 @@ async function runAfterHoursScan(state, candleCache) {
   }
 
   // Fetch candles if not cached
-  for (const ticker of activeTickers2) {
+  for (const ticker of allTickers2) {
     if (!candleCache[ticker]) {
       try {
         candleCache[ticker] = await fetchCandles(ticker, state.apiKey);
@@ -2285,7 +2309,7 @@ async function runAfterHoursScan(state, candleCache) {
 
   // Run dual-timeframe analysis
   const decisions = [];
-  for (const ticker of activeTickers2) {
+  for (const ticker of allTickers2) {
     const candles = candleCache[ticker];
     if (!candles) { decisions.push({ ticker, action: "SKIP", reason: "No candle data" }); continue; }
     const a = runAnalysis(candles);
