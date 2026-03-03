@@ -1487,6 +1487,11 @@ function dashboardHTML(acct) {
   const cfg = acct.config;
   const STARTING_CASH = cfg.startingCash;
   const GOAL = cfg.goal;
+  const PROFIT_TARGET = cfg.profitTarget;
+  const STOP_LOSS = cfg.stopLoss;
+  const BULL_ENTRY = cfg.bullEntry;
+  const BEAR_ENTRY = cfg.bearEntry;
+  const RISK_PCT = acct.riskPct;
   const currentRegime = acct.currentRegime;
   const pv = portfolioValue(state, dashboard.quotes);
   const pnlPct = ((pv - STARTING_CASH) / STARTING_CASH * 100).toFixed(1);
