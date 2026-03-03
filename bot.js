@@ -1,3 +1,4 @@
+import "dotenv/config";
 import fetch from "node-fetch";
 import fs from "fs";
 import readline from "readline";
@@ -117,6 +118,118 @@ function runAnalysis(candles) {
   };
 }
 
+// ─── Short-Term Analysis (7-day focus for contract-duration signals) ───
+
+function runShortTermAnalysis(candles) {
+  if (!candles || candles.length < 15) return null;
+
+  // Use only last 14 candles (≈2 weeks) — matches 7-day contract horizon
+  const recent = candles.slice(-14);
+  const closes = recent.map(d => d.c), highs = recent.map(d => d.h), lows = recent.map(d => d.l), volumes = recent.map(d => d.v);
+  const L = closes.length - 1, c = closes[L];
+
+  // Fast EMAs: 3/5/8 on the short window
+  const ema3 = calcEMA(closes, 3), ema5 = calcEMA(closes, 5), ema8 = calcEMA(closes, 8);
+  // Short RSI (5-period)
+  const rsi5 = calcRSI(closes, 5);
+  const rV = rsi5[rsi5.length - 1] || 50;
+
+  // Momentum: % change over 1d, 3d, 5d, 7d
+  const mom1d = L >= 1 ? ((c - closes[L - 1]) / closes[L - 1]) * 100 : 0;
+  const mom3d = L >= 3 ? ((c - closes[L - 3]) / closes[L - 3]) * 100 : 0;
+  const mom5d = L >= 5 ? ((c - closes[L - 5]) / closes[L - 5]) * 100 : 0;
+  const mom7d = L >= 7 ? ((c - closes[L - 7]) / closes[L - 7]) * 100 : 0;
+
+  // Volume trend: last 3 days vs prior 5 days
+  const recentV3 = volumes.slice(-3).reduce((a, b) => a + b, 0) / 3;
+  const priorV5 = volumes.slice(-8, -3).reduce((a, b) => a + b, 0) / Math.max(1, volumes.slice(-8, -3).length);
+  const vr = priorV5 > 0 ? recentV3 / priorV5 : 1;
+
+  // Fast EMA alignment
+  const aligned = ema3[L] > ema5[L] && ema5[L] > ema8[L];
+  const bearish = ema3[L] < ema5[L] && ema5[L] < ema8[L];
+  const spread = ((ema3[L] - ema8[L]) / ema8[L]) * 100;
+
+  // Recent high/low range
+  const recentHigh = Math.max(...highs.slice(-7));
+  const recentLow = Math.min(...lows.slice(-7));
+  const range7d = ((recentHigh - recentLow) / recentLow) * 100;
+  const nearHigh = c >= recentHigh * 0.995;
+  const nearLow = c <= recentLow * 1.005;
+
+  // Trend structure over last 7 days
+  let hh = 0, hl = 0, lh = 0, ll = 0;
+  for (let i = Math.max(0, L - 6); i < L; i++) {
+    if (highs[i + 1] > highs[i]) hh++; else lh++;
+    if (lows[i + 1] > lows[i]) hl++; else ll++;
+  }
+
+  const sigs = [];
+
+  // ─── Short-term Bull Score ───
+  let bull = 0;
+  if (aligned) { bull += 20; sigs.push({ t: "bull", text: "Fast EMA aligned (3>5>8)" }); }
+  const xover = ema3[L] > ema5[L] && L >= 2 && ema3[L - 2] <= ema5[L - 2];
+  if (xover) { bull += 20; sigs.push({ t: "bull", text: "Fresh 3/5 EMA bullish crossover" }); }
+  if (mom3d > 1.5) { bull += 15; sigs.push({ t: "bull", text: `3-day momentum +${mom3d.toFixed(1)}%` }); }
+  else if (mom3d > 0.5) { bull += 8; sigs.push({ t: "bull", text: `3-day momentum +${mom3d.toFixed(1)}%` }); }
+  if (mom7d > 3) { bull += 10; sigs.push({ t: "bull", text: `7-day momentum +${mom7d.toFixed(1)}%` }); }
+  if (nearHigh && vr > 1.1) { bull += 15; sigs.push({ t: "bull", text: "Near 7d high on expanding volume" }); }
+  if (rV <= 25) { bull += 10; sigs.push({ t: "bull", text: `RSI(5) ${rV.toFixed(0)} — oversold bounce setup` }); }
+  if (rV > 55 && rV < 75 && aligned) { bull += 10; sigs.push({ t: "bull", text: `RSI(5) ${rV.toFixed(0)} — strong momentum` }); }
+  const upTrend = ((hh + hl) / 12) * 100;
+  if (upTrend > 65) { bull += 10; sigs.push({ t: "bull", text: `7d uptrend ${upTrend.toFixed(0)}%` }); }
+
+  // ─── Short-term Bear Score ───
+  let bear = 0;
+  if (bearish) { bear += 20; sigs.push({ t: "bear", text: "Fast EMA bearish (3<5<8)" }); }
+  const xoverBear = ema3[L] < ema5[L] && L >= 2 && ema3[L - 2] >= ema5[L - 2];
+  if (xoverBear) { bear += 20; sigs.push({ t: "bear", text: "Fresh 3/5 EMA bearish crossover" }); }
+  if (mom3d < -1.5) { bear += 15; sigs.push({ t: "bear", text: `3-day momentum ${mom3d.toFixed(1)}%` }); }
+  else if (mom3d < -0.5) { bear += 8; sigs.push({ t: "bear", text: `3-day momentum ${mom3d.toFixed(1)}%` }); }
+  if (mom7d < -3) { bear += 10; sigs.push({ t: "bear", text: `7-day momentum ${mom7d.toFixed(1)}%` }); }
+  if (nearLow && vr > 1.1) { bear += 15; sigs.push({ t: "bear", text: "Near 7d low on expanding volume" }); }
+  if (rV >= 75) { bear += 10; sigs.push({ t: "bear", text: `RSI(5) ${rV.toFixed(0)} — overbought reversal setup` }); }
+  if (rV < 45 && rV > 25 && bearish) { bear += 10; sigs.push({ t: "bear", text: `RSI(5) ${rV.toFixed(0)} — bearish pressure` }); }
+  const dnTrend = ((lh + ll) / 12) * 100;
+  if (dnTrend > 65) { bear += 10; sigs.push({ t: "bear", text: `7d downtrend ${dnTrend.toFixed(0)}%` }); }
+
+  bull = Math.max(0, Math.min(100, bull));
+  bear = Math.max(0, Math.min(100, bear));
+  const netScore = bull - bear;
+  const displayScore = Math.max(0, Math.min(100, 50 + netScore / 2));
+
+  let sig;
+  if (displayScore >= 70) sig = "STRONG BUY";
+  else if (displayScore >= 55) sig = "BUY WATCH";
+  else if (displayScore >= 45) sig = "NEUTRAL";
+  else if (displayScore >= 30) sig = "SELL WATCH";
+  else sig = "STRONG SELL";
+
+  return {
+    score: Math.round(displayScore), bullScore: bull, bearScore: bear,
+    signal: sig, sigs, price: c,
+    ema3v: ema3[L], ema5v: ema5[L], ema8v: ema8[L],
+    aligned, bearish, spread, rsi: rV,
+    mom1d, mom3d, mom5d, mom7d,
+    vr, range7d, nearHigh, nearLow,
+    recentHigh, recentLow,
+  };
+}
+
+// ─── Blended Score (60% short-term, 40% long-term) ───
+
+function blendScores(longTerm, shortTerm) {
+  if (!shortTerm) return longTerm;
+  if (!longTerm) return shortTerm;
+  const blended = Math.round(shortTerm.score * 0.6 + longTerm.score * 0.4);
+  return {
+    score: blended,
+    signal: blended >= 70 ? "STRONG BUY" : blended >= 55 ? "BUY WATCH" : blended >= 45 ? "NEUTRAL" : blended >= 30 ? "SELL WATCH" : "STRONG SELL",
+    longTerm, shortTerm,
+  };
+}
+
 // ─── Options Helpers (ported from live-swing-simulator.jsx) ───
 
 function optPrice(spot, strike, dte, iv, type = "call") {
@@ -141,16 +254,26 @@ const HINT_FILE = "hint.txt";
 const CYCLE_MS = 60_000;       // 60s between cycles
 const API_DELAY = 150;         // 150ms between API calls (Finnhub free tier)
 const MAX_POSITIONS = Infinity; // No hard limit — bot manages liquidity dynamically
-const RISK_PCT = 0.15;         // 15% of portfolio per trade — balanced across more plays
+const BASE_RISK_PCT = 0.15;    // 15% of portfolio per trade — adjusted by market regime
+let RISK_PCT = BASE_RISK_PCT;  // Dynamic — scaled by regime
 const PROFIT_TARGET = 0.40;    // Take profits at +40% (compound faster)
 const STOP_LOSS = -0.35;       // Wider stop to avoid premature exits on volatile plays
 const DEFAULT_IV = 0.30;
 const BULL_ENTRY = 65;         // Buy calls when score >= 65 (bullish)
 const BEAR_ENTRY = 35;         // Buy puts when score <= 35 (bearish)
 
+// ─── Trimming & EOD/EOW Constants ───
+const TRIM_1_PCT = 0.25;       // First trim at +25% profit
+const TRIM_2_PCT = 0.50;       // Second trim at +50% profit
+const EOD_FREEZE_HOUR = 15;    // No new entries after 3:00 PM ET
+const EOD_TIGHTEN_HOUR = 15.5; // Tighten stops after 3:30 PM ET
+const EOW_TRIM_HOUR = 14;      // Friday profit-taking starts at 2:00 PM ET
+const LOW_DTE_THRESHOLD = 3;   // Accelerate exits when DTE <= 3
+const CRITICAL_DTE = 2;        // Force-close when DTE <= 2
+
 const STARTING_CASH = 25_000;
 const GOAL = 200_000;
-const CLAUDE_API_KEY = "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";
+const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 const INIT_STATE = { cash: 25_000, positions: [], history: [], dayTrades: [], apiKey: "" };
 
 // ─── Logging ───
@@ -181,7 +304,147 @@ function logTrade(entry) {
   try {
     const line = JSON.stringify({ ...entry, ts: Date.now() }) + "\n";
     fs.appendFileSync("trades.log", line);
-  } catch {}
+  } catch { }
+}
+
+// ─── Market Regime (SPY/QQQ EMA health) ───
+
+let currentRegime = { mode: "unknown", riskScale: 1.0, label: "UNKNOWN" };
+
+function getMarketRegime(candleCache) {
+  const spyCandles = candleCache["SPY"];
+  const qqqCandles = candleCache["QQQ"];
+  if (!spyCandles || !qqqCandles || spyCandles.length < 55 || qqqCandles.length < 55) {
+    return { mode: "unknown", riskScale: 0.5, label: "UNKNOWN (no data)", spyAbove: null, qqqAbove: null };
+  }
+
+  function checkAboveEMAs(candles) {
+    const closes = candles.map(d => d.c);
+    const ema8 = calcEMA(closes, 8);
+    const ema21 = calcEMA(closes, 21);
+    const ema50 = calcEMA(closes, 50);
+    const L = closes.length - 1;
+    const c = closes[L];
+    const above8 = c > ema8[L];
+    const above21 = c > ema21[L];
+    const above50 = c > ema50[L];
+    const aligned = ema8[L] > ema21[L] && ema21[L] > ema50[L];
+    return { above8, above21, above50, aligned, allAbove: above8 && above21 && above50 };
+  }
+
+  const spy = checkAboveEMAs(spyCandles);
+  const qqq = checkAboveEMAs(qqqCandles);
+
+  let mode, riskScale, label;
+  if (spy.allAbove && qqq.allAbove) {
+    mode = "risk-on";
+    riskScale = 1.0;
+    label = "RISK-ON — SPY+QQQ above all EMAs, full conviction";
+  } else if (spy.allAbove || qqq.allAbove) {
+    mode = "cautious";
+    riskScale = 0.5;
+    label = `CAUTIOUS — ${spy.allAbove ? 'SPY' : 'QQQ'} strong, ${spy.allAbove ? 'QQQ' : 'SPY'} mixed`;
+  } else if (spy.above50 && qqq.above50) {
+    mode = "choppy";
+    riskScale = 0.35;
+    label = "CHOPPY — above 50 EMA but EMA stack broken";
+  } else {
+    mode = "risk-off";
+    riskScale = 0.25;
+    label = "RISK-OFF — below key EMAs, reduce exposure";
+  }
+
+  return { mode, riskScale, label, spyAbove: spy, qqqAbove: qqq };
+}
+
+// ─── Earnings Calendar Check (Finnhub) ───
+
+async function checkEarnings(ticker, apiKey) {
+  try {
+    const now = getETDate();
+    const from = now.toISOString().slice(0, 10);
+    const futureDate = new Date(now.getTime() + 4 * 86400_000); // 4 days out
+    const to = futureDate.toISOString().slice(0, 10);
+    const r = await fetch(`https://finnhub.io/api/v1/calendar/earnings?from=${from}&to=${to}&symbol=${ticker}&token=${apiKey}`);
+    if (!r.ok) return { hasEarnings: false, daysUntil: null };
+    const data = await r.json();
+    const earnings = data.earningsCalendar || [];
+    if (earnings.length === 0) return { hasEarnings: false, daysUntil: null };
+    const nextEarning = earnings[0];
+    const earningDate = new Date(nextEarning.date);
+    const daysUntil = Math.ceil((earningDate - now) / 86400_000);
+    return { hasEarnings: daysUntil <= 3, daysUntil, date: nextEarning.date };
+  } catch {
+    return { hasEarnings: false, daysUntil: null };
+  }
+}
+
+// ─── Consolidation / Tightness Detection (SRxTrades "staircase" setup quality) ───
+
+function detectConsolidation(candles) {
+  if (!candles || candles.length < 20) return { quality: 0, tight: false };
+
+  const recent = candles.slice(-10);
+  const closes = recent.map(d => d.c);
+  const highs = recent.map(d => d.h);
+  const lows = recent.map(d => d.l);
+  const volumes = recent.map(d => d.v);
+
+  // 1. Range tightness: how narrow is the price range over last 10 candles?
+  const rangeHigh = Math.max(...highs);
+  const rangeLow = Math.min(...lows);
+  const rangePct = ((rangeHigh - rangeLow) / rangeLow) * 100;
+  // Tighter range = higher score. Sweet spot: 2-5% range
+  let tightnessScore = 0;
+  if (rangePct < 3) tightnessScore = 30;
+  else if (rangePct < 5) tightnessScore = 25;
+  else if (rangePct < 8) tightnessScore = 15;
+  else if (rangePct < 12) tightnessScore = 5;
+
+  // 2. Volume declining during consolidation (coiled spring)
+  const firstHalfVol = volumes.slice(0, 5).reduce((a, b) => a + b, 0) / 5;
+  const secondHalfVol = volumes.slice(5).reduce((a, b) => a + b, 0) / 5;
+  let volDeclineScore = 0;
+  if (firstHalfVol > 0) {
+    const volRatio = secondHalfVol / firstHalfVol;
+    if (volRatio < 0.7) volDeclineScore = 25;      // Strong volume decline
+    else if (volRatio < 0.85) volDeclineScore = 15;  // Moderate decline
+    else if (volRatio < 1.0) volDeclineScore = 8;    // Slight decline
+  }
+
+  // 3. Price above moving averages during base
+  const allCandles = candles;
+  const allCloses = allCandles.map(d => d.c);
+  const ema8 = calcEMA(allCloses, 8);
+  const ema21 = calcEMA(allCloses, 21);
+  const ema50 = calcEMA(allCloses, 50);
+  const L = allCloses.length - 1;
+  const price = allCloses[L];
+  let emaScore = 0;
+  if (price > ema8[L] && price > ema21[L] && price > ema50[L]) emaScore = 25;
+  else if (price > ema21[L] && price > ema50[L]) emaScore = 15;
+  else if (price > ema50[L]) emaScore = 8;
+
+  // 4. Breakout detection: latest close near/above range high with volume expansion
+  const latestVol = volumes[volumes.length - 1];
+  const avgVol = volumes.slice(0, -1).reduce((a, b) => a + b, 0) / Math.max(1, volumes.length - 1);
+  let breakoutScore = 0;
+  if (price >= rangeHigh * 0.995 && latestVol > avgVol * 1.3) {
+    breakoutScore = 20; // Breaking out of consolidation on volume!
+  } else if (price >= rangeHigh * 0.99) {
+    breakoutScore = 10; // Near breakout level
+  }
+
+  const quality = Math.min(100, tightnessScore + volDeclineScore + emaScore + breakoutScore);
+  return {
+    quality,
+    tight: rangePct < 8,
+    rangePct: rangePct.toFixed(1),
+    volDeclining: secondHalfVol < firstHalfVol * 0.85,
+    aboveEMAs: emaScore >= 15,
+    breakingOut: breakoutScore >= 15,
+    components: { tightnessScore, volDeclineScore, emaScore, breakoutScore },
+  };
 }
 
 // ─── Market Hours ───
@@ -265,7 +528,7 @@ async function fetchCandles(sym, key) {
         return d.c.map((c, i) => ({ c, h: d.h[i], l: d.l[i], o: d.o[i], v: d.v[i], t: d.t[i] }));
       }
     }
-  } catch {}
+  } catch { }
 
   // Fallback: Yahoo Finance (no API key needed)
   try {
@@ -337,6 +600,17 @@ function signalLabel(score) {
 let activeHints = [];        // Array of { ticker, bias, direction, reasoning, expiresAt }
 let lastHintContent = "";    // Track file changes
 
+// ─── Claude API Usage Tracking ───
+let claudeCallCount = 0;
+let claudeTotalInputTokens = 0;
+let claudeTotalOutputTokens = 0;
+const HAIKU_INPUT_COST = 1.00 / 1_000_000;   // $1.00 per 1M input tokens
+const HAIKU_OUTPUT_COST = 5.00 / 1_000_000;  // $5.00 per 1M output tokens
+
+function getClaudeCost() {
+  return (claudeTotalInputTokens * HAIKU_INPUT_COST + claudeTotalOutputTokens * HAIKU_OUTPUT_COST);
+}
+
 async function callClaude(prompt) {
   const r = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -356,6 +630,11 @@ async function callClaude(prompt) {
     throw new Error(`Claude API ${r.status}: ${err}`);
   }
   const data = await r.json();
+  claudeCallCount++;
+  if (data.usage) {
+    claudeTotalInputTokens += data.usage.input_tokens || 0;
+    claudeTotalOutputTokens += data.usage.output_tokens || 0;
+  }
   return data.content[0].text;
 }
 
@@ -484,7 +763,7 @@ async function fetchMarketNews(apiKey) {
         headlines.push({ title: a.headline, source: a.source, time: a.datetime, summary: a.summary?.slice(0, 200) || "" });
       }
     }
-  } catch {}
+  } catch { }
 
   // Finnhub market-wide news for our tickers
   for (const ticker of TICKERS.slice(0, 5)) { // top 5 to save API calls
@@ -497,7 +776,7 @@ async function fetchMarketNews(apiKey) {
         }
       }
       await delay(API_DELAY);
-    } catch {}
+    } catch { }
   }
 
   return headlines;
@@ -620,11 +899,81 @@ function getNewsBrief() {
   return latestNewsBrief;
 }
 
-// ─── Entry Logic ───
+// ─── Claude Pre-Entry Validation ───
 
-function tryEntry(state, ticker, analysis, quote) {
+async function validateEntryWithClaude(ticker, quote, analysis, setupQuality, earningsInfo, regime) {
+  const prompt = `You are a trading bot's risk management system. Evaluate this potential options trade:
+
+Ticker: ${ticker}
+Price: $${quote.c.toFixed(2)}
+Direction: ${analysis.score >= BULL_ENTRY ? 'BULLISH (buying calls)' : 'BEARISH (buying puts)'}
+Technical Score: ${analysis.score}/100
+RSI: ${analysis.rsi?.toFixed(1) || 'N/A'}
+EMA Stack: ${analysis.aligned ? 'Aligned bullish (8>21>50)' : analysis.bearish ? 'Aligned bearish' : 'Mixed'}
+Setup Quality: ${setupQuality.quality}/100 (${setupQuality.tight ? 'tight base' : 'wide range'}, ${setupQuality.breakingOut ? 'breaking out' : 'no breakout'}, vol ${setupQuality.volDeclining ? 'declining' : 'not declining'})
+Market Regime: ${regime.label}
+${earningsInfo.hasEarnings ? `⚠️ EARNINGS in ${earningsInfo.daysUntil} days (${earningsInfo.date})` : 'No upcoming earnings within 3 days'}
+Contract: 7DTE options, 1 strike OTM
+
+Evaluate:
+1. Is this a quality setup (consolidation→breakout) or chasing an extended move?
+2. Any obvious risks for holding this 7-day options contract?
+3. Is the sector/theme strong enough to support this swing?
+
+Respond with ONLY valid JSON (no markdown, no backticks):
+{"approve": true, "confidence": 75, "concerns": [], "suggestion": "brief advice"}`;
+
+  try {
+    const raw = await callClaude(prompt);
+    const cleaned = raw.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+    return JSON.parse(cleaned);
+  } catch (e) {
+    log(`CLAUDE VALIDATE WARN: Parse failed — ${e.message}. Defaulting to approve.`);
+    return { approve: true, confidence: 50, concerns: ["validation parse failed"], suggestion: "proceeding with caution" };
+  }
+}
+
+// ─── Entry Logic (enhanced with setup quality, EOD freeze, Claude validation) ───
+
+async function tryEntry(state, ticker, analysis, quote, candleCache, regime) {
   if (state.positions.some(p => p.ticker === ticker)) return null;
-  if (state.cash < 200) return null; // Need minimum cash to open a position
+  if (state.cash < 200) return null;
+
+  // EOD entry freeze — no new positions after 3:00 PM ET (except very strong signals)
+  const et = getETDate();
+  const etHour = et.getHours() + et.getMinutes() / 60;
+  if (etHour >= EOD_FREEZE_HOUR && analysis.score < 80 && analysis.score > 20) {
+    return { skipped: true, reason: `EOD freeze (${etHour.toFixed(1)} >= ${EOD_FREEZE_HOUR}h, score ${analysis.score} not extreme enough)` };
+  }
+
+  // Setup quality check — require minimum consolidation quality
+  const setupQuality = detectConsolidation(candleCache[ticker]);
+  if (setupQuality.quality < 30) {
+    return { skipped: true, reason: `Low setup quality ${setupQuality.quality}/100 (range ${setupQuality.rangePct}%, need consolidation→breakout)` };
+  }
+
+  // Earnings check — don't enter within 3 days of earnings
+  let earningsInfo = { hasEarnings: false, daysUntil: null };
+  try {
+    earningsInfo = await checkEarnings(ticker, state.apiKey);
+    await delay(API_DELAY);
+  } catch { }
+  if (earningsInfo.hasEarnings) {
+    return { skipped: true, reason: `Earnings in ${earningsInfo.daysUntil} days (${earningsInfo.date}) — too risky for 7DTE options` };
+  }
+
+  // Claude pre-entry validation
+  let claudeResult = { approve: true, confidence: 70, concerns: [], suggestion: "" };
+  try {
+    claudeResult = await validateEntryWithClaude(ticker, quote, analysis, setupQuality, earningsInfo, regime);
+    log(`CLAUDE VALIDATE ${ticker}: ${claudeResult.approve ? '✓ APPROVED' : '✗ REJECTED'} (${claudeResult.confidence}%) — ${claudeResult.suggestion}${claudeResult.concerns.length ? ' | Concerns: ' + claudeResult.concerns.join(', ') : ''}`);
+  } catch (e) {
+    log(`CLAUDE VALIDATE ${ticker}: Error — ${e.message}, proceeding anyway`);
+  }
+
+  if (!claudeResult.approve) {
+    return { skipped: true, reason: `Claude rejected: ${claudeResult.suggestion} (${claudeResult.concerns.join(', ')})` };
+  }
 
   const spot = quote.c;
   const maxRisk = state.cash * RISK_PCT;
@@ -632,29 +981,25 @@ function tryEntry(state, ticker, analysis, quote) {
   let type, strike, dte;
 
   if (analysis.score >= BULL_ENTRY) {
-    // Strong bullish → buy OTM calls
     type = "call";
     const atm = Math.round(spot / 5) * 5;
-    strike = atm + 5; // 1 strike OTM
+    strike = atm + 5;
     dte = 7;
   } else if (analysis.score <= BEAR_ENTRY) {
-    // Strong bearish → buy OTM puts
     type = "put";
     const atm = Math.round(spot / 5) * 5;
-    strike = atm - 5; // 1 strike OTM
+    strike = atm - 5;
     dte = 7;
   } else {
-    return null; // Neutral zone — no edge, wait
+    return null;
   }
 
   const premium = optPrice(spot, strike, dte, DEFAULT_IV, type);
-  const costPer = premium * 100; // 1 contract = 100 shares
+  const costPer = premium * 100;
   let qty = Math.max(1, Math.floor(maxRisk / costPer));
   let totalCost = qty * costPer;
 
-  // If we can't even afford 1 contract, skip
   if (costPer > state.cash) return null;
-  // Cap to what we can afford
   if (totalCost > state.cash) { qty = Math.floor(state.cash / costPer); totalCost = qty * costPer; }
 
   const position = {
@@ -663,9 +1008,14 @@ function tryEntry(state, ticker, analysis, quote) {
     entryPremium: premium,
     entrySpot: spot,
     qty,
+    originalQty: qty,    // Track original size for trimming
     cost: totalCost,
     openDate: getETDateStr(),
     openTime: Date.now(),
+    trimLevel: 0,         // 0=none, 1=first trim, 2=second, 3=third, 4=fully closed
+    bestPnlPct: 0,        // Track high-water mark for trailing stops
+    claudeConfidence: claudeResult.confidence,
+    setupQuality: setupQuality.quality,
   };
 
   state.cash -= totalCost;
@@ -674,9 +1024,37 @@ function tryEntry(state, ticker, analysis, quote) {
   return position;
 }
 
-// ─── Exit Logic ───
+// ─── Exit Logic (with trimming support) ───
 
-function tryExits(state, quotes) {
+function closePosition(state, pos, currentPremium, reason, qtyToClose) {
+  const qty = qtyToClose || pos.qty;
+  const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
+  const pnlDollar = (currentPremium - pos.entryPremium) * qty * 100;
+
+  if (!canClosePDT(state, pos)) {
+    const used = countRecentDayTrades(state);
+    log(`PDT BLOCKED: Cannot close ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} — ${used}/3 day trades used`);
+    return null;
+  }
+
+  const proceeds = currentPremium * qty * 100;
+  state.cash += proceeds;
+  recordDayTrade(state, pos);
+
+  const dtUsed = countRecentDayTrades(state);
+  const trade = { ...pos, qty: qty, closePremium: currentPremium, pnlDollar, pnlPct, reason };
+  logTrade(trade);
+
+  const trimLabel = qty < pos.qty ? `TRIM ${qty}/${pos.qty}` : "EXIT";
+  log(`${trimLabel}: ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} ${pnlDollar >= 0 ? "+" : ""}$${pnlDollar.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${(pnlPct * 100).toFixed(0)}%) — ${reason}`);
+  if (wouldBeDayTrade(pos)) {
+    log(`PDT CHECK: ${dtUsed}/3 day trades used (rolling 5 days)`);
+  }
+
+  return trade;
+}
+
+function tryExits(state, quotes, candleCache) {
   const closed = [];
   const remaining = [];
 
@@ -685,47 +1063,92 @@ function tryExits(state, quotes) {
     if (!q) { remaining.push(pos); continue; }
 
     const spot = q.c;
-    // Decay DTE based on time elapsed
     const elapsed = (Date.now() - pos.openTime) / (86400_000);
     pos.dteRemaining = Math.max(0, pos.dte - elapsed);
 
     const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, DEFAULT_IV, pos.type);
     const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
-    const pnlDollar = (currentPremium - pos.entryPremium) * pos.qty * 100;
+
+    // Track high-water mark
+    if (!pos.bestPnlPct) pos.bestPnlPct = 0;
+    if (pnlPct > pos.bestPnlPct) pos.bestPnlPct = pnlPct;
+    if (!pos.trimLevel) pos.trimLevel = 0;
+    if (!pos.originalQty) pos.originalQty = pos.qty;
 
     let reason = null;
+    let fullClose = false;
 
-    if (pnlPct >= PROFIT_TARGET) {
-      reason = `profit target +${(pnlPct * 100).toFixed(0)}%`;
-    } else if (pnlPct <= STOP_LOSS) {
+    // === Critical DTE — force close everything at DTE <= 2 ===
+    if (pos.dteRemaining <= CRITICAL_DTE) {
+      reason = `DTE critical (${pos.dteRemaining.toFixed(1)}d remaining)`;
+      fullClose = true;
+    }
+    // === Stop loss — always full close ===
+    else if (pnlPct <= STOP_LOSS) {
       reason = `stop loss ${(pnlPct * 100).toFixed(0)}%`;
-    } else if (pos.dteRemaining <= 1) {
+      fullClose = true;
+    }
+    // === DTE expiring soon — full close ===
+    else if (pos.dteRemaining <= 1) {
       reason = "DTE expiring";
+      fullClose = true;
+    }
+    // === Profit target hit — full close on remaining ===
+    else if (pnlPct >= PROFIT_TARGET) {
+      reason = `profit target +${(pnlPct * 100).toFixed(0)}%`;
+      fullClose = true;
+    }
+    // === TRIMMING STRATEGY (SRxTrades 1/4th exits) ===
+    else if (pos.trimLevel === 0 && pnlPct >= TRIM_1_PCT) {
+      // First trim: sell 25% at +25%, move stop to breakeven
+      const trimQty = Math.max(1, Math.floor(pos.originalQty * 0.25));
+      if (trimQty > 0 && pos.qty > trimQty) {
+        const trade = closePosition(state, pos, currentPremium, `trim 1 (+${(pnlPct * 100).toFixed(0)}%, locking gains)`, trimQty);
+        if (trade) {
+          closed.push(trade);
+          pos.qty -= trimQty;
+          pos.trimLevel = 1;
+          log(`TRIM STRATEGY: ${pos.ticker} — sold ${trimQty}/${pos.originalQty}, stop moved to breakeven`);
+        }
+      }
+      remaining.push(pos);
+      continue;
+    }
+    else if (pos.trimLevel === 1 && pnlPct >= TRIM_2_PCT) {
+      // Second trim: sell another 25% at +50%
+      const trimQty = Math.max(1, Math.floor(pos.originalQty * 0.25));
+      if (trimQty > 0 && pos.qty > trimQty) {
+        const trade = closePosition(state, pos, currentPremium, `trim 2 (+${(pnlPct * 100).toFixed(0)}%, trailing EMAs)`, trimQty);
+        if (trade) {
+          closed.push(trade);
+          pos.qty -= trimQty;
+          pos.trimLevel = 2;
+          log(`TRIM STRATEGY: ${pos.ticker} — sold ${trimQty} more, trailing with 8 EMA`);
+        }
+      }
+      remaining.push(pos);
+      continue;
+    }
+    // After trim 1, stop loss moves to breakeven
+    else if (pos.trimLevel >= 1 && pnlPct <= 0) {
+      reason = `breakeven stop (post-trim, was +${(pos.bestPnlPct * 100).toFixed(0)}%)`;
+      fullClose = true;
+    }
+    // After trim 2, trail with 15% profit floor
+    else if (pos.trimLevel >= 2 && pnlPct <= 0.15) {
+      reason = `trailing stop (post-trim2, locked +15%)`;
+      fullClose = true;
     }
 
     if (!reason) { remaining.push(pos); continue; }
 
-    // PDT check
-    if (!canClosePDT(state, pos)) {
-      const used = countRecentDayTrades(state);
-      log(`PDT BLOCKED: Cannot close ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} — ${used}/3 day trades used (opened today)`);
-      remaining.push(pos);
-      continue;
-    }
-
-    // Execute close
-    const proceeds = currentPremium * pos.qty * 100;
-    state.cash += proceeds;
-    recordDayTrade(state, pos);
-
-    const dtUsed = countRecentDayTrades(state);
-    const trade = { ...pos, closePremium: currentPremium, pnlDollar, pnlPct, reason };
-    closed.push(trade);
-    logTrade(trade);
-
-    log(`EXIT: ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} ${pnlDollar >= 0 ? "+" : ""}$${pnlDollar.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${(pnlPct * 100).toFixed(0)}%) — ${reason}`);
-    if (wouldBeDayTrade(pos)) {
-      log(`PDT CHECK: ${dtUsed}/3 day trades used (rolling 5 days)`);
+    if (fullClose) {
+      const trade = closePosition(state, pos, currentPremium, reason);
+      if (trade) {
+        closed.push(trade);
+      } else {
+        remaining.push(pos); // PDT blocked
+      }
     }
   }
 
@@ -745,36 +1168,144 @@ function trySignalExits(state, quotes, analyses) {
     if (!a) { remaining.push(pos); continue; }
 
     let reversed = false;
-    if (pos.type === "call" && a.score <= BEAR_ENTRY) reversed = true; // Was bullish, now bearish
-    if (pos.type === "put" && a.score >= BULL_ENTRY) reversed = true;  // Was bearish, now bullish
+    if (pos.type === "call" && a.score <= BEAR_ENTRY) reversed = true;
+    if (pos.type === "put" && a.score >= BULL_ENTRY) reversed = true;
 
     if (!reversed) { remaining.push(pos); continue; }
 
     const q = quotes[pos.ticker];
     const spot = q ? q.c : pos.entrySpot;
     const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, DEFAULT_IV, pos.type);
-    const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
-    const pnlDollar = (currentPremium - pos.entryPremium) * pos.qty * 100;
 
-    if (!canClosePDT(state, pos)) {
-      const used = countRecentDayTrades(state);
-      log(`PDT BLOCKED: Cannot close ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} on signal reversal — ${used}/3 day trades used`);
+    const trade = closePosition(state, pos, currentPremium, "signal reversed");
+    if (trade) {
+      closed.push(trade);
+    } else {
+      remaining.push(pos); // PDT blocked
+    }
+  }
+
+  state.positions = remaining;
+  state.history.push(...closed);
+  return closed;
+}
+
+// ─── EOD / EOW Theta-Aware Exits ───
+
+function tryTimeBasedExits(state, quotes) {
+  const et = getETDate();
+  const etHour = et.getHours() + et.getMinutes() / 60;
+  const dayOfWeek = et.getDay(); // 0=Sun, 5=Fri
+  const isFriday = dayOfWeek === 5;
+
+  const closed = [];
+  const remaining = [];
+
+  for (const pos of state.positions) {
+    const q = quotes[pos.ticker];
+    if (!q) { remaining.push(pos); continue; }
+
+    const spot = q.c;
+    const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, DEFAULT_IV, pos.type);
+    const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
+    let reason = null;
+
+    // Friday afternoon: close profitable positions to avoid weekend theta crush
+    if (isFriday && etHour >= EOW_TRIM_HOUR) {
+      if (pnlPct >= 0.20) {
+        reason = `EOW profit lock +${(pnlPct * 100).toFixed(0)}% (Fri ${etHour.toFixed(1)}h, avoid weekend theta)`;
+      } else if (pos.dteRemaining <= CRITICAL_DTE) {
+        reason = `EOW + low DTE (${pos.dteRemaining.toFixed(1)}d, Fri close)`;
+      }
+    }
+
+    // Last hour: tighten stops on profitable positions to protect gains overnight
+    if (!reason && etHour >= EOD_TIGHTEN_HOUR) {
+      if (pnlPct >= 0.10 && pos.trimLevel === 0) {
+        // Profitable but untrimmed — lock it in before close
+        reason = `EOD lock +${(pnlPct * 100).toFixed(0)}% (3:30 PM tighten, protecting overnight)`;
+      }
+    }
+
+    // Low DTE acceleration: when DTE <= 3, lower profit target
+    if (!reason && pos.dteRemaining <= LOW_DTE_THRESHOLD && pnlPct >= 0.20) {
+      reason = `low DTE accelerated exit +${(pnlPct * 100).toFixed(0)}% (${pos.dteRemaining.toFixed(1)}d left, theta accelerating)`;
+    }
+
+    if (!reason) { remaining.push(pos); continue; }
+
+    const trade = closePosition(state, pos, currentPremium, reason);
+    if (trade) {
+      closed.push(trade);
+    } else {
+      remaining.push(pos);
+    }
+  }
+
+  state.positions = remaining;
+  state.history.push(...closed);
+  return closed;
+}
+
+// ─── EMA Trailing Exits (trim 3 & 4 — SRxTrades 8/21 EMA trail) ───
+
+function tryEMATrailingExits(state, quotes, candleCache) {
+  const closed = [];
+  const remaining = [];
+
+  for (const pos of state.positions) {
+    if ((pos.trimLevel || 0) < 2) { remaining.push(pos); continue; } // Only for positions past trim 2
+
+    const candles = candleCache[pos.ticker];
+    if (!candles || candles.length < 22) { remaining.push(pos); continue; }
+
+    const closes = candles.map(d => d.c);
+    const ema8 = calcEMA(closes, 8);
+    const ema21 = calcEMA(closes, 21);
+    const L = closes.length - 1;
+    const price = closes[L];
+
+    const q = quotes[pos.ticker];
+    const spot = q ? q.c : pos.entrySpot;
+    const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, DEFAULT_IV, pos.type);
+    const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
+    let reason = null;
+
+    // For calls: bearish when price closes below EMA
+    // For puts: bullish when price closes above EMA (trend reversing against us)
+    const below8 = pos.type === "call" ? price < ema8[L] : price > ema8[L];
+    const below21 = pos.type === "call" ? price < ema21[L] : price > ema21[L];
+
+    if (pos.trimLevel === 2 && below8) {
+      // Third trim: price broke 8 EMA
+      const trimQty = Math.max(1, Math.floor((pos.originalQty || pos.qty) * 0.25));
+      if (trimQty > 0 && pos.qty > trimQty) {
+        const trade = closePosition(state, pos, currentPremium, `8 EMA break (trim 3, trailing 21 EMA with remainder)`, trimQty);
+        if (trade) {
+          closed.push(trade);
+          pos.qty -= trimQty;
+          pos.trimLevel = 3;
+          log(`EMA TRAIL: ${pos.ticker} broke 8 EMA — sold ${trimQty}, trailing 21 EMA with ${pos.qty} left`);
+        }
+      }
       remaining.push(pos);
       continue;
     }
 
-    const proceeds = currentPremium * pos.qty * 100;
-    state.cash += proceeds;
-    recordDayTrade(state, pos);
+    if (pos.trimLevel === 3 && below21) {
+      // Final exit: price broke 21 EMA
+      reason = "21 EMA break (final exit per SRxTrades trail)";
+    }
 
-    const dtUsed = countRecentDayTrades(state);
-    const trade = { ...pos, closePremium: currentPremium, pnlDollar, pnlPct, reason: "signal reversed" };
-    closed.push(trade);
-    logTrade(trade);
-
-    log(`EXIT: ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} ${pnlDollar >= 0 ? "+" : ""}$${pnlDollar.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${(pnlPct * 100).toFixed(0)}%) — signal reversed`);
-    if (wouldBeDayTrade(pos)) {
-      log(`PDT CHECK: ${dtUsed}/3 day trades used (rolling 5 days)`);
+    if (reason) {
+      const trade = closePosition(state, pos, currentPremium, reason);
+      if (trade) {
+        closed.push(trade);
+      } else {
+        remaining.push(pos);
+      }
+    } else {
+      remaining.push(pos);
     }
   }
 
@@ -788,6 +1319,7 @@ function trySignalExits(state, quotes, analyses) {
 const dashboard = {
   quotes: {},
   analyses: {},
+  shortTermAnalyses: {},  // 7-day focused analysis
   candles: {},      // Candle cache for chart rendering
   lastCycle: null,
   cycleLog: [],     // Last 200 log lines
@@ -814,12 +1346,44 @@ function dashboardHTML(state) {
   const progress = ((pv / GOAL) * 100).toFixed(1);
   const dtCount = countRecentDayTrades(state);
 
-  const posRows = dashboard.positionDetails.length > 0 ? dashboard.positionDetails.map(p => {
+  // Build position details on-the-fly if no cycle has run yet
+  let posSource = dashboard.positionDetails;
+  if (posSource.length === 0 && state.positions.length > 0) {
+    posSource = state.positions.map(pos => {
+      const q = dashboard.quotes[pos.ticker];
+      const spot = q ? q.c : pos.entrySpot;
+      const elapsed = (Date.now() - pos.openTime) / 86400_000;
+      const dteLeft = Math.max(0, pos.dte - elapsed);
+      const curPremium = optPrice(spot, pos.strike, dteLeft, DEFAULT_IV, pos.type);
+      const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
+      const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * 100;
+      const profitPrice = pos.entryPremium * (1 + PROFIT_TARGET);
+      const stopPrice = pos.entryPremium * (1 + STOP_LOSS);
+      const isDayTrade = pos.openDate === getETDateStr();
+      const pdtStatus = isDayTrade ? `Day trade (${dtCount}/3 used)` : "Swing (not a day trade)";
+      return {
+        ...pos, spot, dteLeft, curPremium, pnlPct, pnlDollar,
+        profitTarget: { pct: `+${(PROFIT_TARGET * 100).toFixed(0)}%`, premium: profitPrice.toFixed(2) },
+        stopLoss: { pct: `${(STOP_LOSS * 100).toFixed(0)}%`, premium: stopPrice.toFixed(2) },
+        pctToProfit: ((profitPrice - curPremium) / curPremium * 100).toFixed(1),
+        pctToStop: ((stopPrice - curPremium) / curPremium * 100).toFixed(1),
+        pdtStatus,
+        greeks: optGreeks(spot, pos.strike, dteLeft, DEFAULT_IV, pos.type),
+      };
+    });
+  }
+
+  const posRows = posSource.length > 0 ? posSource.map(p => {
     const color = p.pnlPct >= 0 ? "#00ff88" : "#ff4444";
-    const profitBar = Math.min(100, Math.max(0, (p.pnlPct / PROFIT_TARGET) * 100));
-    const stopBar = Math.min(100, Math.max(0, (p.pnlPct / STOP_LOSS) * 100));
+    const q = dashboard.quotes[p.ticker];
+    const spotChg = q && q.d != null ? q.d : 0;
+    const spotChgPct = q && q.dp != null ? q.dp : 0;
+    const spotColor = spotChg >= 0 ? "#00ff88" : "#ff4444";
+    const spotFromEntry = p.spot && p.entrySpot ? ((p.spot - p.entrySpot) / p.entrySpot * 100) : 0;
+    const spotFromEntryColor = spotFromEntry >= 0 ? "#00ff88" : "#ff4444";
     return `<tr>
       <td><a href="/ticker/${p.ticker}"><b>${p.ticker}</b></a></td><td>${p.type.toUpperCase()}</td><td>$${p.strike}</td>
+      <td style="white-space:nowrap">$${p.spot.toFixed(2)}<br><span style="color:${spotColor};font-size:10px">${spotChg >= 0 ? "+" : ""}${spotChg.toFixed(2)} (${spotChgPct >= 0 ? "+" : ""}${spotChgPct.toFixed(1)}%)</span><br><span style="color:${spotFromEntryColor};font-size:10px">from entry: ${spotFromEntry >= 0 ? "+" : ""}${spotFromEntry.toFixed(1)}%</span></td>
       <td>${p.dteLeft.toFixed(1)}d</td><td>${p.qty}</td>
       <td>$${p.entryPremium.toFixed(2)}</td><td>$${p.curPremium.toFixed(2)}</td>
       <td style="color:${color}">${p.pnlPct >= 0 ? "+" : ""}${(p.pnlPct * 100).toFixed(1)}% ($${p.pnlDollar.toFixed(0)})</td>
@@ -827,35 +1391,45 @@ function dashboardHTML(state) {
       <td><span style="color:#ff4444">SL $${p.stopLoss.premium}</span> (${p.pctToStop}% away)</td>
       <td style="font-size:10px;color:#888">δ${p.greeks.delta} θ${p.greeks.theta}<br>${p.pdtStatus}</td>
     </tr>`;
-  }).join("") : '<tr><td colspan="11" style="opacity:.5">No open positions</td></tr>';
+  }).join("") : '<tr><td colspan="12" style="opacity:.5">No open positions</td></tr>';
 
   // Decision reasoning panel
   const decisionRows = dashboard.decisions.map(d => {
     const actionColor = d.action === "BUY CALL" ? "#00ff88" : d.action === "BUY PUT" ? "#ff4444" :
       d.action === "HOLD" ? "#4ecdc4" : d.action === "BLOCKED" ? "#ffd93d" : "#666";
     const hintStr = d.hintBias ? ` <span style="color:#a78bfa">${d.hintBias > 0 ? "+" : ""}${d.hintBias}</span>` : "";
-    const sigList = (d.signals || []).map(s => `<span style="color:#555;font-size:10px">• ${s}</span>`).join("<br>");
+    const stColor = d.shortTermScore != null ? (d.shortTermScore >= 55 ? "#00ff88" : d.shortTermScore >= 45 ? "#888" : "#ff4444") : "#555";
+    const ltColor = d.longTermScore != null ? (d.longTermScore >= 55 ? "#00ff88" : d.longTermScore >= 45 ? "#888" : "#ff4444") : "#555";
+    const mc = v => v > 0 ? "#00ff88" : v < 0 ? "#ff4444" : "#888";
     return `<tr>
       <td><a href="/ticker/${d.ticker}"><b>${d.ticker}</b></a></td>
       <td>${d.price ? "$" + d.price.toFixed(2) : "—"}</td>
-      <td>${d.rawScore ?? "—"}${hintStr} → <b>${d.finalScore ?? "—"}</b></td>
+      <td><span style="color:${stColor}">${d.shortTermScore ?? "—"}</span>/<span style="color:${ltColor}">${d.longTermScore ?? "—"}</span>${hintStr} → <b>${d.finalScore ?? "—"}</b></td>
       <td style="color:${actionColor}"><b>${d.action}</b></td>
       <td style="font-size:11px">${d.reason || "—"}</td>
       <td style="font-size:10px;color:#888">${d.ema8 ? `8:${d.ema8} 21:${d.ema21} 50:${d.ema50}` : "—"}</td>
-      <td style="font-size:10px;color:#888">${d.rsi ? `RSI:${d.rsi} ATR:${d.atrPct}% VR:${d.vr}` : "—"}</td>
+      <td style="font-size:10px;color:#888">${d.stEma3 ? `3:${d.stEma3} 5:${d.stEma5} 8:${d.stEma8}` : "—"}</td>
+      <td style="font-size:10px;color:#888">${d.rsi ? `RSI14:${d.rsi} RSI5:${d.stRsi ?? "—"} ATR:${d.atrPct}% VR:${d.vr}` : "—"}</td>
+      <td style="font-size:10px">${d.mom1d != null ? `<span style="color:${mc(+d.mom1d)}">1d:${d.mom1d}%</span> <span style="color:${mc(+d.mom3d)}">3d:${d.mom3d}%</span> <span style="color:${mc(+d.mom7d)}">7d:${d.mom7d}%</span>` : "—"}</td>
     </tr>`;
-  }).join("") || '<tr><td colspan="7" style="opacity:.5">Waiting for first cycle...</td></tr>';
+  }).join("") || '<tr><td colspan="9" style="opacity:.5">Waiting for first cycle...</td></tr>';
 
   const analysisRows = Object.entries(dashboard.analyses).map(([ticker, a]) => {
     const q = dashboard.quotes[ticker];
     const price = q ? `$${q.c.toFixed(2)}` : "—";
+    const ahPrice = q && q.dp !== undefined ? `<span style="color:${q.d >= 0 ? '#00ff88' : '#ff4444'};font-size:10px">${q.d >= 0 ? '+' : ''}${q.d?.toFixed(2) ?? ''} (${q.dp?.toFixed(1) ?? ''}%)</span>` : "";
+    const st = dashboard.shortTermAnalyses[ticker];
     const sigColor = a.signal === "STRONG BUY" ? "#00ff88" : a.signal === "BUY WATCH" ? "#ffd93d" : a.signal === "NEUTRAL" ? "#888" : a.signal === "SELL WATCH" ? "#ff8c42" : "#ff4444";
+    const stColor = st ? (st.score >= 65 ? "#00ff88" : st.score >= 55 ? "#ffd93d" : st.score >= 45 ? "#888" : st.score >= 35 ? "#ff8c42" : "#ff4444") : "#555";
     const hintBias = getHintBias(ticker);
     const hintTag = hintBias !== 0 ? ` <span style="color:#a78bfa">[${hintBias > 0 ? "+" : ""}${hintBias}]</span>` : "";
-    return `<tr><td><a href="/ticker/${ticker}">${ticker}</a></td><td>${price}</td><td><b style="color:${sigColor}">${a.score}</b></td>
+    const momStr = st ? `<span style="color:${st.mom1d >= 0 ? '#00ff88' : '#ff4444'}">${st.mom1d >= 0 ? '+' : ''}${st.mom1d.toFixed(1)}%</span>` : "—";
+    return `<tr><td><a href="/ticker/${ticker}">${ticker}</a></td><td>${price} ${ahPrice}</td>
+      <td><b style="color:${sigColor}">${a.score}</b></td>
+      <td style="color:${stColor}">${st ? st.score : '—'}</td>
       <td style="color:${sigColor}">${a.signal}${hintTag}</td>
-      <td>${a.rsi.toFixed(0)}</td><td>${a.atrPct.toFixed(1)}%</td><td>${a.vr.toFixed(2)}</td></tr>`;
-  }).join("") || '<tr><td colspan="7" style="opacity:.5">Waiting for first cycle...</td></tr>';
+      <td>${a.rsi.toFixed(0)}</td><td>${st ? st.rsi.toFixed(0) : '—'}</td><td>${momStr}</td><td>${a.atrPct.toFixed(1)}%</td><td>${a.vr.toFixed(2)}</td></tr>`;
+  }).join("") || '<tr><td colspan="10" style="opacity:.5">Waiting for first cycle...</td></tr>';
 
   const historyRows = state.history.slice(-20).reverse().map(h => {
     const color = h.pnlDollar >= 0 ? "#00ff88" : "#ff4444";
@@ -872,10 +1446,10 @@ function dashboardHTML(state) {
 
   const logLines = dashboard.cycleLog.slice(-50).reverse().map(l =>
     l.replace(/\[(\d+:\d+:\d+)\]/, '<span style="color:#666">[$1]</span>')
-     .replace(/(TRADE:|EXIT:|HINT RECEIVED:|CLAUDE SAYS:)/g, '<b style="color:#a78bfa">$1</b>')
-     .replace(/(PDT BLOCKED:)/g, '<b style="color:#ff4444">$1</b>')
-     .replace(/(STRONG BUY)/g, '<span style="color:#00ff88">$1</span>')
-     .replace(/(AVOID)/g, '<span style="color:#ff4444">$1</span>')
+      .replace(/(TRADE:|EXIT:|HINT RECEIVED:|CLAUDE SAYS:)/g, '<b style="color:#a78bfa">$1</b>')
+      .replace(/(PDT BLOCKED:)/g, '<b style="color:#ff4444">$1</b>')
+      .replace(/(STRONG BUY)/g, '<span style="color:#00ff88">$1</span>')
+      .replace(/(AVOID)/g, '<span style="color:#ff4444">$1</span>')
   ).join("<br>");
 
   return `<!DOCTYPE html><html><head><meta charset="utf-8">
@@ -911,9 +1485,11 @@ function dashboardHTML(state) {
   .market-badge{display:inline-block;padding:2px 10px;border-radius:10px;font-size:11px;font-weight:700}
   .open{background:#00ff8830;color:#00ff88}
   .closed{background:#ff444430;color:#ff4444}
+  .flash{animation:flash .4s}
+  @keyframes flash{0%{background:#ffffff15}100%{background:transparent}}
 </style></head><body>
 <h1>SWINGERS Auto-Trading Bot</h1>
-<div class="sub">$25K → $200K Challenge &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; Auto-refreshes every 30s</div>
+<div class="sub">$25K → $200K Challenge &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}" id="mkt-badge">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; <span id="live-indicator" style="color:#00ff88">LIVE</span> updates every 5s &nbsp;|&nbsp; <span id="pv-header">$${pv.toFixed(0)}</span> <span id="pnl-header" style="color:${pnlPct >= 0 ? '#00ff88' : '#ff4444'}">(${pnlPct >= 0 ? '+' : ''}${pnlPct}%)</span> &nbsp;|&nbsp; <span style="color:${currentRegime.mode === 'risk-on' ? '#00ff88' : currentRegime.mode === 'cautious' ? '#ffd93d' : '#ff4444'};font-size:10px">${currentRegime.mode.toUpperCase()}</span> &nbsp;|&nbsp; <span style="color:#a78bfa;font-size:10px" title="Claude Haiku 4.5 API calls this session">🤖 ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span></div>
 
 <div class="grid">
   <div class="card">
@@ -938,19 +1514,19 @@ function dashboardHTML(state) {
 
 <div class="card" style="margin-bottom:16px">
   <h2>Open Positions (${state.positions.length})</h2>
-  <table><tr><th>Ticker</th><th>Type</th><th>Strike</th><th>DTE</th><th>Qty</th><th>Entry</th><th>Current</th><th>P&L</th><th>Profit Target</th><th>Stop Loss</th><th>Greeks / PDT</th></tr>${posRows}</table>
+  <table><tr><th>Ticker</th><th>Type</th><th>Strike</th><th>Stock Price</th><th>DTE</th><th>Qty</th><th>Entry</th><th>Current</th><th>P&L</th><th>Profit Target</th><th>Stop Loss</th><th>Greeks / PDT</th></tr>${posRows}</table>
 </div>
 
 <div class="card" style="margin-bottom:16px">
   <h2>Bot Thinking — Decision Reasoning</h2>
-  <div style="font-size:10px;color:#555;margin-bottom:8px">Score 50=neutral · ≥${BULL_ENTRY} buy calls · ≤${BEAR_ENTRY} buy puts · Risk: ${(RISK_PCT*100)}%/trade · TP: +${(PROFIT_TARGET*100)}% · SL: ${(STOP_LOSS*100)}%</div>
-  <table><tr><th>Ticker</th><th>Price</th><th>Score (raw→final)</th><th>Decision</th><th>Reasoning</th><th>EMAs (8/21/50)</th><th>Indicators</th></tr>${decisionRows}</table>
+  <div style="font-size:10px;color:#555;margin-bottom:8px">Score 50=neutral · ≥${BULL_ENTRY} buy calls · ≤${BEAR_ENTRY} buy puts · Risk: ${(RISK_PCT * 100)}%/trade · TP: +${(PROFIT_TARGET * 100)}% · SL: ${(STOP_LOSS * 100)}%</div>
+  <table><tr><th>Ticker</th><th>Price</th><th>Score (7d/90d→blend→final)</th><th>Decision</th><th>Reasoning</th><th>EMAs (8/21/50)</th><th>7d EMAs (3/5/8)</th><th>Indicators</th><th>Momentum</th></tr>${decisionRows}</table>
 </div>
 
 <div class="grid">
   <div class="card">
     <h2>Analysis (${Object.keys(dashboard.analyses).length} tickers)</h2>
-    <table><tr><th>Ticker</th><th>Price</th><th>Score</th><th>Signal</th><th>RSI</th><th>ATR%</th><th>Vol Ratio</th></tr>${analysisRows}</table>
+    <table><tr><th>Ticker</th><th>Price</th><th>Score</th><th>7d</th><th>Signal</th><th>RSI(14)</th><th>RSI(5)</th><th>1d Mom</th><th>ATR%</th><th>Vol Ratio</th></tr>${analysisRows}</table>
   </div>
   <div class="card">
     <h2>Trade History (last 20)</h2>
@@ -960,8 +1536,32 @@ function dashboardHTML(state) {
 
 <div class="card" style="margin-top:16px">
   <h2>Live Log</h2>
-  <div class="log">${logLines || '<span style="opacity:.5">Waiting for first cycle...</span>'}</div>
+  <div class="log" id="live-log">${logLines || '<span style="opacity:.5">Waiting for first cycle...</span>'}</div>
 </div>
+
+<script>
+let prevPrices = {};
+async function pollLive() {
+  try {
+    const r = await fetch('/api/live');
+    const d = await r.json();
+    // Update header
+    const pvEl = document.getElementById('pv-header');
+    const pnlEl = document.getElementById('pnl-header');
+    if (pvEl) {
+      pvEl.textContent = '$' + d.pv.toFixed(0);
+      const pnl = ((d.pv - ${STARTING_CASH}) / ${STARTING_CASH} * 100).toFixed(1);
+      pnlEl.textContent = '(' + (pnl >= 0 ? '+' : '') + pnl + '%)';
+      pnlEl.style.color = pnl >= 0 ? '#00ff88' : '#ff4444';
+    }
+    // Pulse indicator
+    const ind = document.getElementById('live-indicator');
+    if (ind) { ind.style.opacity = '1'; setTimeout(() => ind.style.opacity = '.4', 200); }
+  } catch(e) {}
+}
+setInterval(pollLive, 5000);
+pollLive();
+</script>
 
 </body></html>`;
 }
@@ -975,84 +1575,102 @@ function tickerDetailHTML(sym, state) {
   const hintBias = getHintBias(sym);
   const hint = activeHints.find(h => h.ticker === sym);
 
-  // Build SVG chart from candles
-  let chartSVG = '<div style="color:#555;padding:40px;text-align:center">No candle data available</div>';
-  let emaChartSVG = '';
-  let volumeSVG = '';
+  const st = dashboard.shortTermAnalyses[sym];
 
-  if (candles && candles.length > 10) {
-    const W = 700, H = 250;
-    const closes = candles.map(c => c.c);
-    const highs = candles.map(c => c.h);
-    const lows = candles.map(c => c.l);
-    const vols = candles.map(c => c.v);
-    const ema8 = calcEMA(closes, 8), ema21 = calcEMA(closes, 21), ema50 = calcEMA(closes, 50);
-
-    const allPrices = [...highs, ...lows];
-    const mn = Math.min(...allPrices) * 0.998, mx = Math.max(...allPrices) * 1.002, rng = mx - mn;
+  // Helper: build SVG candlestick chart from a set of candles with EMA overlays
+  function buildChart(cdata, emas, W, H) {
+    if (!cdata || cdata.length < 3) return { chart: '<div style="color:#555">No data</div>', volume: '' };
+    const cls = cdata.map(c => c.c), hs = cdata.map(c => c.h), ls = cdata.map(c => c.l), vs = cdata.map(c => c.v);
+    const emaLines = emas.map(e => ({ data: calcEMA(cls, e.period), color: e.color, label: e.label }));
+    const allP = [...hs, ...ls];
+    const mn = Math.min(...allP) * 0.998, mx = Math.max(...allP) * 1.002, rng = mx - mn;
     const y = v => H - ((v - mn) / rng) * (H - 20) - 10;
-    const x = i => (i / (closes.length - 1)) * W;
+    const x = i => (i / Math.max(1, cls.length - 1)) * W;
 
-    // Candlestick chart
-    const candleBars = candles.map((c, i) => {
+    const bars = cdata.map((c, i) => {
       const green = c.c >= c.o;
       const color = green ? "#00ff88" : "#ff4444";
-      const bw = Math.max(2, W / candles.length - 1);
+      const bw = Math.max(3, W / cdata.length - 1);
       const top = y(Math.max(c.o, c.c)), bot = y(Math.min(c.o, c.c));
       const bodyH = Math.max(1, bot - top);
       return `<line x1="${x(i)}" y1="${y(c.h)}" x2="${x(i)}" y2="${y(c.l)}" stroke="${color}" stroke-width="1"/>
-        <rect x="${x(i) - bw/2}" y="${top}" width="${bw}" height="${bodyH}" fill="${green ? color : color}" rx="0.5"/>`;
+        <rect x="${x(i) - bw / 2}" y="${top}" width="${bw}" height="${bodyH}" fill="${color}" rx="0.5"/>`;
     }).join("");
 
-    // EMA lines
-    const emaPath = (arr, color) => arr.map((v, i) => `${i ? "L" : "M"}${x(i)},${y(v)}`).join(" ");
+    const emaPaths = emaLines.map(e =>
+      `<path d="${e.data.map((v, i) => `${i ? "L" : "M"}${x(i)},${y(v)}`).join(" ")}" fill="none" stroke="${e.color}" stroke-width="1.5" opacity="0.8"/>`
+    ).join("");
 
-    // Price labels on right axis
-    const priceLabels = [mn, mn + rng * 0.25, mn + rng * 0.5, mn + rng * 0.75, mx].map(p =>
+    const pLabels = [mn, mn + rng * 0.25, mn + rng * 0.5, mn + rng * 0.75, mx].map(p =>
       `<text x="${W + 5}" y="${y(p)}" fill="#555" font-size="9" dominant-baseline="middle">$${p.toFixed(2)}</text>`
     ).join("");
 
-    chartSVG = `<svg viewBox="0 0 ${W + 60} ${H}" style="width:100%;height:${H}px">
-      <defs><linearGradient id="gfill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#00ff8815"/><stop offset="100%" stop-color="#00ff8802"/></linearGradient></defs>
-      ${candleBars}
-      <path d="${emaPath(ema8, '#4ecdc4')}" fill="none" stroke="#4ecdc4" stroke-width="1.5" opacity="0.8"/>
-      <path d="${emaPath(ema21, '#ff6b35')}" fill="none" stroke="#ff6b35" stroke-width="1.5" opacity="0.8"/>
-      <path d="${emaPath(ema50, '#a78bfa')}" fill="none" stroke="#a78bfa" stroke-width="1.5" opacity="0.7"/>
-      ${priceLabels}
-    </svg>
-    <div style="font-size:10px;margin-top:4px;color:#666">
-      <span style="color:#4ecdc4">━ EMA 8 (${ema8[ema8.length-1].toFixed(2)})</span> &nbsp;
-      <span style="color:#ff6b35">━ EMA 21 (${ema21[ema21.length-1].toFixed(2)})</span> &nbsp;
-      <span style="color:#a78bfa">━ EMA 50 (${ema50[ema50.length-1].toFixed(2)})</span>
-    </div>`;
+    const legend = emaLines.map(e =>
+      `<span style="color:${e.color}">\u2501 ${e.label} (${e.data[e.data.length - 1].toFixed(2)})</span>`
+    ).join(" &nbsp; ");
 
-    // Volume chart
-    const maxV = Math.max(...vols);
-    const avgV = vols.reduce((a, b) => a + b, 0) / vols.length;
+    const chart = `<svg viewBox="0 0 ${W + 60} ${H}" style="width:100%;height:${H}px">
+      ${bars}${emaPaths}${pLabels}
+    </svg>
+    <div style="font-size:10px;margin-top:4px;color:#666">${legend}</div>`;
+
+    const maxV = Math.max(...vs);
+    const avgV = vs.reduce((a, b) => a + b, 0) / vs.length;
     const VH = 60;
-    const volBars = vols.map((v, i) => {
-      const bw = Math.max(2, W / vols.length - 1);
+    const volBars = vs.map((v, i) => {
+      const bw = Math.max(3, W / vs.length - 1);
       const h = (v / maxV) * VH;
-      return `<rect x="${x(i) - bw/2}" y="${VH - h}" width="${bw}" height="${h}" fill="${v > avgV * 1.15 ? '#00ff8850' : '#ffffff18'}" rx="0.5"/>`;
+      return `<rect x="${x(i) - bw / 2}" y="${VH - h}" width="${bw}" height="${h}" fill="${v > avgV * 1.15 ? '#00ff8850' : '#ffffff18'}" rx="0.5"/>`;
     }).join("");
-    volumeSVG = `<svg viewBox="0 0 ${W + 60} ${VH}" style="width:100%;height:${VH}px">
-      <line x1="0" y1="${VH - (avgV/maxV)*VH}" x2="${W}" y2="${VH - (avgV/maxV)*VH}" stroke="#ffffff15" stroke-dasharray="3 2"/>
+    const volume = `<svg viewBox="0 0 ${W + 60} ${VH}" style="width:100%;height:${VH}px">
+      <line x1="0" y1="${VH - (avgV / maxV) * VH}" x2="${W}" y2="${VH - (avgV / maxV) * VH}" stroke="#ffffff15" stroke-dasharray="3 2"/>
       ${volBars}
     </svg>`;
+
+    return { chart, volume };
   }
+
+  // 90-day chart with EMA 8/21/50
+  const longChart = buildChart(candles, [
+    { period: 8, color: "#4ecdc4", label: "EMA 8" },
+    { period: 21, color: "#ff6b35", label: "EMA 21" },
+    { period: 50, color: "#a78bfa", label: "EMA 50" },
+  ], 700, 250);
+
+  // 7-day chart (last 14 candles) with EMA 3/5/8
+  const shortCandles = candles ? candles.slice(-14) : null;
+  const shortChart = buildChart(shortCandles, [
+    { period: 3, color: "#00d4ff", label: "EMA 3" },
+    { period: 5, color: "#ffd93d", label: "EMA 5" },
+    { period: 8, color: "#ff6b9d", label: "EMA 8" },
+  ], 700, 250);
+
+  const chartSVG = longChart.chart;
+  const volumeSVG = longChart.volume;
 
   // Position info block
   let posBlock = '<div style="color:#555">No position in this ticker</div>';
   if (pos) {
     const color = pos.pnlPct >= 0 ? "#00ff88" : "#ff4444";
+    const posSpotChg = q && q.d != null ? q.d : 0;
+    const posSpotChgPct = q && q.dp != null ? q.dp : 0;
+    const posSpotColor = posSpotChg >= 0 ? "#00ff88" : "#ff4444";
+    const posSpotFromEntry = pos.spot && pos.entrySpot ? ((pos.spot - pos.entrySpot) / pos.entrySpot * 100) : 0;
+    const posSpotEntryColor = posSpotFromEntry >= 0 ? "#00ff88" : "#ff4444";
     posBlock = `
       <div class="stat"><div class="val">${pos.type.toUpperCase()}</div><div class="lbl">Type</div></div>
       <div class="stat"><div class="val">$${pos.strike}</div><div class="lbl">Strike</div></div>
       <div class="stat"><div class="val">${pos.qty}</div><div class="lbl">Contracts</div></div>
       <div class="stat"><div class="val">${pos.dteLeft.toFixed(1)}d</div><div class="lbl">DTE Left</div></div>
+      <hr style="border-color:#1e1e2e;margin:12px 0">
+      <div class="stat"><div class="val">$${pos.spot.toFixed(2)}</div><div class="lbl">Stock Price</div></div>
+      <div class="stat"><div class="val" style="color:${posSpotColor}">${posSpotChg >= 0 ? "+" : ""}${posSpotChg.toFixed(2)} (${posSpotChgPct >= 0 ? "+" : ""}${posSpotChgPct.toFixed(1)}%)</div><div class="lbl">Today's Move</div></div>
+      <div class="stat"><div class="val">$${pos.entrySpot.toFixed(2)}</div><div class="lbl">Entry Stock Price</div></div>
+      <div class="stat"><div class="val" style="color:${posSpotEntryColor}">${posSpotFromEntry >= 0 ? "+" : ""}${posSpotFromEntry.toFixed(1)}%</div><div class="lbl">Stock Since Entry</div></div>
+      <hr style="border-color:#1e1e2e;margin:12px 0">
       <div class="stat"><div class="val">$${pos.entryPremium.toFixed(2)}</div><div class="lbl">Entry Premium</div></div>
       <div class="stat"><div class="val">$${pos.curPremium.toFixed(2)}</div><div class="lbl">Current Premium</div></div>
-      <div class="stat ${pos.pnlPct >= 0 ? '' : 'neg'}"><div class="val" style="color:${color}">${(pos.pnlPct*100).toFixed(1)}% ($${pos.pnlDollar.toFixed(0)})</div><div class="lbl">P&L</div></div>
+      <div class="stat ${pos.pnlPct >= 0 ? '' : 'neg'}"><div class="val" style="color:${color}">${(pos.pnlPct * 100).toFixed(1)}% ($${pos.pnlDollar.toFixed(0)})</div><div class="lbl">P&L</div></div>
       <hr style="border-color:#1e1e2e;margin:12px 0">
       <div class="stat"><div class="val" style="color:#00ff88">$${pos.profitTarget.premium}</div><div class="lbl">TP (${pos.profitTarget.pct})</div></div>
       <div class="stat"><div class="val" style="color:#ff4444">$${pos.stopLoss.premium}</div><div class="lbl">SL (${pos.stopLoss.pct})</div></div>
@@ -1074,7 +1692,7 @@ function tickerDetailHTML(sym, state) {
       <div class="stat"><div class="val">${dec.finalScore ?? '—'}</div><div class="lbl">Final Score</div></div>
       <div class="stat"><div class="val" style="color:${actionColor}">${dec.action}</div><div class="lbl">Decision</div></div>
       <div style="margin:8px 0;color:#aaa;font-size:12px">${dec.reason}</div>
-      <div style="margin-top:8px">${(dec.signals||[]).map(s => '<div style="color:#888;font-size:11px;padding:2px 0">• ' + s + '</div>').join('')}</div>`;
+      <div style="margin-top:8px">${(dec.signals || []).map(s => '<div style="color:#888;font-size:11px;padding:2px 0">• ' + s + '</div>').join('')}</div>`;
   }
 
   // Analysis stats
@@ -1096,7 +1714,7 @@ function tickerDetailHTML(sym, state) {
   }
 
   const hintBlock = hint
-    ? `<div class="hint">${hint.direction} bias ${hint.bias > 0 ? '+' : ''}${hint.bias} — ${hint.reasoning} (expires ${Math.round((hint.expiresAt - Date.now())/60000)}m)</div>`
+    ? `<div class="hint">${hint.direction} bias ${hint.bias > 0 ? '+' : ''}${hint.bias} — ${hint.reasoning} (expires ${Math.round((hint.expiresAt - Date.now()) / 60000)}m)</div>`
     : '<span style="color:#555">No active hint for this ticker</span>';
 
   return `<!DOCTYPE html><html><head><meta charset="utf-8">
@@ -1119,26 +1737,43 @@ function tickerDetailHTML(sym, state) {
   .stat.neg .val{color:#ff4444}
   .hint{display:inline-block;background:#a78bfa20;border:1px solid #a78bfa40;border-radius:4px;padding:4px 10px;font-size:11px;color:#a78bfa}
 </style></head><body>
-<h1><a href="/">← Back</a> &nbsp; ${sym} ${q ? '$' + q.c.toFixed(2) : ''}</h1>
-<div class="sub">${pos ? pos.type.toUpperCase() + ' $' + pos.strike + ' | ' + pos.qty + ' contracts' : 'Not currently held'} &nbsp;|&nbsp; Auto-refreshes every 30s</div>
+<h1><a href="/">← Back</a> &nbsp; ${sym} ${q ? '$' + q.c.toFixed(2) : ''}
+${q ? `<span style="font-size:13px;color:${q.d >= 0 ? '#00ff88' : '#ff4444'}">${q.d >= 0 ? '+' : ''}${q.d?.toFixed(2)} (${q.dp?.toFixed(2)}%)</span>` : ''}</h1>
+<div class="sub">${pos ? pos.type.toUpperCase() + ' $' + pos.strike + ' | ' + pos.qty + ' contracts' : 'Not currently held'} &nbsp;|&nbsp; Auto-refreshes every 30s
+${q?.t ? ` &nbsp;|&nbsp; Last: ${new Date(q.t * 1000).toLocaleString("en-US", { timeZone: "America/New_York" })} ET` : ''}</div>
 
-<div class="card" style="margin-bottom:16px">
-  <h2>Price Chart (90 days) — Candlesticks + EMAs</h2>
-  ${chartSVG}
+<div class="card" style="margin-bottom:16px;border-color:#00d4ff40">
+  <h2 style="color:#00d4ff">7-Day Chart (Contract Window) — Fast EMAs 3/5/8</h2>
+  ${shortChart.chart}
+  <div style="margin-top:8px">${shortChart.volume}</div>
+  ${st ? `<div style="margin-top:12px;display:flex;gap:20px;flex-wrap:wrap">
+    <div class="stat"><div class="val" style="color:${st.score >= 55 ? '#00ff88' : st.score >= 45 ? '#888' : '#ff4444'}">${st.score}</div><div class="lbl">7d Score</div></div>
+    <div class="stat"><div class="val" style="color:${st.signal.includes('BUY') ? '#00ff88' : st.signal.includes('SELL') ? '#ff4444' : '#888'}">${st.signal}</div><div class="lbl">7d Signal</div></div>
+    <div class="stat"><div class="val" style="color:${st.mom1d >= 0 ? '#00ff88' : '#ff4444'}">${st.mom1d >= 0 ? '+' : ''}${st.mom1d.toFixed(2)}%</div><div class="lbl">1d Momentum</div></div>
+    <div class="stat"><div class="val" style="color:${st.mom3d >= 0 ? '#00ff88' : '#ff4444'}">${st.mom3d >= 0 ? '+' : ''}${st.mom3d.toFixed(2)}%</div><div class="lbl">3d Momentum</div></div>
+    <div class="stat"><div class="val" style="color:${st.mom7d >= 0 ? '#00ff88' : '#ff4444'}">${st.mom7d >= 0 ? '+' : ''}${st.mom7d.toFixed(2)}%</div><div class="lbl">7d Momentum</div></div>
+    <div class="stat"><div class="val">${st.rsi.toFixed(0)}</div><div class="lbl">RSI (5)</div></div>
+    <div class="stat"><div class="val">${st.range7d.toFixed(1)}%</div><div class="lbl">7d Range</div></div>
+    <div class="stat"><div class="val">$${st.recentHigh.toFixed(2)}</div><div class="lbl">7d High${st.nearHigh ? ' (NEAR)' : ''}</div></div>
+    <div class="stat"><div class="val">$${st.recentLow.toFixed(2)}</div><div class="lbl">7d Low${st.nearLow ? ' (NEAR)' : ''}</div></div>
+    <div class="stat"><div class="val">${st.vr.toFixed(2)}</div><div class="lbl">Vol Ratio</div></div>
+  </div>
+  <div style="margin-top:8px">${st.sigs.map(s => '<span style="color:' + (s.t === 'bull' ? '#00ff88' : '#ff4444') + ';font-size:11px;margin-right:12px">• ' + s.text + '</span>').join('')}</div>` : ''}
 </div>
 
 <div class="card" style="margin-bottom:16px">
-  <h2>Volume</h2>
-  ${volumeSVG || '<div style="color:#555">No volume data</div>'}
+  <h2>90-Day Chart — EMAs 8/21/50</h2>
+  ${chartSVG}
+  <div style="margin-top:8px">${volumeSVG || '<div style="color:#555">No volume data</div>'}</div>
 </div>
 
 <div class="grid">
   <div class="card">
-    <h2>Analysis & Indicators</h2>
+    <h2>90-Day Analysis & Indicators</h2>
     ${statsBlock}
   </div>
   <div class="card">
-    <h2>Bot Decision</h2>
+    <h2>Bot Decision (Blended 60% 7d / 40% 90d)</h2>
     ${decBlock || '<div style="color:#555">No decision data yet</div>'}
     <hr style="border-color:#1e1e2e;margin:12px 0">
     <h2 style="margin-top:8px">News/Hint Bias</h2>
@@ -1179,9 +1814,9 @@ function startDashboard(state) {
       return;
     }
 
-    // JSON API
+    // JSON API — full state
     if (req.url === "/api/state") {
-      res.writeHead(200, { "Content-Type": "application/json" });
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       res.end(JSON.stringify({
         cash: state.cash,
         positions: state.positions,
@@ -1193,6 +1828,40 @@ function startDashboard(state) {
         portfolioValue: portfolioValue(state, dashboard.quotes),
         marketOpen: dashboard.marketOpen,
         log: dashboard.cycleLog.slice(-50),
+      }));
+      return;
+    }
+
+    // JSON API — lightweight live ticker (polled every 5s)
+    if (req.url === "/api/live") {
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      const tickers = {};
+      for (const [sym, q] of Object.entries(dashboard.quotes)) {
+        const a = dashboard.analyses[sym];
+        const st = dashboard.shortTermAnalyses[sym];
+        const pos = state.positions.find(p => p.ticker === sym);
+        let posPnl = null;
+        if (pos) {
+          const spot = q ? q.c : pos.entrySpot;
+          const elapsed = (Date.now() - pos.openTime) / 86400_000;
+          const dteLeft = Math.max(0, pos.dte - elapsed);
+          const curPremium = optPrice(spot, pos.strike, dteLeft, DEFAULT_IV, pos.type);
+          posPnl = { pct: ((curPremium - pos.entryPremium) / pos.entryPremium * 100).toFixed(1), dollar: ((curPremium - pos.entryPremium) * pos.qty * 100).toFixed(0) };
+        }
+        tickers[sym] = {
+          c: q.c, pc: q.pc, d: q.d, dp: q.dp, h: q.h, l: q.l,
+          score: a?.score, signal: a?.signal, stScore: st?.score,
+          mom1d: st?.mom1d, mom3d: st?.mom3d, mom7d: st?.mom7d,
+          held: !!pos, type: pos?.type, posPnl,
+        };
+      }
+      res.end(JSON.stringify({
+        tickers,
+        pv: portfolioValue(state, dashboard.quotes),
+        cash: state.cash,
+        open: state.positions.length,
+        marketOpen: dashboard.marketOpen,
+        lastCycle: dashboard.lastCycle,
       }));
       return;
     }
@@ -1260,74 +1929,122 @@ async function runCycle(state, candleCache) {
   // Auto news scan every 3 hours
   await runNewsScan(state);
 
-  // Run analysis on each ticker (with hint bias applied)
+  // Run dual-timeframe analysis on each ticker (with hint bias applied)
+  const shortTermAnalyses = {};
   const decisions = [];
   for (const ticker of TICKERS) {
     const candles = candleCache[ticker];
     if (!candles) { decisions.push({ ticker, action: "SKIP", reason: "No candle data" }); continue; }
-    const a = runAnalysis(candles);
+    const a = runAnalysis(candles);          // 90-day long-term
+    const st = runShortTermAnalysis(candles); // 7-day short-term
     if (!a) { decisions.push({ ticker, action: "SKIP", reason: "Insufficient data (<55 candles)" }); continue; }
 
-    // Apply Claude hint bias
+    // Store short-term analysis for dashboard
+    if (st) shortTermAnalyses[ticker] = st;
+
+    // Blend scores: 60% short-term (matches contract duration), 40% long-term (context)
+    const blended = blendScores(a, st);
+    const effectiveScore = blended.score;
+    const effectiveSignal = blended.signal;
+
+    // Apply Claude hint bias on the blended score
     const hintBias = getHintBias(ticker);
-    const rawScore = a.score;
+    const rawScore = effectiveScore;
+    let finalScore = effectiveScore;
     if (hintBias !== 0) {
-      a.score = Math.max(0, Math.min(100, a.score + hintBias));
-      a.signal = signalLabel(a.score);
+      finalScore = Math.max(0, Math.min(100, effectiveScore + hintBias));
       a.hintBoosted = true;
     }
+    // Update the long-term analysis object with blended+hint final score for compatibility
+    a.score = finalScore;
+    a.signal = signalLabel(finalScore);
+    a.blendedRaw = effectiveScore;
+    a.shortTermScore = st ? st.score : null;
+    a.longTermScore = a.score !== finalScore ? rawScore : a.score; // store the pre-hint blended
     analyses[ticker] = a;
+
     const q = quotes[ticker];
     const price = q ? `$${q.c.toFixed(2)}` : "N/A";
     const hintTag = hintBias !== 0 ? ` [HINT ${hintBias > 0 ? "+" : ""}${hintBias}]` : "";
-    log(`${ticker} ${price} | Score: ${a.score} ${a.signal}${hintTag} | ${a.sigs.map(s => s.text).join(", ") || "No signals"}`);
+    const stTag = st ? ` (7d:${st.score} 90d:${a.blendedRaw !== undefined ? Math.round(a.bullScore * 0.5 + 50 - a.bearScore * 0.5) : '?'})` : "";
+    log(`${ticker} ${price} | Blended: ${finalScore} ${a.signal}${hintTag}${stTag} | ${a.sigs.map(s => s.text).join(", ") || "No signals"}`);
 
     // Build decision reasoning
-    const dec = { ticker, price: q?.c, rawScore, finalScore: a.score, signal: a.signal, hintBias };
+    const dec = { ticker, price: q?.c, rawScore, finalScore, signal: a.signal, hintBias };
     const alreadyHeld = state.positions.some(p => p.ticker === ticker);
     const lowCash = state.cash < 200; // effectively no buying power
 
-    // Score: 50 = neutral, >65 = buy calls, <35 = buy puts
     dec.bullScore = a.bullScore; dec.bearScore = a.bearScore;
-    if (a.score >= BULL_ENTRY) {
+    dec.shortTermScore = st ? st.score : null;
+    dec.longTermScore = a ? Math.round(50 + (a.bullScore - a.bearScore) / 2) : null;
+    dec.blendedScore = effectiveScore;
+
+    // Use the final (blended + hint) score for entry decisions
+    if (finalScore >= BULL_ENTRY) {
       if (alreadyHeld) { dec.action = "HOLD"; dec.reason = "Already in position"; }
       else if (lowCash) { dec.action = "BLOCKED"; dec.reason = `Insufficient cash ($${state.cash.toFixed(0)})`; }
-      else { dec.action = "BUY CALL"; dec.reason = `Bullish ${a.score}/100 (bull:${a.bullScore} bear:${a.bearScore})`; }
-    } else if (a.score <= BEAR_ENTRY) {
+      else { dec.action = "BUY CALL"; dec.reason = `Bullish ${finalScore}/100 (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`; }
+    } else if (finalScore <= BEAR_ENTRY) {
       if (alreadyHeld) { dec.action = "HOLD"; dec.reason = "Already in position"; }
       else if (lowCash) { dec.action = "BLOCKED"; dec.reason = `Insufficient cash ($${state.cash.toFixed(0)})`; }
-      else { dec.action = "BUY PUT"; dec.reason = `Bearish ${a.score}/100 (bull:${a.bullScore} bear:${a.bearScore})`; }
+      else { dec.action = "BUY PUT"; dec.reason = `Bearish ${finalScore}/100 (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`; }
     } else {
       dec.action = "WAIT";
-      if (a.score >= 55) dec.reason = `Score ${a.score} — leaning bullish but need ≥${BULL_ENTRY}`;
-      else if (a.score >= 45) dec.reason = `Score ${a.score} — neutral, no clear edge`;
-      else dec.reason = `Score ${a.score} — leaning bearish but need ≤${BEAR_ENTRY}`;
+      if (finalScore >= 55) dec.reason = `Score ${finalScore} — leaning bullish but need ≥${BULL_ENTRY} (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`;
+      else if (finalScore >= 45) dec.reason = `Score ${finalScore} — neutral (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`;
+      else dec.reason = `Score ${finalScore} — leaning bearish but need ≤${BEAR_ENTRY} (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`;
     }
     dec.ema8 = a.ema8v?.toFixed(2); dec.ema21 = a.ema21v?.toFixed(2); dec.ema50 = a.ema50v?.toFixed(2);
-    dec.rsi = a.rsi?.toFixed(1); dec.atrPct = a.atrPct?.toFixed(2); dec.vr = a.vr?.toFixed(2);
-    dec.signals = a.sigs?.map(s => s.text) || [];
+    dec.stEma3 = st?.ema3v?.toFixed(2); dec.stEma5 = st?.ema5v?.toFixed(2); dec.stEma8 = st?.ema8v?.toFixed(2);
+    dec.rsi = a.rsi?.toFixed(1); dec.stRsi = st?.rsi?.toFixed(1);
+    dec.atrPct = a.atrPct?.toFixed(2); dec.vr = a.vr?.toFixed(2);
+    dec.mom1d = st?.mom1d?.toFixed(2); dec.mom3d = st?.mom3d?.toFixed(2); dec.mom7d = st?.mom7d?.toFixed(2);
+    dec.signals = [...(a.sigs?.map(s => s.text) || []), ...(st?.sigs?.map(s => `[7d] ${s.text}`) || [])];
     decisions.push(dec);
   }
   dashboard.decisions = decisions;
+  dashboard.shortTermAnalyses = shortTermAnalyses;
 
   // Clean old day trades
   cleanDayTrades(state);
 
-  // Exit logic — profit/loss/DTE exits first
-  tryExits(state, quotes);
+  // ─── Market Regime Check ───
+  const regime = getMarketRegime(candleCache);
+  currentRegime = regime;
+  RISK_PCT = BASE_RISK_PCT * regime.riskScale;
+  log(`REGIME: ${regime.label} | Risk: ${(RISK_PCT * 100).toFixed(1)}% per trade (${regime.riskScale}x base)`);
 
-  // Signal-based exits
+  // ─── Exit cascade (order matters: time-based → core → signal → EMA trailing) ───
+
+  // 1. EOD/EOW theta-aware exits first (most urgent)
+  tryTimeBasedExits(state, quotes);
+
+  // 2. Core exits: profit target, stop loss, DTE, trimming
+  tryExits(state, quotes, candleCache);
+
+  // 3. Signal-based exits (trend reversal)
   trySignalExits(state, quotes, analyses);
 
-  // Entry logic
+  // 4. EMA trailing exits for positions past trim 2
+  tryEMATrailingExits(state, quotes, candleCache);
+
+  // ─── Entry logic (async — Claude validation per entry) ───
   for (const ticker of TICKERS) {
     const a = analyses[ticker];
     const q = quotes[ticker];
     if (!a || !q) continue;
 
-    const pos = tryEntry(state, ticker, a, q);
-    if (pos) {
-      log(`TRADE: BUY ${pos.qty}x ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} ${pos.dte}d @ $${pos.entryPremium.toFixed(2)} ($${pos.cost.toFixed(0)})`);
+    const result = await tryEntry(state, ticker, a, q, candleCache, regime);
+    if (result && result.skipped) {
+      log(`SKIP ${ticker}: ${result.reason}`);
+      // Update decision reasoning for dashboard
+      const dec = decisions.find(d => d.ticker === ticker);
+      if (dec && (dec.action === "BUY CALL" || dec.action === "BUY PUT")) {
+        dec.action = "BLOCKED";
+        dec.reason = result.reason;
+      }
+    } else if (result && result.ticker) {
+      log(`TRADE: BUY ${result.qty}x ${result.ticker} $${result.strike} ${result.type.toUpperCase()} ${result.dte}d @ $${result.entryPremium.toFixed(2)} ($${result.cost.toFixed(0)}) [setup:${result.setupQuality}/100 claude:${result.claudeConfidence}%]`);
     }
   }
 
@@ -1341,10 +2058,149 @@ async function runCycle(state, candleCache) {
     const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
     const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * 100;
     const profitPrice = pos.entryPremium * (1 + PROFIT_TARGET);
-    const stopPrice = pos.entryPremium * (1 + STOP_LOSS);
+    const stopLossPrice = pos.entryPremium * (1 + STOP_LOSS);
     const isDayTrade = pos.openDate === getETDateStr();
     const pdtStatus = isDayTrade ? `Day trade (${countRecentDayTrades(state)}/3 used)` : "Swing (not a day trade)";
 
+    // Effective stop depends on trim level
+    let effectiveStop;
+    if ((pos.trimLevel || 0) >= 2) effectiveStop = pos.entryPremium * 1.15; // +15% floor
+    else if ((pos.trimLevel || 0) >= 1) effectiveStop = pos.entryPremium;    // breakeven
+    else effectiveStop = stopLossPrice;
+
+    return {
+      ...pos, spot, dteLeft, curPremium, pnlPct, pnlDollar,
+      profitTarget: { pct: `+${(PROFIT_TARGET * 100).toFixed(0)}%`, premium: profitPrice.toFixed(2) },
+      stopLoss: { pct: `${(STOP_LOSS * 100).toFixed(0)}%`, premium: effectiveStop.toFixed(2) },
+      pctToProfit: ((profitPrice - curPremium) / curPremium * 100).toFixed(1),
+      pctToStop: ((effectiveStop - curPremium) / curPremium * 100).toFixed(1),
+      pdtStatus,
+      greeks: optGreeks(spot, pos.strike, dteLeft, DEFAULT_IV, pos.type),
+    };
+  });
+
+  // Summary
+  const pv = portfolioValue(state, quotes);
+  const pnlPct = ((pv - STARTING_CASH) / STARTING_CASH * 100).toFixed(1);
+  const progress = ((pv / GOAL) * 100).toFixed(1);
+  log(`Portfolio: $${pv.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%) | Goal: ${progress}% of $${GOAL.toLocaleString()} | Cash: $${state.cash.toFixed(0)} | ${state.positions.length} open | ${countRecentDayTrades(state)}/3 PDT | ${regime.mode.toUpperCase()}${getActiveHintsSummary()}`);
+
+  // Update dashboard state
+  dashboard.quotes = quotes;
+  dashboard.analyses = analyses;
+  dashboard.shortTermAnalyses = shortTermAnalyses;
+  dashboard.candles = candleCache;
+  dashboard.lastCycle = Date.now();
+
+  saveState(state);
+  return { quotes, analyses, candleCache };
+}
+
+// ─── After-Hours Scan (analysis only, no trades) ───
+
+async function runAfterHoursScan(state, candleCache) {
+  log("AFTER-HOURS SCAN — Fetching data for analysis (no trades)");
+
+  const quotes = {};
+  const analyses = {};
+  const shortTermAnalyses = {};
+
+  // Fetch quotes (Finnhub returns last close + change data even after hours)
+  for (const ticker of TICKERS) {
+    try {
+      quotes[ticker] = await fetchQuote(ticker, state.apiKey);
+      await delay(API_DELAY);
+    } catch (e) {
+      log(`WARN: Failed to fetch quote for ${ticker} — ${e.message}`);
+    }
+  }
+
+  // Fetch candles if not cached
+  for (const ticker of TICKERS) {
+    if (!candleCache[ticker]) {
+      try {
+        candleCache[ticker] = await fetchCandles(ticker, state.apiKey);
+        await delay(API_DELAY);
+      } catch (e) {
+        log(`WARN: Failed to fetch candles for ${ticker} — ${e.message}`);
+      }
+    }
+  }
+
+  // Check hints
+  await checkHints(state);
+
+  // Run news scan
+  await runNewsScan(state);
+
+  // Run dual-timeframe analysis
+  const decisions = [];
+  for (const ticker of TICKERS) {
+    const candles = candleCache[ticker];
+    if (!candles) { decisions.push({ ticker, action: "SKIP", reason: "No candle data" }); continue; }
+    const a = runAnalysis(candles);
+    const st = runShortTermAnalysis(candles);
+    if (!a) { decisions.push({ ticker, action: "SKIP", reason: "Insufficient data" }); continue; }
+
+    if (st) shortTermAnalyses[ticker] = st;
+
+    const blended = blendScores(a, st);
+    const hintBias = getHintBias(ticker);
+    let finalScore = blended.score;
+    if (hintBias !== 0) {
+      finalScore = Math.max(0, Math.min(100, finalScore + hintBias));
+      a.hintBoosted = true;
+    }
+    a.score = finalScore;
+    a.signal = signalLabel(finalScore);
+    a.blendedRaw = blended.score;
+    a.shortTermScore = st ? st.score : null;
+    analyses[ticker] = a;
+
+    const q = quotes[ticker];
+    const price = q ? `$${q.c.toFixed(2)}` : "N/A";
+    const hintTag = hintBias !== 0 ? ` [HINT ${hintBias > 0 ? "+" : ""}${hintBias}]` : "";
+    log(`${ticker} ${price} | Blended: ${finalScore} ${a.signal}${hintTag} (7d:${st?.score ?? '?'}) | ${a.sigs.map(s => s.text).join(", ") || "No signals"}`);
+
+    const dec = { ticker, price: q?.c, rawScore: blended.score, finalScore, signal: a.signal, hintBias };
+    const alreadyHeld = state.positions.some(p => p.ticker === ticker);
+    dec.shortTermScore = st ? st.score : null;
+    dec.longTermScore = Math.round(50 + (a.bullScore - a.bearScore) / 2);
+    dec.blendedScore = blended.score;
+    dec.bullScore = a.bullScore; dec.bearScore = a.bearScore;
+
+    if (finalScore >= BULL_ENTRY) {
+      dec.action = alreadyHeld ? "HOLD" : "PLAN BUY CALL";
+      dec.reason = alreadyHeld ? "Already in position" : `Bullish ${finalScore}/100 — will buy at open (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`;
+    } else if (finalScore <= BEAR_ENTRY) {
+      dec.action = alreadyHeld ? "HOLD" : "PLAN BUY PUT";
+      dec.reason = alreadyHeld ? "Already in position" : `Bearish ${finalScore}/100 — will buy at open (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`;
+    } else {
+      dec.action = "WATCH";
+      dec.reason = `Score ${finalScore} — monitoring (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`;
+    }
+    dec.ema8 = a.ema8v?.toFixed(2); dec.ema21 = a.ema21v?.toFixed(2); dec.ema50 = a.ema50v?.toFixed(2);
+    dec.stEma3 = st?.ema3v?.toFixed(2); dec.stEma5 = st?.ema5v?.toFixed(2); dec.stEma8 = st?.ema8v?.toFixed(2);
+    dec.rsi = a.rsi?.toFixed(1); dec.stRsi = st?.rsi?.toFixed(1);
+    dec.atrPct = a.atrPct?.toFixed(2); dec.vr = a.vr?.toFixed(2);
+    dec.mom1d = st?.mom1d?.toFixed(2); dec.mom3d = st?.mom3d?.toFixed(2); dec.mom7d = st?.mom7d?.toFixed(2);
+    dec.signals = [...(a.sigs?.map(s => s.text) || []), ...(st?.sigs?.map(s => `[7d] ${s.text}`) || [])];
+    decisions.push(dec);
+  }
+
+  // Build position details
+  dashboard.positionDetails = state.positions.map(pos => {
+    const q = quotes[pos.ticker];
+    const spot = q ? q.c : pos.entrySpot;
+    const elapsed = (Date.now() - pos.openTime) / 86400_000;
+    const dteLeft = Math.max(0, pos.dte - elapsed);
+    const curPremium = optPrice(spot, pos.strike, dteLeft, DEFAULT_IV, pos.type);
+    const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
+    const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * 100;
+    const profitPrice = pos.entryPremium * (1 + PROFIT_TARGET);
+    const stopPrice = pos.entryPremium * (1 + STOP_LOSS);
+    const isDayTrade = pos.openDate === getETDateStr();
+    const pdtStatus = isDayTrade ? `Day trade (${countRecentDayTrades(state)}/3 used)` : "Swing (not a day trade)";
     return {
       ...pos, spot, dteLeft, curPremium, pnlPct, pnlDollar,
       profitTarget: { pct: `+${(PROFIT_TARGET * 100).toFixed(0)}%`, premium: profitPrice.toFixed(2) },
@@ -1356,20 +2212,19 @@ async function runCycle(state, candleCache) {
     };
   });
 
-  // Summary
-  const pv = portfolioValue(state, quotes);
-  const pnlPct = ((pv - STARTING_CASH) / STARTING_CASH * 100).toFixed(1);
-  const progress = ((pv / GOAL) * 100).toFixed(1);
-  log(`Portfolio: $${pv.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%) | Goal: ${progress}% of $${GOAL.toLocaleString()} | Cash: $${state.cash.toFixed(0)} | ${state.positions.length} open | ${countRecentDayTrades(state)}/3 PDT${getActiveHintsSummary()}`);
-
-  // Update dashboard state
+  // Update dashboard
   dashboard.quotes = quotes;
   dashboard.analyses = analyses;
+  dashboard.shortTermAnalyses = shortTermAnalyses;
   dashboard.candles = candleCache;
+  dashboard.decisions = decisions;
   dashboard.lastCycle = Date.now();
 
-  saveState(state);
-  return { quotes, analyses, candleCache };
+  const pv = portfolioValue(state, quotes);
+  const pnlPct = ((pv - STARTING_CASH) / STARTING_CASH * 100).toFixed(1);
+  log(`AFTER-HOURS — Portfolio: $${pv.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%) | Cash: $${state.cash.toFixed(0)} | ${state.positions.length} open${getActiveHintsSummary()}`);
+
+  return candleCache;
 }
 
 // ─── Main Loop ───
@@ -1383,6 +2238,11 @@ async function main() {
 
   // Load or initialize state
   let state = loadState() || { ...INIT_STATE };
+
+  // Pre-populate Finnhub key from .env if not already saved in state
+  if (!state.apiKey && process.env.FINNHUB_API_KEY) {
+    state.apiKey = process.env.FINNHUB_API_KEY;
+  }
 
   // Prompt for API key if missing
   if (!state.apiKey) {
@@ -1434,6 +2294,15 @@ async function main() {
   let lastCandleDate = null;
   let lastCycleTime = Date.now();
 
+  // Run initial scan immediately on startup (even after hours) so dashboard has data
+  log("Running startup scan...");
+  try {
+    candleCache = await runAfterHoursScan(state, candleCache);
+  } catch (e) {
+    log(`WARN: Startup scan failed — ${e.message}`);
+  }
+  console.log("");
+
   // Main loop
   while (true) {
     // Detect sleep/wake gap — if >5 min since last cycle, we likely woke from sleep
@@ -1467,14 +2336,19 @@ async function main() {
       const dayName = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][day];
       const time = et.toLocaleTimeString("en-US", { timeZone: "America/New_York", hour12: true });
       dashboard.marketOpen = false;
-      log(`MARKET CLOSED (${dayName} ${time} ET) — Portfolio: $${state.cash.toFixed(0)} cash | ${state.positions.length} open positions`);
-      log("Waiting for market hours (Mon-Fri 9:30 AM - 4:00 PM ET)...");
+
+      // Run after-hours analysis scan every 15 minutes
+      try {
+        candleCache = await runAfterHoursScan(state, candleCache);
+      } catch (e) {
+        log(`WARN: After-hours scan failed — ${e.message}`);
+      }
 
       // Still check hints while market is closed
       await checkHints(state);
 
-      // Sleep longer outside market hours — check every 5 minutes
-      await delay(300_000);
+      // Scan every 15 minutes after hours
+      await delay(900_000);
     }
   }
 }
