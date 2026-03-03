@@ -249,7 +249,7 @@ function optGreeks(spot, strike, dte, iv, type = "call") {
 // ─── Constants ───
 
 let TICKERS = ["SPY", "QQQ", "AAPL", "NVDA", "TSLA", "MSFT", "META", "AMZN", "GOOGL", "AMD"];
-const STATE_FILE = "state.json";
+const STATE_FILE = process.env.STATE_FILE || "state.json";
 const HINT_FILE = "hint.txt";
 const CYCLE_MS = 60_000;       // 60s between cycles
 const API_DELAY = 150;         // 150ms between API calls (Finnhub free tier)
@@ -1338,7 +1338,7 @@ function log(msg) {
 
 // ─── Web Dashboard ───
 
-const DASH_PORT = 3000;
+const DASH_PORT = process.env.PORT || 3000;
 
 function dashboardHTML(state) {
   const pv = portfolioValue(state, dashboard.quotes);

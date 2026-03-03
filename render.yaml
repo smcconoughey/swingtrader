@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: swingers-bot
+    runtime: node
+    buildCommand: npm install
+    startCommand: node bot.js
+    envVars:
+      - key: FINNHUB_API_KEY
+        sync: false        # set manually in Render dashboard
+      - key: CLAUDE_API_KEY
+        sync: false        # set manually in Render dashboard
+      - key: STATE_FILE
+        value: /data/state.json
+    disk:
+      name: bot-state
+      mountPath: /data
+      sizeGB: 1
