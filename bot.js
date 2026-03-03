@@ -1655,7 +1655,7 @@ function dashboardHTML(acct) {
   </div>
   <div class="card">
     <h2>Claude Hints &amp; News Intel</h2>
-    <div style="margin-bottom:8px;padding:6px 10px;background:#0a0a0f;border-radius:4px;font-size:11px;border-left:3px solid ${latestNewsBrief.includes("CRITICAL") ? "#ff4444" : latestNewsBrief.includes("ELEVATED") ? "#ffd93d" : "#333"}">${latestNewsBrief || '<span style="opacity:.4">News scan runs every 3 hours...</span>'}</div>
+    <div style="margin-bottom:8px;padding:6px 10px;background:#0a0a0f;border-radius:4px;font-size:11px;border-left:3px solid ${(acct.latestNewsBrief || "").includes("CRITICAL") ? "#ff4444" : (acct.latestNewsBrief || "").includes("ELEVATED") ? "#ffd93d" : "#333"}">${acct.latestNewsBrief || '<span style="opacity:.4">News scan runs every 3 hours...</span>'}</div>
     <div style="margin-bottom:8px">${hints}</div>
     <form class="hint-form" method="POST" action="/hint">
       <input name="hint" placeholder='e.g. "PLTR looks bullish, iran war catalyst"' autocomplete="off">
