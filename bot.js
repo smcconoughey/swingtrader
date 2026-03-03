@@ -249,6 +249,24 @@ function optGreeks(spot, strike, dte, iv, type = "call") {
 // ─── Constants ───
 
 let TICKERS = ["SPY", "QQQ", "AAPL", "NVDA", "TSLA", "MSFT", "META", "AMZN", "GOOGL", "AMD"];
+
+// ─── Tiered Watchlists (by cash available) ───
+// Cheap options (premium <$2 = contract <$200)
+const BUDGET_TICKERS = ["SOFI", "PLTR", "RIOT", "MARA", "SQQQ", "SPXS", "F", "BAC", "HOOD", "GME"];
+// Mid-range options (premium $2-8 = contract $200-800)
+const MID_TICKERS = ["AMD", "NVDA", "TSLA", "AMZN", "GOOGL", "AAPL", "META", "MSFT"];
+// Full large-cap watchlist (premium $8+ = contract $800+)
+const LARGE_TICKERS = TICKERS;
+
+function getActiveTickers(cash) {
+  let base;
+  if (cash < 500) base = BUDGET_TICKERS;
+  else if (cash < 2000) base = [...BUDGET_TICKERS, ...MID_TICKERS];
+  else base = [...MID_TICKERS, ...LARGE_TICKERS];
+  // Merge any Claude-hinted tickers not already in the list
+  const hintedTickers = TICKERS.filter(t => !base.includes(t));
+  return [...new Set([...base, ...hintedTickers])];
+}
 const STATE_FILE = process.env.STATE_FILE || "state.json";
 const HINT_FILE = "hint.txt";
 const CYCLE_MS = 60_000;       // 60s between cycles
@@ -1535,6 +1553,46 @@ function dashboardHTML(state) {
 </div>
 
 <div class="card" style="margin-top:16px">
+  <h2>Portfolio Value Over Time</h2>
+  ${(() => {
+      const hist = dashboard.portfolioHistory || [];
+      if (hist.length < 2) return '<span style="opacity:.5;font-size:12px">Collecting data — chart appears after 2+ cycles...</span>';
+      const W = 900, H = 180, PAD = 48;
+      const vals = hist.map(h => h.value);
+      const times = hist.map(h => h.ts);
+      const minV = Math.min(...vals, STARTING_CASH);
+      const maxV = Math.max(...vals, STARTING_CASH * 1.1);
+      const minT = times[0], maxT = times[times.length - 1];
+      const xOf = t => PAD + (t - minT) / Math.max(1, maxT - minT) * (W - PAD * 2);
+      const yOf = v => H - PAD / 2 - (v - minV) / Math.max(1, maxV - minV) * (H - PAD);
+      const pts = hist.map(h => `${xOf(h.ts).toFixed(1)},${yOf(h.value).toFixed(1)}`).join(' ');
+      const lastVal = vals[vals.length - 1];
+      const color = lastVal >= STARTING_CASH ? '#00ff88' : '#ff4444';
+      const startY = yOf(STARTING_CASH).toFixed(1);
+      const goalY = yOf(GOAL) > 0 ? yOf(GOAL).toFixed(1) : '4';
+      const labelTime = t => { const d = new Date(t); return d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true }); };
+      return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;overflow:visible">
+      <defs><linearGradient id="pvgrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="${color}" stop-opacity="0.25"/><stop offset="100%" stop-color="${color}" stop-opacity="0"/></linearGradient></defs>
+      <!-- baseline -->
+      <line x1="${PAD}" y1="${startY}" x2="${W - PAD}" y2="${startY}" stroke="#ffffff22" stroke-width="1" stroke-dasharray="4,4"/>
+      <text x="${PAD - 4}" y="${Number(startY) + 4}" fill="#ffffff44" font-size="10" text-anchor="end">$${STARTING_CASH.toLocaleString()}</text>
+      <!-- goal line -->
+      <line x1="${PAD}" y1="${goalY}" x2="${W - PAD}" y2="${goalY}" stroke="#ffd93d33" stroke-width="1" stroke-dasharray="3,6"/>
+      <!-- area fill -->
+      <polygon points="${pts} ${xOf(maxT).toFixed(1)},${H - PAD / 2} ${xOf(minT).toFixed(1)},${H - PAD / 2}" fill="url(#pvgrad)"/>
+      <!-- line -->
+      <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round"/>
+      <!-- current value dot + label -->
+      <circle cx="${xOf(maxT).toFixed(1)}" cy="${yOf(lastVal).toFixed(1)}" r="4" fill="${color}"/>
+      <text x="${Math.min(xOf(maxT) + 6, W - PAD - 60)}" y="${Math.min(yOf(lastVal) - 6, H - PAD / 2 - 10)}" fill="${color}" font-size="11" font-weight="bold">$${lastVal.toFixed(0)}</text>
+      <!-- x-axis labels -->
+      <text x="${PAD}" y="${H - 6}" fill="#ffffff44" font-size="9">${labelTime(minT)}</text>
+      <text x="${W - PAD}" y="${H - 6}" fill="#ffffff44" font-size="9" text-anchor="end">${labelTime(maxT)}</text>
+    </svg>`;
+    })()}
+</div>
+
+<div class="card" style="margin-top:16px">
   <h2>Live Log</h2>
   <div class="log" id="live-log">${logLines || '<span style="opacity:.5">Waiting for first cycle...</span>'}</div>
 </div>
@@ -1892,8 +1950,10 @@ async function runCycle(state, candleCache) {
   const quotes = {};
   const analyses = {};
 
+  const activeTickers = getActiveTickers(state.cash);
+
   // Fetch quotes for all tickers
-  for (const ticker of TICKERS) {
+  for (const ticker of activeTickers) {
     try {
       quotes[ticker] = await fetchQuote(ticker, state.apiKey);
       await delay(API_DELAY);
@@ -1903,7 +1963,7 @@ async function runCycle(state, candleCache) {
   }
 
   // Fetch candles if not cached this session
-  for (const ticker of TICKERS) {
+  for (const ticker of activeTickers) {
     if (!candleCache[ticker]) {
       try {
         candleCache[ticker] = await fetchCandles(ticker, state.apiKey);
@@ -1932,7 +1992,7 @@ async function runCycle(state, candleCache) {
   // Run dual-timeframe analysis on each ticker (with hint bias applied)
   const shortTermAnalyses = {};
   const decisions = [];
-  for (const ticker of TICKERS) {
+  for (const ticker of activeTickers) {
     const candles = candleCache[ticker];
     if (!candles) { decisions.push({ ticker, action: "SKIP", reason: "No candle data" }); continue; }
     const a = runAnalysis(candles);          // 90-day long-term
@@ -2029,7 +2089,7 @@ async function runCycle(state, candleCache) {
   tryEMATrailingExits(state, quotes, candleCache);
 
   // ─── Entry logic (async — Claude validation per entry) ───
-  for (const ticker of TICKERS) {
+  for (const ticker of activeTickers) {
     const a = analyses[ticker];
     const q = quotes[ticker];
     if (!a || !q) continue;
@@ -2092,6 +2152,12 @@ async function runCycle(state, candleCache) {
   dashboard.candles = candleCache;
   dashboard.lastCycle = Date.now();
 
+  // Track portfolio value history for chart
+  const pv2 = portfolioValue(state, quotes);
+  dashboard.portfolioHistory = dashboard.portfolioHistory || [];
+  dashboard.portfolioHistory.push({ ts: Date.now(), value: pv2 });
+  if (dashboard.portfolioHistory.length > 500) dashboard.portfolioHistory.shift();
+
   saveState(state);
   return { quotes, analyses, candleCache };
 }
@@ -2105,8 +2171,10 @@ async function runAfterHoursScan(state, candleCache) {
   const analyses = {};
   const shortTermAnalyses = {};
 
+  const activeTickers2 = getActiveTickers(state.cash);
+
   // Fetch quotes (Finnhub returns last close + change data even after hours)
-  for (const ticker of TICKERS) {
+  for (const ticker of activeTickers2) {
     try {
       quotes[ticker] = await fetchQuote(ticker, state.apiKey);
       await delay(API_DELAY);
@@ -2116,7 +2184,7 @@ async function runAfterHoursScan(state, candleCache) {
   }
 
   // Fetch candles if not cached
-  for (const ticker of TICKERS) {
+  for (const ticker of activeTickers2) {
     if (!candleCache[ticker]) {
       try {
         candleCache[ticker] = await fetchCandles(ticker, state.apiKey);
@@ -2135,7 +2203,7 @@ async function runAfterHoursScan(state, candleCache) {
 
   // Run dual-timeframe analysis
   const decisions = [];
-  for (const ticker of TICKERS) {
+  for (const ticker of activeTickers2) {
     const candles = candleCache[ticker];
     if (!candles) { decisions.push({ ticker, action: "SKIP", reason: "No candle data" }); continue; }
     const a = runAnalysis(candles);
