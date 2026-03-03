@@ -248,15 +248,8 @@ function optGreeks(spot, strike, dte, iv, type = "call") {
 
 // ─── Constants ───
 
-let TICKERS = ["SPY", "QQQ"]; // anchor tickers for regime — watchlist is built dynamically
-
-// ─── Dynamic Watchlist ───
-const WATCHLIST_REFRESH_MS = 4 * 60 * 60_000; // refresh every 4 hours
-let lastWatchlistRefresh = 0;
-let dynamicWatchlist = [];     // set by refreshWatchlist()
-
-// Stocks that are always included regardless of tier (needed for regime detection)
 const REGIME_TICKERS = ["SPY", "QQQ"];
+const WATCHLIST_REFRESH_MS = 4 * 60 * 60_000; // refresh every 4 hours
 
 async function fetchDynamicWatchlist() {
   const symbols = new Set(REGIME_TICKERS);
@@ -306,91 +299,198 @@ async function fetchDynamicWatchlist() {
   return [...symbols];
 }
 
-async function refreshWatchlist(cash) {
+async function refreshWatchlist(acct) {
   const now = Date.now();
-  if (now - lastWatchlistRefresh < WATCHLIST_REFRESH_MS && dynamicWatchlist.length > 0) return;
-  lastWatchlistRefresh = now;
+  if (now - acct.lastWatchlistRefresh < WATCHLIST_REFRESH_MS && acct.dynamicWatchlist.length > 0) return;
+  acct.lastWatchlistRefresh = now;
 
-  log("WATCHLIST: Refreshing from market data...");
+  log(acct, "WATCHLIST: Refreshing from market data...");
   const raw = await fetchDynamicWatchlist();
 
-  // Estimate max affordable option premium based on cash
-  // A contract = premium * 100. At 15% risk, riskAmt = cash * 0.15
-  // Affordable if: premium * 100 <= cash (single contract)
-  // Rough estimate: option premium ≈ 2-4% of stock price
-  // So max stock price where we can afford 1 contract: cash / (0.03 * 100) = cash / 3
-  const maxStockPrice = Math.max(cash / 2, 20); // always allow up to at least $20 stocks
-
-  // Filter: remove funds/ETFs that don't trade options well (except regime ETFs)
   const blocked = new Set(["UVXY", "VIX", "VXX", "SVXY", "VIXY", "UVIX"]);
 
   const filtered = raw.filter(sym =>
     !blocked.has(sym) || REGIME_TICKERS.includes(sym)
   );
 
-  // Always lead with regime tickers, then dynamic list, then hint tickers
-  const hinted = TICKERS.filter(t => !filtered.includes(t));
-  dynamicWatchlist = [...new Set([...REGIME_TICKERS, ...filtered, ...hinted])];
+  const hinted = acct.tickers.filter(t => !filtered.includes(t));
+  acct.dynamicWatchlist = [...new Set([...REGIME_TICKERS, ...filtered, ...hinted])];
 
-  log(`WATCHLIST: ${dynamicWatchlist.length} tickers — ${dynamicWatchlist.slice(0, 15).join(", ")}${dynamicWatchlist.length > 15 ? "..." : ""}`);
-  TICKERS = [...dynamicWatchlist]; // keep TICKERS in sync for hint system
+  log(acct, `WATCHLIST: ${acct.dynamicWatchlist.length} tickers — ${acct.dynamicWatchlist.slice(0, 15).join(", ")}${acct.dynamicWatchlist.length > 15 ? "..." : ""}`);
+  acct.tickers = [...acct.dynamicWatchlist];
 }
 
-function getActiveTickers(cash) {
-  // If we have a dynamic list, use it — otherwise fall back to TICKERS
-  const base = dynamicWatchlist.length > 0 ? dynamicWatchlist : TICKERS;
-  const hinted = TICKERS.filter(t => !base.includes(t));
+function getActiveTickers(acct) {
+  const base = acct.dynamicWatchlist.length > 0 ? acct.dynamicWatchlist : acct.tickers;
+  const hinted = acct.tickers.filter(t => !base.includes(t));
   return [...new Set([...base, ...hinted])];
 }
 
 const STATE_FILE = process.env.STATE_FILE || "state.json";
+const ACCOUNTS_FILE = process.env.ACCOUNTS_FILE || (process.env.STATE_FILE ? process.env.STATE_FILE.replace(/state\.json$/, "accounts.json") : "accounts.json");
 const HINT_FILE = "hint.txt";
 const CYCLE_MS = 60_000;       // 60s between cycles
 const API_DELAY = 150;         // 150ms between API calls (Finnhub free tier)
-const MAX_POSITIONS = Infinity; // No hard limit — bot manages liquidity dynamically
-const BASE_RISK_PCT = 0.15;    // 15% of portfolio per trade — adjusted by market regime
-let RISK_PCT = BASE_RISK_PCT;  // Dynamic — scaled by regime
-const PROFIT_TARGET = 0.40;    // Take profits at +40% (compound faster)
-const STOP_LOSS = -0.35;       // Wider stop to avoid premature exits on volatile plays
 const DEFAULT_IV = 0.30;
-const BULL_ENTRY = 65;         // Buy calls when score >= 65 (bullish)
-const BEAR_ENTRY = 35;         // Buy puts when score <= 35 (bearish)
 
 // ─── Trimming & EOD/EOW Constants ───
-const TRIM_1_PCT = 0.25;       // First trim at +25% profit
-const TRIM_2_PCT = 0.50;       // Second trim at +50% profit
 const EOD_FREEZE_HOUR = 15;    // No new entries after 3:00 PM ET
 const EOD_TIGHTEN_HOUR = 15.5; // Tighten stops after 3:30 PM ET
 const EOW_TRIM_HOUR = 14;      // Friday profit-taking starts at 2:00 PM ET
 const LOW_DTE_THRESHOLD = 3;   // Accelerate exits when DTE <= 3
 const CRITICAL_DTE = 2;        // Force-close when DTE <= 2
 
-const STARTING_CASH = 200;
-const GOAL = 200_000;
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
-const INIT_STATE = { cash: 200, positions: [], history: [], dayTrades: [], apiKey: "" };
+
+// ─── Default Account Config ───
+
+const DEFAULT_CONFIG = {
+  startingCash: 200,
+  goal: 200_000,
+  baseRiskPct: 0.15,
+  profitTarget: 0.40,
+  stopLoss: -0.35,
+  bullEntry: 65,
+  bearEntry: 35,
+  trim1Pct: 0.25,
+  trim2Pct: 0.50,
+  maxPositions: null,
+  customPromptSuffix: "",
+};
+
+// ─── Multi-Account Runtime ───
+
+const accounts = new Map();
+
+function createAccountRuntime(id, name, config, state) {
+  return {
+    id,
+    name: name || id,
+    createdAt: Date.now(),
+    paused: false,
+    config: { ...DEFAULT_CONFIG, ...config },
+    state: state || {
+      cash: (config && config.startingCash) || DEFAULT_CONFIG.startingCash,
+      positions: [],
+      history: [],
+      dayTrades: [],
+    },
+    dashboard: {
+      quotes: {},
+      analyses: {},
+      shortTermAnalyses: {},
+      candles: {},
+      lastCycle: null,
+      cycleLog: [],
+      marketOpen: false,
+      decisions: [],
+      positionDetails: [],
+      portfolioHistory: [],
+    },
+    candleCache: {},
+    lastCandleDate: null,
+    activeHints: [],
+    lastHintContent: "",
+    currentRegime: { mode: "unknown", riskScale: 1.0, label: "UNKNOWN" },
+    riskPct: (config && config.baseRiskPct) || DEFAULT_CONFIG.baseRiskPct,
+    dynamicWatchlist: [],
+    tickers: ["SPY", "QQQ"],
+    lastWatchlistRefresh: 0,
+    lastNewsScan: 0,
+    latestNewsBrief: "",
+  };
+}
+
+// ─── Account Persistence ───
+
+function loadAccounts() {
+  // Try accounts.json first
+  try {
+    if (fs.existsSync(ACCOUNTS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, "utf-8"));
+      if (data.meta && data.accounts) {
+        for (const [id, acctData] of Object.entries(data.accounts)) {
+          const acct = createAccountRuntime(id, acctData.name, acctData.config, acctData.state);
+          acct.paused = acctData.paused || false;
+          acct.createdAt = acctData.createdAt || Date.now();
+          accounts.set(id, acct);
+        }
+        return true;
+      }
+    }
+  } catch (e) {
+    console.error(`WARN: Failed to load accounts.json — ${e.message}`);
+  }
+
+  // Migrate from state.json
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      const old = JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
+      if (old && typeof old.cash === "number") {
+        const config = { ...DEFAULT_CONFIG, startingCash: DEFAULT_CONFIG.startingCash };
+        const state = {
+          cash: old.cash,
+          positions: old.positions || [],
+          history: old.history || [],
+          dayTrades: old.dayTrades || [],
+        };
+        const acct = createAccountRuntime("default", "Original Strategy", config, state);
+        accounts.set("default", acct);
+
+        // Backup old state.json
+        try {
+          fs.copyFileSync(STATE_FILE, STATE_FILE + ".backup");
+        } catch { }
+
+        // Save as accounts.json
+        saveAccounts();
+        console.log("Migrated state.json → accounts.json (backup saved as state.json.backup)");
+        return true;
+      }
+    }
+  } catch (e) {
+    console.error(`WARN: Failed to migrate state.json — ${e.message}`);
+  }
+
+  return false;
+}
+
+function saveAccounts() {
+  const data = { meta: { version: 1 }, accounts: {} };
+  for (const [id, acct] of accounts) {
+    data.accounts[id] = {
+      id: acct.id,
+      name: acct.name,
+      createdAt: acct.createdAt,
+      paused: acct.paused,
+      config: acct.config,
+      state: acct.state,
+    };
+  }
+  try {
+    fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error(`WARN: Failed to save accounts — ${e.message}`);
+  }
+}
 
 // ─── Logging ───
 
-// log() is defined below after dashboard state init, so it can capture lines for the web UI
-
-// ─── State Persistence ───
-
-function loadState() {
-  try {
-    if (fs.existsSync(STATE_FILE)) return JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
-  } catch (e) {
-    log(`WARN: Failed to load state — ${e.message}`);
+function log(acct, msg) {
+  if (typeof acct === "string") {
+    // Called as log("msg") — global log without account context
+    msg = acct;
+    const now = new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York", hour12: false });
+    const line = `[${now}] ${msg}`;
+    console.log(line);
+    return;
   }
-  return null;
-}
-
-function saveState(state) {
-  try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-  } catch (e) {
-    log(`WARN: Failed to save state — ${e.message}`);
-  }
+  const now = new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York", hour12: false });
+  const prefix = accounts.size > 1 ? `[${acct.id}] ` : "";
+  const line = `[${now}] ${prefix}${msg}`;
+  console.log(line);
+  acct.dashboard.cycleLog.push(line);
+  if (acct.dashboard.cycleLog.length > 200) acct.dashboard.cycleLog.shift();
 }
 
 // Append-only trade log for Monte Carlo training
@@ -402,8 +502,6 @@ function logTrade(entry) {
 }
 
 // ─── Market Regime (SPY/QQQ EMA health) ───
-
-let currentRegime = { mode: "unknown", riskScale: 1.0, label: "UNKNOWN" };
 
 function getMarketRegime(candleCache) {
   const spyCandles = candleCache["SPY"];
@@ -686,15 +784,7 @@ function signalLabel(score) {
   return "STRONG SELL";
 }
 
-// ─── Claude Hint System ───
-// Write to hint.txt anytime to push the bot in a direction.
-// e.g. "check out PLTR, its being used in the iran war and may move"
-// Claude interprets the hint and returns structured trading bias.
-
-let activeHints = [];        // Array of { ticker, bias, direction, reasoning, expiresAt }
-let lastHintContent = "";    // Track file changes
-
-// ─── Claude API Usage Tracking ───
+// ─── Claude API Usage Tracking (global/shared) ───
 let claudeCallCount = 0;
 let claudeTotalInputTokens = 0;
 let claudeTotalOutputTokens = 0;
@@ -732,10 +822,11 @@ async function callClaude(prompt) {
   return data.content[0].text;
 }
 
-async function processHint(hintText, state) {
-  const portfolioContext = `Portfolio: $${state.cash.toFixed(0)} cash, ${state.positions.length} positions open (${state.positions.map(p => `${p.ticker} ${p.type}`).join(", ") || "none"}). Current watchlist: ${TICKERS.join(", ")}.`;
+async function processHint(hintText, acct) {
+  const state = acct.state;
+  const portfolioContext = `Portfolio: $${state.cash.toFixed(0)} cash, ${state.positions.length} positions open (${state.positions.map(p => `${p.ticker} ${p.type}`).join(", ") || "none"}). Current watchlist: ${acct.tickers.join(", ")}.`;
 
-  const prompt = `You are a trading bot's AI advisor. The user gave this hint to guide their options trading bot:
+  const promptText = `You are a trading bot's AI advisor. The user gave this hint to guide their options trading bot:
 
 "${hintText}"
 
@@ -759,81 +850,81 @@ Rules:
 - You can return multiple tickers if the hint implies it`;
 
   try {
-    const raw = await callClaude(prompt);
-    // Parse JSON — handle potential markdown wrapping
+    const raw = await callClaude(promptText);
     const cleaned = raw.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
     return JSON.parse(cleaned);
   } catch (e) {
-    log(`CLAUDE WARN: Failed to parse hint response — ${e.message}`);
+    log(acct, `CLAUDE WARN: Failed to parse hint response — ${e.message}`);
     return null;
   }
 }
 
-async function checkHints(state) {
+async function checkHints(acct) {
+  // Check file-based hints (for default account or single-account mode)
   try {
-    if (!fs.existsSync(HINT_FILE)) return;
-    const content = fs.readFileSync(HINT_FILE, "utf-8").trim();
-    if (!content || content === lastHintContent) return;
+    const hintFile = accounts.size <= 1 ? HINT_FILE : `hint-${acct.id}.txt`;
+    if (!fs.existsSync(hintFile)) return;
+    const content = fs.readFileSync(hintFile, "utf-8").trim();
+    if (!content || content === acct.lastHintContent) return;
 
-    lastHintContent = content;
-    log(`HINT RECEIVED: "${content}"`);
+    acct.lastHintContent = content;
+    log(acct, `HINT RECEIVED: "${content}"`);
 
-    const result = await processHint(content, state);
+    const result = await processHint(content, acct);
     if (!result) return;
 
-    log(`CLAUDE SAYS: ${result.advice}`);
-
-    // Process ticker additions
-    for (const t of result.tickers || []) {
-      // Add to watchlist if new
-      if (!TICKERS.includes(t.symbol)) {
-        TICKERS.push(t.symbol);
-        log(`WATCHLIST +${t.symbol} (${t.direction}, bias ${t.bias > 0 ? "+" : ""}${t.bias})`);
-      } else {
-        log(`BIAS ${t.symbol}: ${t.bias > 0 ? "+" : ""}${t.bias} (${t.direction}) — ${t.reasoning}`);
-      }
-
-      // Set active hint bias — expires in 4 hours
-      const existing = activeHints.findIndex(h => h.ticker === t.symbol);
-      const hint = {
-        ticker: t.symbol,
-        bias: t.bias,
-        direction: t.direction,
-        reasoning: t.reasoning,
-        expiresAt: Date.now() + 4 * 60 * 60_000,
-      };
-      if (existing >= 0) activeHints[existing] = hint;
-      else activeHints.push(hint);
-    }
-
-    // Process removals
-    for (const sym of result.removeTickers || []) {
-      TICKERS = TICKERS.filter(t => t !== sym);
-      activeHints = activeHints.filter(h => h.ticker !== sym);
-      log(`WATCHLIST -${sym}`);
-    }
+    applyHintResult(acct, result);
 
     // Clear the hint file after processing
-    fs.writeFileSync(HINT_FILE, "");
+    fs.writeFileSync(hintFile, "");
 
   } catch (e) {
-    log(`HINT ERROR: ${e.message}`);
+    log(acct, `HINT ERROR: ${e.message}`);
   }
 }
 
-function getHintBias(ticker) {
+function applyHintResult(acct, result) {
+  log(acct, `CLAUDE SAYS: ${result.advice}`);
+
+  for (const t of result.tickers || []) {
+    if (!acct.tickers.includes(t.symbol)) {
+      acct.tickers.push(t.symbol);
+      log(acct, `WATCHLIST +${t.symbol} (${t.direction}, bias ${t.bias > 0 ? "+" : ""}${t.bias})`);
+    } else {
+      log(acct, `BIAS ${t.symbol}: ${t.bias > 0 ? "+" : ""}${t.bias} (${t.direction}) — ${t.reasoning}`);
+    }
+
+    const existing = acct.activeHints.findIndex(h => h.ticker === t.symbol);
+    const hint = {
+      ticker: t.symbol,
+      bias: t.bias,
+      direction: t.direction,
+      reasoning: t.reasoning,
+      expiresAt: Date.now() + 4 * 60 * 60_000,
+    };
+    if (existing >= 0) acct.activeHints[existing] = hint;
+    else acct.activeHints.push(hint);
+  }
+
+  for (const sym of result.removeTickers || []) {
+    acct.tickers = acct.tickers.filter(t => t !== sym);
+    acct.activeHints = acct.activeHints.filter(h => h.ticker !== sym);
+    log(acct, `WATCHLIST -${sym}`);
+  }
+}
+
+function getHintBias(acct, ticker) {
   const now = Date.now();
-  // Clean expired hints
-  activeHints = activeHints.filter(h => h.expiresAt > now);
-  const hint = activeHints.find(h => h.ticker === ticker);
+  acct.activeHints = acct.activeHints.filter(h => h.expiresAt > now);
+  const hint = acct.activeHints.find(h => h.ticker === ticker);
   return hint ? hint.bias : 0;
 }
 
-function getActiveHintsSummary() {
+function getActiveHintsSummary(acct) {
   const now = Date.now();
-  activeHints = activeHints.filter(h => h.expiresAt > now);
-  if (activeHints.length === 0) return "";
-  return " | Hints: " + activeHints.map(h => {
+  acct.activeHints = acct.activeHints.filter(h => h.expiresAt > now);
+  if (acct.activeHints.length === 0) return "";
+  return " | Hints: " + acct.activeHints.map(h => {
     const mins = Math.round((h.expiresAt - now) / 60_000);
     return `${h.ticker} ${h.bias > 0 ? "+" : ""}${h.bias} (${mins}m left)`;
   }).join(", ");
@@ -842,13 +933,10 @@ function getActiveHintsSummary() {
 // ─── Auto News Scanner (runs every 3 hours) ───
 
 const NEWS_INTERVAL = 3 * 60 * 60_000; // 3 hours
-let lastNewsScan = 0;
-let latestNewsBrief = "";
 
-async function fetchMarketNews(apiKey) {
+async function fetchMarketNews(apiKey, tickers) {
   const headlines = [];
 
-  // Finnhub general market news
   try {
     const r = await fetch(`https://finnhub.io/api/v1/news?category=general&token=${apiKey}`);
     if (r.ok) {
@@ -859,8 +947,7 @@ async function fetchMarketNews(apiKey) {
     }
   } catch { }
 
-  // Finnhub market-wide news for our tickers
-  for (const ticker of TICKERS.slice(0, 5)) { // top 5 to save API calls
+  for (const ticker of tickers.slice(0, 5)) {
     try {
       const r = await fetch(`https://finnhub.io/api/v1/company-news?symbol=${ticker}&from=${todayStr()}&to=${todayStr()}&token=${apiKey}`);
       if (r.ok) {
@@ -881,16 +968,17 @@ function todayStr() {
   return d.toISOString().slice(0, 10);
 }
 
-async function runNewsScan(state) {
+async function runNewsScan(acct, apiKey) {
   const now = Date.now();
-  if (now - lastNewsScan < NEWS_INTERVAL) return;
-  lastNewsScan = now;
+  if (now - acct.lastNewsScan < NEWS_INTERVAL) return;
+  acct.lastNewsScan = now;
 
-  log("NEWS SCAN: Fetching latest market headlines...");
+  const state = acct.state;
+  log(acct, "NEWS SCAN: Fetching latest market headlines...");
 
-  const headlines = await fetchMarketNews(state.apiKey);
+  const headlines = await fetchMarketNews(apiKey, acct.tickers);
   if (headlines.length === 0) {
-    log("NEWS SCAN: No headlines fetched");
+    log(acct, "NEWS SCAN: No headlines fetched");
     return;
   }
 
@@ -902,14 +990,14 @@ async function runNewsScan(state) {
     ? `Current positions: ${state.positions.map(p => `${p.ticker} ${p.type.toUpperCase()} $${p.strike}`).join(", ")}`
     : "No open positions";
 
-  const prompt = `You are a trading bot's market intelligence system. Analyze these headlines for anything that could drastically impact markets in the next few hours.
+  const promptText = `You are a trading bot's market intelligence system. Analyze these headlines for anything that could drastically impact markets in the next few hours.
 
 CURRENT HEADLINES:
 ${headlineText}
 
 PORTFOLIO CONTEXT:
 Cash: $${state.cash.toFixed(0)} | ${positionContext}
-Watchlist: ${TICKERS.join(", ")}
+Watchlist: ${acct.tickers.join(", ")}
 
 Respond with ONLY valid JSON (no markdown, no backticks):
 {
@@ -934,80 +1022,74 @@ Rules:
 - Be concise. Only flag what actually matters for short-term options trading.`;
 
   try {
-    const raw = await callClaude(prompt);
+    const raw = await callClaude(promptText);
     const cleaned = raw.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
     const result = JSON.parse(cleaned);
 
-    // Log the scan
     const sevColor = result.severity === "critical" ? "!!!" : result.severity === "elevated" ? "!!" : "";
-    log(`NEWS ${sevColor}${result.severity.toUpperCase()}: ${result.summary}`);
-    latestNewsBrief = `[${result.severity.toUpperCase()}] ${result.summary}`;
+    log(acct, `NEWS ${sevColor}${result.severity.toUpperCase()}: ${result.summary}`);
+    acct.latestNewsBrief = `[${result.severity.toUpperCase()}] ${result.summary}`;
 
     if (result.blackSwan) {
-      log("BLACK SWAN DETECTED — Claude recommends defensive action");
-      log(`ACTION ADVICE: ${result.actionAdvice}`);
+      log(acct, "BLACK SWAN DETECTED — Claude recommends defensive action");
+      log(acct, `ACTION ADVICE: ${result.actionAdvice}`);
     }
 
-    // Apply impacts as hint biases
     for (const impact of result.impacts || []) {
-      if (!TICKERS.includes(impact.ticker) && impact.ticker) {
-        TICKERS.push(impact.ticker);
-        log(`NEWS WATCHLIST +${impact.ticker}`);
+      if (!acct.tickers.includes(impact.ticker) && impact.ticker) {
+        acct.tickers.push(impact.ticker);
+        log(acct, `NEWS WATCHLIST +${impact.ticker}`);
       }
 
-      const existing = activeHints.findIndex(h => h.ticker === impact.ticker);
+      const existing = acct.activeHints.findIndex(h => h.ticker === impact.ticker);
       const hint = {
         ticker: impact.ticker,
         bias: impact.bias,
         direction: impact.direction,
         reasoning: `[NEWS] ${impact.reasoning}`,
-        expiresAt: Date.now() + 3 * 60 * 60_000, // expires at next scan
+        expiresAt: Date.now() + 3 * 60 * 60_000,
       };
-      if (existing >= 0) activeHints[existing] = hint;
-      else activeHints.push(hint);
+      if (existing >= 0) acct.activeHints[existing] = hint;
+      else acct.activeHints.push(hint);
 
-      log(`NEWS BIAS: ${impact.ticker} ${impact.bias > 0 ? "+" : ""}${impact.bias} (${impact.direction}) — ${impact.reasoning}`);
+      log(acct, `NEWS BIAS: ${impact.ticker} ${impact.bias > 0 ? "+" : ""}${impact.bias} (${impact.direction}) — ${impact.reasoning}`);
     }
 
-    // Add new tickers from news
     for (const ticker of result.newTickers || []) {
-      if (!TICKERS.includes(ticker)) {
-        TICKERS.push(ticker);
-        log(`NEWS WATCHLIST +${ticker}`);
+      if (!acct.tickers.includes(ticker)) {
+        acct.tickers.push(ticker);
+        log(acct, `NEWS WATCHLIST +${ticker}`);
       }
     }
 
-    // If critical, also log the advice prominently
     if (result.severity === "critical" || result.severity === "elevated") {
-      log(`NEWS ADVICE: ${result.actionAdvice}`);
+      log(acct, `NEWS ADVICE: ${result.actionAdvice}`);
     }
 
     return result;
   } catch (e) {
-    log(`NEWS SCAN ERROR: ${e.message}`);
+    log(acct, `NEWS SCAN ERROR: ${e.message}`);
     return null;
   }
 }
 
-function getNewsBrief() {
-  return latestNewsBrief;
-}
-
 // ─── Claude Pre-Entry Validation ───
 
-async function validateEntryWithClaude(ticker, quote, analysis, setupQuality, earningsInfo, regime) {
-  const prompt = `You are a trading bot's risk management system. Evaluate this potential options trade:
+async function validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime) {
+  const cfg = acct.config;
+  const promptText = `You are a trading bot's risk management system. Evaluate this potential options trade:
 
 Ticker: ${ticker}
 Price: $${quote.c.toFixed(2)}
-Direction: ${analysis.score >= BULL_ENTRY ? 'BULLISH (buying calls)' : 'BEARISH (buying puts)'}
+Direction: ${analysis.score >= cfg.bullEntry ? 'BULLISH (buying calls)' : 'BEARISH (buying puts)'}
 Technical Score: ${analysis.score}/100
 RSI: ${analysis.rsi?.toFixed(1) || 'N/A'}
 EMA Stack: ${analysis.aligned ? 'Aligned bullish (8>21>50)' : analysis.bearish ? 'Aligned bearish' : 'Mixed'}
 Setup Quality: ${setupQuality.quality}/100 (${setupQuality.tight ? 'tight base' : 'wide range'}, ${setupQuality.breakingOut ? 'breaking out' : 'no breakout'}, vol ${setupQuality.volDeclining ? 'declining' : 'not declining'})
 Market Regime: ${regime.label}
-${earningsInfo.hasEarnings ? `⚠️ EARNINGS in ${earningsInfo.daysUntil} days (${earningsInfo.date})` : 'No upcoming earnings within 3 days'}
+${earningsInfo.hasEarnings ? `EARNINGS in ${earningsInfo.daysUntil} days (${earningsInfo.date})` : 'No upcoming earnings within 3 days'}
 Contract: 7DTE options, 1 strike OTM
+${cfg.customPromptSuffix ? `\nAdditional context: ${cfg.customPromptSuffix}` : ''}
 
 Evaluate:
 1. Is this a quality setup (consolidation→breakout) or chasing an extended move?
@@ -1018,51 +1100,49 @@ Respond with ONLY valid JSON (no markdown, no backticks):
 {"approve": true, "confidence": 75, "concerns": [], "suggestion": "brief advice"}`;
 
   try {
-    const raw = await callClaude(prompt);
+    const raw = await callClaude(promptText);
     const cleaned = raw.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
     return JSON.parse(cleaned);
   } catch (e) {
-    log(`CLAUDE VALIDATE WARN: Parse failed — ${e.message}. Defaulting to approve.`);
+    log(acct, `CLAUDE VALIDATE WARN: Parse failed — ${e.message}. Defaulting to approve.`);
     return { approve: true, confidence: 50, concerns: ["validation parse failed"], suggestion: "proceeding with caution" };
   }
 }
 
 // ─── Entry Logic (enhanced with setup quality, EOD freeze, Claude validation) ───
 
-async function tryEntry(state, ticker, analysis, quote, candleCache, regime) {
+async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
+  const state = acct.state;
+  const cfg = acct.config;
   if (state.positions.some(p => p.ticker === ticker)) return null;
-  if (state.cash < 200) return null;
+  if (state.cash < cfg.startingCash) return null;
 
-  // EOD entry freeze — no new positions after 3:00 PM ET (except very strong signals)
   const et = getETDate();
   const etHour = et.getHours() + et.getMinutes() / 60;
   if (etHour >= EOD_FREEZE_HOUR && analysis.score < 80 && analysis.score > 20) {
     return { skipped: true, reason: `EOD freeze (${etHour.toFixed(1)} >= ${EOD_FREEZE_HOUR}h, score ${analysis.score} not extreme enough)` };
   }
 
-  // Setup quality check — require minimum consolidation quality
-  const setupQuality = detectConsolidation(candleCache[ticker]);
+  const setupQuality = detectConsolidation(acct.candleCache[ticker]);
   if (setupQuality.quality < 30) {
     return { skipped: true, reason: `Low setup quality ${setupQuality.quality}/100 (range ${setupQuality.rangePct}%, need consolidation→breakout)` };
   }
 
-  // Earnings check — don't enter within 3 days of earnings
   let earningsInfo = { hasEarnings: false, daysUntil: null };
   try {
-    earningsInfo = await checkEarnings(ticker, state.apiKey);
+    earningsInfo = await checkEarnings(ticker, apiKey);
     await delay(API_DELAY);
   } catch { }
   if (earningsInfo.hasEarnings) {
     return { skipped: true, reason: `Earnings in ${earningsInfo.daysUntil} days (${earningsInfo.date}) — too risky for 7DTE options` };
   }
 
-  // Claude pre-entry validation
   let claudeResult = { approve: true, confidence: 70, concerns: [], suggestion: "" };
   try {
-    claudeResult = await validateEntryWithClaude(ticker, quote, analysis, setupQuality, earningsInfo, regime);
-    log(`CLAUDE VALIDATE ${ticker}: ${claudeResult.approve ? '✓ APPROVED' : '✗ REJECTED'} (${claudeResult.confidence}%) — ${claudeResult.suggestion}${claudeResult.concerns.length ? ' | Concerns: ' + claudeResult.concerns.join(', ') : ''}`);
+    claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime);
+    log(acct, `CLAUDE VALIDATE ${ticker}: ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%) — ${claudeResult.suggestion}${claudeResult.concerns.length ? ' | Concerns: ' + claudeResult.concerns.join(', ') : ''}`);
   } catch (e) {
-    log(`CLAUDE VALIDATE ${ticker}: Error — ${e.message}, proceeding anyway`);
+    log(acct, `CLAUDE VALIDATE ${ticker}: Error — ${e.message}, proceeding anyway`);
   }
 
   if (!claudeResult.approve) {
@@ -1070,16 +1150,16 @@ async function tryEntry(state, ticker, analysis, quote, candleCache, regime) {
   }
 
   const spot = quote.c;
-  const maxRisk = state.cash * RISK_PCT;
+  const maxRisk = state.cash * acct.riskPct;
 
   let type, strike, dte;
 
-  if (analysis.score >= BULL_ENTRY) {
+  if (analysis.score >= cfg.bullEntry) {
     type = "call";
     const atm = Math.round(spot / 5) * 5;
     strike = atm + 5;
     dte = 7;
-  } else if (analysis.score <= BEAR_ENTRY) {
+  } else if (analysis.score <= cfg.bearEntry) {
     type = "put";
     const atm = Math.round(spot / 5) * 5;
     strike = atm - 5;
@@ -1102,12 +1182,12 @@ async function tryEntry(state, ticker, analysis, quote, candleCache, regime) {
     entryPremium: premium,
     entrySpot: spot,
     qty,
-    originalQty: qty,    // Track original size for trimming
+    originalQty: qty,
     cost: totalCost,
     openDate: getETDateStr(),
     openTime: Date.now(),
-    trimLevel: 0,         // 0=none, 1=first trim, 2=second, 3=third, 4=fully closed
-    bestPnlPct: 0,        // Track high-water mark for trailing stops
+    trimLevel: 0,
+    bestPnlPct: 0,
     claudeConfidence: claudeResult.confidence,
     setupQuality: setupQuality.quality,
   };
@@ -1120,14 +1200,15 @@ async function tryEntry(state, ticker, analysis, quote, candleCache, regime) {
 
 // ─── Exit Logic (with trimming support) ───
 
-function closePosition(state, pos, currentPremium, reason, qtyToClose) {
+function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
+  const state = acct.state;
   const qty = qtyToClose || pos.qty;
   const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
   const pnlDollar = (currentPremium - pos.entryPremium) * qty * 100;
 
   if (!canClosePDT(state, pos)) {
     const used = countRecentDayTrades(state);
-    log(`PDT BLOCKED: Cannot close ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} — ${used}/3 day trades used`);
+    log(acct, `PDT BLOCKED: Cannot close ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} — ${used}/3 day trades used`);
     return null;
   }
 
@@ -1140,15 +1221,17 @@ function closePosition(state, pos, currentPremium, reason, qtyToClose) {
   logTrade(trade);
 
   const trimLabel = qty < pos.qty ? `TRIM ${qty}/${pos.qty}` : "EXIT";
-  log(`${trimLabel}: ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} ${pnlDollar >= 0 ? "+" : ""}$${pnlDollar.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${(pnlPct * 100).toFixed(0)}%) — ${reason}`);
+  log(acct, `${trimLabel}: ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} ${pnlDollar >= 0 ? "+" : ""}$${pnlDollar.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${(pnlPct * 100).toFixed(0)}%) — ${reason}`);
   if (wouldBeDayTrade(pos)) {
-    log(`PDT CHECK: ${dtUsed}/3 day trades used (rolling 5 days)`);
+    log(acct, `PDT CHECK: ${dtUsed}/3 day trades used (rolling 5 days)`);
   }
 
   return trade;
 }
 
-function tryExits(state, quotes, candleCache) {
+function tryExits(acct, quotes) {
+  const state = acct.state;
+  const cfg = acct.config;
   const closed = [];
   const remaining = [];
 
@@ -1163,7 +1246,6 @@ function tryExits(state, quotes, candleCache) {
     const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, DEFAULT_IV, pos.type);
     const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
 
-    // Track high-water mark
     if (!pos.bestPnlPct) pos.bestPnlPct = 0;
     if (pnlPct > pos.bestPnlPct) pos.bestPnlPct = pnlPct;
     if (!pos.trimLevel) pos.trimLevel = 0;
@@ -1172,63 +1254,54 @@ function tryExits(state, quotes, candleCache) {
     let reason = null;
     let fullClose = false;
 
-    // === Critical DTE — force close everything at DTE <= 2 ===
     if (pos.dteRemaining <= CRITICAL_DTE) {
       reason = `DTE critical (${pos.dteRemaining.toFixed(1)}d remaining)`;
       fullClose = true;
     }
-    // === Stop loss — always full close ===
-    else if (pnlPct <= STOP_LOSS) {
+    else if (pnlPct <= cfg.stopLoss) {
       reason = `stop loss ${(pnlPct * 100).toFixed(0)}%`;
       fullClose = true;
     }
-    // === DTE expiring soon — full close ===
     else if (pos.dteRemaining <= 1) {
       reason = "DTE expiring";
       fullClose = true;
     }
-    // === Profit target hit — full close on remaining ===
-    else if (pnlPct >= PROFIT_TARGET) {
+    else if (pnlPct >= cfg.profitTarget) {
       reason = `profit target +${(pnlPct * 100).toFixed(0)}%`;
       fullClose = true;
     }
-    // === TRIMMING STRATEGY (SRxTrades 1/4th exits) ===
-    else if (pos.trimLevel === 0 && pnlPct >= TRIM_1_PCT) {
-      // First trim: sell 25% at +25%, move stop to breakeven
+    else if (pos.trimLevel === 0 && pnlPct >= cfg.trim1Pct) {
       const trimQty = Math.max(1, Math.floor(pos.originalQty * 0.25));
       if (trimQty > 0 && pos.qty > trimQty) {
-        const trade = closePosition(state, pos, currentPremium, `trim 1 (+${(pnlPct * 100).toFixed(0)}%, locking gains)`, trimQty);
+        const trade = closePosition(acct, pos, currentPremium, `trim 1 (+${(pnlPct * 100).toFixed(0)}%, locking gains)`, trimQty);
         if (trade) {
           closed.push(trade);
           pos.qty -= trimQty;
           pos.trimLevel = 1;
-          log(`TRIM STRATEGY: ${pos.ticker} — sold ${trimQty}/${pos.originalQty}, stop moved to breakeven`);
+          log(acct, `TRIM STRATEGY: ${pos.ticker} — sold ${trimQty}/${pos.originalQty}, stop moved to breakeven`);
         }
       }
       remaining.push(pos);
       continue;
     }
-    else if (pos.trimLevel === 1 && pnlPct >= TRIM_2_PCT) {
-      // Second trim: sell another 25% at +50%
+    else if (pos.trimLevel === 1 && pnlPct >= cfg.trim2Pct) {
       const trimQty = Math.max(1, Math.floor(pos.originalQty * 0.25));
       if (trimQty > 0 && pos.qty > trimQty) {
-        const trade = closePosition(state, pos, currentPremium, `trim 2 (+${(pnlPct * 100).toFixed(0)}%, trailing EMAs)`, trimQty);
+        const trade = closePosition(acct, pos, currentPremium, `trim 2 (+${(pnlPct * 100).toFixed(0)}%, trailing EMAs)`, trimQty);
         if (trade) {
           closed.push(trade);
           pos.qty -= trimQty;
           pos.trimLevel = 2;
-          log(`TRIM STRATEGY: ${pos.ticker} — sold ${trimQty} more, trailing with 8 EMA`);
+          log(acct, `TRIM STRATEGY: ${pos.ticker} — sold ${trimQty} more, trailing with 8 EMA`);
         }
       }
       remaining.push(pos);
       continue;
     }
-    // After trim 1, stop loss moves to breakeven
     else if (pos.trimLevel >= 1 && pnlPct <= 0) {
       reason = `breakeven stop (post-trim, was +${(pos.bestPnlPct * 100).toFixed(0)}%)`;
       fullClose = true;
     }
-    // After trim 2, trail with 15% profit floor
     else if (pos.trimLevel >= 2 && pnlPct <= 0.15) {
       reason = `trailing stop (post-trim2, locked +15%)`;
       fullClose = true;
@@ -1237,11 +1310,11 @@ function tryExits(state, quotes, candleCache) {
     if (!reason) { remaining.push(pos); continue; }
 
     if (fullClose) {
-      const trade = closePosition(state, pos, currentPremium, reason);
+      const trade = closePosition(acct, pos, currentPremium, reason);
       if (trade) {
         closed.push(trade);
       } else {
-        remaining.push(pos); // PDT blocked
+        remaining.push(pos);
       }
     }
   }
@@ -1253,7 +1326,9 @@ function tryExits(state, quotes, candleCache) {
 
 // ─── Signal-Based Exit ───
 
-function trySignalExits(state, quotes, analyses) {
+function trySignalExits(acct, quotes, analyses) {
+  const state = acct.state;
+  const cfg = acct.config;
   const closed = [];
   const remaining = [];
 
@@ -1262,8 +1337,8 @@ function trySignalExits(state, quotes, analyses) {
     if (!a) { remaining.push(pos); continue; }
 
     let reversed = false;
-    if (pos.type === "call" && a.score <= BEAR_ENTRY) reversed = true;
-    if (pos.type === "put" && a.score >= BULL_ENTRY) reversed = true;
+    if (pos.type === "call" && a.score <= cfg.bearEntry) reversed = true;
+    if (pos.type === "put" && a.score >= cfg.bullEntry) reversed = true;
 
     if (!reversed) { remaining.push(pos); continue; }
 
@@ -1271,11 +1346,11 @@ function trySignalExits(state, quotes, analyses) {
     const spot = q ? q.c : pos.entrySpot;
     const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, DEFAULT_IV, pos.type);
 
-    const trade = closePosition(state, pos, currentPremium, "signal reversed");
+    const trade = closePosition(acct, pos, currentPremium, "signal reversed");
     if (trade) {
       closed.push(trade);
     } else {
-      remaining.push(pos); // PDT blocked
+      remaining.push(pos);
     }
   }
 
@@ -1286,11 +1361,11 @@ function trySignalExits(state, quotes, analyses) {
 
 // ─── EOD / EOW Theta-Aware Exits ───
 
-function tryTimeBasedExits(state, quotes) {
+function tryTimeBasedExits(acct, quotes) {
+  const state = acct.state;
   const et = getETDate();
   const etHour = et.getHours() + et.getMinutes() / 60;
-  const dayOfWeek = et.getDay(); // 0=Sun, 5=Fri
-  const isFriday = dayOfWeek === 5;
+  const isFriday = et.getDay() === 5;
 
   const closed = [];
   const remaining = [];
@@ -1304,7 +1379,6 @@ function tryTimeBasedExits(state, quotes) {
     const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
     let reason = null;
 
-    // Friday afternoon: close profitable positions to avoid weekend theta crush
     if (isFriday && etHour >= EOW_TRIM_HOUR) {
       if (pnlPct >= 0.20) {
         reason = `EOW profit lock +${(pnlPct * 100).toFixed(0)}% (Fri ${etHour.toFixed(1)}h, avoid weekend theta)`;
@@ -1313,22 +1387,19 @@ function tryTimeBasedExits(state, quotes) {
       }
     }
 
-    // Last hour: tighten stops on profitable positions to protect gains overnight
     if (!reason && etHour >= EOD_TIGHTEN_HOUR) {
       if (pnlPct >= 0.10 && pos.trimLevel === 0) {
-        // Profitable but untrimmed — lock it in before close
         reason = `EOD lock +${(pnlPct * 100).toFixed(0)}% (3:30 PM tighten, protecting overnight)`;
       }
     }
 
-    // Low DTE acceleration: when DTE <= 3, lower profit target
     if (!reason && pos.dteRemaining <= LOW_DTE_THRESHOLD && pnlPct >= 0.20) {
       reason = `low DTE accelerated exit +${(pnlPct * 100).toFixed(0)}% (${pos.dteRemaining.toFixed(1)}d left, theta accelerating)`;
     }
 
     if (!reason) { remaining.push(pos); continue; }
 
-    const trade = closePosition(state, pos, currentPremium, reason);
+    const trade = closePosition(acct, pos, currentPremium, reason);
     if (trade) {
       closed.push(trade);
     } else {
@@ -1343,14 +1414,15 @@ function tryTimeBasedExits(state, quotes) {
 
 // ─── EMA Trailing Exits (trim 3 & 4 — SRxTrades 8/21 EMA trail) ───
 
-function tryEMATrailingExits(state, quotes, candleCache) {
+function tryEMATrailingExits(acct, quotes) {
+  const state = acct.state;
   const closed = [];
   const remaining = [];
 
   for (const pos of state.positions) {
-    if ((pos.trimLevel || 0) < 2) { remaining.push(pos); continue; } // Only for positions past trim 2
+    if ((pos.trimLevel || 0) < 2) { remaining.push(pos); continue; }
 
-    const candles = candleCache[pos.ticker];
+    const candles = acct.candleCache[pos.ticker];
     if (!candles || candles.length < 22) { remaining.push(pos); continue; }
 
     const closes = candles.map(d => d.c);
@@ -1362,24 +1434,20 @@ function tryEMATrailingExits(state, quotes, candleCache) {
     const q = quotes[pos.ticker];
     const spot = q ? q.c : pos.entrySpot;
     const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, DEFAULT_IV, pos.type);
-    const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
     let reason = null;
 
-    // For calls: bearish when price closes below EMA
-    // For puts: bullish when price closes above EMA (trend reversing against us)
     const below8 = pos.type === "call" ? price < ema8[L] : price > ema8[L];
     const below21 = pos.type === "call" ? price < ema21[L] : price > ema21[L];
 
     if (pos.trimLevel === 2 && below8) {
-      // Third trim: price broke 8 EMA
       const trimQty = Math.max(1, Math.floor((pos.originalQty || pos.qty) * 0.25));
       if (trimQty > 0 && pos.qty > trimQty) {
-        const trade = closePosition(state, pos, currentPremium, `8 EMA break (trim 3, trailing 21 EMA with remainder)`, trimQty);
+        const trade = closePosition(acct, pos, currentPremium, `8 EMA break (trim 3, trailing 21 EMA with remainder)`, trimQty);
         if (trade) {
           closed.push(trade);
           pos.qty -= trimQty;
           pos.trimLevel = 3;
-          log(`EMA TRAIL: ${pos.ticker} broke 8 EMA — sold ${trimQty}, trailing 21 EMA with ${pos.qty} left`);
+          log(acct, `EMA TRAIL: ${pos.ticker} broke 8 EMA — sold ${trimQty}, trailing 21 EMA with ${pos.qty} left`);
         }
       }
       remaining.push(pos);
@@ -1387,12 +1455,11 @@ function tryEMATrailingExits(state, quotes, candleCache) {
     }
 
     if (pos.trimLevel === 3 && below21) {
-      // Final exit: price broke 21 EMA
       reason = "21 EMA break (final exit per SRxTrades trail)";
     }
 
     if (reason) {
-      const trade = closePosition(state, pos, currentPremium, reason);
+      const trade = closePosition(acct, pos, currentPremium, reason);
       if (trade) {
         closed.push(trade);
       } else {
@@ -1408,33 +1475,19 @@ function tryEMATrailingExits(state, quotes, candleCache) {
   return closed;
 }
 
-// ─── Dashboard State (shared with web server) ───
-
-const dashboard = {
-  quotes: {},
-  analyses: {},
-  shortTermAnalyses: {},  // 7-day focused analysis
-  candles: {},      // Candle cache for chart rendering
-  lastCycle: null,
-  cycleLog: [],     // Last 200 log lines
-  marketOpen: false,
-  decisions: [],    // Per-ticker decision reasoning each cycle
-  positionDetails: [], // Enriched position info with stops/targets
-};
-
-function log(msg) {
-  const now = new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York", hour12: false });
-  const line = `[${now}] ${msg}`;
-  console.log(line);
-  dashboard.cycleLog.push(line);
-  if (dashboard.cycleLog.length > 200) dashboard.cycleLog.shift();
-}
+// ─── Dashboard State — now per-account in acct.dashboard ───
 
 // ─── Web Dashboard ───
 
 const DASH_PORT = parseInt(process.env.PORT) || 3000;
 
-function dashboardHTML(state) {
+function dashboardHTML(acct) {
+  const state = acct.state;
+  const dashboard = acct.dashboard;
+  const cfg = acct.config;
+  const STARTING_CASH = cfg.startingCash;
+  const GOAL = cfg.goal;
+  const currentRegime = acct.currentRegime;
   const pv = portfolioValue(state, dashboard.quotes);
   const pnlPct = ((pv - STARTING_CASH) / STARTING_CASH * 100).toFixed(1);
   const progress = ((pv / GOAL) * 100).toFixed(1);
@@ -1700,14 +1753,16 @@ pollLive();
 </body></html>`;
 }
 
-function tickerDetailHTML(sym, state) {
+function tickerDetailHTML(sym, acct) {
+  const state = acct.state;
+  const dashboard = acct.dashboard;
   const candles = dashboard.candles[sym];
   const a = dashboard.analyses[sym];
   const q = dashboard.quotes[sym];
   const dec = dashboard.decisions.find(d => d.ticker === sym);
   const pos = dashboard.positionDetails.find(p => p.ticker === sym);
-  const hintBias = getHintBias(sym);
-  const hint = activeHints.find(h => h.ticker === sym);
+  const hintBias = getHintBias(acct, sym);
+  const hint = acct.activeHints.find(h => h.ticker === sym);
 
   const st = dashboard.shortTermAnalyses[sym];
 
@@ -1920,8 +1975,11 @@ ${pos ? '<div class="card" style="margin-top:16px"><h2>Position Details</h2>' + 
 </body></html>`;
 }
 
-function startDashboard(state) {
+function startDashboard(acct, apiKey) {
   const server = http.createServer(async (req, res) => {
+    const state = acct.state;
+    const dashboard = acct.dashboard;
+
     // Handle hint submission via POST
     if (req.method === "POST" && req.url === "/hint") {
       let body = "";
@@ -1931,7 +1989,7 @@ function startDashboard(state) {
         const hint = params.get("hint");
         if (hint) {
           fs.writeFileSync(HINT_FILE, hint);
-          log(`HINT (via dashboard): "${hint}"`);
+          log(acct, `HINT (via dashboard): "${hint}"`);
         }
         res.writeHead(302, { Location: "/" });
         res.end();
@@ -1943,15 +2001,13 @@ function startDashboard(state) {
     const tickerMatch = req.url.match(/^\/ticker\/([A-Z]+)$/);
     if (tickerMatch) {
       const sym = tickerMatch[1];
-      // Fetch candles + quote on-demand if not cached (e.g. position tickers not in watchlist)
       try {
-        if (!dashboard.candles[sym] && state.apiKey) {
-          dashboard.candles[sym] = await fetchCandles(sym, state.apiKey);
+        if (!dashboard.candles[sym] && apiKey) {
+          dashboard.candles[sym] = await fetchCandles(sym, apiKey);
         }
-        if (!dashboard.quotes[sym] && state.apiKey) {
-          dashboard.quotes[sym] = await fetchQuote(sym, state.apiKey);
+        if (!dashboard.quotes[sym] && apiKey) {
+          dashboard.quotes[sym] = await fetchQuote(sym, apiKey);
         }
-        // Run analysis on-demand if we have candles but no analysis
         if (dashboard.candles[sym] && !dashboard.analyses[sym]) {
           const a = runAnalysis(dashboard.candles[sym]);
           if (a) dashboard.analyses[sym] = a;
@@ -1959,10 +2015,10 @@ function startDashboard(state) {
           if (st) dashboard.shortTermAnalyses[sym] = st;
         }
       } catch (e) {
-        log(`WARN: On-demand fetch for ${sym} failed — ${e.message}`);
+        log(acct, `WARN: On-demand fetch for ${sym} failed — ${e.message}`);
       }
       res.writeHead(200, { "Content-Type": "text/html" });
-      res.end(tickerDetailHTML(sym, state));
+      res.end(tickerDetailHTML(sym, acct));
       return;
     }
 
@@ -1976,7 +2032,7 @@ function startDashboard(state) {
         dayTrades: state.dayTrades,
         quotes: dashboard.quotes,
         analyses: Object.fromEntries(Object.entries(dashboard.analyses).map(([k, v]) => [k, { score: v.score, signal: v.signal, price: v.price, rsi: v.rsi }])),
-        activeHints,
+        activeHints: acct.activeHints,
         portfolioValue: portfolioValue(state, dashboard.quotes),
         marketOpen: dashboard.marketOpen,
         log: dashboard.cycleLog.slice(-50),
@@ -2020,16 +2076,16 @@ function startDashboard(state) {
 
     // Dashboard HTML
     res.writeHead(200, { "Content-Type": "text/html" });
-    res.end(dashboardHTML(state));
+    res.end(dashboardHTML(acct));
   });
 
   server.listen(DASH_PORT, () => {
-    log(`Dashboard running at http://localhost:${DASH_PORT}`);
+    console.log(`  Dashboard running at http://localhost:${DASH_PORT}`);
   });
 
   server.on("error", (e) => {
     if (e.code === "EADDRINUSE") {
-      log(`WARN: Dashboard port ${DASH_PORT} in use, trying ${DASH_PORT + 1}`);
+      console.log(`  WARN: Dashboard port ${DASH_PORT} in use, trying ${DASH_PORT + 1}`);
       server.listen(DASH_PORT + 1);
     }
   });
@@ -2037,41 +2093,30 @@ function startDashboard(state) {
 
 // ─── Main Trading Cycle ───
 
-async function runCycle(state, candleCache) {
-  log("MARKET OPEN — Starting auto-trade cycle");
-  dashboard.marketOpen = true;
+async function runCycle(acct, sharedQuotes, apiKey) {
+  const state = acct.state;
+  const cfg = acct.config;
+  const dash = acct.dashboard;
+  log(acct, "MARKET OPEN — Starting auto-trade cycle");
+  dash.marketOpen = true;
 
   const quotes = {};
   const analyses = {};
 
-  const activeTickers = getActiveTickers(state.cash);
-  // Include position tickers that may not be in the watchlist
+  const activeTickers = getActiveTickers(acct);
   const positionTickers = state.positions.map(p => p.ticker).filter(t => !activeTickers.includes(t));
   const allTickers = [...activeTickers, ...positionTickers];
 
-  // Fetch quotes for all tickers
+  // Use shared quotes (fetched once for all accounts)
   for (const ticker of allTickers) {
-    try {
-      quotes[ticker] = await fetchQuote(ticker, state.apiKey);
-      await delay(API_DELAY);
-    } catch (e) {
-      log(`WARN: Failed to fetch quote for ${ticker} — ${e.message}`);
-    }
+    if (sharedQuotes[ticker]) quotes[ticker] = sharedQuotes[ticker];
   }
 
-  // Fetch candles if not cached this session
+  // Update candle cache latest values from quotes
   for (const ticker of allTickers) {
-    if (!candleCache[ticker]) {
-      try {
-        candleCache[ticker] = await fetchCandles(ticker, state.apiKey);
-        await delay(API_DELAY);
-      } catch (e) {
-        log(`WARN: Failed to fetch candles for ${ticker} — ${e.message}`);
-      }
-    } else if (quotes[ticker]) {
-      // Update latest candle with current quote
+    if (acct.candleCache[ticker] && quotes[ticker]) {
       const q = quotes[ticker];
-      const last = candleCache[ticker][candleCache[ticker].length - 1];
+      const last = acct.candleCache[ticker][acct.candleCache[ticker].length - 1];
       if (last) {
         last.c = q.c;
         last.h = Math.max(last.h, q.h);
@@ -2080,79 +2125,66 @@ async function runCycle(state, candleCache) {
     }
   }
 
-  // Refresh dynamic watchlist from market data (every 4 hours)
-  await refreshWatchlist(state.cash);
+  await refreshWatchlist(acct);
+  await checkHints(acct);
+  await runNewsScan(acct, apiKey);
 
-  // Check for new hints from user (via hint.txt)
-  await checkHints(state);
-
-  // Auto news scan every 3 hours
-  await runNewsScan(state);
-
-  // Run dual-timeframe analysis on each ticker (with hint bias applied)
   const shortTermAnalyses = {};
   const decisions = [];
   for (const ticker of allTickers) {
-    const candles = candleCache[ticker];
+    const candles = acct.candleCache[ticker];
     if (!candles) { decisions.push({ ticker, action: "SKIP", reason: "No candle data" }); continue; }
-    const a = runAnalysis(candles);          // 90-day long-term
-    const st = runShortTermAnalysis(candles); // 7-day short-term
+    const a = runAnalysis(candles);
+    const st = runShortTermAnalysis(candles);
     if (!a) { decisions.push({ ticker, action: "SKIP", reason: "Insufficient data (<55 candles)" }); continue; }
 
-    // Store short-term analysis for dashboard
     if (st) shortTermAnalyses[ticker] = st;
 
-    // Blend scores: 60% short-term (matches contract duration), 40% long-term (context)
     const blended = blendScores(a, st);
     const effectiveScore = blended.score;
-    const effectiveSignal = blended.signal;
 
-    // Apply Claude hint bias on the blended score
-    const hintBias = getHintBias(ticker);
+    const hintBias = getHintBias(acct, ticker);
     const rawScore = effectiveScore;
     let finalScore = effectiveScore;
     if (hintBias !== 0) {
       finalScore = Math.max(0, Math.min(100, effectiveScore + hintBias));
       a.hintBoosted = true;
     }
-    // Update the long-term analysis object with blended+hint final score for compatibility
     a.score = finalScore;
     a.signal = signalLabel(finalScore);
     a.blendedRaw = effectiveScore;
     a.shortTermScore = st ? st.score : null;
-    a.longTermScore = a.score !== finalScore ? rawScore : a.score; // store the pre-hint blended
+    a.longTermScore = a.score !== finalScore ? rawScore : a.score;
     analyses[ticker] = a;
 
     const q = quotes[ticker];
     const price = q ? `$${q.c.toFixed(2)}` : "N/A";
     const hintTag = hintBias !== 0 ? ` [HINT ${hintBias > 0 ? "+" : ""}${hintBias}]` : "";
     const stTag = st ? ` (7d:${st.score} 90d:${a.blendedRaw !== undefined ? Math.round(a.bullScore * 0.5 + 50 - a.bearScore * 0.5) : '?'})` : "";
-    log(`${ticker} ${price} | Blended: ${finalScore} ${a.signal}${hintTag}${stTag} | ${a.sigs.map(s => s.text).join(", ") || "No signals"}`);
+    log(acct, `${ticker} ${price} | Blended: ${finalScore} ${a.signal}${hintTag}${stTag} | ${a.sigs.map(s => s.text).join(", ") || "No signals"}`);
 
-    // Build decision reasoning
     const dec = { ticker, price: q?.c, rawScore, finalScore, signal: a.signal, hintBias };
     const alreadyHeld = state.positions.some(p => p.ticker === ticker);
-    const lowCash = state.cash < 200; // effectively no buying power
+    const lowCash = state.cash < cfg.startingCash;
 
     dec.bullScore = a.bullScore; dec.bearScore = a.bearScore;
     dec.shortTermScore = st ? st.score : null;
     dec.longTermScore = a ? Math.round(50 + (a.bullScore - a.bearScore) / 2) : null;
     dec.blendedScore = effectiveScore;
 
-    // Use the final (blended + hint) score for entry decisions
-    if (finalScore >= BULL_ENTRY) {
+    if (finalScore >= cfg.bullEntry) {
       if (alreadyHeld) { dec.action = "HOLD"; dec.reason = "Already in position"; }
       else if (lowCash) { dec.action = "BLOCKED"; dec.reason = `Insufficient cash ($${state.cash.toFixed(0)})`; }
       else { dec.action = "BUY CALL"; dec.reason = `Bullish ${finalScore}/100 (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`; }
-    } else if (finalScore <= BEAR_ENTRY) {
+    } else if (finalScore <= cfg.bearEntry) {
       if (alreadyHeld) { dec.action = "HOLD"; dec.reason = "Already in position"; }
       else if (lowCash) { dec.action = "BLOCKED"; dec.reason = `Insufficient cash ($${state.cash.toFixed(0)})`; }
       else { dec.action = "BUY PUT"; dec.reason = `Bearish ${finalScore}/100 (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`; }
     } else {
       dec.action = "WAIT";
-      if (finalScore >= 55) dec.reason = `Score ${finalScore} — leaning bullish but need ≥${BULL_ENTRY} (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`;
+      if (finalScore >= 55) dec.reason = `Score ${finalScore} — leaning bullish but need >=${cfg.bullEntry} (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`;
       else if (finalScore >= 45) dec.reason = `Score ${finalScore} — neutral (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`;
-      else dec.reason = `Score ${finalScore} — leaning bearish but need ≤${BEAR_ENTRY} (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`;
+      else dec.reason = `Score ${finalScore} — leaning bearish but need <=${cfg.bearEntry} (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`;
     }
     dec.ema8 = a.ema8v?.toFixed(2); dec.ema21 = a.ema21v?.toFixed(2); dec.ema50 = a.ema50v?.toFixed(2);
     dec.stEma3 = st?.ema3v?.toFixed(2); dec.stEma5 = st?.ema5v?.toFixed(2); dec.stEma8 = st?.ema8v?.toFixed(2);
@@ -2162,54 +2194,63 @@ async function runCycle(state, candleCache) {
     dec.signals = [...(a.sigs?.map(s => s.text) || []), ...(st?.sigs?.map(s => `[7d] ${s.text}`) || [])];
     decisions.push(dec);
   }
-  dashboard.decisions = decisions;
-  dashboard.shortTermAnalyses = shortTermAnalyses;
+  dash.decisions = decisions;
+  dash.shortTermAnalyses = shortTermAnalyses;
 
-  // Clean old day trades
   cleanDayTrades(state);
 
-  // ─── Market Regime Check ───
-  const regime = getMarketRegime(candleCache);
-  currentRegime = regime;
-  RISK_PCT = BASE_RISK_PCT * regime.riskScale;
-  log(`REGIME: ${regime.label} | Risk: ${(RISK_PCT * 100).toFixed(1)}% per trade (${regime.riskScale}x base)`);
+  const regime = getMarketRegime(acct.candleCache);
+  acct.currentRegime = regime;
+  acct.riskPct = cfg.baseRiskPct * regime.riskScale;
+  log(acct, `REGIME: ${regime.label} | Risk: ${(acct.riskPct * 100).toFixed(1)}% per trade (${regime.riskScale}x base)`);
 
-  // ─── Exit cascade (order matters: time-based → core → signal → EMA trailing) ───
+  tryTimeBasedExits(acct, quotes);
+  tryExits(acct, quotes);
+  trySignalExits(acct, quotes, analyses);
+  tryEMATrailingExits(acct, quotes);
 
-  // 1. EOD/EOW theta-aware exits first (most urgent)
-  tryTimeBasedExits(state, quotes);
-
-  // 2. Core exits: profit target, stop loss, DTE, trimming
-  tryExits(state, quotes, candleCache);
-
-  // 3. Signal-based exits (trend reversal)
-  trySignalExits(state, quotes, analyses);
-
-  // 4. EMA trailing exits for positions past trim 2
-  tryEMATrailingExits(state, quotes, candleCache);
-
-  // ─── Entry logic (async — Claude validation per entry) ───
   for (const ticker of activeTickers) {
     const a = analyses[ticker];
     const q = quotes[ticker];
     if (!a || !q) continue;
 
-    const result = await tryEntry(state, ticker, a, q, candleCache, regime);
+    const result = await tryEntry(acct, ticker, a, q, regime, apiKey);
     if (result && result.skipped) {
-      log(`SKIP ${ticker}: ${result.reason}`);
-      // Update decision reasoning for dashboard
+      log(acct, `SKIP ${ticker}: ${result.reason}`);
       const dec = decisions.find(d => d.ticker === ticker);
       if (dec && (dec.action === "BUY CALL" || dec.action === "BUY PUT")) {
         dec.action = "BLOCKED";
         dec.reason = result.reason;
       }
     } else if (result && result.ticker) {
-      log(`TRADE: BUY ${result.qty}x ${result.ticker} $${result.strike} ${result.type.toUpperCase()} ${result.dte}d @ $${result.entryPremium.toFixed(2)} ($${result.cost.toFixed(0)}) [setup:${result.setupQuality}/100 claude:${result.claudeConfidence}%]`);
+      log(acct, `TRADE: BUY ${result.qty}x ${result.ticker} $${result.strike} ${result.type.toUpperCase()} ${result.dte}d @ $${result.entryPremium.toFixed(2)} ($${result.cost.toFixed(0)}) [setup:${result.setupQuality}/100 claude:${result.claudeConfidence}%]`);
     }
   }
 
-  // Build enriched position details for dashboard
-  dashboard.positionDetails = state.positions.map(pos => {
+  dash.positionDetails = buildPositionDetails(acct, quotes);
+
+  const pv = portfolioValue(state, quotes);
+  const pnlPct = ((pv - cfg.startingCash) / cfg.startingCash * 100).toFixed(1);
+  const progress = ((pv / cfg.goal) * 100).toFixed(1);
+  log(acct, `Portfolio: $${pv.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%) | Goal: ${progress}% of $${cfg.goal.toLocaleString()} | Cash: $${state.cash.toFixed(0)} | ${state.positions.length} open | ${countRecentDayTrades(state)}/3 PDT | ${regime.mode.toUpperCase()}${getActiveHintsSummary(acct)}`);
+
+  dash.quotes = quotes;
+  dash.analyses = analyses;
+  dash.shortTermAnalyses = shortTermAnalyses;
+  dash.candles = acct.candleCache;
+  dash.lastCycle = Date.now();
+
+  dash.portfolioHistory = dash.portfolioHistory || [];
+  dash.portfolioHistory.push({ ts: Date.now(), value: pv });
+  if (dash.portfolioHistory.length > 500) dash.portfolioHistory.shift();
+
+  saveAccounts();
+}
+
+function buildPositionDetails(acct, quotes) {
+  const state = acct.state;
+  const cfg = acct.config;
+  return state.positions.map(pos => {
     const q = quotes[pos.ticker];
     const spot = q ? q.c : pos.entrySpot;
     const elapsed = (Date.now() - pos.openTime) / 86400_000;
@@ -2217,100 +2258,56 @@ async function runCycle(state, candleCache) {
     const curPremium = optPrice(spot, pos.strike, dteLeft, DEFAULT_IV, pos.type);
     const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
     const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * 100;
-    const profitPrice = pos.entryPremium * (1 + PROFIT_TARGET);
-    const stopLossPrice = pos.entryPremium * (1 + STOP_LOSS);
+    const profitPrice = pos.entryPremium * (1 + cfg.profitTarget);
+    const stopLossPrice = pos.entryPremium * (1 + cfg.stopLoss);
     const isDayTrade = pos.openDate === getETDateStr();
     const pdtStatus = isDayTrade ? `Day trade (${countRecentDayTrades(state)}/3 used)` : "Swing (not a day trade)";
 
-    // Effective stop depends on trim level
     let effectiveStop;
-    if ((pos.trimLevel || 0) >= 2) effectiveStop = pos.entryPremium * 1.15; // +15% floor
-    else if ((pos.trimLevel || 0) >= 1) effectiveStop = pos.entryPremium;    // breakeven
+    if ((pos.trimLevel || 0) >= 2) effectiveStop = pos.entryPremium * 1.15;
+    else if ((pos.trimLevel || 0) >= 1) effectiveStop = pos.entryPremium;
     else effectiveStop = stopLossPrice;
 
     return {
       ...pos, spot, dteLeft, curPremium, pnlPct, pnlDollar,
-      profitTarget: { pct: `+${(PROFIT_TARGET * 100).toFixed(0)}%`, premium: profitPrice.toFixed(2) },
-      stopLoss: { pct: `${(STOP_LOSS * 100).toFixed(0)}%`, premium: effectiveStop.toFixed(2) },
+      profitTarget: { pct: `+${(cfg.profitTarget * 100).toFixed(0)}%`, premium: profitPrice.toFixed(2) },
+      stopLoss: { pct: `${(cfg.stopLoss * 100).toFixed(0)}%`, premium: effectiveStop.toFixed(2) },
       pctToProfit: ((profitPrice - curPremium) / curPremium * 100).toFixed(1),
       pctToStop: ((effectiveStop - curPremium) / curPremium * 100).toFixed(1),
       pdtStatus,
       greeks: optGreeks(spot, pos.strike, dteLeft, DEFAULT_IV, pos.type),
     };
   });
-
-  // Summary
-  const pv = portfolioValue(state, quotes);
-  const pnlPct = ((pv - STARTING_CASH) / STARTING_CASH * 100).toFixed(1);
-  const progress = ((pv / GOAL) * 100).toFixed(1);
-  log(`Portfolio: $${pv.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%) | Goal: ${progress}% of $${GOAL.toLocaleString()} | Cash: $${state.cash.toFixed(0)} | ${state.positions.length} open | ${countRecentDayTrades(state)}/3 PDT | ${regime.mode.toUpperCase()}${getActiveHintsSummary()}`);
-
-  // Update dashboard state
-  dashboard.quotes = quotes;
-  dashboard.analyses = analyses;
-  dashboard.shortTermAnalyses = shortTermAnalyses;
-  dashboard.candles = candleCache;
-  dashboard.lastCycle = Date.now();
-
-  // Track portfolio value history for chart
-  const pv2 = portfolioValue(state, quotes);
-  dashboard.portfolioHistory = dashboard.portfolioHistory || [];
-  dashboard.portfolioHistory.push({ ts: Date.now(), value: pv2 });
-  if (dashboard.portfolioHistory.length > 500) dashboard.portfolioHistory.shift();
-
-  saveState(state);
-  return { quotes, analyses, candleCache };
 }
 
 // ─── After-Hours Scan (analysis only, no trades) ───
 
-async function runAfterHoursScan(state, candleCache) {
-  log("AFTER-HOURS SCAN — Fetching data for analysis (no trades)");
+async function runAfterHoursScan(acct, sharedQuotes, apiKey) {
+  const state = acct.state;
+  const cfg = acct.config;
+  const dash = acct.dashboard;
+  log(acct, "AFTER-HOURS SCAN — Fetching data for analysis (no trades)");
 
   const quotes = {};
   const analyses = {};
   const shortTermAnalyses = {};
 
-  const activeTickers2 = getActiveTickers(state.cash);
-  // Include position tickers that may not be in the watchlist
+  const activeTickers2 = getActiveTickers(acct);
   const positionTickers2 = state.positions.map(p => p.ticker).filter(t => !activeTickers2.includes(t));
   const allTickers2 = [...activeTickers2, ...positionTickers2];
 
-  // Fetch quotes (Finnhub returns last close + change data even after hours)
+  // Use shared quotes
   for (const ticker of allTickers2) {
-    try {
-      quotes[ticker] = await fetchQuote(ticker, state.apiKey);
-      await delay(API_DELAY);
-    } catch (e) {
-      log(`WARN: Failed to fetch quote for ${ticker} — ${e.message}`);
-    }
+    if (sharedQuotes[ticker]) quotes[ticker] = sharedQuotes[ticker];
   }
 
-  // Fetch candles if not cached
-  for (const ticker of allTickers2) {
-    if (!candleCache[ticker]) {
-      try {
-        candleCache[ticker] = await fetchCandles(ticker, state.apiKey);
-        await delay(API_DELAY);
-      } catch (e) {
-        log(`WARN: Failed to fetch candles for ${ticker} — ${e.message}`);
-      }
-    }
-  }
+  await refreshWatchlist(acct);
+  await checkHints(acct);
+  await runNewsScan(acct, apiKey);
 
-  // Refresh dynamic watchlist from market data (every 4 hours)
-  await refreshWatchlist(state.cash);
-
-  // Check hints
-  await checkHints(state);
-
-  // Run news scan
-  await runNewsScan(state);
-
-  // Run dual-timeframe analysis
   const decisions = [];
   for (const ticker of allTickers2) {
-    const candles = candleCache[ticker];
+    const candles = acct.candleCache[ticker];
     if (!candles) { decisions.push({ ticker, action: "SKIP", reason: "No candle data" }); continue; }
     const a = runAnalysis(candles);
     const st = runShortTermAnalysis(candles);
@@ -2319,7 +2316,7 @@ async function runAfterHoursScan(state, candleCache) {
     if (st) shortTermAnalyses[ticker] = st;
 
     const blended = blendScores(a, st);
-    const hintBias = getHintBias(ticker);
+    const hintBias = getHintBias(acct, ticker);
     let finalScore = blended.score;
     if (hintBias !== 0) {
       finalScore = Math.max(0, Math.min(100, finalScore + hintBias));
@@ -2334,7 +2331,7 @@ async function runAfterHoursScan(state, candleCache) {
     const q = quotes[ticker];
     const price = q ? `$${q.c.toFixed(2)}` : "N/A";
     const hintTag = hintBias !== 0 ? ` [HINT ${hintBias > 0 ? "+" : ""}${hintBias}]` : "";
-    log(`${ticker} ${price} | Blended: ${finalScore} ${a.signal}${hintTag} (7d:${st?.score ?? '?'}) | ${a.sigs.map(s => s.text).join(", ") || "No signals"}`);
+    log(acct, `${ticker} ${price} | Blended: ${finalScore} ${a.signal}${hintTag} (7d:${st?.score ?? '?'}) | ${a.sigs.map(s => s.text).join(", ") || "No signals"}`);
 
     const dec = { ticker, price: q?.c, rawScore: blended.score, finalScore, signal: a.signal, hintBias };
     const alreadyHeld = state.positions.some(p => p.ticker === ticker);
@@ -2343,10 +2340,10 @@ async function runAfterHoursScan(state, candleCache) {
     dec.blendedScore = blended.score;
     dec.bullScore = a.bullScore; dec.bearScore = a.bearScore;
 
-    if (finalScore >= BULL_ENTRY) {
+    if (finalScore >= cfg.bullEntry) {
       dec.action = alreadyHeld ? "HOLD" : "PLAN BUY CALL";
       dec.reason = alreadyHeld ? "Already in position" : `Bullish ${finalScore}/100 — will buy at open (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`;
-    } else if (finalScore <= BEAR_ENTRY) {
+    } else if (finalScore <= cfg.bearEntry) {
       dec.action = alreadyHeld ? "HOLD" : "PLAN BUY PUT";
       dec.reason = alreadyHeld ? "Already in position" : `Bearish ${finalScore}/100 — will buy at open (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`;
     } else {
@@ -2362,43 +2359,17 @@ async function runAfterHoursScan(state, candleCache) {
     decisions.push(dec);
   }
 
-  // Build position details
-  dashboard.positionDetails = state.positions.map(pos => {
-    const q = quotes[pos.ticker];
-    const spot = q ? q.c : pos.entrySpot;
-    const elapsed = (Date.now() - pos.openTime) / 86400_000;
-    const dteLeft = Math.max(0, pos.dte - elapsed);
-    const curPremium = optPrice(spot, pos.strike, dteLeft, DEFAULT_IV, pos.type);
-    const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
-    const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * 100;
-    const profitPrice = pos.entryPremium * (1 + PROFIT_TARGET);
-    const stopPrice = pos.entryPremium * (1 + STOP_LOSS);
-    const isDayTrade = pos.openDate === getETDateStr();
-    const pdtStatus = isDayTrade ? `Day trade (${countRecentDayTrades(state)}/3 used)` : "Swing (not a day trade)";
-    return {
-      ...pos, spot, dteLeft, curPremium, pnlPct, pnlDollar,
-      profitTarget: { pct: `+${(PROFIT_TARGET * 100).toFixed(0)}%`, premium: profitPrice.toFixed(2) },
-      stopLoss: { pct: `${(STOP_LOSS * 100).toFixed(0)}%`, premium: stopPrice.toFixed(2) },
-      pctToProfit: ((profitPrice - curPremium) / curPremium * 100).toFixed(1),
-      pctToStop: ((stopPrice - curPremium) / curPremium * 100).toFixed(1),
-      pdtStatus,
-      greeks: optGreeks(spot, pos.strike, dteLeft, DEFAULT_IV, pos.type),
-    };
-  });
-
-  // Update dashboard
-  dashboard.quotes = quotes;
-  dashboard.analyses = analyses;
-  dashboard.shortTermAnalyses = shortTermAnalyses;
-  dashboard.candles = candleCache;
-  dashboard.decisions = decisions;
-  dashboard.lastCycle = Date.now();
+  dash.positionDetails = buildPositionDetails(acct, quotes);
+  dash.quotes = quotes;
+  dash.analyses = analyses;
+  dash.shortTermAnalyses = shortTermAnalyses;
+  dash.candles = acct.candleCache;
+  dash.decisions = decisions;
+  dash.lastCycle = Date.now();
 
   const pv = portfolioValue(state, quotes);
-  const pnlPct = ((pv - STARTING_CASH) / STARTING_CASH * 100).toFixed(1);
-  log(`AFTER-HOURS — Portfolio: $${pv.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%) | Cash: $${state.cash.toFixed(0)} | ${state.positions.length} open${getActiveHintsSummary()}`);
-
-  return candleCache;
+  const pnlPct = ((pv - cfg.startingCash) / cfg.startingCash * 100).toFixed(1);
+  log(acct, `AFTER-HOURS — Portfolio: $${pv.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%) | Cash: $${state.cash.toFixed(0)} | ${state.positions.length} open${getActiveHintsSummary(acct)}`);
 }
 
 // ─── Main Loop ───
@@ -2406,134 +2377,190 @@ async function runAfterHoursScan(state, candleCache) {
 async function main() {
   console.log("\n  ╔═══════════════════════════════════════════════╗");
   console.log("  ║  Swing Trader — Auto-Trading Bot v1.0         ║");
-  console.log("  ║  $200 → $200,000 Challenge · PDT Enforced     ║");
+  console.log("  ║  Multi-Account · Dynamic Watchlist · PDT      ║");
   console.log("  ║  Headless · Finnhub · Aggressive Mode          ║");
   console.log("  ╚═══════════════════════════════════════════════╝\n");
 
-  // Load or initialize state
-  let state;
+  // Force reset: wipe accounts file so loadAccounts creates fresh default
   if (process.env.FORCE_RESET_STATE === "true") {
-    state = { ...INIT_STATE };
-    if (process.env.FINNHUB_API_KEY) state.apiKey = process.env.FINNHUB_API_KEY;
-    saveState(state);
-    log("FORCE RESET: Started fresh with $" + STARTING_CASH + " cash.");
-  } else {
-    state = loadState() || { ...INIT_STATE };
+    try { fs.unlinkSync(ACCOUNTS_FILE); } catch { }
+    try { fs.unlinkSync(STATE_FILE); } catch { }
+    console.log("  FORCE RESET: Wiped state files. Starting fresh.\n");
   }
 
-  // Pre-populate Finnhub key from .env if not already saved in state
-  if (!state.apiKey && process.env.FINNHUB_API_KEY) {
-    state.apiKey = process.env.FINNHUB_API_KEY;
-  }
+  // Load accounts (migrates from legacy state.json if needed)
+  loadAccounts();
 
-  // Prompt for API key if missing
-  if (!state.apiKey) {
+  // Get API key from env or first account's state, or prompt
+  let apiKey = process.env.FINNHUB_API_KEY || "";
+  if (!apiKey) {
+    // Check if any account has a stored key
+    for (const [, acct] of accounts) {
+      if (acct.state.apiKey) { apiKey = acct.state.apiKey; break; }
+    }
+  }
+  if (!apiKey) {
     console.log("  No API key found. Get a free key at https://finnhub.io/\n");
     const key = await prompt("  Enter Finnhub API key: ");
     if (!key) { console.log("  No key provided. Exiting."); process.exit(1); }
-
-    log("Validating API key...");
+    console.log("  Validating API key...");
     const valid = await validateKey(key);
-    if (!valid) { console.log("  Invalid API key or connection error. Exiting."); process.exit(1); }
-
-    state.apiKey = key;
-    saveState(state);
-    log("API key validated and saved.");
+    if (!valid) { console.log("  Invalid API key. Exiting."); process.exit(1); }
+    apiKey = key;
   } else {
-    log(`Loaded state — Cash: $${state.cash.toFixed(0)} | ${state.positions.length} positions | ${state.history.length} trades`);
-
-    // Revalidate stored key
-    log("Validating stored API key...");
-    const valid = await validateKey(state.apiKey);
-    if (!valid) {
-      log("Stored API key is invalid. Please delete state.json and restart.");
-      process.exit(1);
-    }
-    log("API key valid.");
+    console.log("  Validating API key...");
+    const valid = await validateKey(apiKey);
+    if (!valid) { console.log("  Stored API key is invalid. Exiting."); process.exit(1); }
+    console.log("  API key valid.\n");
   }
 
-  console.log("");
-  log(`Watching: ${TICKERS.join(", ")}`);
-  log(`PDT status: ${countRecentDayTrades(state)}/3 day trades in rolling 5 days`);
-  log(`Positions: ${state.positions.length} open (no limit — cash-managed)`);
-  log(`Claude hints: Write to hint.txt to push the bot in a direction`);
-  log(`  e.g. echo "check out PLTR, iran war catalyst" > hint.txt`);
+  // Store apiKey in each account state for backwards compat
+  for (const [, acct] of accounts) acct.state.apiKey = apiKey;
+
+  // Log account info
+  for (const [id, acct] of accounts) {
+    console.log(`  [${id}] ${acct.name} — Cash: $${acct.state.cash.toFixed(0)} | ${acct.state.positions.length} positions | ${acct.state.history.length} trades`);
+  }
   console.log("");
 
-  // Start web dashboard
-  startDashboard(state);
+  // Get primary account for dashboard (first account)
+  const primaryAcct = accounts.values().next().value;
 
-  // Graceful shutdown — save state on exit
+  // Start web dashboard  
+  startDashboard(primaryAcct, apiKey);
+
+  // Graceful shutdown
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     process.on(sig, () => {
-      log(`Received ${sig} — saving state and exiting...`);
-      saveState(state);
+      console.log(`\n  Received ${sig} — saving all accounts and exiting...`);
+      saveAccounts();
       process.exit(0);
     });
   }
 
-  let candleCache = {};
+  let sharedCandleCache = {};
   let lastCandleDate = null;
   let lastCycleTime = Date.now();
 
-  // Run initial scan immediately on startup (even after hours) so dashboard has data
-  log("Running startup scan...");
+  // Run initial scan immediately on startup
+  console.log("  Running startup scan...\n");
   try {
-    candleCache = await runAfterHoursScan(state, candleCache);
+    // Refresh watchlist for primary account
+    await refreshWatchlist(primaryAcct);
+    // Fetch shared market data
+    const activeTickers = getActiveTickers(primaryAcct);
+    const sharedQuotes = {};
+    for (const ticker of activeTickers) {
+      try {
+        sharedQuotes[ticker] = await fetchQuote(ticker, apiKey);
+        await delay(API_DELAY);
+      } catch (e) { }
+    }
+    for (const ticker of activeTickers) {
+      if (!sharedCandleCache[ticker]) {
+        try {
+          sharedCandleCache[ticker] = await fetchCandles(ticker, apiKey);
+          await delay(API_DELAY);
+        } catch (e) { }
+      }
+    }
+    // Run after-hours scan for each account
+    for (const [, acct] of accounts) {
+      if (acct.paused) continue;
+      await runAfterHoursScan(acct, sharedQuotes, apiKey);
+    }
   } catch (e) {
-    log(`WARN: Startup scan failed — ${e.message}`);
+    console.log(`  WARN: Startup scan failed — ${e.message}`);
   }
-  console.log("");
 
   // Main loop
   while (true) {
-    // Detect sleep/wake gap — if >5 min since last cycle, we likely woke from sleep
     const gap = Date.now() - lastCycleTime;
     if (gap > 5 * 60_000) {
-      log(`WAKE DETECTED — ${(gap / 60_000).toFixed(0)}m gap since last cycle. Re-syncing...`);
-      candleCache = {}; // Force candle refresh after sleep
+      console.log(`  WAKE DETECTED — ${(gap / 60_000).toFixed(0)}m gap. Re-syncing...`);
+      sharedCandleCache = {};
     }
     lastCycleTime = Date.now();
 
     if (isMarketOpen()) {
-      // Reset candle cache on new trading day
       const today = getETDateStr();
       if (lastCandleDate !== today) {
-        candleCache = {};
+        sharedCandleCache = {};
         lastCandleDate = today;
       }
 
-      try {
-        const result = await runCycle(state, candleCache);
-        candleCache = result.candleCache;
-      } catch (e) {
-        log(`ERROR in cycle: ${e.message}`);
+      // Refresh watchlist (shared across accounts)
+      await refreshWatchlist(primaryAcct);
+
+      // Fetch shared market data once
+      const activeTickers = getActiveTickers(primaryAcct);
+      const sharedQuotes = {};
+      for (const ticker of activeTickers) {
+        try {
+          sharedQuotes[ticker] = await fetchQuote(ticker, apiKey);
+          await delay(API_DELAY);
+        } catch (e) { }
+      }
+      for (const ticker of activeTickers) {
+        if (!sharedCandleCache[ticker]) {
+          try {
+            sharedCandleCache[ticker] = await fetchCandles(ticker, apiKey);
+            await delay(API_DELAY);
+          } catch (e) { }
+        } else if (sharedQuotes[ticker]) {
+          const q = sharedQuotes[ticker];
+          const last = sharedCandleCache[ticker][sharedCandleCache[ticker].length - 1];
+          if (last) { last.c = q.c; last.h = Math.max(last.h, q.h); last.l = Math.min(last.l, q.l); }
+        }
       }
 
+      // Run cycle for each active account
+      for (const [, acct] of accounts) {
+        if (acct.paused) continue;
+        try {
+          await runCycle(acct, sharedQuotes, apiKey);
+        } catch (e) {
+          log(acct, `ERROR in cycle: ${e.message}`);
+        }
+      }
+
+      saveAccounts();
       console.log("");
       await delay(CYCLE_MS);
     } else {
-      const et = getETDate();
-      const day = et.getDay();
-      const dayName = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][day];
-      const time = et.toLocaleTimeString("en-US", { timeZone: "America/New_York", hour12: true });
-      dashboard.marketOpen = false;
-
-      // Run after-hours analysis scan every 15 minutes
+      // After hours
       try {
-        candleCache = await runAfterHoursScan(state, candleCache);
+        await refreshWatchlist(primaryAcct);
+        const activeTickers = getActiveTickers(primaryAcct);
+        const sharedQuotes = {};
+        for (const ticker of activeTickers) {
+          try {
+            sharedQuotes[ticker] = await fetchQuote(ticker, apiKey);
+            await delay(API_DELAY);
+          } catch (e) { }
+        }
+        for (const ticker of activeTickers) {
+          if (!sharedCandleCache[ticker]) {
+            try {
+              sharedCandleCache[ticker] = await fetchCandles(ticker, apiKey);
+              await delay(API_DELAY);
+            } catch (e) { }
+          }
+        }
+        for (const [, acct] of accounts) {
+          if (acct.paused) continue;
+          await runAfterHoursScan(acct, sharedQuotes, apiKey);
+        }
       } catch (e) {
-        log(`WARN: After-hours scan failed — ${e.message}`);
+        console.log(`  WARN: After-hours scan failed — ${e.message}`);
       }
 
-      // Still check hints while market is closed
-      await checkHints(state);
-
-      // Scan every 15 minutes after hours
-      await delay(900_000);
+      saveAccounts();
+      await delay(900_000); // 15 min after hours
     }
   }
 }
+
 
 // ─── Start ───
 main().catch(e => { console.error("Fatal error:", e); process.exit(1); });
