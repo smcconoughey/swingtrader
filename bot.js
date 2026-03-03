@@ -1338,7 +1338,7 @@ function log(msg) {
 
 // ─── Web Dashboard ───
 
-const DASH_PORT = process.env.PORT || 3000;
+const DASH_PORT = parseInt(process.env.PORT) || 3000;
 
 function dashboardHTML(state) {
   const pv = portfolioValue(state, dashboard.quotes);
