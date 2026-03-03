@@ -1453,7 +1453,7 @@ function dashboardHTML(state) {
   ).join("<br>");
 
   return `<!DOCTYPE html><html><head><meta charset="utf-8">
-<title>Swingers Bot Dashboard</title>
+<title>Swing Trader Dashboard</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="30">
 <style>
@@ -1488,8 +1488,8 @@ function dashboardHTML(state) {
   .flash{animation:flash .4s}
   @keyframes flash{0%{background:#ffffff15}100%{background:transparent}}
 </style></head><body>
-<h1>SWINGERS Auto-Trading Bot</h1>
-<div class="sub">$25K → $200K Challenge &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}" id="mkt-badge">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; <span id="live-indicator" style="color:#00ff88">LIVE</span> updates every 5s &nbsp;|&nbsp; <span id="pv-header">$${pv.toFixed(0)}</span> <span id="pnl-header" style="color:${pnlPct >= 0 ? '#00ff88' : '#ff4444'}">(${pnlPct >= 0 ? '+' : ''}${pnlPct}%)</span> &nbsp;|&nbsp; <span style="color:${currentRegime.mode === 'risk-on' ? '#00ff88' : currentRegime.mode === 'cautious' ? '#ffd93d' : '#ff4444'};font-size:10px">${currentRegime.mode.toUpperCase()}</span> &nbsp;|&nbsp; <span style="color:#a78bfa;font-size:10px" title="Claude Haiku 4.5 API calls this session">🤖 ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span></div>
+<h1>Swing Trader Auto-Trading Bot</h1>
+<div class="sub">$200 → $200K Challenge &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}" id="mkt-badge">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; <span id="live-indicator" style="color:#00ff88">LIVE</span> updates every 5s &nbsp;|&nbsp; <span id="pv-header">$${pv.toFixed(0)}</span> <span id="pnl-header" style="color:${pnlPct >= 0 ? '#00ff88' : '#ff4444'}">(${pnlPct >= 0 ? '+' : ''}${pnlPct}%)</span> &nbsp;|&nbsp; <span style="color:${currentRegime.mode === 'risk-on' ? '#00ff88' : currentRegime.mode === 'cautious' ? '#ffd93d' : '#ff4444'};font-size:10px">${currentRegime.mode.toUpperCase()}</span> &nbsp;|&nbsp; <span style="color:#a78bfa;font-size:10px" title="Claude Haiku 4.5 API calls this session">🤖 ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span></div>
 
 <div class="grid">
   <div class="card">
@@ -1718,7 +1718,7 @@ function tickerDetailHTML(sym, state) {
     : '<span style="color:#555">No active hint for this ticker</span>';
 
   return `<!DOCTYPE html><html><head><meta charset="utf-8">
-<title>${sym} — Swingers Bot</title>
+<title>${sym} — Swing Trader</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="30">
 <style>
@@ -2231,7 +2231,7 @@ async function runAfterHoursScan(state, candleCache) {
 
 async function main() {
   console.log("\n  ╔═══════════════════════════════════════════════╗");
-  console.log("  ║  SWINGERS — Auto-Trading Bot v1.0             ║");
+  console.log("  ║  Swing Trader — Auto-Trading Bot v1.0         ║");
   console.log("  ║  $200 → $200,000 Challenge · PDT Enforced     ║");
   console.log("  ║  Headless · Finnhub · Aggressive Mode          ║");
   console.log("  ╚═══════════════════════════════════════════════╝\n");
