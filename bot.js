@@ -340,7 +340,7 @@ const EOW_TRIM_HOUR = 14;      // Friday profit-taking starts at 2:00 PM ET
 const LOW_DTE_THRESHOLD = 3;   // Accelerate exits when DTE <= 3
 const CRITICAL_DTE = 2;        // Force-close when DTE <= 2
 
-const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
+const CLAUDE_API_KEY = (process.env.CLAUDE_API_KEY || "").trim();
 
 // ─── Default Account Config ───
 
@@ -796,6 +796,7 @@ function getClaudeCost() {
 }
 
 async function callClaude(prompt) {
+  if (!CLAUDE_API_KEY) throw new Error("CLAUDE_API_KEY not set");
   const r = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -1573,7 +1574,7 @@ function dashboardHTML(acct) {
     const st = dashboard.shortTermAnalyses[ticker];
     const sigColor = a.signal === "STRONG BUY" ? "#00ff88" : a.signal === "BUY WATCH" ? "#ffd93d" : a.signal === "NEUTRAL" ? "#888" : a.signal === "SELL WATCH" ? "#ff8c42" : "#ff4444";
     const stColor = st ? (st.score >= 65 ? "#00ff88" : st.score >= 55 ? "#ffd93d" : st.score >= 45 ? "#888" : st.score >= 35 ? "#ff8c42" : "#ff4444") : "#555";
-    const hintBias = getHintBias(ticker);
+    const hintBias = getHintBias(acct, ticker);
     const hintTag = hintBias !== 0 ? ` <span style="color:#a78bfa">[${hintBias > 0 ? "+" : ""}${hintBias}]</span>` : "";
     const momStr = st ? `<span style="color:${st.mom1d >= 0 ? '#00ff88' : '#ff4444'}">${st.mom1d >= 0 ? '+' : ''}${st.mom1d.toFixed(1)}%</span>` : "—";
     return `<tr><td><a href="/ticker/${ticker}">${ticker}</a></td><td>${price} ${ahPrice}</td>
@@ -1678,7 +1679,7 @@ ${accountActionsHTML(acct.id)}
     <h2>Claude Hints &amp; News Intel</h2>
     <div style="margin-bottom:8px;padding:6px 10px;background:#0a0a0f;border-radius:4px;font-size:11px;border-left:3px solid ${(acct.latestNewsBrief || "").includes("CRITICAL") ? "#ff4444" : (acct.latestNewsBrief || "").includes("ELEVATED") ? "#ffd93d" : "#333"}">${acct.latestNewsBrief || '<span style="opacity:.4">News scan runs every 3 hours...</span>'}</div>
     <div style="margin-bottom:8px">${hints}</div>
-    <form class="hint-form" method="POST" action="/hint">
+    <form class="hint-form" method="POST" action="/hint?a=${acct.id}">
       <input name="hint" placeholder='e.g. "PLTR looks bullish, iran war catalyst"' autocomplete="off">
       <button type="submit">Send Hint</button>
     </form>
@@ -1756,7 +1757,7 @@ ${accountActionsHTML(acct.id)}
 let prevPrices = {};
 async function pollLive() {
   try {
-    const r = await fetch('/api/live');
+    const r = await fetch('/api/live?a=${acct.id}');
     const d = await r.json();
     // Update header
     const pvEl = document.getElementById('pv-header');
@@ -2156,10 +2157,19 @@ function startDashboard(defaultAcct, apiKey) {
     if (req.method === "POST" && pathname === "/hint") {
       let body = "";
       req.on("data", chunk => body += chunk);
-      req.on("end", () => {
+      req.on("end", async () => {
         const params = new URLSearchParams(body);
-        const hint = params.get("hint");
-        if (hint) { fs.writeFileSync(HINT_FILE, hint); log(activeAcct, `HINT (via dashboard): "${hint}"`); }
+        const hintText = params.get("hint");
+        if (hintText) {
+          log(activeAcct, `HINT (via dashboard): "${hintText}"`);
+          // Process hint directly via Claude instead of file
+          try {
+            const result = await processHint(hintText, activeAcct);
+            if (result) applyHintResult(activeAcct, result);
+          } catch (e) {
+            log(activeAcct, `HINT ERROR: ${e.message}`);
+          }
+        }
         res.writeHead(302, { Location: `/?a=${acctId}` });
         res.end();
       });
@@ -2209,6 +2219,53 @@ function startDashboard(defaultAcct, apiKey) {
 
   server.listen(DASH_PORT, () => { console.log(`  Dashboard running at http://localhost:${DASH_PORT}`); });
   server.on("error", (e) => { if (e.code === "EADDRINUSE") { console.log(`  WARN: Port ${DASH_PORT} in use, trying ${DASH_PORT + 1}`); server.listen(DASH_PORT + 1); } });
+}
+
+// ─── Shared Market Data Fetch (rate limit protection) ───
+
+async function fetchSharedMarketData(apiKey, sharedCandleCache) {
+  // Collect union of all accounts' tickers
+  const allTickers = new Set();
+  for (const [, acct] of accounts) {
+    if (acct.paused) continue;
+    // Refresh watchlist for each account first
+    await refreshWatchlist(acct);
+    for (const t of getActiveTickers(acct)) allTickers.add(t);
+    // Also include position tickers
+    for (const p of acct.state.positions) allTickers.add(p.ticker);
+  }
+
+  const tickerList = [...allTickers];
+  const sharedQuotes = {};
+
+  // Fetch quotes once for all tickers
+  for (const ticker of tickerList) {
+    try {
+      sharedQuotes[ticker] = await fetchQuote(ticker, apiKey);
+      await delay(API_DELAY);
+    } catch (e) { }
+  }
+
+  // Fetch candles for tickers not already cached
+  for (const ticker of tickerList) {
+    if (!sharedCandleCache[ticker]) {
+      try {
+        sharedCandleCache[ticker] = await fetchCandles(ticker, apiKey);
+        await delay(API_DELAY);
+      } catch (e) { }
+    } else if (sharedQuotes[ticker]) {
+      // Update latest candle with current quote
+      const q = sharedQuotes[ticker];
+      const last = sharedCandleCache[ticker][sharedCandleCache[ticker].length - 1];
+      if (last) {
+        last.c = q.c;
+        last.h = Math.max(last.h, q.h);
+        last.l = Math.min(last.l, q.l);
+      }
+    }
+  }
+
+  return { sharedQuotes, tickerList };
 }
 
 // ─── Main Trading Cycle ───
@@ -2534,6 +2591,13 @@ async function main() {
     console.log("  API key valid.\n");
   }
 
+  // Log Claude API key status
+  if (CLAUDE_API_KEY) {
+    console.log(`  Claude API key: ${CLAUDE_API_KEY.slice(0, 12)}...${CLAUDE_API_KEY.slice(-4)} (${CLAUDE_API_KEY.length} chars)`);
+  } else {
+    console.log("  WARNING: No CLAUDE_API_KEY set — news scans and entry validation will fail");
+  }
+
   // Store apiKey in each account state for backwards compat
   for (const [, acct] of accounts) acct.state.apiKey = apiKey;
 
@@ -2565,26 +2629,11 @@ async function main() {
   // Run initial scan immediately on startup
   console.log("  Running startup scan...\n");
   try {
-    // Refresh watchlist for primary account
-    await refreshWatchlist(primaryAcct);
-    // Fetch shared market data
-    const activeTickers = getActiveTickers(primaryAcct);
-    const sharedQuotes = {};
-    for (const ticker of activeTickers) {
-      try {
-        sharedQuotes[ticker] = await fetchQuote(ticker, apiKey);
-        await delay(API_DELAY);
-      } catch (e) { }
+    const { sharedQuotes } = await fetchSharedMarketData(apiKey, sharedCandleCache);
+    // Copy shared candles into each account's cache
+    for (const [, acct] of accounts) {
+      Object.assign(acct.candleCache, sharedCandleCache);
     }
-    for (const ticker of activeTickers) {
-      if (!sharedCandleCache[ticker]) {
-        try {
-          sharedCandleCache[ticker] = await fetchCandles(ticker, apiKey);
-          await delay(API_DELAY);
-        } catch (e) { }
-      }
-    }
-    // Run after-hours scan for each account
     for (const [, acct] of accounts) {
       if (acct.paused) continue;
       await runAfterHoursScan(acct, sharedQuotes, apiKey);
@@ -2599,6 +2648,7 @@ async function main() {
     if (gap > 5 * 60_000) {
       console.log(`  WAKE DETECTED — ${(gap / 60_000).toFixed(0)}m gap. Re-syncing...`);
       sharedCandleCache = {};
+      for (const [, acct] of accounts) acct.candleCache = {};
     }
     lastCycleTime = Date.now();
 
@@ -2606,42 +2656,29 @@ async function main() {
       const today = getETDateStr();
       if (lastCandleDate !== today) {
         sharedCandleCache = {};
+        for (const [, acct] of accounts) acct.candleCache = {};
         lastCandleDate = today;
       }
 
-      // Refresh watchlist (shared across accounts)
-      await refreshWatchlist(primaryAcct);
+      try {
+        const { sharedQuotes } = await fetchSharedMarketData(apiKey, sharedCandleCache);
+        // Sync shared candles into each account's cache
+        for (const [, acct] of accounts) {
+          for (const [ticker, candles] of Object.entries(sharedCandleCache)) {
+            if (!acct.candleCache[ticker]) acct.candleCache[ticker] = candles;
+          }
+        }
 
-      // Fetch shared market data once
-      const activeTickers = getActiveTickers(primaryAcct);
-      const sharedQuotes = {};
-      for (const ticker of activeTickers) {
-        try {
-          sharedQuotes[ticker] = await fetchQuote(ticker, apiKey);
-          await delay(API_DELAY);
-        } catch (e) { }
-      }
-      for (const ticker of activeTickers) {
-        if (!sharedCandleCache[ticker]) {
+        for (const [, acct] of accounts) {
+          if (acct.paused) continue;
           try {
-            sharedCandleCache[ticker] = await fetchCandles(ticker, apiKey);
-            await delay(API_DELAY);
-          } catch (e) { }
-        } else if (sharedQuotes[ticker]) {
-          const q = sharedQuotes[ticker];
-          const last = sharedCandleCache[ticker][sharedCandleCache[ticker].length - 1];
-          if (last) { last.c = q.c; last.h = Math.max(last.h, q.h); last.l = Math.min(last.l, q.l); }
+            await runCycle(acct, sharedQuotes, apiKey);
+          } catch (e) {
+            log(acct, `ERROR in cycle: ${e.message}`);
+          }
         }
-      }
-
-      // Run cycle for each active account
-      for (const [, acct] of accounts) {
-        if (acct.paused) continue;
-        try {
-          await runCycle(acct, sharedQuotes, apiKey);
-        } catch (e) {
-          log(acct, `ERROR in cycle: ${e.message}`);
-        }
+      } catch (e) {
+        console.log(`  ERROR in shared fetch: ${e.message}`);
       }
 
       saveAccounts();
@@ -2650,23 +2687,13 @@ async function main() {
     } else {
       // After hours
       try {
-        await refreshWatchlist(primaryAcct);
-        const activeTickers = getActiveTickers(primaryAcct);
-        const sharedQuotes = {};
-        for (const ticker of activeTickers) {
-          try {
-            sharedQuotes[ticker] = await fetchQuote(ticker, apiKey);
-            await delay(API_DELAY);
-          } catch (e) { }
-        }
-        for (const ticker of activeTickers) {
-          if (!sharedCandleCache[ticker]) {
-            try {
-              sharedCandleCache[ticker] = await fetchCandles(ticker, apiKey);
-              await delay(API_DELAY);
-            } catch (e) { }
+        const { sharedQuotes } = await fetchSharedMarketData(apiKey, sharedCandleCache);
+        for (const [, acct] of accounts) {
+          for (const [ticker, candles] of Object.entries(sharedCandleCache)) {
+            if (!acct.candleCache[ticker]) acct.candleCache[ticker] = candles;
           }
         }
+
         for (const [, acct] of accounts) {
           if (acct.paused) continue;
           await runAfterHoursScan(acct, sharedQuotes, apiKey);

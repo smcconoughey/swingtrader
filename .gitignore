@@ -1,3 +1,5 @@
 node_modules/
 .env
 state.json
+state.json.backup
+accounts.json

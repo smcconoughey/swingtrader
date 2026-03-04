@@ -11,6 +11,8 @@ services:
         sync: false        # set manually in Render dashboard
       - key: STATE_FILE
         value: /data/state.json
+      - key: ACCOUNTS_FILE
+        value: /data/accounts.json
     disk:
       name: bot-state
       mountPath: /data
