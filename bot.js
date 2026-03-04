@@ -2096,13 +2096,38 @@ function tabBarHTML(activeId) {
 function accountActionsHTML(acctId) {
   const acct = accounts.get(acctId);
   if (!acct) return "";
+  const cfg = acct.config;
   return `<div class="acct-actions">
+    <button type="button" class="acct-btn edit" onclick="document.getElementById('edit-modal').style.display='flex'">⚙ Settings</button>
     <form method="POST" action="/api/accounts/${acctId}/pause" style="display:inline">
       <button type="submit" class="acct-btn ${acct.paused ? "resume" : "pause"}">${acct.paused ? "▶ Resume" : "⏸ Pause"}</button>
     </form>
     ${acctId !== "default" ? `<form method="POST" action="/api/accounts/${acctId}/delete" style="display:inline" onsubmit="return confirm('Delete account ${acct.name}? This cannot be undone.')">
       <button type="submit" class="acct-btn delete">🗑 Delete</button>
     </form>` : ""}
+  </div>
+  <div id="edit-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:999;align-items:center;justify-content:center">
+    <div style="background:#14141e;border:1px solid #333;border-radius:12px;padding:24px;max-width:420px;width:90%">
+      <h2 style="margin:0 0 16px;color:#fff">Settings: ${acct.name}</h2>
+      <form method="POST" action="/api/accounts/${acctId}/config">
+        <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Risk per Trade (%)</label>
+        <input name="baseRiskPct" type="number" step="0.01" value="${(cfg.baseRiskPct * 100).toFixed(1)}" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:12px;box-sizing:border-box">
+        <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Profit Target (%)</label>
+        <input name="profitTarget" type="number" step="1" value="${(cfg.profitTarget * 100).toFixed(0)}" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:12px;box-sizing:border-box">
+        <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Stop Loss (%)</label>
+        <input name="stopLoss" type="number" step="1" value="${(cfg.stopLoss * 100).toFixed(0)}" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:12px;box-sizing:border-box">
+        <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Goal ($)</label>
+        <input name="goal" type="number" value="${cfg.goal}" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:12px;box-sizing:border-box">
+        <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Max Positions (blank = unlimited)</label>
+        <input name="maxPositions" type="number" value="${cfg.maxPositions || ""}" placeholder="unlimited" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:12px;box-sizing:border-box">
+        <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Custom Prompt Suffix</label>
+        <input name="customPromptSuffix" value="${(cfg.customPromptSuffix || "").replace(/"/g, "&quot;")}" placeholder="e.g. Focus on tech sector only" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:16px;box-sizing:border-box">
+        <div style="display:flex;gap:8px">
+          <button type="submit" style="flex:1;padding:10px;background:#a78bfa;color:#000;border:none;border-radius:6px;font-weight:bold;cursor:pointer">Save Settings</button>
+          <button type="button" onclick="document.getElementById('edit-modal').style.display='none'" style="flex:1;padding:10px;background:#333;color:#fff;border:none;border-radius:6px;cursor:pointer">Cancel</button>
+        </div>
+      </form>
+    </div>
   </div>`;
 }
 
@@ -2163,6 +2188,32 @@ function startDashboard(defaultAcct, apiKey) {
       if (id !== "default" && accounts.has(id)) { accounts.delete(id); saveAccounts(); console.log(`  [${id}] Deleted`); }
       res.writeHead(302, { Location: "/" });
       res.end();
+      return;
+    }
+
+    const cfgMatch = pathname.match(/^\/api\/accounts\/([^/]+)\/config$/);
+    if (req.method === "POST" && cfgMatch) {
+      const id = cfgMatch[1];
+      const target = accounts.get(id);
+      if (!target) { res.writeHead(302, { Location: "/" }); res.end(); return; }
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", () => {
+        const params = new URLSearchParams(body);
+        const cfg = target.config;
+        if (params.has("baseRiskPct")) cfg.baseRiskPct = parseFloat(params.get("baseRiskPct")) / 100;
+        if (params.has("profitTarget")) cfg.profitTarget = parseFloat(params.get("profitTarget")) / 100;
+        if (params.has("stopLoss")) cfg.stopLoss = parseFloat(params.get("stopLoss")) / 100;
+        if (params.has("goal")) cfg.goal = parseFloat(params.get("goal")) || cfg.goal;
+        if (params.get("maxPositions")) cfg.maxPositions = parseInt(params.get("maxPositions")) || null;
+        else cfg.maxPositions = null;
+        cfg.customPromptSuffix = params.get("customPromptSuffix") || "";
+        target.riskPct = cfg.baseRiskPct * (target.currentRegime?.riskScale || 0.5);
+        saveAccounts();
+        console.log(`  [${id}] Config updated: risk=${(cfg.baseRiskPct*100).toFixed(1)}% target=${(cfg.profitTarget*100)}% stop=${(cfg.stopLoss*100)}%`);
+        res.writeHead(302, { Location: `/?a=${id}` });
+        res.end();
+      });
       return;
     }
 
