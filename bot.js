@@ -355,6 +355,7 @@ const DEFAULT_CONFIG = {
   trim1Pct: 0.25,
   trim2Pct: 0.50,
   maxPositions: null,
+  minSetupQuality: 50,
   customPromptSuffix: "",
 };
 
@@ -703,9 +704,21 @@ function recordDayTrade(state, position) {
 // ─── API Layer ───
 
 async function fetchQuote(sym, key) {
-  const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${key}`);
+  try {
+    const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${key}`);
+    if (r.ok) {
+      const data = await r.json();
+      if (data && data.c > 0) return data;
+    }
+  } catch { }
+  // Fallback: Yahoo Finance realtime quote
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=1d`;
+  const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
   if (!r.ok) throw new Error(`Quote error ${r.status}`);
-  return r.json();
+  const d = await r.json();
+  const meta = d.chart?.result?.[0]?.meta;
+  if (!meta || !meta.regularMarketPrice) throw new Error(`No Yahoo quote for ${sym}`);
+  return { c: meta.regularMarketPrice, h: meta.regularMarketDayHigh || meta.regularMarketPrice, l: meta.regularMarketDayLow || meta.regularMarketPrice, o: meta.regularMarketOpen || meta.regularMarketPrice, pc: meta.chartPreviousClose || meta.previousClose || 0 };
 }
 
 async function fetchCandles(sym, key) {
@@ -1136,8 +1149,9 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   }
 
   const setupQuality = detectConsolidation(acct.candleCache[ticker]);
-  if (setupQuality.quality < 50) {
-    return { skipped: true, reason: `Low setup quality ${setupQuality.quality}/100 (range ${setupQuality.rangePct}%, need consolidation→breakout)` };
+  const minQuality = acct.config.minSetupQuality ?? 50;
+  if (setupQuality.quality < minQuality) {
+    return { skipped: true, reason: `Low setup quality ${setupQuality.quality}/100 (need >=${minQuality}, range ${setupQuality.rangePct}%, need consolidation→breakout)` };
   }
 
   // ─── Local pre-filters (catch what Claude would reject without API call) ───
@@ -1158,8 +1172,9 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   }
 
   // Range too wide — extended move, not consolidation
-  if (parseFloat(setupQuality.rangePct) > 15) {
-    return { skipped: true, reason: `Range ${setupQuality.rangePct}% too wide — extended move, not consolidation setup` };
+  const maxRange = minQuality < 30 ? 30 : 15;
+  if (parseFloat(setupQuality.rangePct) > maxRange) {
+    return { skipped: true, reason: `Range ${setupQuality.rangePct}% too wide (max ${maxRange}%) — extended move, not consolidation setup` };
   }
 
   let earningsInfo = { hasEarnings: false, daysUntil: null };
@@ -2082,6 +2097,8 @@ function tabBarHTML(activeId) {
       <input name="stopLoss" type="number" step="1" value="-35" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:12px;box-sizing:border-box">
       <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Goal ($)</label>
       <input name="goal" type="number" value="200000" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:12px;box-sizing:border-box">
+      <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Min Setup Quality (0-100, lower = more aggressive)</label>
+      <input name="minSetupQuality" type="number" value="50" min="0" max="100" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:12px;box-sizing:border-box">
       <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Custom Prompt Suffix (optional)</label>
       <input name="customPromptSuffix" value="" placeholder="e.g. Focus on tech sector only" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:16px;box-sizing:border-box">
       <div style="display:flex;gap:8px">
@@ -2120,6 +2137,8 @@ function accountActionsHTML(acctId) {
         <input name="goal" type="number" value="${cfg.goal}" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:12px;box-sizing:border-box">
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Max Positions (blank = unlimited)</label>
         <input name="maxPositions" type="number" value="${cfg.maxPositions || ""}" placeholder="unlimited" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:12px;box-sizing:border-box">
+        <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Min Setup Quality (0=trade anything, 50=default, 100=perfect setups only)</label>
+        <input name="minSetupQuality" type="number" value="${cfg.minSetupQuality ?? 50}" min="0" max="100" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:12px;box-sizing:border-box">
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Custom Prompt Suffix</label>
         <input name="customPromptSuffix" value="${(cfg.customPromptSuffix || "").replace(/"/g, "&quot;")}" placeholder="e.g. Focus on tech sector only" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:16px;box-sizing:border-box">
         <div style="display:flex;gap:8px">
@@ -2159,6 +2178,7 @@ function startDashboard(defaultAcct, apiKey) {
           profitTarget: (parseFloat(params.get("profitTarget")) || 40) / 100,
           stopLoss: (parseFloat(params.get("stopLoss")) || -35) / 100,
           bullEntry: 65, bearEntry: 35, trim1Pct: 0.25, trim2Pct: 0.50,
+          minSetupQuality: parseInt(params.get("minSetupQuality")) || 50,
           customPromptSuffix: params.get("customPromptSuffix") || "",
         };
         const newAcct = createAccountRuntime(id, name, config);
@@ -2207,10 +2227,11 @@ function startDashboard(defaultAcct, apiKey) {
         if (params.has("goal")) cfg.goal = parseFloat(params.get("goal")) || cfg.goal;
         if (params.get("maxPositions")) cfg.maxPositions = parseInt(params.get("maxPositions")) || null;
         else cfg.maxPositions = null;
+        if (params.has("minSetupQuality")) cfg.minSetupQuality = parseInt(params.get("minSetupQuality")) ?? 50;
         cfg.customPromptSuffix = params.get("customPromptSuffix") || "";
         target.riskPct = cfg.baseRiskPct * (target.currentRegime?.riskScale || 0.5);
         saveAccounts();
-        console.log(`  [${id}] Config updated: risk=${(cfg.baseRiskPct*100).toFixed(1)}% target=${(cfg.profitTarget*100)}% stop=${(cfg.stopLoss*100)}%`);
+        console.log(`  [${id}] Config updated: risk=${(cfg.baseRiskPct*100).toFixed(1)}% target=${(cfg.profitTarget*100)}% stop=${(cfg.stopLoss*100)}% minQuality=${cfg.minSetupQuality}`);
         res.writeHead(302, { Location: `/?a=${id}` });
         res.end();
       });
