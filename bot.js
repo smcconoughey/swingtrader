@@ -258,7 +258,7 @@ async function fetchDynamicWatchlist() {
   // 1. Most active US stocks
   try {
     const r = await fetch(
-      "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=most_actives&count=30&lang=en-US&region=US",
+      "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=most_actives&count=15&lang=en-US&region=US",
       { headers }
     );
     if (r.ok) {
@@ -271,7 +271,7 @@ async function fetchDynamicWatchlist() {
   // 2. Trending tickers
   try {
     const r = await fetch(
-      "https://query1.finance.yahoo.com/v1/finance/trending/US?count=20&lang=en-US",
+      "https://query1.finance.yahoo.com/v1/finance/trending/US?count=10&lang=en-US",
       { headers }
     );
     if (r.ok) {
@@ -285,7 +285,7 @@ async function fetchDynamicWatchlist() {
   for (const scrId of ["day_gainers", "day_losers"]) {
     try {
       const r = await fetch(
-        `https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=${scrId}&count=15&lang=en-US&region=US`,
+        `https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=${scrId}&count=8&lang=en-US&region=US`,
         { headers }
       );
       if (r.ok) {
@@ -1118,6 +1118,9 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   if (state.positions.some(p => p.ticker === ticker)) return null;
   if (state.cash < cfg.startingCash) return null;
 
+  // Early exit: skip tickers that aren't actionable (WAIT zone) before any expensive checks
+  if (analysis.score < cfg.bullEntry && analysis.score > cfg.bearEntry) return null;
+
   const et = getETDate();
   const etHour = et.getHours() + et.getMinutes() / 60;
   if (etHour >= EOD_FREEZE_HOUR && analysis.score < 80 && analysis.score > 20) {
@@ -1125,8 +1128,30 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   }
 
   const setupQuality = detectConsolidation(acct.candleCache[ticker]);
-  if (setupQuality.quality < 30) {
+  if (setupQuality.quality < 50) {
     return { skipped: true, reason: `Low setup quality ${setupQuality.quality}/100 (range ${setupQuality.rangePct}%, need consolidation→breakout)` };
+  }
+
+  // ─── Local pre-filters (catch what Claude would reject without API call) ───
+  const isBullish = analysis.score >= cfg.bullEntry;
+  const isBearish = analysis.score <= cfg.bearEntry;
+
+  // RSI conflict: overbought buying calls, not-oversold buying puts
+  if (isBullish && analysis.rsi > 70) {
+    return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} overbought — chasing extended move, high reversal risk for calls` };
+  }
+  if (isBearish && analysis.rsi > 30 && analysis.rsi < 55 && !analysis.bearish) {
+    return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} neutral with non-bearish EMA stack — weak put setup` };
+  }
+
+  // Risk-off regime contradicts bullish calls
+  if (isBullish && regime.mode === "risk-off" && !analysis.aligned) {
+    return { skipped: true, reason: `Risk-off regime + misaligned EMAs contradicts bullish call bias` };
+  }
+
+  // Range too wide — extended move, not consolidation
+  if (parseFloat(setupQuality.rangePct) > 15) {
+    return { skipped: true, reason: `Range ${setupQuality.rangePct}% too wide — extended move, not consolidation setup` };
   }
 
   let earningsInfo = { hasEarnings: false, daysUntil: null };
