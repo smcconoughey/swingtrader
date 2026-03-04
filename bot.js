@@ -1639,9 +1639,30 @@ function dashboardHTML(acct) {
   .closed{background:#ff444430;color:#ff4444}
   .flash{animation:flash .4s}
   @keyframes flash{0%{background:#ffffff15}100%{background:transparent}}
+  .tab-bar{background:#0a0a12;border-bottom:1px solid #222;padding:6px 12px 0}
+  .tab-row{display:flex;flex-wrap:wrap;gap:4px;align-items:stretch}
+  .acct-tab{display:flex;flex-direction:column;align-items:center;padding:8px 16px 6px;background:#14141e;border:1px solid #222;border-bottom:none;border-radius:8px 8px 0 0;color:#888;text-decoration:none;font-size:11px;min-width:100px;transition:all .2s}
+  .acct-tab:hover{background:#1a1a2e;color:#fff}
+  .acct-tab.active{background:#1a1a2e;border-color:#333;color:#fff;border-bottom:2px solid #00ff88}
+  .acct-tab.new-tab{border-style:dashed;color:#555;justify-content:center}
+  .acct-tab.new-tab:hover{color:#00ff88;border-color:#00ff88}
+  .tab-name{font-weight:700;font-size:12px}
+  .tab-pv{font-size:14px;font-weight:700;color:#fff}
+  .tab-pnl{font-size:11px}
+  .tab-status{font-size:8px}
+  .global-stats{display:flex;gap:16px;padding:6px 0;font-size:11px;color:#666}
+  .global-stats b{color:#fff}
+  .acct-actions{padding:4px 0;display:flex;gap:8px}
+  .acct-btn{padding:4px 12px;border:1px solid #333;border-radius:4px;background:#14141e;color:#888;cursor:pointer;font-size:11px}
+  .acct-btn:hover{background:#1e1e30;color:#fff}
+  .acct-btn.pause:hover{border-color:#ffd93d;color:#ffd93d}
+  .acct-btn.resume:hover{border-color:#00ff88;color:#00ff88}
+  .acct-btn.delete:hover{border-color:#ff4444;color:#ff4444}
 </style></head><body>
-<h1>Swing Trader Auto-Trading Bot</h1>
-<div class="sub">$200 → $200K Challenge &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}" id="mkt-badge">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; <span id="live-indicator" style="color:#00ff88">LIVE</span> updates every 5s &nbsp;|&nbsp; <span id="pv-header">$${pv.toFixed(0)}</span> <span id="pnl-header" style="color:${pnlPct >= 0 ? '#00ff88' : '#ff4444'}">(${pnlPct >= 0 ? '+' : ''}${pnlPct}%)</span> &nbsp;|&nbsp; <span style="color:${currentRegime.mode === 'risk-on' ? '#00ff88' : currentRegime.mode === 'cautious' ? '#ffd93d' : '#ff4444'};font-size:10px">${currentRegime.mode.toUpperCase()}</span> &nbsp;|&nbsp; <span style="color:#a78bfa;font-size:10px" title="Claude Haiku 4.5 API calls this session">🤖 ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span></div>
+${tabBarHTML(acct.id)}
+${accountActionsHTML(acct.id)}
+<h1>${acct.name || "Swing Trader"}</h1>
+<div class="sub">$${STARTING_CASH} → $${GOAL.toLocaleString()} Challenge &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}" id="mkt-badge">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; <span id="live-indicator" style="color:#00ff88">LIVE</span> updates every 5s &nbsp;|&nbsp; <span id="pv-header">$${pv.toFixed(0)}</span> <span id="pnl-header" style="color:${pnlPct >= 0 ? '#00ff88' : '#ff4444'}">(${pnlPct >= 0 ? '+' : ''}${pnlPct}%)</span> &nbsp;|&nbsp; <span style="color:${currentRegime.mode === 'risk-on' ? '#00ff88' : currentRegime.mode === 'cautious' ? '#ffd93d' : '#ff4444'};font-size:10px">${currentRegime.mode.toUpperCase()}</span> &nbsp;|&nbsp; <span style="color:#a78bfa;font-size:10px" title="Claude Haiku 4.5 API calls this session">🤖 ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>${acct.paused ? ' &nbsp;|&nbsp; <span style="color:#ff4444;font-weight:bold">⏸ PAUSED</span>' : ''}</div>
 
 <div class="grid">
   <div class="card">
@@ -1980,120 +2001,214 @@ ${pos ? '<div class="card" style="margin-top:16px"><h2>Position Details</h2>' + 
 </body></html>`;
 }
 
-function startDashboard(acct, apiKey) {
-  const server = http.createServer(async (req, res) => {
-    const state = acct.state;
-    const dashboard = acct.dashboard;
+// ─── Tab Bar HTML ───
 
-    // Handle hint submission via POST
-    if (req.method === "POST" && req.url === "/hint") {
+function tabBarHTML(activeId) {
+  let totalPV = 0;
+  const tabs = [];
+  for (const [id, acct] of accounts) {
+    const pv = portfolioValue(acct.state, acct.dashboard.quotes);
+    totalPV += pv;
+    const pnl = ((pv - acct.config.startingCash) / acct.config.startingCash * 100).toFixed(1);
+    const color = pnl >= 0 ? "#00ff88" : "#ff4444";
+    const isActive = id === activeId;
+    const statusDot = acct.paused ? "🔴" : "🟢";
+    tabs.push(`<a href="/?a=${id}" class="acct-tab ${isActive ? "active" : ""}" title="${acct.name}">
+      <span class="tab-status">${statusDot}</span>
+      <span class="tab-name">${acct.name}</span>
+      <span class="tab-pv">$${pv.toFixed(0)}</span>
+      <span class="tab-pnl" style="color:${color}">${pnl >= 0 ? "+" : ""}${pnl}%</span>
+    </a>`);
+  }
+  return `<div class="tab-bar">
+  <div class="tab-row">${tabs.join("")}
+    <a href="#" class="acct-tab new-tab" onclick="document.getElementById('acct-modal').style.display='flex';return false">+ New Account</a>
+  </div>
+  <div class="global-stats">
+    <span>Total PV: <b>$${totalPV.toFixed(0)}</b></span>
+    <span style="color:#a78bfa">🤖 Claude: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>
+    <span>${accounts.size} account${accounts.size !== 1 ? "s" : ""}</span>
+  </div>
+</div>
+
+<!-- Account Management Modal -->
+<div id="acct-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:999;align-items:center;justify-content:center">
+  <div style="background:#14141e;border:1px solid #333;border-radius:12px;padding:24px;max-width:420px;width:90%">
+    <h2 style="margin:0 0 16px;color:#fff">New Account</h2>
+    <form method="POST" action="/api/accounts">
+      <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Account Name</label>
+      <input name="name" value="Strategy 2" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:12px;box-sizing:border-box">
+      <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Starting Cash ($)</label>
+      <input name="startingCash" type="number" value="200" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:12px;box-sizing:border-box">
+      <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Risk per Trade (%)</label>
+      <input name="baseRiskPct" type="number" step="0.01" value="15" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:12px;box-sizing:border-box">
+      <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Profit Target (%)</label>
+      <input name="profitTarget" type="number" step="1" value="40" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:12px;box-sizing:border-box">
+      <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Stop Loss (%)</label>
+      <input name="stopLoss" type="number" step="1" value="-35" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:12px;box-sizing:border-box">
+      <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Goal ($)</label>
+      <input name="goal" type="number" value="200000" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:12px;box-sizing:border-box">
+      <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Custom Prompt Suffix (optional)</label>
+      <input name="customPromptSuffix" value="" placeholder="e.g. Focus on tech sector only" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:16px;box-sizing:border-box">
+      <div style="display:flex;gap:8px">
+        <button type="submit" style="flex:1;padding:10px;background:#00ff88;color:#000;border:none;border-radius:6px;font-weight:bold;cursor:pointer">Create Account</button>
+        <button type="button" onclick="document.getElementById('acct-modal').style.display='none'" style="flex:1;padding:10px;background:#333;color:#fff;border:none;border-radius:6px;cursor:pointer">Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>`;
+}
+
+function accountActionsHTML(acctId) {
+  const acct = accounts.get(acctId);
+  if (!acct) return "";
+  return `<div class="acct-actions">
+    <form method="POST" action="/api/accounts/${acctId}/pause" style="display:inline">
+      <button type="submit" class="acct-btn ${acct.paused ? "resume" : "pause"}">${acct.paused ? "▶ Resume" : "⏸ Pause"}</button>
+    </form>
+    ${acctId !== "default" ? `<form method="POST" action="/api/accounts/${acctId}/delete" style="display:inline" onsubmit="return confirm('Delete account ${acct.name}? This cannot be undone.')">
+      <button type="submit" class="acct-btn delete">🗑 Delete</button>
+    </form>` : ""}
+  </div>`;
+}
+
+function startDashboard(defaultAcct, apiKey) {
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const pathname = url.pathname;
+
+    // Resolve active account from ?a= param
+    const acctId = url.searchParams.get("a") || accounts.keys().next().value;
+    const activeAcct = accounts.get(acctId) || accounts.values().next().value;
+    const state = activeAcct.state;
+    const dashboard = activeAcct.dashboard;
+
+    // ─── Account CRUD API ───
+
+    if (req.method === "POST" && pathname === "/api/accounts") {
       let body = "";
       req.on("data", chunk => body += chunk);
       req.on("end", () => {
         const params = new URLSearchParams(body);
-        const hint = params.get("hint");
-        if (hint) {
-          fs.writeFileSync(HINT_FILE, hint);
-          log(acct, `HINT (via dashboard): "${hint}"`);
-        }
-        res.writeHead(302, { Location: "/" });
+        const name = params.get("name") || `Account ${accounts.size + 1}`;
+        const id = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || `acct-${Date.now()}`;
+        if (accounts.has(id)) { res.writeHead(302, { Location: `/?a=${id}` }); res.end(); return; }
+        const config = {
+          startingCash: parseFloat(params.get("startingCash")) || 200,
+          goal: parseFloat(params.get("goal")) || 200000,
+          baseRiskPct: (parseFloat(params.get("baseRiskPct")) || 15) / 100,
+          profitTarget: (parseFloat(params.get("profitTarget")) || 40) / 100,
+          stopLoss: (parseFloat(params.get("stopLoss")) || -35) / 100,
+          bullEntry: 65, bearEntry: 35, trim1Pct: 0.25, trim2Pct: 0.50,
+          customPromptSuffix: params.get("customPromptSuffix") || "",
+        };
+        const newAcct = createAccountRuntime(id, name, config);
+        newAcct.state.apiKey = apiKey;
+        accounts.set(id, newAcct);
+        saveAccounts();
+        console.log(`  [${id}] Created account: ${name}`);
+        res.writeHead(302, { Location: `/?a=${id}` });
         res.end();
       });
       return;
     }
 
-    // Ticker detail page
-    const tickerMatch = req.url.match(/^\/ticker\/([A-Z]+)$/);
+    const pauseMatch = pathname.match(/^\/api\/accounts\/([^/]+)\/pause$/);
+    if (req.method === "POST" && pauseMatch) {
+      const id = pauseMatch[1];
+      const target = accounts.get(id);
+      if (target) { target.paused = !target.paused; saveAccounts(); console.log(`  [${id}] ${target.paused ? "Paused" : "Resumed"}`); }
+      res.writeHead(302, { Location: `/?a=${id}` });
+      res.end();
+      return;
+    }
+
+    const delMatch = pathname.match(/^\/api\/accounts\/([^/]+)\/delete$/);
+    if (req.method === "POST" && delMatch) {
+      const id = delMatch[1];
+      if (id !== "default" && accounts.has(id)) { accounts.delete(id); saveAccounts(); console.log(`  [${id}] Deleted`); }
+      res.writeHead(302, { Location: "/" });
+      res.end();
+      return;
+    }
+
+    if (pathname === "/api/accounts" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      const list = [];
+      for (const [id, a] of accounts) {
+        const pv = portfolioValue(a.state, a.dashboard.quotes);
+        list.push({ id, name: a.name, paused: a.paused, cash: a.state.cash, positions: a.state.positions.length, trades: a.state.history.length, pv, pnl: ((pv - a.config.startingCash) / a.config.startingCash * 100).toFixed(1), config: a.config });
+      }
+      res.end(JSON.stringify(list));
+      return;
+    }
+
+    if (pathname === "/api/global") {
+      let totalPV = 0, totalPositions = 0, totalTrades = 0;
+      for (const [, a] of accounts) { totalPV += portfolioValue(a.state, a.dashboard.quotes); totalPositions += a.state.positions.length; totalTrades += a.state.history.length; }
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ accounts: accounts.size, totalPV, totalPositions, totalTrades, claudeCalls: claudeCallCount, claudeCost: getClaudeCost() }));
+      return;
+    }
+
+    // ─── Existing routes (scoped to activeAcct) ───
+
+    if (req.method === "POST" && pathname === "/hint") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", () => {
+        const params = new URLSearchParams(body);
+        const hint = params.get("hint");
+        if (hint) { fs.writeFileSync(HINT_FILE, hint); log(activeAcct, `HINT (via dashboard): "${hint}"`); }
+        res.writeHead(302, { Location: `/?a=${acctId}` });
+        res.end();
+      });
+      return;
+    }
+
+    const tickerMatch = pathname.match(/^\/ticker\/([A-Z]+)$/);
     if (tickerMatch) {
       const sym = tickerMatch[1];
       try {
-        if (!dashboard.candles[sym] && apiKey) {
-          dashboard.candles[sym] = await fetchCandles(sym, apiKey);
-        }
-        if (!dashboard.quotes[sym] && apiKey) {
-          dashboard.quotes[sym] = await fetchQuote(sym, apiKey);
-        }
+        if (!dashboard.candles[sym] && apiKey) dashboard.candles[sym] = await fetchCandles(sym, apiKey);
+        if (!dashboard.quotes[sym] && apiKey) dashboard.quotes[sym] = await fetchQuote(sym, apiKey);
         if (dashboard.candles[sym] && !dashboard.analyses[sym]) {
-          const a = runAnalysis(dashboard.candles[sym]);
-          if (a) dashboard.analyses[sym] = a;
-          const st = runShortTermAnalysis(dashboard.candles[sym]);
-          if (st) dashboard.shortTermAnalyses[sym] = st;
+          const a = runAnalysis(dashboard.candles[sym]); if (a) dashboard.analyses[sym] = a;
+          const st = runShortTermAnalysis(dashboard.candles[sym]); if (st) dashboard.shortTermAnalyses[sym] = st;
         }
-      } catch (e) {
-        log(acct, `WARN: On-demand fetch for ${sym} failed — ${e.message}`);
-      }
+      } catch (e) { log(activeAcct, `WARN: On-demand fetch for ${sym} failed — ${e.message}`); }
       res.writeHead(200, { "Content-Type": "text/html" });
-      res.end(tickerDetailHTML(sym, acct));
+      res.end(tickerDetailHTML(sym, activeAcct));
       return;
     }
 
-    // JSON API — full state
-    if (req.url === "/api/state") {
+    if (pathname === "/api/state") {
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-      res.end(JSON.stringify({
-        cash: state.cash,
-        positions: state.positions,
-        history: state.history.slice(-50),
-        dayTrades: state.dayTrades,
-        quotes: dashboard.quotes,
-        analyses: Object.fromEntries(Object.entries(dashboard.analyses).map(([k, v]) => [k, { score: v.score, signal: v.signal, price: v.price, rsi: v.rsi }])),
-        activeHints: acct.activeHints,
-        portfolioValue: portfolioValue(state, dashboard.quotes),
-        marketOpen: dashboard.marketOpen,
-        log: dashboard.cycleLog.slice(-50),
-      }));
+      res.end(JSON.stringify({ cash: state.cash, positions: state.positions, history: state.history.slice(-50), dayTrades: state.dayTrades, quotes: dashboard.quotes, analyses: Object.fromEntries(Object.entries(dashboard.analyses).map(([k, v]) => [k, { score: v.score, signal: v.signal, price: v.price, rsi: v.rsi }])), activeHints: activeAcct.activeHints, portfolioValue: portfolioValue(state, dashboard.quotes), marketOpen: dashboard.marketOpen, log: dashboard.cycleLog.slice(-50) }));
       return;
     }
 
-    // JSON API — lightweight live ticker (polled every 5s)
-    if (req.url === "/api/live") {
+    if (pathname === "/api/live") {
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       const tickers = {};
       for (const [sym, q] of Object.entries(dashboard.quotes)) {
-        const a = dashboard.analyses[sym];
-        const st = dashboard.shortTermAnalyses[sym];
+        const a = dashboard.analyses[sym]; const st = dashboard.shortTermAnalyses[sym];
         const pos = state.positions.find(p => p.ticker === sym);
         let posPnl = null;
-        if (pos) {
-          const spot = q ? q.c : pos.entrySpot;
-          const elapsed = (Date.now() - pos.openTime) / 86400_000;
-          const dteLeft = Math.max(0, pos.dte - elapsed);
-          const curPremium = optPrice(spot, pos.strike, dteLeft, DEFAULT_IV, pos.type);
-          posPnl = { pct: ((curPremium - pos.entryPremium) / pos.entryPremium * 100).toFixed(1), dollar: ((curPremium - pos.entryPremium) * pos.qty * 100).toFixed(0) };
-        }
-        tickers[sym] = {
-          c: q.c, pc: q.pc, d: q.d, dp: q.dp, h: q.h, l: q.l,
-          score: a?.score, signal: a?.signal, stScore: st?.score,
-          mom1d: st?.mom1d, mom3d: st?.mom3d, mom7d: st?.mom7d,
-          held: !!pos, type: pos?.type, posPnl,
-        };
+        if (pos) { const spot = q ? q.c : pos.entrySpot; const elapsed = (Date.now() - pos.openTime) / 86400_000; const dteLeft = Math.max(0, pos.dte - elapsed); const curPremium = optPrice(spot, pos.strike, dteLeft, DEFAULT_IV, pos.type); posPnl = { pct: ((curPremium - pos.entryPremium) / pos.entryPremium * 100).toFixed(1), dollar: ((curPremium - pos.entryPremium) * pos.qty * 100).toFixed(0) }; }
+        tickers[sym] = { c: q.c, pc: q.pc, d: q.d, dp: q.dp, h: q.h, l: q.l, score: a?.score, signal: a?.signal, stScore: st?.score, mom1d: st?.mom1d, mom3d: st?.mom3d, mom7d: st?.mom7d, held: !!pos, type: pos?.type, posPnl };
       }
-      res.end(JSON.stringify({
-        tickers,
-        pv: portfolioValue(state, dashboard.quotes),
-        cash: state.cash,
-        open: state.positions.length,
-        marketOpen: dashboard.marketOpen,
-        lastCycle: dashboard.lastCycle,
-      }));
+      res.end(JSON.stringify({ tickers, pv: portfolioValue(state, dashboard.quotes), cash: state.cash, open: state.positions.length, marketOpen: dashboard.marketOpen, lastCycle: dashboard.lastCycle }));
       return;
     }
 
     // Dashboard HTML
     res.writeHead(200, { "Content-Type": "text/html" });
-    res.end(dashboardHTML(acct));
+    res.end(dashboardHTML(activeAcct));
   });
 
-  server.listen(DASH_PORT, () => {
-    console.log(`  Dashboard running at http://localhost:${DASH_PORT}`);
-  });
-
-  server.on("error", (e) => {
-    if (e.code === "EADDRINUSE") {
-      console.log(`  WARN: Dashboard port ${DASH_PORT} in use, trying ${DASH_PORT + 1}`);
-      server.listen(DASH_PORT + 1);
-    }
-  });
+  server.listen(DASH_PORT, () => { console.log(`  Dashboard running at http://localhost:${DASH_PORT}`); });
+  server.on("error", (e) => { if (e.code === "EADDRINUSE") { console.log(`  WARN: Port ${DASH_PORT} in use, trying ${DASH_PORT + 1}`); server.listen(DASH_PORT + 1); } });
 }
 
 // ─── Main Trading Cycle ───
