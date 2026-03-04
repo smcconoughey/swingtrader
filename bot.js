@@ -795,32 +795,40 @@ function getClaudeCost() {
   return (claudeTotalInputTokens * HAIKU_INPUT_COST + claudeTotalOutputTokens * HAIKU_OUTPUT_COST);
 }
 
-async function callClaude(prompt) {
+async function callClaude(prompt, retries = 3) {
   if (!CLAUDE_API_KEY) throw new Error("CLAUDE_API_KEY not set");
-  const r = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": CLAUDE_API_KEY,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 1024,
-      messages: [{ role: "user", content: prompt }],
-    }),
-  });
-  if (!r.ok) {
-    const err = await r.text();
-    throw new Error(`Claude API ${r.status}: ${err}`);
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": CLAUDE_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 1024,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    if (!r.ok) {
+      const err = await r.text();
+      const retryable = [429, 500, 502, 503, 504, 529].includes(r.status);
+      if (retryable && attempt < retries) {
+        const delay = Math.min(1000 * 2 ** attempt, 10000);
+        await new Promise(res => setTimeout(res, delay));
+        continue;
+      }
+      throw new Error(`Claude API ${r.status}: ${err}`);
+    }
+    const data = await r.json();
+    claudeCallCount++;
+    if (data.usage) {
+      claudeTotalInputTokens += data.usage.input_tokens || 0;
+      claudeTotalOutputTokens += data.usage.output_tokens || 0;
+    }
+    return data.content[0].text;
   }
-  const data = await r.json();
-  claudeCallCount++;
-  if (data.usage) {
-    claudeTotalInputTokens += data.usage.input_tokens || 0;
-    claudeTotalOutputTokens += data.usage.output_tokens || 0;
-  }
-  return data.content[0].text;
 }
 
 async function processHint(hintText, acct) {
