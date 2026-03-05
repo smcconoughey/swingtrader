@@ -3,6 +3,8 @@ import fetch from "node-fetch";
 import fs from "fs";
 import readline from "readline";
 import http from "http";
+import { TwitterApi } from "twitter-api-v2";
+import { Resvg } from "@resvg/resvg-js";
 
 // ─── Technical Analysis Engine (ported from live-swing-simulator.jsx) ───
 
@@ -69,6 +71,14 @@ function runAnalysis(candles) {
   const trendUp = ((hh + hl) / 18) * 100;
   if (trendUp > 60) { bull += 10; sigs.push({ t: "bull", text: `Uptrend structure ${trendUp.toFixed(0)}%` }); }
 
+  // ─── SRxTrades: Undercut & Reclaim (bullish reversal) ───
+  const ur = detectUndercutReclaim(candles);
+  if (ur.detected) {
+    const urBoost = Math.round(ur.quality * 0.25); // Up to +25 bull score
+    bull += urBoost;
+    sigs.push({ t: "bull", text: `U&R detected (${ur.quality}/100) — ${ur.reasons.slice(0, 2).join(", ")}` });
+  }
+
   // ─── Bearish score (0 to 100) ───
   let bear = 0;
   if (bearish) { bear += 25; sigs.push({ t: "bear", text: "EMA Stack Bearish (8<21<50)" }); }
@@ -88,6 +98,14 @@ function runAnalysis(candles) {
   for (let i = Math.max(0, L - 9); i < L; i++) { if (highs[i + 1] < highs[i]) lh++; if (lows[i + 1] < lows[i]) ll++; }
   const trendDn = ((lh + ll) / 18) * 100;
   if (trendDn > 60) { bear += 10; sigs.push({ t: "bear", text: `Downtrend structure ${trendDn.toFixed(0)}%` }); }
+
+  // ─── SRxTrades: Uppercut / Failed Breakout (bearish reversal) ───
+  const uc = detectUppercut(candles);
+  if (uc.detected) {
+    const ucBoost = Math.round(uc.quality * 0.25); // Up to +25 bear score
+    bear += ucBoost;
+    sigs.push({ t: "bear", text: `Uppercut detected (${uc.quality}/100) — ${uc.reasons.slice(0, 2).join(", ")}` });
+  }
 
   // Price distance from 50 EMA — further below = stronger bear
   if (bearish && spread < -1) { bear += 5; sigs.push({ t: "bear", text: `Price ${Math.abs(spread).toFixed(1)}% below 50 EMA` }); }
@@ -180,6 +198,14 @@ function runShortTermAnalysis(candles) {
   const upTrend = ((hh + hl) / 12) * 100;
   if (upTrend > 65) { bull += 10; sigs.push({ t: "bull", text: `7d uptrend ${upTrend.toFixed(0)}%` }); }
 
+  // ─── SRxTrades: Short-term U&R (bullish reversal on recent candles) ───
+  const stUr = detectUndercutReclaim(candles);
+  if (stUr.detected) {
+    const urBoost = Math.round(stUr.quality * 0.20); // Up to +20 in short-term
+    bull += urBoost;
+    sigs.push({ t: "bull", text: `[ST] U&R setup (${stUr.quality}/100) — ${stUr.reasons.slice(0, 2).join(", ")}` });
+  }
+
   // ─── Short-term Bear Score ───
   let bear = 0;
   if (bearish) { bear += 20; sigs.push({ t: "bear", text: "Fast EMA bearish (3<5<8)" }); }
@@ -191,6 +217,14 @@ function runShortTermAnalysis(candles) {
   if (nearLow && vr > 1.1) { bear += 15; sigs.push({ t: "bear", text: "Near 7d low on expanding volume" }); }
   if (rV >= 75) { bear += 10; sigs.push({ t: "bear", text: `RSI(5) ${rV.toFixed(0)} — overbought reversal setup` }); }
   if (rV < 45 && rV > 25 && bearish) { bear += 10; sigs.push({ t: "bear", text: `RSI(5) ${rV.toFixed(0)} — bearish pressure` }); }
+
+  // ─── SRxTrades: Short-term Uppercut (bearish failed breakout) ───
+  const stUc = detectUppercut(candles);
+  if (stUc.detected) {
+    const ucBoost = Math.round(stUc.quality * 0.20);
+    bear += ucBoost;
+    sigs.push({ t: "bear", text: `[ST] Uppercut/Failed BO (${stUc.quality}/100) — ${stUc.reasons.slice(0, 2).join(", ")}` });
+  }
   const dnTrend = ((lh + ll) / 12) * 100;
   if (dnTrend > 65) { bear += 10; sigs.push({ t: "bear", text: `7d downtrend ${dnTrend.toFixed(0)}%` }); }
 
@@ -502,6 +536,228 @@ function logTrade(entry) {
   } catch { }
 }
 
+// ─── X (Twitter) Integration ───
+
+const ENABLE_TWEETS = process.env.ENABLE_TWEETS === "true";
+const X_DAILY_CAP = parseInt(process.env.X_DAILY_CAP) || 30;
+let xClient = null;
+let xTweetCount = 0;
+let xTweetDate = null;
+let lastWatchlistTweetDate = null;
+
+function initTwitterClient() {
+  const apiKey = process.env.X_API_KEY;
+  const apiSecret = process.env.X_API_SECRET;
+  const accessToken = process.env.X_ACCESS_TOKEN;
+  const accessSecret = process.env.X_ACCESS_SECRET;
+  if (!apiKey || !apiSecret || !accessToken || !accessSecret) {
+    console.log("  X/Twitter: Missing API keys — tweeting disabled (dry-run logs only)");
+    return null;
+  }
+  try {
+    const client = new TwitterApi({ appKey: apiKey, appSecret: apiSecret, accessToken, accessSecret });
+    console.log("  X/Twitter: Client initialized ✓");
+    return client;
+  } catch (e) {
+    console.log(`  X/Twitter: Init failed — ${e.message}`);
+    return null;
+  }
+}
+
+function canTweet() {
+  const today = getETDateStr();
+  if (xTweetDate !== today) { xTweetCount = 0; xTweetDate = today; }
+  return xTweetCount < X_DAILY_CAP;
+}
+
+async function tweetWithChart(text, pngBuffer) {
+  if (!canTweet()) { console.log(`  [X] Daily cap reached (${X_DAILY_CAP}), skipping tweet`); return; }
+  if (!ENABLE_TWEETS || !xClient) {
+    console.log(`  [X DRY-RUN] ${text.slice(0, 120)}...`);
+    if (pngBuffer) console.log(`  [X DRY-RUN] (chart image: ${(pngBuffer.length / 1024).toFixed(0)}KB)`);
+    return;
+  }
+  try {
+    if (pngBuffer) {
+      const mediaId = await xClient.v1.uploadMedia(pngBuffer, { mimeType: "image/png" });
+      await xClient.v2.tweet({ text, media: { media_ids: [mediaId] } });
+    } else {
+      await xClient.v2.tweet({ text });
+    }
+    xTweetCount++;
+    console.log(`  [X] Tweeted (${xTweetCount}/${X_DAILY_CAP} today)`);
+  } catch (e) {
+    console.log(`  [X] Tweet failed — ${e.message}`);
+  }
+}
+
+function renderChartPNG(candles, ticker, analysis, shortTermAnalysis, quote) {
+  if (!candles || candles.length < 3) return null;
+  try {
+    const W = 1100, H = 500, PAD = 50;
+    const cls = candles.map(c => c.c), hs = candles.map(c => c.h), ls = candles.map(c => c.l), vs = candles.map(c => c.v);
+    const emas = [
+      { period: 8, color: "#4ecdc4", label: "EMA 8", data: calcEMA(cls, 8) },
+      { period: 21, color: "#ff6b35", label: "EMA 21", data: calcEMA(cls, 21) },
+      { period: 50, color: "#a78bfa", label: "EMA 50", data: calcEMA(cls, 50) },
+    ];
+    const allP = [...hs, ...ls];
+    const mn = Math.min(...allP) * 0.998, mx = Math.max(...allP) * 1.002, rng = mx - mn;
+    const y = v => H - ((v - mn) / rng) * (H - 40) - 20;
+    const x = i => PAD + (i / Math.max(1, cls.length - 1)) * (W - PAD);
+
+    // Candlestick bars
+    const bars = candles.map((c, i) => {
+      const green = c.c >= c.o;
+      const color = green ? "#00ff88" : "#ff4444";
+      const bw = Math.max(4, (W - PAD) / candles.length - 1.5);
+      const top = y(Math.max(c.o, c.c)), bot = y(Math.min(c.o, c.c));
+      const bodyH = Math.max(1, bot - top);
+      return `<line x1="${x(i)}" y1="${y(c.h)}" x2="${x(i)}" y2="${y(c.l)}" stroke="${color}" stroke-width="1"/>
+        <rect x="${x(i) - bw / 2}" y="${top}" width="${bw}" height="${bodyH}" fill="${color}" rx="0.5"/>`;
+    }).join("");
+
+    // EMA overlay paths
+    const emaPaths = emas.map(e =>
+      `<path d="${e.data.map((v, i) => `${i ? "L" : "M"}${x(i)},${y(v)}`).join(" ")}" fill="none" stroke="${e.color}" stroke-width="2" opacity="0.85"/>`
+    ).join("");
+
+    // Price labels on right side
+    const pLabels = [mn, mn + rng * 0.25, mn + rng * 0.5, mn + rng * 0.75, mx].map(p =>
+      `<text x="${W + 8}" y="${y(p)}" fill="#888" font-size="11" font-family="monospace" dominant-baseline="middle">$${p.toFixed(2)}</text>`
+    ).join("");
+
+    // Volume bars at bottom
+    const maxV = Math.max(...vs);
+    const avgV = vs.reduce((a, b) => a + b, 0) / vs.length;
+    const VH = 60;
+    const volBars = vs.map((v, i) => {
+      const bw = Math.max(4, (W - PAD) / vs.length - 1.5);
+      const h = (v / maxV) * VH;
+      return `<rect x="${x(i) - bw / 2}" y="${H + 20 + VH - h}" width="${bw}" height="${h}" fill="${v > avgV * 1.15 ? '#00ff8850' : '#ffffff18'}" rx="0.5"/>`;
+    }).join("");
+
+    // Info overlay
+    const score = analysis?.score ?? "?";
+    const signal = analysis?.signal ?? "?";
+    const rsi = analysis?.rsi?.toFixed(1) ?? "?";
+    const stScore = shortTermAnalysis?.score ?? "?";
+    const price = quote?.c?.toFixed(2) ?? "?";
+    const chg = quote?.dp != null ? `${quote.dp >= 0 ? "+" : ""}${quote.dp.toFixed(1)}%` : "";
+    const chgColor = (quote?.dp ?? 0) >= 0 ? "#00ff88" : "#ff4444";
+    const scoreColor = score >= 65 ? "#00ff88" : score <= 35 ? "#ff4444" : "#ffd93d";
+
+    const signalsList = [
+      ...(analysis?.sigs?.slice(0, 3)?.map(s => s.text) || []),
+      ...(shortTermAnalysis?.sigs?.slice(0, 2)?.map(s => `[7d] ${s.text}`) || []),
+    ];
+    const signalsText = signalsList.map((s, i) =>
+      `<text x="20" y="${H + VH + 70 + i * 18}" fill="#aaa" font-size="12" font-family="monospace">• ${s.length > 60 ? s.slice(0, 57) + "..." : s}</text>`
+    ).join("");
+
+    // EMA legend
+    const legendY = 30;
+    const legend = emas.map((e, i) =>
+      `<rect x="${20 + i * 130}" y="${legendY - 6}" width="12" height="3" fill="${e.color}" rx="1"/>
+       <text x="${36 + i * 130}" y="${legendY}" fill="${e.color}" font-size="11" font-family="monospace">${e.label} (${e.data[e.data.length - 1]?.toFixed(2) ?? "?"})</text>`
+    ).join("");
+
+    const totalH = H + VH + 40 + signalsList.length * 18 + 20;
+
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="${totalH}" viewBox="0 0 1200 ${totalH}">
+      <rect width="1200" height="${totalH}" fill="#0a0a14" rx="12"/>
+      <text x="20" y="22" fill="#fff" font-size="18" font-weight="bold" font-family="monospace">$${ticker}</text>
+      <text x="${20 + ticker.length * 12 + 10}" y="22" fill="#888" font-size="14" font-family="monospace">$${price}</text>
+      <text x="${20 + ticker.length * 12 + 80}" y="22" fill="${chgColor}" font-size="14" font-family="monospace">${chg}</text>
+      <text x="${W - 20}" y="22" fill="${scoreColor}" font-size="16" font-weight="bold" font-family="monospace" text-anchor="end">Score: ${score}/100 ${signal}</text>
+      <text x="${W + 60}" y="22" fill="#888" font-size="12" font-family="monospace">RSI: ${rsi} | 7d: ${stScore}</text>
+      ${legend}
+      <g transform="translate(0, 10)">
+        ${bars}
+        ${emaPaths}
+        ${pLabels}
+        ${volBars}
+      </g>
+      <line x1="20" y1="${H + VH + 40}" x2="${W + 60}" y2="${H + VH + 40}" stroke="#222" stroke-width="1"/>
+      <text x="20" y="${H + VH + 58}" fill="#666" font-size="11" font-family="monospace">Key Signals:</text>
+      ${signalsText}
+      <text x="1180" y="${totalH - 10}" fill="#333" font-size="10" font-family="monospace" text-anchor="end">SwingTrader Bot</text>
+    </svg>`;
+
+    const resvg = new Resvg(svg, { fitTo: { mode: "width", value: 1200 } });
+    const rendered = resvg.render();
+    return rendered.asPng();
+  } catch (e) {
+    console.log(`  [X] Chart render failed for ${ticker}: ${e.message}`);
+    return null;
+  }
+}
+
+async function tweetTradeEntry(acct, result, analysis, shortTermAnalysis, quote) {
+  const signals = [
+    ...(analysis?.sigs?.slice(0, 2)?.map(s => s.text) || []),
+    ...(shortTermAnalysis?.sigs?.slice(0, 1)?.map(s => `[7d] ${s.text}`) || []),
+  ].join(", ");
+  const stScore = shortTermAnalysis?.score ?? "?";
+  const ltScore = analysis ? Math.round(50 + (analysis.bullScore - analysis.bearScore) / 2) : "?";
+  const text = `🟢 $${result.ticker} — Entered $${result.strike} ${result.type.toUpperCase()} ${result.dte}DTE
+
+Blended: ${analysis?.score ?? "?"}/100 (7d:${stScore} 90d:${ltScore})
+RSI: ${analysis?.rsi?.toFixed(1) ?? "?"} | Setup: ${result.setupQuality}/100
+Signals: ${signals || "Multiple confirmations"}
+Claude: APPROVED (${result.claudeConfidence}%)
+
+#SwingTrader #Options`;
+
+  const chart = renderChartPNG(acct.candleCache[result.ticker], result.ticker, analysis, shortTermAnalysis, quote);
+  await tweetWithChart(text, chart);
+}
+
+async function tweetTradeExit(acct, pos, trade) {
+  const emoji = trade.pnlPct >= 0 ? "💰" : "🔴";
+  const pnlStr = `${trade.pnlPct >= 0 ? "+" : ""}${(trade.pnlPct * 100).toFixed(0)}%`;
+  const held = ((Date.now() - pos.openTime) / 86400_000).toFixed(1);
+  const trimLabel = trade.qty < pos.qty ? `Trimmed ${trade.qty}/${pos.qty}` : "Closed";
+  const text = `${emoji} $${pos.ticker} — ${trimLabel} $${pos.strike} ${pos.type.toUpperCase()} ${pnlStr}
+
+Held ${held} days | ${trade.reason}
+Setup: ${pos.setupQuality ?? "?"}/100 | Claude: ${pos.claudeConfidence ?? "?"}%
+
+#SwingTrader #Options`;
+
+  await tweetWithChart(text, null);
+}
+
+async function tweetWatchlistSummary(acct, decisions, regime) {
+  const today = getETDateStr();
+  if (lastWatchlistTweetDate === today) return;
+  lastWatchlistTweetDate = today;
+
+  const bulls = decisions.filter(d => d.finalScore >= 65).sort((a, b) => b.finalScore - a.finalScore).slice(0, 5);
+  const bears = decisions.filter(d => d.finalScore <= 35).sort((a, b) => a.finalScore - b.finalScore).slice(0, 3);
+  const neutral = decisions.filter(d => d.finalScore > 35 && d.finalScore < 65 && d.finalScore >= 50).sort((a, b) => b.finalScore - a.finalScore).slice(0, 3);
+
+  if (bulls.length === 0 && bears.length === 0) return;
+
+  const date = new Date().toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  let text = `📊 Watchlist Update — ${date}\n\n`;
+  if (bulls.length) text += `🟢 ${bulls.map(d => `${d.ticker} ${d.finalScore}`).join(" | ")}\n`;
+  if (bears.length) text += `🔴 ${bears.map(d => `${d.ticker} ${d.finalScore}`).join(" | ")}\n`;
+  if (neutral.length) text += `⏳ ${neutral.map(d => `${d.ticker} ${d.finalScore}`).join(" | ")}\n`;
+  text += `\nRegime: ${regime?.mode?.toUpperCase() ?? "?"} | ${acct.state.positions.length} positions open\n\n#SwingTrader #Watchlist`;
+
+  // Render chart for top bull ticker if available
+  let chart = null;
+  if (bulls.length > 0) {
+    const topTicker = bulls[0].ticker;
+    const topAnalysis = acct.dashboard.analyses[topTicker];
+    const topST = acct.dashboard.shortTermAnalyses[topTicker];
+    const topQuote = acct.dashboard.quotes[topTicker];
+    chart = renderChartPNG(acct.candleCache[topTicker], topTicker, topAnalysis, topST, topQuote);
+  }
+  await tweetWithChart(text, chart);
+}
+
 // ─── Market Regime (SPY/QQQ EMA health) ───
 
 function getMarketRegime(candleCache) {
@@ -637,6 +893,161 @@ function detectConsolidation(candles) {
     aboveEMAs: emaScore >= 15,
     breakingOut: breakoutScore >= 15,
     components: { tightnessScore, volDeclineScore, emaScore, breakoutScore },
+  };
+}
+
+// ─── SRxTrades: Undercut & Reclaim / Uppercut Detection ───
+
+function detectUndercutReclaim(candles) {
+  // Bullish reversal: price undercuts a key low then reclaims it with strength
+  // Best in leading stocks near 21 EMA or 50 MA
+  if (!candles || candles.length < 20) return { detected: false };
+
+  const recent = candles.slice(-5);
+  const prior = candles.slice(-20, -5);
+  const allCloses = candles.map(d => d.c);
+  const ema21 = calcEMA(allCloses, 21);
+  const ema50 = calcEMA(allCloses, 50);
+  const L = allCloses.length - 1;
+
+  // Find the key low from prior candles (well-defined swing low)
+  const priorLows = prior.map(d => d.l);
+  const keyLow = Math.min(...priorLows);
+  // Also check prior day's low and recent swing low (last 10 candles)
+  const recentSwingLows = candles.slice(-10, -3).map(d => d.l);
+  const swingLow = recentSwingLows.length > 0 ? Math.min(...recentSwingLows) : keyLow;
+  const testLevel = Math.min(keyLow, swingLow);
+
+  // Check if any recent candle undercut the key low
+  let undercutCandle = -1;
+  for (let i = 0; i < recent.length - 1; i++) {
+    if (recent[i].l < testLevel * 0.998) { // Broke below by at least 0.2%
+      undercutCandle = i;
+    }
+  }
+  if (undercutCandle === -1) return { detected: false };
+
+  // Check for reclaim: latest candle(s) must close back above the key low
+  const lastCandle = recent[recent.length - 1];
+  const reclaimed = lastCandle.c > testLevel * 1.001; // Closed above by 0.1%+
+  if (!reclaimed) return { detected: false };
+
+  // Quality scoring
+  let quality = 0;
+  const reasons = [];
+
+  // 1. Wick characteristic on undercut candle (long lower wick = liquidity grab)
+  const uc = recent[undercutCandle];
+  const bodySize = Math.abs(uc.c - uc.o);
+  const lowerWick = Math.min(uc.o, uc.c) - uc.l;
+  if (lowerWick > bodySize * 1.5) { quality += 20; reasons.push("Long lower wick (liquidity grab)"); }
+  else if (lowerWick > bodySize) { quality += 10; reasons.push("Lower wick present"); }
+
+  // 2. Volume on undercut and reclaim
+  const avgVol = prior.map(d => d.v).reduce((a, b) => a + b, 0) / prior.length;
+  if (uc.v > avgVol * 1.3) { quality += 15; reasons.push("High volume on undercut"); }
+  if (lastCandle.v > avgVol * 1.2) { quality += 15; reasons.push("Strong volume on reclaim"); }
+
+  // 3. Strong reclaim candle (bullish close, little hesitation)
+  if (lastCandle.c > lastCandle.o) { quality += 10; reasons.push("Bullish reclaim candle"); }
+  const reclaimStrength = (lastCandle.c - testLevel) / testLevel * 100;
+  if (reclaimStrength > 1) { quality += 10; reasons.push(`Strong reclaim +${reclaimStrength.toFixed(1)}%`); }
+
+  // 4. Near key EMAs (highest probability U&Rs per SRxTrades)
+  const nearEma21 = Math.abs(testLevel - ema21[L]) / ema21[L] < 0.03;
+  const nearEma50 = Math.abs(testLevel - ema50[L]) / ema50[L] < 0.03;
+  if (nearEma21 || nearEma50) { quality += 15; reasons.push(`Near ${nearEma21 ? '21' : '50'} EMA support`); }
+
+  // 5. Quick undercut (not a sustained breakdown)
+  const daysBelowKey = recent.filter(c => c.l < testLevel).length;
+  if (daysBelowKey <= 2) { quality += 10; reasons.push("Quick undercut (1-2 candles)"); }
+
+  quality = Math.min(100, quality);
+
+  return {
+    detected: quality >= 30,
+    quality,
+    keyLevel: testLevel,
+    reclaimPrice: lastCandle.c,
+    reasons,
+    pattern: "Undercut & Reclaim",
+    bias: "bullish",
+  };
+}
+
+function detectUppercut(candles) {
+  // Bearish reversal (failed breakout): price breaks above key resistance then fails back below
+  // "Breakout buyers and late longs get trapped at the highs, adding selling pressure"
+  if (!candles || candles.length < 20) return { detected: false };
+
+  const recent = candles.slice(-5);
+  const prior = candles.slice(-20, -5);
+  const allCloses = candles.map(d => d.c);
+  const ema21 = calcEMA(allCloses, 21);
+  const ema50 = calcEMA(allCloses, 50);
+  const L = allCloses.length - 1;
+
+  // Find key resistance: prior highs, range highs
+  const priorHighs = prior.map(d => d.h);
+  const keyHigh = Math.max(...priorHighs);
+  const recentSwingHighs = candles.slice(-10, -3).map(d => d.h);
+  const swingHigh = recentSwingHighs.length > 0 ? Math.max(...recentSwingHighs) : keyHigh;
+  const testLevel = Math.max(keyHigh, swingHigh);
+
+  // Check if any recent candle broke above the key high
+  let uppercutCandle = -1;
+  for (let i = 0; i < recent.length - 1; i++) {
+    if (recent[i].h > testLevel * 1.002) { // Broke above by at least 0.2%
+      uppercutCandle = i;
+    }
+  }
+  if (uppercutCandle === -1) return { detected: false };
+
+  // Check for reclaim back below: latest candle must close below the key high
+  const lastCandle = recent[recent.length - 1];
+  const reclaimed = lastCandle.c < testLevel * 0.999; // Closed below by 0.1%+
+  if (!reclaimed) return { detected: false };
+
+  // Quality scoring
+  let quality = 0;
+  const reasons = [];
+
+  // 1. Upper wick on uppercut candle (trap candle)
+  const uc = recent[uppercutCandle];
+  const bodySize = Math.abs(uc.c - uc.o);
+  const upperWick = uc.h - Math.max(uc.o, uc.c);
+  if (upperWick > bodySize * 1.5) { quality += 20; reasons.push("Long upper wick (bull trap)"); }
+  else if (upperWick > bodySize) { quality += 10; reasons.push("Upper wick present"); }
+
+  // 2. Volume on the failed breakout
+  const avgVol = prior.map(d => d.v).reduce((a, b) => a + b, 0) / prior.length;
+  if (uc.v > avgVol * 1.3) { quality += 15; reasons.push("High volume on failed breakout"); }
+  if (lastCandle.v > avgVol * 1.2) { quality += 15; reasons.push("Strong selling volume on reclaim"); }
+
+  // 3. Bearish reclaim candle
+  if (lastCandle.c < lastCandle.o) { quality += 10; reasons.push("Bearish reversal candle"); }
+  const reclaimStrength = (testLevel - lastCandle.c) / testLevel * 100;
+  if (reclaimStrength > 1) { quality += 10; reasons.push(`Strong rejection -${reclaimStrength.toFixed(1)}%`); }
+
+  // 4. Near overhead MAs (resistance confirmation)
+  const nearEma21 = Math.abs(testLevel - ema21[L]) / ema21[L] < 0.03;
+  const nearEma50 = Math.abs(testLevel - ema50[L]) / ema50[L] < 0.03;
+  if (nearEma21 || nearEma50) { quality += 15; reasons.push(`Failed at ${nearEma21 ? '21' : '50'} EMA resistance`); }
+
+  // 5. Quick break above (not a sustained breakout)
+  const daysAboveKey = recent.filter(c => c.h > testLevel).length;
+  if (daysAboveKey <= 2) { quality += 10; reasons.push("Quick trap (1-2 candles above)"); }
+
+  quality = Math.min(100, quality);
+
+  return {
+    detected: quality >= 30,
+    quality,
+    keyLevel: testLevel,
+    reclaimPrice: lastCandle.c,
+    reasons,
+    pattern: "Uppercut (Failed Breakout)",
+    bias: "bearish",
   };
 }
 
@@ -1274,6 +1685,9 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
   if (wouldBeDayTrade(pos)) {
     log(acct, `PDT CHECK: ${dtUsed}/3 day trades used (rolling 5 days)`);
   }
+
+  // Tweet trade exit
+  tweetTradeExit(acct, pos, trade).catch(e => console.log(`  [X] Exit tweet error: ${e.message}`));
 
   return trade;
 }
@@ -2231,7 +2645,7 @@ function startDashboard(defaultAcct, apiKey) {
         cfg.customPromptSuffix = params.get("customPromptSuffix") || "";
         target.riskPct = cfg.baseRiskPct * (target.currentRegime?.riskScale || 0.5);
         saveAccounts();
-        console.log(`  [${id}] Config updated: risk=${(cfg.baseRiskPct*100).toFixed(1)}% target=${(cfg.profitTarget*100)}% stop=${(cfg.stopLoss*100)}% minQuality=${cfg.minSetupQuality}`);
+        console.log(`  [${id}] Config updated: risk=${(cfg.baseRiskPct * 100).toFixed(1)}% target=${(cfg.profitTarget * 100)}% stop=${(cfg.stopLoss * 100)}% minQuality=${cfg.minSetupQuality}`);
         res.writeHead(302, { Location: `/?a=${id}` });
         res.end();
       });
@@ -2506,6 +2920,11 @@ async function runCycle(acct, sharedQuotes, apiKey) {
       }
     } else if (result && result.ticker) {
       log(acct, `TRADE: BUY ${result.qty}x ${result.ticker} $${result.strike} ${result.type.toUpperCase()} ${result.dte}d @ $${result.entryPremium.toFixed(2)} ($${result.cost.toFixed(0)}) [setup:${result.setupQuality}/100 claude:${result.claudeConfidence}%]`);
+      // Tweet trade entry with chart
+      const a = analyses[ticker];
+      const st = shortTermAnalyses[ticker];
+      const q = quotes[ticker];
+      tweetTradeEntry(acct, result, a, st, q).catch(e => console.log(`  [X] Entry tweet error: ${e.message}`));
     }
   }
 
@@ -2515,6 +2934,9 @@ async function runCycle(acct, sharedQuotes, apiKey) {
   const pnlPct = ((pv - cfg.startingCash) / cfg.startingCash * 100).toFixed(1);
   const progress = ((pv / cfg.goal) * 100).toFixed(1);
   log(acct, `Portfolio: $${pv.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%) | Goal: ${progress}% of $${cfg.goal.toLocaleString()} | Cash: $${state.cash.toFixed(0)} | ${state.positions.length} open | ${countRecentDayTrades(state)}/3 PDT | ${regime.mode.toUpperCase()}${getActiveHintsSummary(acct)}`);
+
+  // Tweet daily watchlist summary (once per day)
+  tweetWatchlistSummary(acct, decisions, regime).catch(e => console.log(`  [X] Watchlist tweet error: ${e.message}`));
 
   dash.quotes = quotes;
   dash.analyses = analyses;
@@ -2701,6 +3123,14 @@ async function main() {
     console.log(`  Claude API key: ${CLAUDE_API_KEY.slice(0, 12)}...${CLAUDE_API_KEY.slice(-4)} (${CLAUDE_API_KEY.length} chars)`);
   } else {
     console.log("  WARNING: No CLAUDE_API_KEY set — news scans and entry validation will fail");
+  }
+
+  // Initialize X/Twitter client
+  xClient = initTwitterClient();
+  if (ENABLE_TWEETS && xClient) {
+    console.log(`  X/Twitter: LIVE mode — tweets enabled (cap: ${X_DAILY_CAP}/day)`);
+  } else if (!ENABLE_TWEETS) {
+    console.log("  X/Twitter: DRY-RUN mode — set ENABLE_TWEETS=true to post live");
   }
 
   // Store apiKey in each account state for backwards compat
