@@ -1681,7 +1681,8 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
   const state = acct.state;
   const cfg = acct.config;
   if (state.positions.some(p => p.ticker === ticker)) return null;
-  if (state.cash < cfg.startingCash) return null;
+  // In sim mode, allow trading as long as we have enough for at least 1 contract
+  if (state.cash < 10) return null;
   if (analysis.score < cfg.bullEntry && analysis.score > cfg.bearEntry) return null;
 
   const setupQuality = detectConsolidation(acct.candleCache[ticker]);
@@ -1690,11 +1691,8 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
 
   const isBullish = analysis.score >= cfg.bullEntry;
   const isBearish = analysis.score <= cfg.bearEntry;
-  if (isBullish && analysis.rsi > 70) return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} overbought` };
+  if (isBullish && analysis.rsi > 80) return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} extremely overbought` };
   if (isBearish && analysis.rsi > 30 && analysis.rsi < 55 && !analysis.bearish) return { skipped: true, reason: `Weak put setup` };
-  if (isBullish && regime.mode === "risk-off" && !analysis.aligned) return { skipped: true, reason: `Risk-off + misaligned EMAs` };
-  const maxRange = minQuality < 30 ? 30 : 15;
-  if (parseFloat(setupQuality.rangePct) > maxRange) return { skipped: true, reason: `Range too wide ${setupQuality.rangePct}%` };
 
   let claudeResult = { approve: true, confidence: 70, concerns: [], suggestion: "" };
   if (useClaude && CLAUDE_API_KEY) {
@@ -1750,7 +1748,7 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
 
   const proceeds = currentPremium * qty * 100;
   state.cash += proceeds;
-  recordDayTrade(state, pos);
+  if (!acct._simMode) recordDayTrade(state, pos);
 
   const dtUsed = countRecentDayTrades(state);
   const trade = { ...pos, qty: qty, closePremium: currentPremium, pnlDollar, pnlPct, reason };
@@ -1758,7 +1756,7 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
 
   const trimLabel = qty < pos.qty ? `TRIM ${qty}/${pos.qty}` : "EXIT";
   log(acct, `${trimLabel}: ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} ${pnlDollar >= 0 ? "+" : ""}$${pnlDollar.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${(pnlPct * 100).toFixed(0)}%) — ${reason}`);
-  if (wouldBeDayTrade(pos)) {
+  if (!acct._simMode && wouldBeDayTrade(pos)) {
     log(acct, `PDT CHECK: ${dtUsed}/3 day trades used (rolling 5 days)`);
   }
 
@@ -3546,17 +3544,23 @@ async function simTick(sim) {
     try {
       const result = await tryEntryForSim(acct, ticker, a, q, regime, useClaude);
       if (result && result.ticker) {
-        sim.tradeHistory.push({ type: "entry", date: dateStr, ticker: result.ticker, direction: result.type, strike: result.strike, qty: result.qty, premium: result.entryPremium, cost: result.cost });
+        const entry = { type: "entry", date: dateStr, ticker: result.ticker, direction: result.type, strike: result.strike, qty: result.qty, premium: result.entryPremium, cost: result.cost };
+        sim.tradeHistory.push(entry);
+        emitSSE(sim, { type: "trade", action: "BUY", date: dateStr, ticker: result.ticker, direction: result.type, strike: result.strike, qty: result.qty, reason: `Score ${a.score} — ${a.signal}` });
+      } else if (result && result.skipped) {
+        sim.log.push(`${dateStr} SKIP ${ticker}: ${result.reason}`);
       }
     } catch { }
   }
 
-  // Record closed trades
+  // Record closed trades and emit SSE events
   const prevHistLen = sim._prevHistLen || 0;
   if (acct.state.history.length > prevHistLen) {
     for (let i = prevHistLen; i < acct.state.history.length; i++) {
       const h = acct.state.history[i];
-      sim.tradeHistory.push({ type: "exit", date: dateStr, ticker: h.ticker, direction: h.type, strike: h.strike, qty: h.qty, pnlDollar: h.pnlDollar, pnlPct: h.pnlPct, reason: h.reason });
+      const exit = { type: "exit", date: dateStr, ticker: h.ticker, direction: h.type, strike: h.strike, qty: h.qty, pnlDollar: h.pnlDollar, pnlPct: h.pnlPct, reason: h.reason };
+      sim.tradeHistory.push(exit);
+      emitSSE(sim, { type: "trade", action: "CLOSE", date: dateStr, ticker: h.ticker, direction: h.type, strike: h.strike, qty: h.qty, pnlDollar: h.pnlDollar, pnlPct: h.pnlPct, reason: h.reason });
     }
   }
   sim._prevHistLen = acct.state.history.length;
@@ -3575,7 +3579,7 @@ async function simTick(sim) {
     cash: +acct.state.cash.toFixed(2),
     positions: acct.state.positions.length,
     regime: regime.mode,
-    totalTrades: sim.tradeHistory.length,
+    totalTrades: sim.tradeHistory.filter(t => t.type === "entry").length,
     openPositions: acct.state.positions.map(p => ({ ticker: p.ticker, type: p.type, strike: p.strike, qty: p.qty, pnlPct: quotes[p.ticker] ? +((optPrice(quotes[p.ticker].c, p.strike, p.dteRemaining, DEFAULT_IV, p.type) - p.entryPremium) / p.entryPremium).toFixed(3) : 0 })),
   });
 
@@ -3618,7 +3622,7 @@ function buildSimDoneEvent(sim) {
 
   return {
     type: "done", totalReturn, winRate, maxDrawdown: (maxDD * 100).toFixed(2),
-    sharpe, avgWin, avgLoss, totalTrades: exits.length,
+    sharpe, avgWin, avgLoss, totalTrades: sim.tradeHistory.filter(t => t.type === "entry").length,
     finalValue: +endVal.toFixed(2), startValue: startVal,
   };
 }
