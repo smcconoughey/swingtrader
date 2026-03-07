@@ -1683,6 +1683,9 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
   if (state.positions.some(p => p.ticker === ticker)) return null;
   // In sim mode, allow trading as long as we have enough for at least 1 contract
   if (state.cash < 10) return null;
+  // Limit concurrent positions to avoid overexposure
+  const maxPos = cfg.maxPositions || 5;
+  if (state.positions.length >= maxPos) return null;
   if (analysis.score < cfg.bullEntry && analysis.score > cfg.bearEntry) return null;
 
   const setupQuality = detectConsolidation(acct.candleCache[ticker]);
@@ -2639,11 +2642,57 @@ function accountActionsHTML(acctId) {
   </div>`;
 }
 
+let lastSimConfig = null;
+
 function simulatorPageHTML(simId) {
   const sixMonthsAgo = new Date(Date.now() - 180 * 86400_000).toISOString().slice(0, 10);
   const today = new Date().toISOString().slice(0, 10);
 
   if (simId === "new") {
+    // Use last config if available, otherwise defaults
+    const c = lastSimConfig || {};
+    const v = {
+      startDate: c.startDate || sixMonthsAgo,
+      endDate: c.endDate || today,
+      startingCash: c.startingCash || 200,
+      baseRiskPct: c.baseRiskPct != null ? Math.round(c.baseRiskPct * 100) : 15,
+      minSetupQuality: c.minSetupQuality ?? 50,
+      profitTarget: c.profitTarget != null ? Math.round(c.profitTarget * 100) : 40,
+      stopLoss: c.stopLoss != null ? Math.round(c.stopLoss * 100) : -35,
+      bullEntry: c.bullEntry || 65,
+      bearEntry: c.bearEntry || 35,
+      maxPositions: c.maxPositions || 5,
+      tickers: c.tickers ? c.tickers.join(",") : "SPY,QQQ,AAPL,NVDA,TSLA,MSFT,META,AMZN,GOOGL,AMD",
+      speedMs: c.speedMs || 3000,
+      useClaude: c.useClaude || false,
+    };
+    const speedLabel = v.speedMs >= 8000 ? "Slow" : v.speedMs >= 2000 ? "Normal" : v.speedMs >= 400 ? "Fast" : "Turbo";
+    const speedDisp = v.speedMs >= 1000 ? (v.speedMs / 1000).toFixed(1) + "s" : v.speedMs + "ms";
+
+    // Build previous sim list
+    const prevSims = [...simulations.values()].reverse().slice(0, 10);
+    const prevSimsHTML = prevSims.length > 0 ? `<div class="card" style="margin-top:16px;max-width:600px;margin-left:auto;margin-right:auto">
+  <h2>Previous Simulations</h2>
+  <table style="width:100%;border-collapse:collapse;font-size:12px">
+    <tr><th style="text-align:left;padding:4px 8px;color:#666;font-size:10px">ID</th><th style="text-align:left;padding:4px 8px;color:#666;font-size:10px">Dates</th><th style="text-align:left;padding:4px 8px;color:#666;font-size:10px">Status</th><th style="text-align:right;padding:4px 8px;color:#666;font-size:10px">Return</th><th style="text-align:left;padding:4px 8px;color:#666;font-size:10px"></th></tr>
+    ${prevSims.map(s => {
+      const hist = s.portfolioHistory;
+      const startVal = s.config.startingCash || 200;
+      const endVal = hist.length > 0 ? hist[hist.length - 1].value : startVal;
+      const ret = ((endVal - startVal) / startVal * 100).toFixed(1);
+      const retColor = ret >= 0 ? "#00ff88" : "#ff4444";
+      const statusColor = s.status === "done" ? "#00ff88" : s.status === "running" ? "#a78bfa" : s.status === "paused" ? "#ffd93d" : "#ff4444";
+      return `<tr style="border-bottom:1px solid #1e1e2e">
+        <td style="padding:6px 8px">#${s.id}</td>
+        <td style="padding:6px 8px;color:#888">${s.startDate} — ${s.endDate}</td>
+        <td style="padding:6px 8px;color:${statusColor}">${s.status.toUpperCase()}</td>
+        <td style="padding:6px 8px;text-align:right;color:${retColor}">${ret >= 0 ? "+" : ""}${ret}%</td>
+        <td style="padding:6px 8px"><a href="/?sim=${s.id}" style="color:#4ecdc4">View</a> &nbsp;<a href="#" onclick="reuse(${s.id});return false" style="color:#a78bfa">Reuse</a></td>
+      </tr>`;
+    }).join("")}
+  </table>
+</div>` : "";
+
     return `<!DOCTYPE html><html><head><meta charset="utf-8">
 <title>Historical Simulator — Swing Trader</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2662,50 +2711,75 @@ function simulatorPageHTML(simId) {
   .btn:hover{background:#8b5cf6}
   a{color:#4ecdc4;text-decoration:none}
   .warn{color:#ffd93d;font-size:11px;margin-top:-8px;margin-bottom:12px}
-  .speed-label{color:#a78bfa;font-size:12px;font-weight:bold;text-align:center;margin-bottom:14px}
   .tab-bar{background:#0a0a12;border-bottom:1px solid #222;padding:6px 12px 0;margin:-20px -20px 20px}
   .tab-row{display:flex;flex-wrap:wrap;gap:4px;align-items:stretch}
   .acct-tab{display:flex;flex-direction:column;align-items:center;padding:8px 16px 6px;background:#14141e;border:1px solid #222;border-bottom:none;border-radius:8px 8px 0 0;color:#888;text-decoration:none;font-size:11px;min-width:100px;transition:all .2s}
   .acct-tab:hover{background:#1a1a2e;color:#fff}
   .acct-tab.active{background:#1a1a2e;border-color:#a78bfa;color:#fff;border-bottom:2px solid #a78bfa}
   .acct-tab.new-tab{border-style:dashed;color:#555;justify-content:center}
+  table th{text-align:left}
 </style></head><body>
 <div class="tab-bar"><div class="tab-row">
   ${[...accounts].map(([id, a]) => `<a href="/?a=${id}" class="acct-tab"><span style="font-weight:700;font-size:12px">${a.name}</span></a>`).join("")}
   <a href="/?sim=new" class="acct-tab active" style="border-color:#a78bfa40;color:#a78bfa">&#x1F9EA; Simulator</a>
 </div></div>
 <h1>Historical Trading Simulator</h1>
-<div class="sub">Backtest the bot's full analysis engine on historical data with live visualization</div>
+<div class="sub">Backtest the bot's full analysis engine on historical data with live visualization${lastSimConfig ? ' &nbsp;|&nbsp; <span style="color:#a78bfa">Config restored from last run</span>' : ''}</div>
 <div class="card">
   <h2>Simulation Config</h2>
-  <form method="POST" action="/api/sim/start">
+  <form method="POST" action="/api/sim/start" id="sim-form">
     <div class="row">
-      <div><label>Start Date</label><input type="date" name="startDate" value="${sixMonthsAgo}"></div>
-      <div><label>End Date</label><input type="date" name="endDate" value="${today}"></div>
+      <div><label>Start Date</label><input type="date" name="startDate" value="${v.startDate}"></div>
+      <div><label>End Date</label><input type="date" name="endDate" value="${v.endDate}"></div>
     </div>
     <label>Starting Cash ($)</label>
-    <input type="number" name="startingCash" value="200">
+    <input type="number" name="startingCash" value="${v.startingCash}">
     <div class="row">
-      <div><label>Risk per Trade (%)</label><input type="number" name="baseRiskPct" value="15" step="1"></div>
-      <div><label>Min Setup Quality (0-100)</label><input type="number" name="minSetupQuality" value="50" min="0" max="100"></div>
+      <div><label>Risk per Trade (%)</label><input type="number" name="baseRiskPct" value="${v.baseRiskPct}" step="1"></div>
+      <div><label>Min Setup Quality (0-100)</label><input type="number" name="minSetupQuality" value="${v.minSetupQuality}" min="0" max="100"></div>
     </div>
     <div class="row">
-      <div><label>Profit Target (%)</label><input type="number" name="profitTarget" value="40" step="1"></div>
-      <div><label>Stop Loss (%)</label><input type="number" name="stopLoss" value="-35" step="1"></div>
+      <div><label>Profit Target (%)</label><input type="number" name="profitTarget" value="${v.profitTarget}" step="1"></div>
+      <div><label>Stop Loss (%)</label><input type="number" name="stopLoss" value="${v.stopLoss}" step="1"></div>
     </div>
     <div class="row">
-      <div><label>Bull Entry Threshold</label><input type="number" name="bullEntry" value="65" min="50" max="90"></div>
-      <div><label>Bear Entry Threshold</label><input type="number" name="bearEntry" value="35" min="10" max="50"></div>
+      <div><label>Bull Entry Threshold</label><input type="number" name="bullEntry" value="${v.bullEntry}" min="50" max="90"></div>
+      <div><label>Bear Entry Threshold</label><input type="number" name="bearEntry" value="${v.bearEntry}" min="10" max="50"></div>
     </div>
+    <label>Max Concurrent Positions</label>
+    <input type="number" name="maxPositions" value="${v.maxPositions}" min="1" max="20">
     <label>Tickers (comma-separated)</label>
-    <input type="text" name="tickers" value="SPY,QQQ,AAPL,NVDA,TSLA,MSFT,META,AMZN,GOOGL,AMD">
-    <label>Speed: <span id="speed-label">Normal (3s/day)</span></label>
-    <input type="range" name="speedMs" min="100" max="12000" value="3000" step="100" oninput="const v=+this.value;const l=v>=8000?'Slow':v>=2000?'Normal':v>=400?'Fast':'Turbo';document.getElementById('speed-label').textContent=l+' ('+( v>=1000?(v/1000).toFixed(1)+'s':v+'ms')+'/day)'">
-    <label style="margin-top:4px"><input type="checkbox" name="useClaude" value="true" style="width:auto;margin-right:8px">Enable Claude validation (uses API credits)</label>
+    <input type="text" name="tickers" value="${v.tickers}">
+    <label>Speed: <span id="speed-label">${speedLabel} (${speedDisp}/day)</span></label>
+    <input type="range" name="speedMs" min="100" max="12000" value="${v.speedMs}" step="100" oninput="const v=+this.value;const l=v>=8000?'Slow':v>=2000?'Normal':v>=400?'Fast':'Turbo';document.getElementById('speed-label').textContent=l+' ('+(v>=1000?(v/1000).toFixed(1)+'s':v+'ms')+'/day)'">
+    <label style="margin-top:4px"><input type="checkbox" name="useClaude" value="true" style="width:auto;margin-right:8px"${v.useClaude ? " checked" : ""}>Enable Claude validation (uses API credits)</label>
     <div class="warn">Each entry check costs ~$0.001 in Claude API credits</div>
     <button type="submit" class="btn">Start Simulation</button>
   </form>
 </div>
+${prevSimsHTML}
+<script>
+const simConfigs = ${JSON.stringify(Object.fromEntries([...simulations].map(([id, s]) => [id, s.config])))};
+function reuse(id) {
+  const c = simConfigs[id];
+  if (!c) return;
+  const f = document.getElementById('sim-form');
+  if (c.startDate) f.startDate.value = c.startDate;
+  if (c.endDate) f.endDate.value = c.endDate;
+  if (c.startingCash) f.startingCash.value = c.startingCash;
+  if (c.baseRiskPct != null) f.baseRiskPct.value = Math.round(c.baseRiskPct * 100);
+  if (c.minSetupQuality != null) f.minSetupQuality.value = c.minSetupQuality;
+  if (c.profitTarget != null) f.profitTarget.value = Math.round(c.profitTarget * 100);
+  if (c.stopLoss != null) f.stopLoss.value = Math.round(c.stopLoss * 100);
+  if (c.bullEntry) f.bullEntry.value = c.bullEntry;
+  if (c.bearEntry) f.bearEntry.value = c.bearEntry;
+  if (c.maxPositions) f.maxPositions.value = c.maxPositions;
+  if (c.tickers) f.tickers.value = Array.isArray(c.tickers) ? c.tickers.join(',') : c.tickers;
+  if (c.speedMs) { f.speedMs.value = c.speedMs; f.speedMs.dispatchEvent(new Event('input')); }
+  if (c.useClaude) f.useClaude.checked = c.useClaude;
+  window.scrollTo({top: 0, behavior: 'smooth'});
+}
+</script>
 </body></html>`;
   }
 
@@ -3075,10 +3149,12 @@ function startDashboard(defaultAcct, apiKey) {
           bullEntry: parseInt(params.get("bullEntry")) || 65,
           bearEntry: parseInt(params.get("bearEntry")) || 35,
           minSetupQuality: parseInt(params.get("minSetupQuality")) || 50,
+          maxPositions: parseInt(params.get("maxPositions")) || 5,
           useClaude: params.get("useClaude") === "true",
           speedMs: parseInt(params.get("speedMs")) || 3000,
           tickers: (params.get("tickers") || "SPY,QQQ,AAPL,NVDA,TSLA,MSFT,META,AMZN,GOOGL,AMD").split(",").map(s => s.trim()).filter(Boolean),
         };
+        lastSimConfig = config;
         const sim = await startSimulation(config);
         res.writeHead(302, { Location: `/?sim=${sim.id}` });
         res.end();
@@ -3108,7 +3184,12 @@ function startDashboard(defaultAcct, apiKey) {
         emitSSE(sim, { type: "status", status: "paused" });
       } else if (action === "resume" && sim.status === "paused") {
         sim.status = "running";
-        sim.interval = setInterval(() => simTick(sim), sim.speedMs);
+        sim._tickRunning = false;
+        sim.interval = setInterval(() => {
+          if (sim._tickRunning) return;
+          sim._tickRunning = true;
+          simTick(sim).finally(() => { sim._tickRunning = false; });
+        }, sim.speedMs);
         emitSSE(sim, { type: "status", status: "running" });
       } else if (action === "cancel") {
         sim.status = "cancelled";
@@ -3119,7 +3200,11 @@ function startDashboard(defaultAcct, apiKey) {
         sim.speedMs = Math.max(50, Math.min(15000, newSpeed));
         if (sim.status === "running") {
           clearInterval(sim.interval);
-          sim.interval = setInterval(() => simTick(sim), sim.speedMs);
+          sim.interval = setInterval(() => {
+            if (sim._tickRunning) return;
+            sim._tickRunning = true;
+            simTick(sim).finally(() => { sim._tickRunning = false; });
+          }, sim.speedMs);
         }
       }
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -3411,7 +3496,7 @@ async function startSimulation(config) {
   const {
     startDate, endDate, startingCash = 200, baseRiskPct = 0.15,
     profitTarget = 0.40, stopLoss = -0.35, bullEntry = 65, bearEntry = 35,
-    minSetupQuality = 50, useClaude = false, speedMs = 3000,
+    minSetupQuality = 50, maxPositions = 5, useClaude = false, speedMs = 3000,
     tickers = ["SPY","QQQ","AAPL","NVDA","TSLA","MSFT","META","AMZN","GOOGL","AMD"],
   } = config;
 
@@ -3463,7 +3548,7 @@ async function startSimulation(config) {
   // Create virtual account
   const acctConfig = {
     startingCash, goal: 1_000_000, baseRiskPct, profitTarget, stopLoss,
-    bullEntry, bearEntry, trim1Pct: 0.25, trim2Pct: 0.50, minSetupQuality,
+    bullEntry, bearEntry, trim1Pct: 0.25, trim2Pct: 0.50, minSetupQuality, maxPositions,
   };
   const acct = createAccountRuntime(`sim-${simId}`, `Sim #${simId}`, acctConfig);
   acct._simMode = true;
@@ -3477,8 +3562,13 @@ async function startSimulation(config) {
 
   emitSSE(sim, { type: "status", status: "running", totalDays: allDates.length, message: "Simulation started" });
 
-  // Start tick interval
-  sim.interval = setInterval(() => simTick(sim), sim.speedMs);
+  // Start tick loop (sequential to prevent race conditions)
+  sim._tickRunning = false;
+  sim.interval = setInterval(() => {
+    if (sim._tickRunning) return; // skip if previous tick still running
+    sim._tickRunning = true;
+    simTick(sim).finally(() => { sim._tickRunning = false; });
+  }, sim.speedMs);
   return sim;
 }
 
