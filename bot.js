@@ -1623,7 +1623,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   const state = acct.state;
   const cfg = acct.config;
   if (state.positions.some(p => p.ticker === ticker)) return null;
-  if (state.cash < cfg.startingCash) return null;
+  if (state.cash < 100) return null; // need enough for at least 1 contract
 
   // Early exit: skip tickers that aren't actionable (WAIT zone) before any expensive checks
   if (analysis.score < cfg.bullEntry && analysis.score > cfg.bearEntry) return null;
@@ -1696,7 +1696,10 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
 
   let claudeResult = { approve: true, confidence: 70, concerns: [], suggestion: "" };
   try {
-    claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime);
+    const qualityObj = isCrisis
+      ? { quality: entryQuality, tight: false, breakingOut: false, volDeclining: false, rangePct: "N/A" }
+      : detectConsolidation(acct.candleCache[ticker]);
+    claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, qualityObj, earningsInfo, regime);
     log(acct, `CLAUDE VALIDATE ${ticker}: ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%) — ${claudeResult.suggestion}${claudeResult.concerns.length ? ' | Concerns: ' + claudeResult.concerns.join(', ') : ''}`);
   } catch (e) {
     log(acct, `CLAUDE VALIDATE ${ticker}: Error — ${e.message}, proceeding anyway`);
