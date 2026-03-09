@@ -1799,15 +1799,43 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     return { skipped: true, reason: `Earnings in ${earningsInfo.daysUntil} days (${earningsInfo.date}) — too risky for 7DTE options` };
   }
 
+  // ─── Local pre-filters that don't need Claude (save API calls) ───
+  if (isCrisis && !isGapReversal) {
+    // In crisis without a U&R/Uppercut pattern: apply strict local filters instead of burning Claude calls
+    // Puts on deeply oversold stocks = likely to bounce, skip
+    if (isBearish && analysis.rsi < 30) {
+      return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} deeply oversold — likely to bounce, not chasing puts [LOCAL]` };
+    }
+    // Puts with weak score and mixed EMAs = no conviction
+    if (isBearish && analysis.score > 25 && !analysis.bearish) {
+      return { skipped: true, reason: `Score ${analysis.score} with mixed EMAs — weak put conviction without reversal pattern [LOCAL]` };
+    }
+    // Bullish calls blocked by risk-off without gap reversal already filtered above
+    // Weak scores in crisis without pattern = skip (score barely past threshold)
+    if (analysis.score > 25 && analysis.score < 40) {
+      return { skipped: true, reason: `Score ${analysis.score} in no-man's-land — too weak for conviction without U&R/Uppercut pattern [LOCAL]` };
+    }
+  }
+
+  // Only call Claude for high-conviction setups to save API costs
+  const shouldCallClaude = !isCrisis                           // always validate in normal markets
+    || isGapReversal                                            // validate U&R/Uppercut patterns
+    || analysis.score >= 80 || analysis.score <= 15             // extreme scores worth validating
+    || (isBullish && isCrisisLong);                             // crisis-safe longs
+
   let claudeResult = { approve: true, confidence: 70, concerns: [], suggestion: "" };
-  try {
-    const qualityObj = isCrisis
-      ? { quality: entryQuality, tight: false, breakingOut: false, volDeclining: false, rangePct: "N/A" }
-      : detectConsolidation(acct.candleCache[ticker]);
-    claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, qualityObj, earningsInfo, regime);
-    log(acct, `CLAUDE VALIDATE ${ticker}: ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%) — ${claudeResult.suggestion}${claudeResult.concerns.length ? ' | Concerns: ' + claudeResult.concerns.join(', ') : ''}`);
-  } catch (e) {
-    log(acct, `CLAUDE VALIDATE ${ticker}: Error — ${e.message}, proceeding anyway`);
+  if (shouldCallClaude) {
+    try {
+      const qualityObj = isCrisis
+        ? { quality: entryQuality, tight: false, breakingOut: false, volDeclining: false, rangePct: "N/A" }
+        : detectConsolidation(acct.candleCache[ticker]);
+      claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, qualityObj, earningsInfo, regime);
+      log(acct, `CLAUDE VALIDATE ${ticker}: ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%) — ${claudeResult.suggestion}${claudeResult.concerns.length ? ' | Concerns: ' + claudeResult.concerns.join(', ') : ''}`);
+    } catch (e) {
+      log(acct, `CLAUDE VALIDATE ${ticker}: Error — ${e.message}, proceeding anyway`);
+    }
+  } else {
+    log(acct, `SKIP CLAUDE for ${ticker}: crisis momentum trade, using local filters only`);
   }
 
   if (!claudeResult.approve) {
