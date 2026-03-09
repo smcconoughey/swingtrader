@@ -3453,7 +3453,7 @@ async function runCycle(acct, sharedQuotes, apiKey) {
 
     const dec = { ticker, price: q?.c, rawScore, finalScore, signal: a.signal, hintBias };
     const alreadyHeld = state.positions.some(p => p.ticker === ticker);
-    const lowCash = state.cash < cfg.startingCash;
+    const lowCash = state.cash < 100;
 
     dec.bullScore = a.bullScore; dec.bearScore = a.bearScore;
     dec.shortTermScore = st ? st.score : null;
