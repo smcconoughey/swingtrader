@@ -801,8 +801,8 @@ function getMarketRegime(candleCache) {
     label = "CHOPPY — above 50 EMA but EMA stack broken";
   } else {
     mode = "risk-off";
-    riskScale = 0.25;
-    label = "RISK-OFF — below key EMAs, reduce exposure";
+    riskScale = 0.4;
+    label = "RISK-OFF — below key EMAs, crisis momentum mode";
   }
 
   return { mode, riskScale, label, spyAbove: spy, qqqAbove: qqq };
@@ -896,6 +896,64 @@ function detectConsolidation(candles) {
     breakingOut: breakoutScore >= 15,
     components: { tightnessScore, volDeclineScore, emaScore, breakoutScore },
   };
+}
+
+// ─── Crisis / Momentum Mode Helpers ───
+
+// Assets that thrive in crisis — exempt from risk-off call blocking
+const CRISIS_LONGS = new Set([
+  "USO", "XLE", "XOM", "OXY", "CVX", "COP", "SLB", "HAL", "MPC", "VLO", "PSX", // oil/energy
+  "GLD", "GDX", "GOLD", "NEM", "AEM", "SLV",                                     // gold/silver
+  "DBC", "DBA", "PDBC", "GSG",                                                     // commodities
+  "LMT", "NOC", "RTX", "GD", "BA", "HII",                                         // defense
+  "UUP", "WEAT", "CORN",                                                           // dollar, ag
+  "WTI", "BZ=F", "CL=F", "IEO", "MEOH",                                           // oil-adjacent
+  "VIX", "UVXY", "VIXY",                                                           // vol
+]);
+
+function detectMomentumQuality(candles) {
+  if (!candles || candles.length < 10) return { quality: 0 };
+  const recent = candles.slice(-7);
+  const closes = recent.map(d => d.c);
+  const volumes = recent.map(d => d.v);
+  const allCloses = candles.map(d => d.c);
+
+  // 1. Trend strength: how consistent is the direction over last 7 days?
+  let trendDays = 0;
+  const direction = closes[closes.length - 1] > closes[0] ? "up" : "down";
+  for (let i = 1; i < closes.length; i++) {
+    if (direction === "up" && closes[i] >= closes[i - 1]) trendDays++;
+    if (direction === "down" && closes[i] <= closes[i - 1]) trendDays++;
+  }
+  const trendScore = Math.min(35, Math.round((trendDays / (closes.length - 1)) * 35));
+
+  // 2. Magnitude: how big is the move? bigger = stronger signal
+  const movePct = Math.abs((closes[closes.length - 1] - closes[0]) / closes[0]) * 100;
+  let magScore = 0;
+  if (movePct > 15) magScore = 30;
+  else if (movePct > 8) magScore = 25;
+  else if (movePct > 4) magScore = 20;
+  else if (movePct > 2) magScore = 10;
+
+  // 3. Volume confirmation: is volume expanding with the move?
+  const avgVol5 = candles.slice(-5).reduce((s, c) => s + c.v, 0) / 5;
+  const avgVol20 = candles.slice(-20).reduce((s, c) => s + c.v, 0) / Math.min(20, candles.length);
+  const volRatio = avgVol20 > 0 ? avgVol5 / avgVol20 : 1;
+  let volScore = 0;
+  if (volRatio > 1.5) volScore = 25;
+  else if (volRatio > 1.2) volScore = 15;
+  else if (volRatio > 1.0) volScore = 8;
+
+  // 4. EMA alignment bonus (trending in same direction as the trade)
+  const ema8 = calcEMA(allCloses, 8);
+  const ema21 = calcEMA(allCloses, 21);
+  const L = allCloses.length - 1;
+  let emaScore = 0;
+  if (direction === "up" && ema8[L] > ema21[L]) emaScore = 10;
+  if (direction === "down" && ema8[L] < ema21[L]) emaScore = 10;
+
+  const quality = Math.min(100, trendScore + magScore + volScore + emaScore);
+  return { quality, direction, movePct: movePct.toFixed(1), volRatio: volRatio.toFixed(2), trendDays };
 }
 
 // ─── SRxTrades: Undercut & Reclaim / Uppercut Detection ───
@@ -1576,33 +1634,55 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     return { skipped: true, reason: `EOD freeze (${etHour.toFixed(1)} >= ${EOD_FREEZE_HOUR}h, score ${analysis.score} not extreme enough)` };
   }
 
-  const setupQuality = detectConsolidation(acct.candleCache[ticker]);
-  const minQuality = acct.config.minSetupQuality ?? 50;
-  if (setupQuality.quality < minQuality) {
-    return { skipped: true, reason: `Low setup quality ${setupQuality.quality}/100 (need >=${minQuality}, range ${setupQuality.rangePct}%, need consolidation→breakout)` };
-  }
-
-  // ─── Local pre-filters (catch what Claude would reject without API call) ───
   const isBullish = analysis.score >= cfg.bullEntry;
   const isBearish = analysis.score <= cfg.bearEntry;
+  const isCrisis = regime.mode === "risk-off" || regime.mode === "choppy";
+  const isCrisisLong = CRISIS_LONGS.has(ticker);
 
-  // RSI conflict: overbought buying calls, not-oversold buying puts
-  if (isBullish && analysis.rsi > 70) {
+  // ─── Setup Quality: consolidation in normal markets, momentum in crisis ───
+  let entryQuality = 0;
+  if (isCrisis) {
+    // Crisis mode: use momentum quality instead of consolidation
+    const momentum = detectMomentumQuality(acct.candleCache[ticker]);
+    const minMom = Math.max(20, (acct.config.minSetupQuality ?? 50) - 20); // lower bar in crisis
+    if (momentum.quality < minMom) {
+      return { skipped: true, reason: `Low momentum quality ${momentum.quality}/100 (need >=${minMom}, move ${momentum.movePct}%, vol ${momentum.volRatio}x) [CRISIS MODE]` };
+    }
+    entryQuality = momentum.quality;
+    log(acct, `CRISIS MOMENTUM: ${ticker} quality ${momentum.quality}/100 (${momentum.direction} ${momentum.movePct}%, vol ${momentum.volRatio}x, ${momentum.trendDays} trend days)`);
+  } else {
+    // Normal mode: require consolidation→breakout pattern
+    const setupQuality = detectConsolidation(acct.candleCache[ticker]);
+    const minQuality = acct.config.minSetupQuality ?? 50;
+    if (setupQuality.quality < minQuality) {
+      return { skipped: true, reason: `Low setup quality ${setupQuality.quality}/100 (need >=${minQuality}, range ${setupQuality.rangePct}%, need consolidation→breakout)` };
+    }
+    // Range too wide — extended move, not consolidation (normal mode only)
+    const maxRange = minQuality < 30 ? 30 : 15;
+    if (parseFloat(setupQuality.rangePct) > maxRange) {
+      return { skipped: true, reason: `Range ${setupQuality.rangePct}% too wide (max ${maxRange}%) — extended move, not consolidation setup` };
+    }
+    entryQuality = setupQuality.quality;
+  }
+
+  // ─── Local pre-filters ───
+
+  // RSI overbought for calls — more lenient for crisis-safe longs
+  if (isBullish && !isCrisisLong && analysis.rsi > 70) {
     return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} overbought — chasing extended move, high reversal risk for calls` };
   }
-  if (isBearish && analysis.rsi > 30 && analysis.rsi < 55 && !analysis.bearish) {
+  if (isBullish && isCrisisLong && analysis.rsi > 90) {
+    return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} extremely overbought — even crisis assets need a breather` };
+  }
+
+  // RSI put filter: in crisis, allow aggressive shorting of weakness (no RSI floor)
+  if (!isCrisis && isBearish && analysis.rsi > 30 && analysis.rsi < 55 && !analysis.bearish) {
     return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} neutral with non-bearish EMA stack — weak put setup` };
   }
 
-  // Risk-off regime contradicts bullish calls
-  if (isBullish && regime.mode === "risk-off" && !analysis.aligned) {
+  // Risk-off regime blocks non-crisis bullish calls
+  if (isBullish && regime.mode === "risk-off" && !analysis.aligned && !isCrisisLong) {
     return { skipped: true, reason: `Risk-off regime + misaligned EMAs contradicts bullish call bias` };
-  }
-
-  // Range too wide — extended move, not consolidation
-  const maxRange = minQuality < 30 ? 30 : 15;
-  if (parseFloat(setupQuality.rangePct) > maxRange) {
-    return { skipped: true, reason: `Range ${setupQuality.rangePct}% too wide (max ${maxRange}%) — extended move, not consolidation setup` };
   }
 
   let earningsInfo = { hasEarnings: false, daysUntil: null };
@@ -1666,7 +1746,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     trimLevel: 0,
     bestPnlPct: 0,
     claudeConfidence: claudeResult.confidence,
-    setupQuality: setupQuality.quality,
+    setupQuality: entryQuality,
   };
 
   state.cash -= totalCost;
@@ -1688,14 +1768,25 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
   if (state.positions.length >= maxPos) return null;
   if (analysis.score < cfg.bullEntry && analysis.score > cfg.bearEntry) return null;
 
-  const setupQuality = detectConsolidation(acct.candleCache[ticker]);
-  const minQuality = cfg.minSetupQuality ?? 50;
-  if (setupQuality.quality < minQuality) return { skipped: true, reason: `Low setup quality ${setupQuality.quality}` };
-
   const isBullish = analysis.score >= cfg.bullEntry;
   const isBearish = analysis.score <= cfg.bearEntry;
-  if (isBullish && analysis.rsi > 80) return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} extremely overbought` };
-  if (isBearish && analysis.rsi > 30 && analysis.rsi < 55 && !analysis.bearish) return { skipped: true, reason: `Weak put setup` };
+  const isCrisis = regime.mode === "risk-off" || regime.mode === "choppy";
+  const isCrisisLong = CRISIS_LONGS.has(ticker);
+
+  // Setup quality: momentum in crisis, consolidation in normal
+  if (isCrisis) {
+    const momentum = detectMomentumQuality(acct.candleCache[ticker]);
+    const minMom = Math.max(20, (cfg.minSetupQuality ?? 50) - 20);
+    if (momentum.quality < minMom) return { skipped: true, reason: `Low momentum quality ${momentum.quality} [CRISIS]` };
+  } else {
+    const setupQuality = detectConsolidation(acct.candleCache[ticker]);
+    const minQuality = cfg.minSetupQuality ?? 50;
+    if (setupQuality.quality < minQuality) return { skipped: true, reason: `Low setup quality ${setupQuality.quality}` };
+  }
+
+  if (isBullish && !isCrisisLong && analysis.rsi > 80) return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} extremely overbought` };
+  if (isBullish && isCrisisLong && analysis.rsi > 90) return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} extremely overbought (crisis asset)` };
+  if (!isCrisis && isBearish && analysis.rsi > 30 && analysis.rsi < 55 && !analysis.bearish) return { skipped: true, reason: `Weak put setup` };
 
   let claudeResult = { approve: true, confidence: 70, concerns: [], suggestion: "" };
   if (useClaude && CLAUDE_API_KEY) {
