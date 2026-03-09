@@ -1818,10 +1818,9 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   }
 
   // Only call Claude for high-conviction setups to save API costs
+  // In crisis: everything has extreme scores, so ONLY validate actual reversal patterns
   const shouldCallClaude = !isCrisis                           // always validate in normal markets
-    || isGapReversal                                            // validate U&R/Uppercut patterns
-    || analysis.score >= 80 || analysis.score <= 15             // extreme scores worth validating
-    || (isBullish && isCrisisLong);                             // crisis-safe longs
+    || isGapReversal;                                           // only validate U&R/Uppercut patterns in crisis
 
   let claudeResult = { approve: true, confidence: 70, concerns: [], suggestion: "" };
   if (shouldCallClaude) {
