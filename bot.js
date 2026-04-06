@@ -1633,25 +1633,6 @@ Rules:
 
 async function validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime) {
   const cfg = acct.config;
-  const isCrisis = regime.mode === "risk-off" || regime.mode === "choppy";
-
-  const crisisContext = isCrisis ? `
-CRISIS MODE ACTIVE — The strategy for this regime is:
-- BUY gap downs: price gaps down, undercuts support, then reclaims = bullish reversal (Undercut & Rally). These work best on stocks with the biggest bases.
-- SELL gap ups into declining EMAs: relief rallies fail at overhead resistance = bearish (Uppercut/Failed Breakout).
-- Oversold RSI is EXPECTED and DESIRED for U&R call setups — do NOT reject calls just because RSI is low.
-- In crisis, momentum and reversal patterns matter more than consolidation→breakout.
-- Be more lenient with approval. The pre-filters have already validated the setup pattern.` : '';
-
-  const normalEval = `1. Is this a quality setup (consolidation→breakout) or chasing an extended move?
-2. Any obvious risks for holding this 7-day options contract?
-3. Is the sector/theme strong enough to support this swing?`;
-
-  const crisisEval = `1. Does this reversal setup have conviction (volume, wick pattern, reclaim strength)?
-2. Is there a clear catalyst or regime shift that could invalidate the trade within 7 days?
-3. Is the risk/reward reasonable for a short-term swing in volatile conditions?
-NOTE: Oversold RSI on calls or overbought RSI on puts is EXPECTED in crisis reversal setups — it is NOT a reason to reject.`;
-
   const promptText = `You are a trading bot's risk management system. Evaluate this potential options trade:
 
 Ticker: ${ticker}
@@ -1664,11 +1645,12 @@ Setup Quality: ${setupQuality.quality}/100 (${setupQuality.tight ? 'tight base' 
 Market Regime: ${regime.label}
 ${earningsInfo.hasEarnings ? `EARNINGS in ${earningsInfo.daysUntil} days (${earningsInfo.date})` : 'No upcoming earnings within 3 days'}
 Contract: 7DTE options, 1 strike OTM
-${crisisContext}
 ${cfg.customPromptSuffix ? `\nAdditional context: ${cfg.customPromptSuffix}` : ''}
 
 Evaluate:
-${isCrisis ? crisisEval : normalEval}
+1. Is this a quality setup (consolidation→breakout) or chasing an extended move?
+2. Any obvious risks for holding this 7-day options contract?
+3. Is the sector/theme strong enough to support this swing?
 
 Respond with ONLY valid JSON (no markdown, no backticks):
 {"approve": true, "confidence": 75, "concerns": [], "suggestion": "brief advice"}`;
@@ -1689,10 +1671,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   const state = acct.state;
   const cfg = acct.config;
   if (state.positions.some(p => p.ticker === ticker)) return null;
-  // Protect starting cash once we've taken profits, but allow new accounts to deploy capital
-  const hasRealizedProfits = (state.realizedPnl || 0) > 0;
-  const cashFloor = hasRealizedProfits ? cfg.startingCash : 100;
-  if (state.cash < cashFloor) return null;
+  if (state.cash < cfg.startingCash) return null;
 
   // Early exit: skip tickers that aren't actionable (WAIT zone) before any expensive checks
   if (analysis.score < cfg.bullEntry && analysis.score > cfg.bearEntry) return null;
@@ -1703,91 +1682,32 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     return { skipped: true, reason: `EOD freeze (${etHour.toFixed(1)} >= ${EOD_FREEZE_HOUR}h, score ${analysis.score} not extreme enough)` };
   }
 
+  const setupQuality = detectConsolidation(acct.candleCache[ticker]);
+  const minQuality = acct.config.minSetupQuality ?? 50;
+  if (setupQuality.quality < minQuality) {
+    return { skipped: true, reason: `Low setup quality ${setupQuality.quality}/100 (need >=${minQuality}, range ${setupQuality.rangePct}%, need consolidation→breakout)` };
+  }
+
+  // ─── Local pre-filters (catch what Claude would reject without API call) ───
   const isBullish = analysis.score >= cfg.bullEntry;
   const isBearish = analysis.score <= cfg.bearEntry;
-  const isCrisis = regime.mode === "risk-off" || regime.mode === "choppy";
-  const isCrisisLong = CRISIS_LONGS.has(ticker);
 
-  // ─── Gap & Reversal Detection (crisis regime strategy) ───
-  const candles = acct.candleCache[ticker];
-  const gap = detectGap(candles);
-  const ur = detectUndercutReclaim(candles);
-  const uc = detectUppercut(candles);
-  const base = measureBaseSize(candles);
-  let isGapReversal = false; // flag to override risk-off blocker
-
-  // ─── Setup Quality: consolidation in normal markets, momentum/reversals in crisis ───
-  let entryQuality = 0;
-  if (isCrisis) {
-    // Crisis strategy: buy gap downs (U&R), sell gap ups into declining EMAs (Uppercut)
-    // U&R on gap down = high-conviction bullish reversal
-    if (isBullish && ur.detected && gap.type === "gap_down") {
-      const baseBonus = Math.min(20, Math.round(base.days * 0.8)); // bigger base = bigger bonus
-      entryQuality = Math.min(100, ur.quality + baseBonus);
-      isGapReversal = true;
-      log(acct, `CRISIS GAP-DOWN U&R: ${ticker} gap -${gap.pct}% → reclaim! U&R ${ur.quality}/100, base ${base.days}d (${base.rangePct}% range), total quality ${entryQuality} — ${ur.reasons.slice(0, 3).join(", ")}`);
-    }
-    // U&R without gap — still valid in crisis but slightly lower priority
-    else if (isBullish && ur.detected) {
-      const baseBonus = Math.min(15, Math.round(base.days * 0.6));
-      entryQuality = Math.min(100, ur.quality + baseBonus);
-      isGapReversal = true;
-      log(acct, `CRISIS U&R: ${ticker} undercut & reclaim ${ur.quality}/100, base ${base.days}d — ${ur.reasons.slice(0, 3).join(", ")}`);
-    }
-    // Uppercut on gap up into declining EMAs = high-conviction bearish
-    else if (isBearish && uc.detected && gap.type === "gap_up" && analysis.bearish) {
-      const baseBonus = Math.min(15, Math.round(base.days * 0.6));
-      entryQuality = Math.min(100, uc.quality + baseBonus);
-      log(acct, `CRISIS GAP-UP UPPERCUT: ${ticker} gap +${gap.pct}% → failed at declining EMAs! ${uc.quality}/100 — ${uc.reasons.slice(0, 3).join(", ")}`);
-    }
-    // Uppercut without gap — sell the rip into declining EMAs
-    else if (isBearish && uc.detected && analysis.bearish) {
-      entryQuality = uc.quality;
-      log(acct, `CRISIS UPPERCUT: ${ticker} failed breakout into resistance ${uc.quality}/100 — ${uc.reasons.slice(0, 3).join(", ")}`);
-    }
-    // Fallback: momentum quality (original crisis logic)
-    else {
-      const momentum = detectMomentumQuality(candles);
-      const minMom = Math.max(20, (acct.config.minSetupQuality ?? 50) - 20);
-      if (momentum.quality < minMom) {
-        return { skipped: true, reason: `Low momentum quality ${momentum.quality}/100 (need >=${minMom}, move ${momentum.movePct}%, vol ${momentum.volRatio}x) [CRISIS MODE]` };
-      }
-      entryQuality = momentum.quality;
-      log(acct, `CRISIS MOMENTUM: ${ticker} quality ${momentum.quality}/100 (${momentum.direction} ${momentum.movePct}%, vol ${momentum.volRatio}x, ${momentum.trendDays} trend days)`);
-    }
-  } else {
-    // Normal mode: require consolidation→breakout pattern
-    const setupQuality = detectConsolidation(candles);
-    const minQuality = acct.config.minSetupQuality ?? 50;
-    if (setupQuality.quality < minQuality) {
-      return { skipped: true, reason: `Low setup quality ${setupQuality.quality}/100 (need >=${minQuality}, range ${setupQuality.rangePct}%, need consolidation→breakout)` };
-    }
-    // Range too wide — extended move, not consolidation (normal mode only)
-    const maxRange = minQuality < 30 ? 30 : 15;
-    if (parseFloat(setupQuality.rangePct) > maxRange) {
-      return { skipped: true, reason: `Range ${setupQuality.rangePct}% too wide (max ${maxRange}%) — extended move, not consolidation setup` };
-    }
-    entryQuality = setupQuality.quality;
-  }
-
-  // ─── Local pre-filters ───
-
-  // RSI overbought for calls — more lenient for crisis-safe longs and gap reversals
-  if (isBullish && !isCrisisLong && !isGapReversal && analysis.rsi > 70) {
+  if (isBullish && analysis.rsi > 70) {
     return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} overbought — chasing extended move, high reversal risk for calls` };
   }
-  if (isBullish && (isCrisisLong || isGapReversal) && analysis.rsi > 90) {
-    return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} extremely overbought — even reversal setups need a breather` };
-  }
-
-  // RSI put filter: in crisis, allow aggressive shorting of weakness (no RSI floor)
-  if (!isCrisis && isBearish && analysis.rsi > 30 && analysis.rsi < 55 && !analysis.bearish) {
+  if (isBearish && analysis.rsi > 30 && analysis.rsi < 55 && !analysis.bearish) {
     return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} neutral with non-bearish EMA stack — weak put setup` };
   }
 
-  // Risk-off regime blocks non-crisis bullish calls — UNLESS it's a gap-down U&R reversal
-  if (isBullish && regime.mode === "risk-off" && !analysis.aligned && !isCrisisLong && !isGapReversal) {
+  // Risk-off regime contradicts bullish calls
+  if (isBullish && regime.mode === "risk-off" && !analysis.aligned) {
     return { skipped: true, reason: `Risk-off regime + misaligned EMAs contradicts bullish call bias` };
+  }
+
+  // Range too wide — extended move, not consolidation
+  const maxRange = minQuality < 30 ? 30 : 15;
+  if (parseFloat(setupQuality.rangePct) > maxRange) {
+    return { skipped: true, reason: `Range ${setupQuality.rangePct}% too wide (max ${maxRange}%) — extended move, not consolidation setup` };
   }
 
   let earningsInfo = { hasEarnings: false, daysUntil: null };
@@ -1799,42 +1719,12 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     return { skipped: true, reason: `Earnings in ${earningsInfo.daysUntil} days (${earningsInfo.date}) — too risky for 7DTE options` };
   }
 
-  // ─── Local pre-filters that don't need Claude (save API calls) ───
-  if (isCrisis && !isGapReversal) {
-    // In crisis without a U&R/Uppercut pattern: apply strict local filters instead of burning Claude calls
-    // Puts on deeply oversold stocks = likely to bounce, skip
-    if (isBearish && analysis.rsi < 30) {
-      return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} deeply oversold — likely to bounce, not chasing puts [LOCAL]` };
-    }
-    // Puts with weak score and mixed EMAs = no conviction
-    if (isBearish && analysis.score > 25 && !analysis.bearish) {
-      return { skipped: true, reason: `Score ${analysis.score} with mixed EMAs — weak put conviction without reversal pattern [LOCAL]` };
-    }
-    // Bullish calls blocked by risk-off without gap reversal already filtered above
-    // Weak scores in crisis without pattern = skip (score barely past threshold)
-    if (analysis.score > 25 && analysis.score < 40) {
-      return { skipped: true, reason: `Score ${analysis.score} in no-man's-land — too weak for conviction without U&R/Uppercut pattern [LOCAL]` };
-    }
-  }
-
-  // Only call Claude for high-conviction setups to save API costs
-  // In crisis: everything has extreme scores, so ONLY validate actual reversal patterns
-  const shouldCallClaude = !isCrisis                           // always validate in normal markets
-    || isGapReversal;                                           // only validate U&R/Uppercut patterns in crisis
-
   let claudeResult = { approve: true, confidence: 70, concerns: [], suggestion: "" };
-  if (shouldCallClaude) {
-    try {
-      const qualityObj = isCrisis
-        ? { quality: entryQuality, tight: false, breakingOut: false, volDeclining: false, rangePct: "N/A" }
-        : detectConsolidation(acct.candleCache[ticker]);
-      claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, qualityObj, earningsInfo, regime);
-      log(acct, `CLAUDE VALIDATE ${ticker}: ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%) — ${claudeResult.suggestion}${claudeResult.concerns.length ? ' | Concerns: ' + claudeResult.concerns.join(', ') : ''}`);
-    } catch (e) {
-      log(acct, `CLAUDE VALIDATE ${ticker}: Error — ${e.message}, proceeding anyway`);
-    }
-  } else {
-    log(acct, `SKIP CLAUDE for ${ticker}: crisis momentum trade, using local filters only`);
+  try {
+    claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime);
+    log(acct, `CLAUDE VALIDATE ${ticker}: ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%) — ${claudeResult.suggestion}${claudeResult.concerns.length ? ' | Concerns: ' + claudeResult.concerns.join(', ') : ''}`);
+  } catch (e) {
+    log(acct, `CLAUDE VALIDATE ${ticker}: Error — ${e.message}, proceeding anyway`);
   }
 
   if (!claudeResult.approve) {
@@ -1881,7 +1771,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     trimLevel: 0,
     bestPnlPct: 0,
     claudeConfidence: claudeResult.confidence,
-    setupQuality: entryQuality,
+    setupQuality: setupQuality.quality,
   };
 
   state.cash -= totalCost;
@@ -1897,9 +1787,7 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
   const cfg = acct.config;
   if (state.positions.some(p => p.ticker === ticker)) return null;
   // In sim mode, allow trading as long as we have enough for at least 1 contract
-  const hasRealizedProfits = (state.realizedPnl || 0) > 0;
-  const cashFloor = hasRealizedProfits ? cfg.startingCash : 100;
-  if (state.cash < cashFloor) return null;
+  if (state.cash < 10) return null;
   // Limit concurrent positions to avoid overexposure
   const maxPos = cfg.maxPositions || 5;
   if (state.positions.length >= maxPos) return null;
@@ -1907,49 +1795,22 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
 
   const isBullish = analysis.score >= cfg.bullEntry;
   const isBearish = analysis.score <= cfg.bearEntry;
-  const isCrisis = regime.mode === "risk-off" || regime.mode === "choppy";
-  const isCrisisLong = CRISIS_LONGS.has(ticker);
 
-  // Setup quality: gap reversals + momentum in crisis, consolidation in normal
   const candles = acct.candleCache[ticker];
-  const gap = detectGap(candles);
-  const ur = detectUndercutReclaim(candles);
-  const uc = detectUppercut(candles);
-  const base = measureBaseSize(candles);
-  let entryQuality = 0;
-  let isGapReversal = false;
+  const sq = detectConsolidation(candles);
+  const minQuality = cfg.minSetupQuality ?? 50;
+  if (sq.quality < minQuality) return { skipped: true, reason: `Low setup quality ${sq.quality}/100` };
 
-  if (isCrisis) {
-    if (isBullish && ur.detected && gap.type === "gap_down") {
-      entryQuality = Math.min(100, ur.quality + Math.min(20, Math.round(base.days * 0.8)));
-      isGapReversal = true;
-    } else if (isBullish && ur.detected) {
-      entryQuality = Math.min(100, ur.quality + Math.min(15, Math.round(base.days * 0.6)));
-      isGapReversal = true;
-    } else if (isBearish && uc.detected && analysis.bearish) {
-      entryQuality = Math.min(100, uc.quality + Math.min(15, Math.round(base.days * 0.6)));
-    } else {
-      const momentum = detectMomentumQuality(candles);
-      const minMom = Math.max(20, (cfg.minSetupQuality ?? 50) - 20);
-      if (momentum.quality < minMom) return { skipped: true, reason: `Low momentum quality ${momentum.quality} [CRISIS]` };
-      entryQuality = momentum.quality;
-    }
-  } else {
-    const sq = detectConsolidation(candles);
-    const minQuality = cfg.minSetupQuality ?? 50;
-    if (sq.quality < minQuality) return { skipped: true, reason: `Low setup quality ${sq.quality}` };
-    entryQuality = sq.quality;
-  }
+  if (isBullish && analysis.rsi > 70) return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} overbought` };
+  if (isBearish && analysis.rsi > 30 && analysis.rsi < 55 && !analysis.bearish) return { skipped: true, reason: `Weak put setup` };
+  if (isBullish && regime.mode === "risk-off" && !analysis.aligned) return { skipped: true, reason: `Risk-off + misaligned EMAs` };
+  const maxRange = minQuality < 30 ? 30 : 15;
+  if (parseFloat(sq.rangePct) > maxRange) return { skipped: true, reason: `Range too wide ${sq.rangePct}%` };
 
-  if (isBullish && !isCrisisLong && !isGapReversal && analysis.rsi > 80) return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} extremely overbought` };
-  if (isBullish && (isCrisisLong || isGapReversal) && analysis.rsi > 90) return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} extremely overbought` };
-  if (!isCrisis && isBearish && analysis.rsi > 30 && analysis.rsi < 55 && !analysis.bearish) return { skipped: true, reason: `Weak put setup` };
-
-  const qualityObj = { quality: entryQuality, tight: false, breakingOut: false, volDeclining: false, rangePct: "N/A" };
   let claudeResult = { approve: true, confidence: 70, concerns: [], suggestion: "" };
   if (useClaude && CLAUDE_API_KEY) {
     try {
-      claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, qualityObj, { hasEarnings: false }, regime);
+      claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, sq, { hasEarnings: false }, regime);
       if (!claudeResult.approve) return { skipped: true, reason: `Claude rejected: ${claudeResult.suggestion}` };
     } catch (e) { /* proceed */ }
   }
@@ -1977,7 +1838,7 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
     openTime: acct._simNow || Date.now(),
     trimLevel: 0, bestPnlPct: 0,
     claudeConfidence: claudeResult.confidence,
-    setupQuality: entryQuality,
+    setupQuality: sq.quality,
   };
   state.cash -= totalCost;
   state.positions.push(position);
