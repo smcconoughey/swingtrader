@@ -5,6 +5,7 @@ import readline from "readline";
 import http from "http";
 import { TwitterApi } from "twitter-api-v2";
 import { Resvg } from "@resvg/resvg-js";
+import webpush from "web-push";
 
 // ─── Technical Analysis Engine (ported from live-swing-simulator.jsx) ───
 
@@ -557,29 +558,57 @@ function logTrade(entry) {
 const ENABLE_TWEETS = process.env.ENABLE_TWEETS === "true";
 const X_DAILY_CAP = parseInt(process.env.X_DAILY_CAP) || 30;
 
-// ─── Pushover Push Notifications ───
-// Set PUSHOVER_USER_KEY and PUSHOVER_APP_TOKEN in .env to enable phone alerts.
-// Get them at https://pushover.net — free API, one-time $5 app purchase.
-const PUSHOVER_USER_KEY = (process.env.PUSHOVER_USER_KEY || "").trim();
-const PUSHOVER_APP_TOKEN = (process.env.PUSHOVER_APP_TOKEN || "").trim();
+// ─── Chrome Web Push Notifications ───
+// No external accounts needed — browser-native push via the dashboard.
+// VAPID keys are auto-generated on first run and saved to vapid-keys.json.
 
-async function sendPush(title, message, priority = 0) {
-  if (!PUSHOVER_USER_KEY || !PUSHOVER_APP_TOKEN) return;
-  try {
-    await fetch("https://api.pushover.net/1/messages.json", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        token: PUSHOVER_APP_TOKEN,
-        user: PUSHOVER_USER_KEY,
-        title,
-        message,
-        priority, // -1 = quiet, 0 = normal, 1 = high (bypasses quiet hours)
-        sound: priority >= 1 ? "cashregister" : "pushover",
-      }),
-    });
-  } catch (e) {
-    console.log(`  [PUSH] Notification error: ${e.message}`);
+const VAPID_FILE = "vapid-keys.json";
+const PUSH_SUBS_FILE = "push-subscriptions.json";
+let _vapidKeys = null;
+let pushSubscriptions = [];
+
+function getVapidKeys() {
+  if (_vapidKeys) return _vapidKeys;
+  if (fs.existsSync(VAPID_FILE)) {
+    _vapidKeys = JSON.parse(fs.readFileSync(VAPID_FILE, "utf8"));
+  } else {
+    _vapidKeys = webpush.generateVAPIDKeys();
+    fs.writeFileSync(VAPID_FILE, JSON.stringify(_vapidKeys));
+    console.log("  [PUSH] Generated VAPID keys → vapid-keys.json");
+  }
+  webpush.setVapidDetails(
+    "mailto:bot@localhost",
+    _vapidKeys.publicKey,
+    _vapidKeys.privateKey
+  );
+  return _vapidKeys;
+}
+
+function loadPushSubs() {
+  if (fs.existsSync(PUSH_SUBS_FILE)) {
+    try { pushSubscriptions = JSON.parse(fs.readFileSync(PUSH_SUBS_FILE, "utf8")); } catch { }
+  }
+}
+
+function savePushSubs() {
+  fs.writeFileSync(PUSH_SUBS_FILE, JSON.stringify(pushSubscriptions, null, 2));
+}
+
+async function sendPush(title, message, urgent = false) {
+  if (pushSubscriptions.length === 0) return;
+  getVapidKeys(); // ensure webpush is initialized
+  const payload = JSON.stringify({ title, body: message, urgent });
+  const dead = [];
+  for (const sub of pushSubscriptions) {
+    try {
+      await webpush.sendNotification(sub, payload);
+    } catch (e) {
+      if (e.statusCode === 410 || e.statusCode === 404) dead.push(sub.endpoint);
+    }
+  }
+  if (dead.length) {
+    pushSubscriptions = pushSubscriptions.filter(s => !dead.includes(s.endpoint));
+    savePushSubs();
   }
 }
 let xClient = null;
@@ -1926,7 +1955,7 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
     sendPush(
       `${emoji} ${label}: ${pos.ticker} ${pos.type.toUpperCase()} $${pos.strike} [${acct.name}]`,
       `P&L: ${pnlDollar >= 0 ? "+" : ""}$${pnlDollar.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${(pnlPct * 100).toFixed(0)}%)\n${reason}`,
-      pnlDollar >= 0 ? 0 : 1 // high priority for stop losses
+      pnlDollar < 0 // urgent only for stop losses
     ).catch(() => {});
     tweetTradeExit(acct, pos, trade).catch(e => console.log(`  [X] Exit tweet error: ${e.message}`));
   }
@@ -2480,6 +2509,54 @@ async function pollLive() {
 setInterval(pollLive, 5000);
 pollLive();
 </script>
+<script>
+function urlBase64ToUint8Array(b64) {
+  const pad = '='.repeat((4 - b64.length % 4) % 4);
+  const base64 = (b64 + pad).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(base64);
+  return Uint8Array.from(raw, c => c.charCodeAt(0));
+}
+async function subscribeToPush() {
+  const btn = document.getElementById('push-btn');
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+    alert('Push notifications are not supported in this browser. Use Chrome or Edge.');
+    return;
+  }
+  try {
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') { alert('Notification permission denied.'); return; }
+    if (btn) { btn.textContent = '🔔 Subscribing…'; btn.disabled = true; }
+    const reg = await navigator.serviceWorker.register('/sw.js');
+    await navigator.serviceWorker.ready;
+    const keyRes = await fetch('/api/push/vapid-key');
+    const { publicKey } = await keyRes.json();
+    const sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(publicKey)
+    });
+    await fetch('/api/push/subscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sub)
+    });
+    if (btn) { btn.textContent = '🔔 On'; btn.style.borderColor = '#00ff88'; btn.style.color = '#00ff88'; btn.disabled = false; }
+    console.log('[Push] Subscribed successfully');
+  } catch(e) {
+    console.error('[Push] Error:', e);
+    if (btn) { btn.textContent = '🔔 Notify'; btn.disabled = false; }
+    alert('Push subscription failed: ' + e.message);
+  }
+}
+// Auto-check if already subscribed on page load
+navigator.serviceWorker && navigator.serviceWorker.ready.then(reg => {
+  reg.pushManager.getSubscription().then(sub => {
+    if (sub) {
+      const btn = document.getElementById('push-btn');
+      if (btn) { btn.textContent = '🔔 On'; btn.style.borderColor = '#00ff88'; btn.style.color = '#00ff88'; }
+    }
+  });
+}).catch(() => {});
+</script>
 
 </body></html>`;
 }
@@ -2776,6 +2853,7 @@ function accountActionsHTML(acctId) {
     <form method="POST" action="/api/accounts/${acctId}/pause" style="display:inline">
       <button type="submit" class="acct-btn ${acct.paused ? "resume" : "pause"}">${acct.paused ? "▶ Resume" : "⏸ Pause"}</button>
     </form>
+    <button type="button" class="acct-btn" id="push-btn" onclick="subscribeToPush()" title="Get push notifications for every trade">🔔 Notify</button>
     ${acctId !== "default" ? `<form method="POST" action="/api/accounts/${acctId}/delete" style="display:inline" onsubmit="return confirm('Delete account ${acct.name}? This cannot be undone.')">
       <button type="submit" class="acct-btn delete">🗑 Delete</button>
     </form>` : ""}
@@ -3386,6 +3464,63 @@ function startDashboard(defaultAcct, apiKey) {
       return;
     }
 
+    // ─── Web Push endpoints ───
+
+    if (pathname === "/sw.js") {
+      res.writeHead(200, { "Content-Type": "application/javascript", "Service-Worker-Allowed": "/" });
+      res.end(`
+self.addEventListener('push', e => {
+  const d = e.data ? e.data.json() : { title: 'Bot alert', body: '' };
+  e.waitUntil(self.registration.showNotification(d.title, {
+    body: d.body,
+    icon: '/favicon.ico',
+    requireInteraction: !!d.urgent,
+    tag: 'bot-trade',
+  }));
+});
+self.addEventListener('notificationclick', e => {
+  e.notification.close();
+  e.waitUntil(clients.matchAll({ type: 'window' }).then(cs => {
+    for (const c of cs) if (c.url === '/' && 'focus' in c) return c.focus();
+    if (clients.openWindow) return clients.openWindow('/');
+  }));
+});
+`);
+      return;
+    }
+
+    if (pathname === "/api/push/vapid-key") {
+      const keys = getVapidKeys();
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ publicKey: keys.publicKey }));
+      return;
+    }
+
+    if (req.method === "POST" && pathname === "/api/push/subscribe") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", () => {
+        try {
+          const sub = JSON.parse(body);
+          if (sub && sub.endpoint) {
+            // deduplicate by endpoint
+            if (!pushSubscriptions.find(s => s.endpoint === sub.endpoint)) {
+              pushSubscriptions.push(sub);
+              savePushSubs();
+              console.log(`  [PUSH] New subscription registered (total: ${pushSubscriptions.length})`);
+            }
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: true }));
+          } else {
+            res.writeHead(400); res.end("Bad subscription");
+          }
+        } catch {
+          res.writeHead(400); res.end("Invalid JSON");
+        }
+      });
+      return;
+    }
+
     // ─── Simulator page ───
     const simParam = url.searchParams.get("sim");
     if (simParam) {
@@ -3597,7 +3732,7 @@ async function runCycle(acct, sharedQuotes, apiKey) {
       sendPush(
         `🤖 ${result.ticker} ${result.type.toUpperCase()} $${result.strike} [${acct.name}]`,
         `Entry: $${result.entryPremium.toFixed(2)} · ${result.dte}d · ${result.qty}x\nTP: $${tpPrice} (+${((acct.config.profitTarget || 0.40) * 100).toFixed(0)}%) · SL: $${slPrice}\nScore: ${entryA?.score ?? '?'}/100 · Setup: ${result.setupQuality}/100\n${topSignals}`,
-        1 // high priority — bypass quiet hours for trade alerts
+        true // urgent
       ).catch(() => {});
       // Tweet trade entry with chart
       const st = shortTermAnalyses[ticker];
@@ -4064,6 +4199,9 @@ async function main() {
 
   // Load accounts (migrates from legacy state.json if needed)
   loadAccounts();
+
+  // Load saved push subscriptions
+  loadPushSubs();
 
   // Get API key from env or first account's state, or prompt
   let apiKey = process.env.FINNHUB_API_KEY || "";
