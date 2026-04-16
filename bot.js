@@ -285,6 +285,20 @@ function optGreeks(spot, strike, dte, iv, type = "call") {
 const REGIME_TICKERS = ["SPY", "QQQ"];
 const WATCHLIST_REFRESH_MS = 4 * 60 * 60_000; // refresh every 4 hours
 
+// ─── SRxTrades Curated Watchlist ───
+// Pinned names from @SRxTrades — always analyzed regardless of dynamic screener.
+// Theme: Data Centers (physical AI infrastructure) + Space + key momentum names.
+const SR_WATCHLIST = [
+  // Data center / physical AI infrastructure
+  "CIFR", "WULF", "HUT", "NBIS", "WGMI",
+  // Space names
+  "BKSY", "PL", "LUNR",
+  // AI / semiconductor
+  "ARM", "CRWV",
+  // Other SRxTrades positions / watchlist
+  "OPTX",
+];
+
 async function fetchDynamicWatchlist() {
   const symbols = new Set(REGIME_TICKERS);
   const headers = { "User-Agent": "Mozilla/5.0" };
@@ -348,7 +362,7 @@ async function refreshWatchlist(acct) {
   );
 
   const hinted = acct.tickers.filter(t => !filtered.includes(t));
-  acct.dynamicWatchlist = [...new Set([...REGIME_TICKERS, ...filtered, ...hinted])];
+  acct.dynamicWatchlist = [...new Set([...REGIME_TICKERS, ...SR_WATCHLIST, ...filtered, ...hinted])];
 
   log(acct, `WATCHLIST: ${acct.dynamicWatchlist.length} tickers — ${acct.dynamicWatchlist.slice(0, 15).join(", ")}${acct.dynamicWatchlist.length > 15 ? "..." : ""}`);
   acct.tickers = [...acct.dynamicWatchlist];
@@ -542,6 +556,32 @@ function logTrade(entry) {
 
 const ENABLE_TWEETS = process.env.ENABLE_TWEETS === "true";
 const X_DAILY_CAP = parseInt(process.env.X_DAILY_CAP) || 30;
+
+// ─── Pushover Push Notifications ───
+// Set PUSHOVER_USER_KEY and PUSHOVER_APP_TOKEN in .env to enable phone alerts.
+// Get them at https://pushover.net — free API, one-time $5 app purchase.
+const PUSHOVER_USER_KEY = (process.env.PUSHOVER_USER_KEY || "").trim();
+const PUSHOVER_APP_TOKEN = (process.env.PUSHOVER_APP_TOKEN || "").trim();
+
+async function sendPush(title, message, priority = 0) {
+  if (!PUSHOVER_USER_KEY || !PUSHOVER_APP_TOKEN) return;
+  try {
+    await fetch("https://api.pushover.net/1/messages.json", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        token: PUSHOVER_APP_TOKEN,
+        user: PUSHOVER_USER_KEY,
+        title,
+        message,
+        priority, // -1 = quiet, 0 = normal, 1 = high (bypasses quiet hours)
+        sound: priority >= 1 ? "cashregister" : "pushover",
+      }),
+    });
+  } catch (e) {
+    console.log(`  [PUSH] Notification error: ${e.message}`);
+  }
+}
 let xClient = null;
 let xTweetCount = 0;
 let xTweetDate = null;
@@ -1489,6 +1529,7 @@ function getActiveHintsSummary(acct) {
 // ─── Auto News Scanner (runs every 3 hours) ───
 
 const NEWS_INTERVAL = 3 * 60 * 60_000; // 3 hours
+let globalLastNewsScan = 0; // shared across all accounts to avoid duplicate Claude calls
 
 async function fetchMarketNews(apiKey, tickers) {
   const headlines = [];
@@ -1526,8 +1567,9 @@ function todayStr() {
 
 async function runNewsScan(acct, apiKey) {
   const now = Date.now();
-  if (now - acct.lastNewsScan < NEWS_INTERVAL) return;
-  acct.lastNewsScan = now;
+  if (now - globalLastNewsScan < NEWS_INTERVAL) return;
+  globalLastNewsScan = now;
+  acct.lastNewsScan = now; // keep per-account field in sync for display
 
   const state = acct.state;
   log(acct, "NEWS SCAN: Fetching latest market headlines...");
@@ -1671,7 +1713,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   const state = acct.state;
   const cfg = acct.config;
   if (state.positions.some(p => p.ticker === ticker)) return null;
-  if (state.cash < cfg.startingCash) return null;
+  if (state.cash < 100) return null;
 
   // Early exit: skip tickers that aren't actionable (WAIT zone) before any expensive checks
   if (analysis.score < cfg.bullEntry && analysis.score > cfg.bearEntry) return null;
@@ -1692,8 +1734,10 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   const isBullish = analysis.score >= cfg.bullEntry;
   const isBearish = analysis.score <= cfg.bearEntry;
 
-  if (isBullish && analysis.rsi > 70) {
-    return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} overbought — chasing extended move, high reversal risk for calls` };
+  // SRxTrades style: relative strength names often have RSI 70-90 on 8 EMA taps — that IS the setup.
+  // Only block truly parabolic RSI that indicates exhaustion, not healthy momentum.
+  if (isBullish && analysis.rsi > 85 && !analysis.aligned) {
+    return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} parabolic with misaligned EMAs — exhaustion risk, not a healthy strength setup` };
   }
   if (isBearish && analysis.rsi > 30 && analysis.rsi < 55 && !analysis.bearish) {
     return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} neutral with non-bearish EMA stack — weak put setup` };
@@ -1874,8 +1918,18 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
     log(acct, `PDT CHECK: ${dtUsed}/3 day trades used (rolling 5 days)`);
   }
 
-  // Tweet trade exit
-  if (!acct._simMode) tweetTradeExit(acct, pos, trade).catch(e => console.log(`  [X] Exit tweet error: ${e.message}`));
+  // Push notification — exit alert
+  if (!acct._simMode) {
+    const isTrim = qty < pos.qty;
+    const emoji = pnlDollar >= 0 ? "✅" : "🛑";
+    const label = isTrim ? "TRIM" : (pnlDollar >= 0 ? "EXIT TP" : "EXIT SL");
+    sendPush(
+      `${emoji} ${label}: ${pos.ticker} ${pos.type.toUpperCase()} $${pos.strike} [${acct.name}]`,
+      `P&L: ${pnlDollar >= 0 ? "+" : ""}$${pnlDollar.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${(pnlPct * 100).toFixed(0)}%)\n${reason}`,
+      pnlDollar >= 0 ? 0 : 1 // high priority for stop losses
+    ).catch(() => {});
+    tweetTradeExit(acct, pos, trade).catch(e => console.log(`  [X] Exit tweet error: ${e.message}`));
+  }
 
   return trade;
 }
@@ -3355,7 +3409,11 @@ async function fetchSharedMarketData(apiKey, sharedCandleCache) {
   // Collect union of all accounts' tickers
   const allTickers = new Set();
   for (const [, acct] of accounts) {
-    if (acct.paused) continue;
+    if (acct.paused) {
+      // Still need quotes for open positions so exits can fire
+      for (const p of acct.state.positions) allTickers.add(p.ticker);
+      continue;
+    }
     // Refresh watchlist for each account first
     await refreshWatchlist(acct);
     for (const t of getActiveTickers(acct)) allTickers.add(t);
@@ -3531,11 +3589,20 @@ async function runCycle(acct, sharedQuotes, apiKey) {
       }
     } else if (result && result.ticker) {
       log(acct, `TRADE: BUY ${result.qty}x ${result.ticker} $${result.strike} ${result.type.toUpperCase()} ${result.dte}d @ $${result.entryPremium.toFixed(2)} ($${result.cost.toFixed(0)}) [setup:${result.setupQuality}/100 claude:${result.claudeConfidence}%]`);
+      // Push notification — replicate this trade
+      const entryA = analyses[ticker];
+      const topSignals = entryA?.sigs?.slice(0, 2).map(s => s.text).join(" · ") || "";
+      const tpPrice = (result.entryPremium * (1 + (acct.config.profitTarget || 0.40))).toFixed(2);
+      const slPrice = (result.entryPremium * (1 + (acct.config.stopLoss || -0.35))).toFixed(2);
+      sendPush(
+        `🤖 ${result.ticker} ${result.type.toUpperCase()} $${result.strike} [${acct.name}]`,
+        `Entry: $${result.entryPremium.toFixed(2)} · ${result.dte}d · ${result.qty}x\nTP: $${tpPrice} (+${((acct.config.profitTarget || 0.40) * 100).toFixed(0)}%) · SL: $${slPrice}\nScore: ${entryA?.score ?? '?'}/100 · Setup: ${result.setupQuality}/100\n${topSignals}`,
+        1 // high priority — bypass quiet hours for trade alerts
+      ).catch(() => {});
       // Tweet trade entry with chart
-      const a = analyses[ticker];
       const st = shortTermAnalyses[ticker];
       const q = quotes[ticker];
-      tweetTradeEntry(acct, result, a, st, q).catch(e => console.log(`  [X] Entry tweet error: ${e.message}`));
+      tweetTradeEntry(acct, result, entryA, st, q).catch(e => console.log(`  [X] Entry tweet error: ${e.message}`));
     }
   }
 
@@ -3560,6 +3627,63 @@ async function runCycle(acct, sharedQuotes, apiKey) {
   if (dash.portfolioHistory.length > 500) dash.portfolioHistory.shift();
 
   saveAccounts();
+}
+
+// ─── Paused Cycle (exits only — no LLM calls, no new entries) ───
+
+async function runPausedCycle(acct, sharedQuotes) {
+  const state = acct.state;
+  const cfg = acct.config;
+  const dash = acct.dashboard;
+
+  if (state.positions.length === 0) return;
+
+  const positionTickers = state.positions.map(p => p.ticker);
+  const quotes = {};
+  for (const ticker of positionTickers) {
+    if (sharedQuotes[ticker]) quotes[ticker] = sharedQuotes[ticker];
+  }
+
+  // Update candle cache latest values from quotes
+  for (const ticker of positionTickers) {
+    if (acct.candleCache[ticker] && quotes[ticker]) {
+      const q = quotes[ticker];
+      const last = acct.candleCache[ticker][acct.candleCache[ticker].length - 1];
+      if (last) {
+        last.c = q.c;
+        last.h = Math.max(last.h, q.h);
+        last.l = Math.min(last.l, q.l);
+      }
+    }
+  }
+
+  cleanDayTrades(state);
+
+  // Build minimal analyses for signal-based exits
+  const analyses = {};
+  for (const ticker of positionTickers) {
+    const candles = acct.candleCache[ticker];
+    if (candles) {
+      const a = runAnalysis(candles);
+      if (a) analyses[ticker] = a;
+    }
+  }
+
+  tryTimeBasedExits(acct, quotes);
+  tryExits(acct, quotes);
+  trySignalExits(acct, quotes, analyses);
+  tryEMATrailingExits(acct, quotes);
+
+  dash.positionDetails = buildPositionDetails(acct, quotes);
+  dash.lastCycle = Date.now();
+
+  const pv = portfolioValue(state, quotes);
+  const pnlPct = ((pv - cfg.startingCash) / cfg.startingCash * 100).toFixed(1);
+  log(acct, `[PAUSED] Portfolio: $${pv.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%) | Cash: $${state.cash.toFixed(0)} | ${state.positions.length} open | exits active, no new entries`);
+
+  dash.portfolioHistory = dash.portfolioHistory || [];
+  dash.portfolioHistory.push({ ts: Date.now(), value: pv });
+  if (dash.portfolioHistory.length > 500) dash.portfolioHistory.shift();
 }
 
 function buildPositionDetails(acct, quotes) {
@@ -4016,8 +4140,7 @@ async function main() {
       Object.assign(acct.candleCache, sharedCandleCache);
     }
     for (const [, acct] of accounts) {
-      if (acct.paused) continue;
-      await runAfterHoursScan(acct, sharedQuotes, apiKey);
+      if (!acct.paused) await runAfterHoursScan(acct, sharedQuotes, apiKey);
     }
   } catch (e) {
     console.log(`  WARN: Startup scan failed — ${e.message}`);
@@ -4051,9 +4174,12 @@ async function main() {
         }
 
         for (const [, acct] of accounts) {
-          if (acct.paused) continue;
           try {
-            await runCycle(acct, sharedQuotes, apiKey);
+            if (acct.paused) {
+              await runPausedCycle(acct, sharedQuotes);
+            } else {
+              await runCycle(acct, sharedQuotes, apiKey);
+            }
           } catch (e) {
             log(acct, `ERROR in cycle: ${e.message}`);
           }
@@ -4076,8 +4202,8 @@ async function main() {
         }
 
         for (const [, acct] of accounts) {
-          if (acct.paused) continue;
-          await runAfterHoursScan(acct, sharedQuotes, apiKey);
+          if (!acct.paused) await runAfterHoursScan(acct, sharedQuotes, apiKey);
+          // paused accounts: candles already synced above, no further action needed after hours
         }
       } catch (e) {
         console.log(`  WARN: After-hours scan failed — ${e.message}`);
