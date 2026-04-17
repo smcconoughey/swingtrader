@@ -1753,10 +1753,14 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     return { skipped: true, reason: `EOD freeze (${etHour.toFixed(1)} >= ${EOD_FREEZE_HOUR}h, score ${analysis.score} not extreme enough)` };
   }
 
+  // Use the better of consolidation quality (tight base) or momentum quality (trending runner).
+  // SRxTrades buys both: tight-base breakouts AND 8 EMA taps on leaders in motion.
   const setupQuality = detectConsolidation(acct.candleCache[ticker]);
+  const momentumQuality = detectMomentumQuality(acct.candleCache[ticker]);
+  const effectiveQuality = Math.max(setupQuality.quality, momentumQuality.quality);
   const minQuality = acct.config.minSetupQuality ?? 50;
-  if (setupQuality.quality < minQuality) {
-    return { skipped: true, reason: `Low setup quality ${setupQuality.quality}/100 (need >=${minQuality}, range ${setupQuality.rangePct}%, need consolidation→breakout)` };
+  if (effectiveQuality < minQuality) {
+    return { skipped: true, reason: `Low setup quality ${effectiveQuality}/100 (base:${setupQuality.quality} mom:${momentumQuality.quality}, need >=${minQuality}, range ${setupQuality.rangePct}%)` };
   }
 
   // ─── Local pre-filters (catch what Claude would reject without API call) ───
@@ -1777,8 +1781,8 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     return { skipped: true, reason: `Risk-off regime + misaligned EMAs contradicts bullish call bias` };
   }
 
-  // Range too wide — extended move, not consolidation
-  const maxRange = minQuality < 30 ? 30 : 15;
+  // Range cap: tight consolidation setups need <15%; aligned EMA leaders (SRxTrades style) allow up to 60%
+  const maxRange = (analysis.aligned && isBullish) || (analysis.bearish && isBearish) ? 60 : 15;
   if (parseFloat(setupQuality.rangePct) > maxRange) {
     return { skipped: true, reason: `Range ${setupQuality.rangePct}% too wide (max ${maxRange}%) — extended move, not consolidation setup` };
   }
@@ -1871,13 +1875,15 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
 
   const candles = acct.candleCache[ticker];
   const sq = detectConsolidation(candles);
+  const mq = detectMomentumQuality(candles);
+  const effectiveQuality = Math.max(sq.quality, mq.quality);
   const minQuality = cfg.minSetupQuality ?? 50;
-  if (sq.quality < minQuality) return { skipped: true, reason: `Low setup quality ${sq.quality}/100` };
+  if (effectiveQuality < minQuality) return { skipped: true, reason: `Low setup quality ${effectiveQuality}/100 (base:${sq.quality} mom:${mq.quality})` };
 
-  if (isBullish && analysis.rsi > 70) return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} overbought` };
+  if (isBullish && analysis.rsi > 85 && !analysis.aligned) return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} parabolic with misaligned EMAs` };
   if (isBearish && analysis.rsi > 30 && analysis.rsi < 55 && !analysis.bearish) return { skipped: true, reason: `Weak put setup` };
   if (isBullish && regime.mode === "risk-off" && !analysis.aligned) return { skipped: true, reason: `Risk-off + misaligned EMAs` };
-  const maxRange = minQuality < 30 ? 30 : 15;
+  const maxRange = (analysis.aligned && isBullish) || (analysis.bearish && isBearish) ? 60 : 15;
   if (parseFloat(sq.rangePct) > maxRange) return { skipped: true, reason: `Range too wide ${sq.rangePct}%` };
 
   let claudeResult = { approve: true, confidence: 70, concerns: [], suggestion: "" };
