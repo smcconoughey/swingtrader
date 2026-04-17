@@ -553,6 +553,29 @@ function logTrade(entry) {
   } catch { }
 }
 
+// ─── Claude Call History (persisted 3-day rolling log) ───
+const CLAUDE_LOG_FILE = "claude-log.json";
+const CLAUDE_LOG_TTL_MS = 3 * 24 * 60 * 60 * 1000;
+
+function loadClaudeLog() {
+  try {
+    const raw = fs.readFileSync(CLAUDE_LOG_FILE, "utf8");
+    const entries = JSON.parse(raw);
+    const cutoff = Date.now() - CLAUDE_LOG_TTL_MS;
+    return Array.isArray(entries) ? entries.filter(e => e.ts > cutoff) : [];
+  } catch {
+    return [];
+  }
+}
+
+function logClaudeCall(entry) {
+  try {
+    const entries = loadClaudeLog();
+    entries.push({ ...entry, ts: Date.now() });
+    fs.writeFileSync(CLAUDE_LOG_FILE, JSON.stringify(entries));
+  } catch {}
+}
+
 // ─── X (Twitter) Integration ───
 
 const ENABLE_TWEETS = process.env.ENABLE_TWEETS === "true";
@@ -1800,6 +1823,20 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   try {
     claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime);
     log(acct, `CLAUDE VALIDATE ${ticker}: ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%) — ${claudeResult.suggestion}${claudeResult.concerns.length ? ' | Concerns: ' + claudeResult.concerns.join(', ') : ''}`);
+    logClaudeCall({
+      type: "entry_validation",
+      ticker,
+      acctId: acct.id,
+      outcome: claudeResult.approve ? "APPROVED" : "REJECTED",
+      confidence: claudeResult.confidence,
+      concerns: claudeResult.concerns || [],
+      suggestion: claudeResult.suggestion || "",
+      setupQuality: effectiveQuality,
+      technicalScore: analysis.score,
+      price: quote.c,
+      direction: isBullish ? "BULLISH" : "BEARISH",
+      regime: regime.label,
+    });
   } catch (e) {
     log(acct, `CLAUDE VALIDATE ${ticker}: Error — ${e.message}, proceeding anyway`);
   }
@@ -2579,6 +2616,10 @@ function tickerDetailHTML(sym, acct) {
   const hint = acct.activeHints.find(h => h.ticker === sym);
 
   const st = dashboard.shortTermAnalyses[sym];
+  const recentClaudeLogs = loadClaudeLog()
+    .filter(e => e.ticker === sym && e.acctId === acct.id)
+    .sort((a, b) => b.ts - a.ts)
+    .slice(0, 8);
 
   // Helper: build SVG candlestick chart from a set of candles with EMA overlays
   function buildChart(cdata, emas, W, H) {
@@ -2781,6 +2822,34 @@ ${q?.t ? ` &nbsp;|&nbsp; Last: ${new Date(q.t * 1000).toLocaleString("en-US", { 
     <hr style="border-color:#1e1e2e;margin:12px 0">
     <h2 style="margin-top:8px">News/Hint Bias</h2>
     ${hintBlock}
+    <hr style="border-color:#1e1e2e;margin:12px 0">
+    <h2 style="margin-top:8px">AI Validation History (3d)</h2>
+    ${recentClaudeLogs.length === 0 ? '<div style="color:#555;font-size:11px">No AI validations in last 3 days</div>' :
+      recentClaudeLogs.map(e => {
+        const approved = e.outcome === "APPROVED";
+        const color = approved ? "#00ff88" : "#ff4444";
+        const age = Date.now() - e.ts;
+        const ageStr = age < 3600000 ? Math.round(age / 60000) + "m ago"
+          : age < 86400000 ? Math.round(age / 3600000) + "h ago"
+          : Math.round(age / 86400000) + "d ago";
+        const ts = new Date(e.ts).toLocaleString("en-US", { timeZone: "America/New_York", month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
+        return `<div style="border:1px solid ${color}22;border-radius:6px;padding:8px 10px;margin-bottom:8px;background:${color}08">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+            <span style="color:${color};font-weight:bold;font-size:12px">${e.outcome}</span>
+            <span style="color:#555;font-size:10px" title="${ts}">${ageStr}</span>
+          </div>
+          <div style="color:#ccc;font-size:11px;margin-bottom:3px">${e.suggestion || ''}</div>
+          ${e.concerns && e.concerns.length ? `<div style="color:#ff8c42;font-size:10px">⚠ ${e.concerns.join(' · ')}</div>` : ''}
+          <div style="margin-top:4px;display:flex;gap:12px;flex-wrap:wrap">
+            <span style="color:#888;font-size:10px">Confidence: <b style="color:#e0e0e0">${e.confidence}%</b></span>
+            <span style="color:#888;font-size:10px">Setup: <b style="color:#e0e0e0">${e.setupQuality}/100</b></span>
+            <span style="color:#888;font-size:10px">Score: <b style="color:#e0e0e0">${e.technicalScore}</b></span>
+            <span style="color:#888;font-size:10px">@ <b style="color:#e0e0e0">$${e.price?.toFixed(2)}</b></span>
+            <span style="color:#888;font-size:10px">${e.direction}</span>
+            <span style="color:#888;font-size:10px">${e.regime || ''}</span>
+          </div>
+        </div>`;
+      }).join('')}
   </div>
 </div>
 
