@@ -438,10 +438,12 @@ function createAccountRuntime(id, name, config, state) {
       decisions: [],
       positionDetails: [],
       portfolioHistory: [],
+      onDemandAnalyses: {},
     },
     candleCache: {},
     lastCandleDate: null,
     activeHints: [],
+    chatHistory: [],
     lastHintContent: "",
     currentRegime: { mode: "unknown", riskScale: 1.0, label: "UNKNOWN" },
     riskPct: (config && config.baseRiskPct) || DEFAULT_CONFIG.baseRiskPct,
@@ -1472,30 +1474,40 @@ async function callClaude(prompt, retries = 3) {
 
 async function processHint(hintText, acct) {
   const state = acct.state;
-  const portfolioContext = `Portfolio: $${state.cash.toFixed(0)} cash, ${state.positions.length} positions open (${state.positions.map(p => `${p.ticker} ${p.type}`).join(", ") || "none"}). Current watchlist: ${acct.tickers.join(", ")}.`;
+  const dash = acct.dashboard;
+  const portfolioContext = `Portfolio: $${state.cash.toFixed(0)} cash, ${state.positions.length} positions open (${state.positions.map(p => `${p.ticker} ${p.type} @ $${p.entrySpot?.toFixed(0)}`).join(", ") || "none"}). Watchlist: ${acct.tickers.join(", ")}. Active hints: ${acct.activeHints.map(h => `${h.ticker} ${h.bias > 0 ? '+' : ''}${h.bias}`).join(", ") || "none"}.`;
 
-  const promptText = `You are a trading bot's AI advisor. The user gave this hint to guide their options trading bot:
+  // Gather any available analysis for tickers mentioned in the message
+  const mentionedTickers = Object.keys(dash.analyses).filter(t =>
+    hintText.toUpperCase().includes(t));
+  const analysisContext = mentionedTickers.map(t => {
+    const a = dash.analyses[t]; const st = dash.shortTermAnalyses[t]; const q = dash.quotes[t];
+    return `${t}: price $${q?.c?.toFixed(2) || '?'}, score ${a?.score}/100 (${a?.signal}), 7d score ${st?.score || '?'}, RSI ${a?.rsi?.toFixed(1) || '?'}`;
+  }).join("; ");
+
+  const promptText = `You are an AI assistant for a swing options trading bot. The user said:
 
 "${hintText}"
 
 ${portfolioContext}
+${analysisContext ? `\nCurrent data: ${analysisContext}` : ''}
 
-Interpret this hint and respond with ONLY valid JSON (no markdown, no backticks) in this exact format:
+Determine intent and respond with ONLY valid JSON (no markdown, no backticks):
 {
-  "tickers": [{"symbol": "PLTR", "direction": "bullish", "bias": 25, "reasoning": "short explanation"}],
+  "type": "action" | "question",
+  "response": "Your conversational reply to show the user (1-4 sentences, be specific and useful)",
+  "tickers": [{"symbol": "PLTR", "direction": "bullish", "bias": 25, "reasoning": "brief"}],
   "removeTickers": [],
-  "urgency": "high",
-  "advice": "one sentence summary of action"
+  "urgency": "high" | "medium" | "low",
+  "advice": "one sentence action summary"
 }
 
 Rules:
-- "bias" is a score adjustment from -30 to +30 added to the technical analysis score
-- "direction" is "bullish" or "bearish"
-- If the hint mentions a new ticker not in the watchlist, include it in tickers with appropriate bias
-- "removeTickers" only if the user explicitly says to stop watching something
-- "urgency": "high" (act now), "medium" (watch closely), "low" (keep in mind)
-- Keep reasoning very brief
-- You can return multiple tickers if the hint implies it`;
+- type="question" for questions, analysis requests, portfolio status, or anything conversational. Fill "response" with a helpful answer. Tickers/removeTickers should be empty unless you're also adding a watch.
+- type="action" for directives: "watch X", "focus on Y", "remove Z", "go bullish on X". Fill tickers/removeTickers/urgency/advice AND a confirmation in "response".
+- For type="question", "advice" can be empty string.
+- bias is -30 to +30 score adjustment. direction is "bullish" or "bearish".
+- Keep responses concise and direct — this is shown in a trading terminal.`;
 
   try {
     const raw = await callClaude(promptText);
@@ -1521,7 +1533,7 @@ async function checkHints(acct) {
     const result = await processHint(content, acct);
     if (!result) return;
 
-    applyHintResult(acct, result);
+    applyHintResult(acct, result, content);
 
     // Clear the hint file after processing
     fs.writeFileSync(hintFile, "");
@@ -1531,8 +1543,14 @@ async function checkHints(acct) {
   }
 }
 
-function applyHintResult(acct, result) {
-  log(acct, `CLAUDE SAYS: ${result.advice}`);
+function applyHintResult(acct, result, userMessage) {
+  if (result.advice) log(acct, `CLAUDE SAYS: ${result.advice || result.response}`);
+
+  // Store in chat history (keep last 30 exchanges)
+  if (!acct.chatHistory) acct.chatHistory = [];
+  acct.chatHistory.push({ role: "user", content: userMessage, ts: Date.now() });
+  acct.chatHistory.push({ role: "ai", content: result.response || result.advice || "", ts: Date.now() });
+  if (acct.chatHistory.length > 60) acct.chatHistory = acct.chatHistory.slice(-60);
 
   for (const t of result.tickers || []) {
     if (!acct.tickers.includes(t.symbol)) {
@@ -1757,6 +1775,60 @@ Respond with ONLY valid JSON (no markdown, no backticks):
     log(acct, `CLAUDE VALIDATE WARN: Parse failed — ${e.message}. Defaulting to approve.`);
     return { approve: true, confidence: 50, concerns: ["validation parse failed"], suggestion: "proceeding with caution" };
   }
+}
+
+// ─── On-Demand Ticker Analysis via Claude ───
+
+async function analyzeTickerOnDemand(acct, sym, userQuestion) {
+  const dash = acct.dashboard;
+  const state = acct.state;
+  const a = dash.analyses[sym];
+  const st = dash.shortTermAnalyses[sym];
+  const q = dash.quotes[sym];
+  const pos = state.positions.find(p => p.ticker === sym);
+  const regime = acct.currentRegime;
+  const claudeLogs = loadClaudeLog().filter(e => e.ticker === sym && e.acctId === acct.id).sort((a, b) => b.ts - a.ts);
+
+  const priceStr = q ? `$${q.c.toFixed(2)} (${q.dp >= 0 ? '+' : ''}${q.dp?.toFixed(2)}% today)` : "unknown";
+  const posStr = pos ? `Currently holding ${pos.qty}x $${pos.strike} ${pos.type.toUpperCase()} (entry $${pos.entrySpot?.toFixed(2)}, opened ${pos.openDate}, Claude confidence was ${pos.claudeConfidence}%)` : "Not currently held";
+  const prevValidations = claudeLogs.slice(0, 3).map(e =>
+    `  ${new Date(e.ts).toLocaleDateString()} — ${e.outcome} (${e.confidence}% confidence, $${e.price?.toFixed(2)}): "${e.suggestion}"`
+  ).join("\n") || "  None";
+
+  const promptText = `You are an expert options swing trader analyzing a stock for a 7DTE options trade. Give a thorough, direct assessment.
+
+Stock: ${sym}
+Price: ${priceStr}
+Market Regime: ${regime?.label || 'unknown'}
+
+90-Day Analysis:
+  Score: ${a?.score || '?'}/100 (${a?.signal || '?'})
+  RSI(14): ${a?.rsi?.toFixed(1) || '?'}
+  EMA Stack (8/21/50): ${a?.aligned ? 'BULLISH ALIGNED' : a?.bearish ? 'BEARISH ALIGNED' : 'MIXED'}
+  ATR%: ${a?.atrPct?.toFixed(2) || '?'}%
+  Vol Ratio: ${a?.vr?.toFixed(2) || '?'}
+  EMA Spread: ${a?.spread?.toFixed(2) || '?'}%
+
+7-Day Short-Term:
+  Score: ${st?.score || '?'}/100 (${st?.signal || '?'})
+  RSI(5): ${st?.rsi?.toFixed(1) || '?'}
+  1d Mom: ${st?.mom1d >= 0 ? '+' : ''}${st?.mom1d?.toFixed(2) || '?'}% | 3d: ${st?.mom3d >= 0 ? '+' : ''}${st?.mom3d?.toFixed(2) || '?'}% | 7d: ${st?.mom7d >= 0 ? '+' : ''}${st?.mom7d?.toFixed(2) || '?'}%
+
+Position Status: ${posStr}
+
+Previous AI Validations:
+${prevValidations}
+
+User question: "${userQuestion || 'Should I enter a position on this stock right now? Give me your full analysis.'}"
+
+Respond in plain text (not JSON). Be direct and specific — mention the actual numbers. Structure your response as:
+1. Current Setup Assessment (2-3 sentences on what the chart/indicators say)
+2. Key Risks (bullets)
+3. Recommendation (clear: enter call / enter put / wait / avoid — explain why)
+4. If currently held: position management advice`;
+
+  const raw = await callClaude(promptText);
+  return raw.trim();
 }
 
 // ─── Entry Logic (enhanced with setup quality, EOD freeze, Claude validation) ───
@@ -2452,13 +2524,28 @@ ${accountActionsHTML(acct.id)}
     <div style="font-size:11px;color:#666">${progress}% to $${GOAL.toLocaleString()} goal</div>
   </div>
   <div class="card">
-    <h2>Claude Hints &amp; News Intel</h2>
+    <h2>AI Assistant &amp; News Intel</h2>
     <div style="margin-bottom:8px;padding:6px 10px;background:#0a0a0f;border-radius:4px;font-size:11px;border-left:3px solid ${(acct.latestNewsBrief || "").includes("CRITICAL") ? "#ff4444" : (acct.latestNewsBrief || "").includes("ELEVATED") ? "#ffd93d" : "#333"}">${acct.latestNewsBrief || '<span style="opacity:.4">News scan runs every 3 hours...</span>'}</div>
-    <div style="margin-bottom:8px">${hints}</div>
+    ${hints ? `<div style="margin-bottom:8px">${hints}</div>` : ''}
+    ${(() => {
+      const history = (acct.chatHistory || []).slice(-10);
+      if (!history.length) return '<div style="color:#444;font-size:11px;margin-bottom:8px">No conversation yet. Ask a question or give a trading directive below.</div>';
+      return `<div style="max-height:220px;overflow-y:auto;margin-bottom:10px;padding:8px;background:#0a0a0f;border-radius:6px">` +
+        history.map(m => {
+          const isUser = m.role === "user";
+          const age = Date.now() - m.ts;
+          const ageStr = age < 3600000 ? Math.round(age / 60000) + "m ago" : Math.round(age / 3600000) + "h ago";
+          return `<div style="margin-bottom:8px">
+            <div style="font-size:9px;color:#444;margin-bottom:2px">${isUser ? 'YOU' : 'CLAUDE'} · ${ageStr}</div>
+            <div style="font-size:11px;color:${isUser ? '#888' : '#ccc'};line-height:1.5;padding:4px 8px;background:${isUser ? 'transparent' : '#a78bfa10'};border-left:2px solid ${isUser ? '#333' : '#a78bfa'};border-radius:0 4px 4px 0">${m.content}</div>
+          </div>`;
+        }).join('') + '</div>';
+    })()}
     <form class="hint-form" method="POST" action="/hint?a=${acct.id}">
-      <input name="hint" placeholder='e.g. "PLTR looks bullish, iran war catalyst"' autocomplete="off">
-      <button type="submit">Send Hint</button>
+      <input name="hint" placeholder='Ask anything: "should I buy NVDA?" or "watch PLTR bullish"' autocomplete="off">
+      <button type="submit">Ask AI</button>
     </form>
+    <div style="color:#444;font-size:10px;margin-top:4px">Ask questions or give directives · Watches expire in 4h</div>
   </div>
 </div>
 
@@ -2620,6 +2707,7 @@ function tickerDetailHTML(sym, acct) {
     .filter(e => e.ticker === sym && e.acctId === acct.id)
     .sort((a, b) => b.ts - a.ts)
     .slice(0, 8);
+  const onDemandAnalysis = dashboard.onDemandAnalyses?.[sym] || null;
 
   // Helper: build SVG candlestick chart from a set of candles with EMA overlays
   function buildChart(cdata, emas, W, H) {
@@ -2854,6 +2942,21 @@ ${q?.t ? ` &nbsp;|&nbsp; Last: ${new Date(q.t * 1000).toLocaleString("en-US", { 
 </div>
 
 ${pos ? '<div class="card" style="margin-top:16px"><h2>Position Details</h2>' + posBlock + '</div>' : ''}
+
+<div class="card" style="margin-top:16px;border-color:#a78bfa40">
+  <h2 style="color:#a78bfa">Ask Claude About ${sym}</h2>
+  ${onDemandAnalysis ? `
+  <div style="margin-bottom:12px;padding:12px;background:#0a0a0f;border-radius:6px;border-left:3px solid #a78bfa">
+    ${onDemandAnalysis.question ? `<div style="color:#666;font-size:10px;margin-bottom:6px">Q: ${onDemandAnalysis.question} &nbsp;<span style="color:#444">${Math.round((Date.now() - onDemandAnalysis.ts) / 60000)}m ago</span></div>` : `<div style="color:#666;font-size:10px;margin-bottom:6px">General analysis &nbsp;<span style="color:#444">${Math.round((Date.now() - onDemandAnalysis.ts) / 60000)}m ago</span></div>`}
+    <div style="color:#ccc;font-size:12px;line-height:1.7;white-space:pre-wrap">${onDemandAnalysis.response}</div>
+  </div>` : ''}
+  <form method="POST" action="/api/ticker/${sym}/analyze?a=${acct.id}" style="display:flex;gap:8px;margin-top:4px">
+    <input name="question" placeholder='e.g. "Should I enter now?" or "What are the key risks?"'
+      style="flex:1;background:#0a0a0f;border:1px solid #a78bfa40;color:#e0e0e0;padding:8px 12px;border-radius:4px;font-family:inherit;font-size:12px">
+    <button type="submit" style="background:#a78bfa;color:#000;border:none;padding:8px 16px;border-radius:4px;cursor:pointer;font-weight:700;font-size:12px;white-space:nowrap">Ask Claude</button>
+  </form>
+  <div style="color:#444;font-size:10px;margin-top:6px">Leave blank for a full setup analysis · Uses Claude Haiku</div>
+</div>
 
 </body></html>`;
 }
@@ -3403,12 +3506,41 @@ function startDashboard(defaultAcct, apiKey) {
           // Process hint directly via Claude instead of file
           try {
             const result = await processHint(hintText, activeAcct);
-            if (result) applyHintResult(activeAcct, result);
+            if (result) applyHintResult(activeAcct, result, hintText);
           } catch (e) {
             log(activeAcct, `HINT ERROR: ${e.message}`);
           }
         }
         res.writeHead(302, { Location: `/?a=${acctId}` });
+        res.end();
+      });
+      return;
+    }
+
+    const tickerAnalyzeMatch = pathname.match(/^\/api\/ticker\/([A-Z]+)\/analyze$/);
+    if (req.method === "POST" && tickerAnalyzeMatch) {
+      const sym = tickerAnalyzeMatch[1];
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", async () => {
+        const params = new URLSearchParams(body);
+        const question = params.get("question") || "";
+        try {
+          // Ensure we have fresh data
+          if (!dashboard.candles[sym] && apiKey) dashboard.candles[sym] = await fetchCandles(sym, apiKey);
+          if (!dashboard.quotes[sym] && apiKey) dashboard.quotes[sym] = await fetchQuote(sym, apiKey);
+          if (dashboard.candles[sym] && !dashboard.analyses[sym]) {
+            const a = runAnalysis(dashboard.candles[sym]); if (a) dashboard.analyses[sym] = a;
+            const st = runShortTermAnalysis(dashboard.candles[sym]); if (st) dashboard.shortTermAnalyses[sym] = st;
+          }
+          const analysisText = await analyzeTickerOnDemand(activeAcct, sym, question);
+          dashboard.onDemandAnalyses[sym] = { ts: Date.now(), question, response: analysisText };
+          log(activeAcct, `ON-DEMAND ANALYSIS: ${sym} — "${question || 'general analysis'}"`);
+        } catch (e) {
+          log(activeAcct, `ON-DEMAND ANALYSIS ERROR: ${sym} — ${e.message}`);
+          dashboard.onDemandAnalyses[sym] = { ts: Date.now(), question, response: `Analysis failed: ${e.message}` };
+        }
+        res.writeHead(302, { Location: `/ticker/${sym}?a=${acctId}` });
         res.end();
       });
       return;
@@ -3738,9 +3870,7 @@ async function runCycle(acct, sharedQuotes, apiKey) {
 
     const dec = { ticker, price: q?.c, rawScore, finalScore, signal: a.signal, hintBias };
     const alreadyHeld = state.positions.some(p => p.ticker === ticker);
-    const hasRealizedProfits = (state.realizedPnl || 0) > 0;
-    const cashFloor = hasRealizedProfits ? cfg.startingCash : 100;
-    const lowCash = state.cash < cashFloor;
+    const lowCash = state.cash < 100;
 
     dec.bullScore = a.bullScore; dec.bearScore = a.bearScore;
     dec.shortTermScore = st ? st.score : null;
