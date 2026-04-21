@@ -1436,6 +1436,29 @@ function getClaudeCost() {
   return (claudeTotalInputTokens * HAIKU_INPUT_COST + claudeTotalOutputTokens * HAIKU_OUTPUT_COST);
 }
 
+// ─── Claude Entry Validation Cooldown Cache ───
+// Prevents re-calling Claude for the same ticker every 60s cycle when setup hasn't changed.
+// Key: "<acctId>:<ticker>" → { ts, score, direction, result }
+const claudeValidationCache = new Map();
+const CLAUDE_VALIDATION_COOLDOWN_MS = 10 * 60_000; // 10 minutes
+const CLAUDE_VALIDATION_SCORE_DELTA = 5;            // re-validate if score shifts ≥5 pts
+
+function getCachedValidation(acctId, ticker, currentScore, direction) {
+  const key = `${acctId}:${ticker}`;
+  const cached = claudeValidationCache.get(key);
+  if (!cached) return null;
+  const age = Date.now() - cached.ts;
+  if (age > CLAUDE_VALIDATION_COOLDOWN_MS) return null;           // expired
+  if (Math.abs(currentScore - cached.score) >= CLAUDE_VALIDATION_SCORE_DELTA) return null; // score shifted
+  if (cached.direction !== direction) return null;                // direction flipped
+  return cached.result;
+}
+
+function setCachedValidation(acctId, ticker, score, direction, result) {
+  const key = `${acctId}:${ticker}`;
+  claudeValidationCache.set(key, { ts: Date.now(), score, direction, result });
+}
+
 async function callClaude(prompt, retries = 3) {
   if (!CLAUDE_API_KEY) throw new Error("CLAUDE_API_KEY not set");
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -1893,22 +1916,30 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
 
   let claudeResult = { approve: true, confidence: 70, concerns: [], suggestion: "" };
   try {
-    claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime);
-    log(acct, `CLAUDE VALIDATE ${ticker}: ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%) — ${claudeResult.suggestion}${claudeResult.concerns.length ? ' | Concerns: ' + claudeResult.concerns.join(', ') : ''}`);
-    logClaudeCall({
-      type: "entry_validation",
-      ticker,
-      acctId: acct.id,
-      outcome: claudeResult.approve ? "APPROVED" : "REJECTED",
-      confidence: claudeResult.confidence,
-      concerns: claudeResult.concerns || [],
-      suggestion: claudeResult.suggestion || "",
-      setupQuality: effectiveQuality,
-      technicalScore: analysis.score,
-      price: quote.c,
-      direction: isBullish ? "BULLISH" : "BEARISH",
-      regime: regime.label,
-    });
+    const direction = isBullish ? "BULLISH" : "BEARISH";
+    const cached = getCachedValidation(acct.id, ticker, analysis.score, direction);
+    if (cached) {
+      claudeResult = cached;
+      log(acct, `CLAUDE VALIDATE ${ticker}: CACHED (${claudeResult.approve ? 'APPROVED' : 'REJECTED'} ${claudeResult.confidence}%) — score unchanged, skipping API call`);
+    } else {
+      claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime);
+      setCachedValidation(acct.id, ticker, analysis.score, direction, claudeResult);
+      log(acct, `CLAUDE VALIDATE ${ticker}: ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%) — ${claudeResult.suggestion}${claudeResult.concerns.length ? ' | Concerns: ' + claudeResult.concerns.join(', ') : ''}`);
+      logClaudeCall({
+        type: "entry_validation",
+        ticker,
+        acctId: acct.id,
+        outcome: claudeResult.approve ? "APPROVED" : "REJECTED",
+        confidence: claudeResult.confidence,
+        concerns: claudeResult.concerns || [],
+        suggestion: claudeResult.suggestion || "",
+        setupQuality: effectiveQuality,
+        technicalScore: analysis.score,
+        price: quote.c,
+        direction,
+        regime: regime.label,
+      });
+    }
   } catch (e) {
     log(acct, `CLAUDE VALIDATE ${ticker}: Error — ${e.message}, proceeding anyway`);
   }
