@@ -1398,59 +1398,83 @@ async function fetchCandles(sym, key) {
 }
 
 // ─── Finnhub Options Chain ───
-// Fetches the real options chain and finds the best-matching contract for a given
-// type (call/put), target strike, and target expiry date. Returns real mid-price,
-// actual IV, and the nearest available expiry. Falls back gracefully to null.
-async function fetchOptionsData(sym, type, targetStrike, targetExpiryMs, apiKey) {
+
+async function fetchFullOptionsChain(sym, apiKey) {
   if (!apiKey) return null;
   try {
     const r = await fetch(`https://finnhub.io/api/v1/stock/option-chain?symbol=${sym}&token=${apiKey}`);
     if (!r.ok) return null;
     const data = await r.json();
     if (!data || !Array.isArray(data.data) || data.data.length === 0) return null;
-
-    // Find the expiry date in the chain closest to our target
-    let bestExpiry = null;
-    let bestDiff = Infinity;
-    for (const exp of data.data) {
-      const diff = Math.abs(new Date(exp.expirationDate).getTime() - targetExpiryMs);
-      if (diff < bestDiff) { bestDiff = diff; bestExpiry = exp; }
-    }
-    if (!bestExpiry) return null;
-
-    const contracts = bestExpiry.options?.[type.toUpperCase()] || [];
-    if (contracts.length === 0) return null;
-
-    // Find the contract with the closest strike to our target
-    let best = null;
-    let bestStrikeDiff = Infinity;
-    for (const c of contracts) {
-      const diff = Math.abs((c.strike || 0) - targetStrike);
-      if (diff < bestStrikeDiff) { bestStrikeDiff = diff; best = c; }
-    }
-    if (!best) return null;
-
-    // Use bid/ask midpoint; fall back to lastPrice
-    const mid = (best.bid > 0 && best.ask > 0) ? (best.bid + best.ask) / 2 : best.lastPrice;
-    if (!mid || mid <= 0) return null;
-
-    // Actual expiry timestamp from the chain (4pm ET on that Friday)
-    const actualExpiry = new Date(bestExpiry.expirationDate);
-    actualExpiry.setHours(16, 0, 0, 0);
-
-    return {
-      premium: +Math.max(0.01, mid).toFixed(2),
-      iv: best.impliedVolatility > 0 ? best.impliedVolatility : DEFAULT_IV,
-      strike: best.strike,
-      expiryDate: actualExpiry.getTime(),
-      dte: Math.max(1, Math.round((actualExpiry.getTime() - Date.now()) / 86400_000)),
-      openInterest: best.openInterest || 0,
-      volume: best.volume || 0,
-      source: "finnhub",
-    };
+    return data.data;
   } catch {
     return null;
   }
+}
+
+// Filters the full chain down to viable candidate contracts for Claude to choose from.
+// Returns up to maxCandidates sorted by a quality score (DTE preference, liquidity, spread).
+function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 12) {
+  const now = Date.now();
+  const typeKey = type.toUpperCase();
+  const candidates = [];
+
+  for (const exp of chain) {
+    const expiryDt = new Date(exp.expirationDate);
+    expiryDt.setHours(16, 0, 0, 0);
+    const dte = Math.round((expiryDt.getTime() - now) / 86400_000);
+    if (dte < 3 || dte > 45) continue; // only consider 3-45 DTE
+
+    const contracts = exp.options?.[typeKey] || [];
+    for (const c of contracts) {
+      if (!c.strike || c.strike <= 0) continue;
+      if (!c.bid || c.bid <= 0) continue;       // no bid = can't fill
+      if ((c.openInterest || 0) < 5) continue;  // completely illiquid
+
+      const mid = +((c.bid + c.ask) / 2).toFixed(2);
+      if (mid < 0.02) continue;
+
+      // Moneyness: positive = OTM (we want to be able to buy OTM or slight ITM)
+      const moneyness = typeKey === "CALL"
+        ? (c.strike - spotPrice) / spotPrice   // +ve = OTM call
+        : (spotPrice - c.strike) / spotPrice;  // +ve = OTM put
+
+      // Allow from 10% ITM to 25% OTM — lets Claude decide depth
+      if (moneyness < -0.10 || moneyness > 0.25) continue;
+
+      const spread = +(c.ask - c.bid).toFixed(2);
+      const spreadPct = mid > 0 ? (spread / mid) : 1;
+      if (spreadPct > 0.40 && mid > 0.10) continue; // too wide a spread
+
+      const iv = c.impliedVolatility > 0 ? c.impliedVolatility : null;
+      const delta = c.delta != null ? c.delta : null;
+
+      // Quality score: penalise wide spreads, illiquidity, very short or very long DTE
+      const dtePenalty = Math.abs(dte - 10); // prefer ~10 DTE
+      const liqScore = Math.log1p((c.openInterest || 0) + (c.volume || 0));
+      const quality = liqScore - spreadPct * 3 - dtePenalty * 0.1;
+
+      candidates.push({
+        strike: c.strike,
+        expiryDate: expiryDt.getTime(),
+        expiryStr: exp.expirationDate,
+        dte,
+        mid,
+        bid: c.bid,
+        ask: +(c.ask || 0).toFixed(2),
+        iv,
+        delta,
+        oi: c.openInterest || 0,
+        volume: c.volume || 0,
+        spread,
+        spreadPct: +(spreadPct * 100).toFixed(1),
+        quality,
+      });
+    }
+  }
+
+  candidates.sort((a, b) => b.quality - a.quality);
+  return candidates.slice(0, maxCandidates);
 }
 
 async function fetchHistoricalCandles(sym, fromUnix, toUnix) {
@@ -1850,37 +1874,70 @@ Rules:
 
 // ─── Claude Pre-Entry Validation ───
 
-async function validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime) {
+async function validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, candidates) {
   const cfg = acct.config;
-  const promptText = `You are a trading bot's risk management system. Evaluate this potential options trade:
+  const direction = analysis.score >= cfg.bullEntry ? 'BULLISH (buying calls)' : 'BEARISH (buying puts)';
+
+  // Build the candidate contract table if we have real chain data
+  let contractSection = '';
+  let contractInstruction = '';
+  if (candidates && candidates.length > 0) {
+    const header = `#  | Expiry      | DTE | Strike   | Mid    | IV    | Delta | OI      | Vol    | Spread`;
+    const rows = candidates.map((c, i) => {
+      const num = String(i + 1).padStart(2);
+      const exp = c.expiryStr.slice(5);
+      const dte = String(c.dte).padStart(3);
+      const strike = `$${c.strike}`.padStart(8);
+      const mid = `$${c.mid}`.padStart(6);
+      const iv = c.iv != null ? `${(c.iv * 100).toFixed(0)}%`.padStart(5) : '   ?%';
+      const delta = c.delta != null ? String(Math.abs(c.delta).toFixed(2)).padStart(5) : '   ?';
+      const oi = String(c.oi).padStart(7);
+      const vol = String(c.volume).padStart(6);
+      const spread = `$${c.spread}`;
+      return `${num} | ${exp}      | ${dte} | ${strike} | ${mid} | ${iv} | ${delta} | ${oi} | ${vol} | ${spread}`;
+    }).join('\n');
+    contractSection = `\nReal options chain (${candidates.length} viable contracts):\n${header}\n${rows}`;
+    contractInstruction = `\nSelect the best contract index (1-${candidates.length}) for this trade. Consider: DTE vs setup timeframe, delta (higher confidence → closer to ATM), liquidity (OI + volume), and spread cost.`;
+  } else {
+    contractSection = '\nNo real chain data available — synthetic pricing will be used.';
+  }
+
+  const promptText = `You are a trading bot's risk management system. Evaluate this potential options trade and select the best available contract.
 
 Ticker: ${ticker}
 Price: $${quote.c.toFixed(2)}
-Direction: ${analysis.score >= cfg.bullEntry ? 'BULLISH (buying calls)' : 'BEARISH (buying puts)'}
+Direction: ${direction}
 Technical Score: ${analysis.score}/100
 RSI: ${analysis.rsi?.toFixed(1) || 'N/A'}
-EMA Stack: ${analysis.aligned ? 'Aligned bullish (8>21>50)' : analysis.bearish ? 'Aligned bearish' : 'Mixed'}
-Setup Quality: ${setupQuality.quality}/100 (${setupQuality.tight ? 'tight base' : 'wide range'}, ${setupQuality.breakingOut ? 'breaking out' : 'no breakout'}, vol ${setupQuality.volDeclining ? 'declining' : 'not declining'})
+EMA Stack: ${analysis.aligned ? 'Aligned bullish (8>21>50)' : analysis.bearish ? 'Aligned bearish (50>21>8)' : 'Mixed/transitioning'}
+Setup Quality: ${setupQuality.quality}/100 (${setupQuality.tight ? 'tight base' : 'wide range'}, ${setupQuality.breakingOut ? 'breaking out' : 'no breakout'}, vol ${setupQuality.volDeclining ? 'declining in base' : 'normal'})
 Market Regime: ${regime.label}
-${earningsInfo.hasEarnings ? `EARNINGS in ${earningsInfo.daysUntil} days (${earningsInfo.date})` : 'No upcoming earnings within 3 days'}
-Contract: 7DTE options, 1 strike OTM
-${cfg.customPromptSuffix ? `\nAdditional context: ${cfg.customPromptSuffix}` : ''}
+${earningsInfo.hasEarnings ? `⚠ EARNINGS in ${earningsInfo.daysUntil} days (${earningsInfo.date})` : 'No earnings risk in next 3 days'}
+${cfg.customPromptSuffix ? `Additional context: ${cfg.customPromptSuffix}` : ''}
+${contractSection}
 
 Evaluate:
-1. Is this a quality setup (consolidation→breakout) or chasing an extended move?
-2. Any obvious risks for holding this 7-day options contract?
-3. Is the sector/theme strong enough to support this swing?
+1. Is this a quality setup or chasing an extended move?
+2. Key risks for this trade given current conditions?
+3. Best contract choice and why (DTE, strike depth)?
+${contractInstruction}
 
 Respond with ONLY valid JSON (no markdown, no backticks):
-{"approve": true, "confidence": 75, "concerns": [], "suggestion": "brief advice"}`;
+{"approve": true, "confidence": 75, "concerns": [], "suggestion": "brief rationale"${candidates?.length > 0 ? ', "contractIdx": 1' : ''}}`;
 
   try {
     const raw = await callClaude(promptText);
     const cleaned = raw.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-    return JSON.parse(cleaned);
+    const result = JSON.parse(cleaned);
+    // Validate contractIdx is in range
+    if (candidates?.length > 0) {
+      const idx = parseInt(result.contractIdx);
+      result.contractIdx = (idx >= 1 && idx <= candidates.length) ? idx - 1 : 0; // convert to 0-based
+    }
+    return result;
   } catch (e) {
     log(acct, `CLAUDE VALIDATE WARN: Parse failed — ${e.message}. Defaulting to approve.`);
-    return { approve: true, confidence: 50, concerns: ["validation parse failed"], suggestion: "proceeding with caution" };
+    return { approve: true, confidence: 50, concerns: ["validation parse failed"], suggestion: "proceeding with caution", contractIdx: 0 };
   }
 }
 
@@ -1998,17 +2055,37 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     return { skipped: true, reason: `Earnings in ${earningsInfo.daysUntil} days (${earningsInfo.date}) — too risky for 7DTE options` };
   }
 
-  let claudeResult = { approve: true, confidence: 70, concerns: [], suggestion: "" };
+  const spot = quote.c;
+  const maxRisk = state.cash * acct.riskPct;
+  const direction = isBullish ? "BULLISH" : "BEARISH";
+  const type = isBullish ? "call" : "put";
+
+  // ─── Step 1: Fetch full options chain and build candidate list ───
+  let candidates = [];
+  let chain = null;
   try {
-    const direction = isBullish ? "BULLISH" : "BEARISH";
+    chain = await fetchFullOptionsChain(ticker, apiKey);
+    await delay(API_DELAY);
+    if (chain) {
+      candidates = buildCandidateContracts(chain, type, spot);
+      log(acct, `OPTIONS ${ticker}: chain fetched — ${candidates.length} viable ${type} contracts across ${chain.length} expiries`);
+    }
+  } catch (e) {
+    log(acct, `OPTIONS ${ticker}: chain fetch error — ${e.message}`);
+  }
+
+  // ─── Step 2: Claude validates setup AND selects best contract ───
+  let claudeResult = { approve: true, confidence: 70, concerns: [], suggestion: "", contractIdx: 0 };
+  try {
     const cached = getCachedValidation(acct.id, ticker, analysis.score, direction);
-    if (cached) {
+    if (cached && candidates.length === 0) {
+      // Only use cache if we have no chain (chain data changes, so don't cache contract selection)
       claudeResult = cached;
-      log(acct, `CLAUDE VALIDATE ${ticker}: CACHED (${claudeResult.approve ? 'APPROVED' : 'REJECTED'} ${claudeResult.confidence}%) — score unchanged, skipping API call`);
+      log(acct, `CLAUDE VALIDATE ${ticker}: CACHED (${claudeResult.approve ? 'APPROVED' : 'REJECTED'} ${claudeResult.confidence}%)`);
     } else {
-      claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime);
-      setCachedValidation(acct.id, ticker, analysis.score, direction, claudeResult);
-      log(acct, `CLAUDE VALIDATE ${ticker}: ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%) — ${claudeResult.suggestion}${claudeResult.concerns.length ? ' | Concerns: ' + claudeResult.concerns.join(', ') : ''}`);
+      claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, candidates);
+      if (candidates.length === 0) setCachedValidation(acct.id, ticker, analysis.score, direction, claudeResult);
+      log(acct, `CLAUDE VALIDATE ${ticker}: ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%)${candidates.length > 0 ? ` — selected contract #${(claudeResult.contractIdx || 0) + 1}` : ''} — ${claudeResult.suggestion}${claudeResult.concerns?.length ? ' | ' + claudeResult.concerns.join(', ') : ''}`);
       logClaudeCall({
         type: "entry_validation",
         ticker,
@@ -2029,94 +2106,46 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   }
 
   if (!claudeResult.approve) {
-    return { skipped: true, reason: `Claude rejected: ${claudeResult.suggestion} (${claudeResult.concerns.join(', ')})` };
+    return { skipped: true, reason: `Claude rejected: ${claudeResult.suggestion} (${(claudeResult.concerns || []).join(', ')})` };
   }
 
-  const spot = quote.c;
-  const maxRisk = state.cash * acct.riskPct;
+  // ─── Step 3: Use Claude's chosen contract, or fall back to synthetic ───
+  let strike, dte, expiryDate, premium, posIv, optionsSource;
 
-  let type, strike;
+  const selectedCandidate = candidates.length > 0 ? candidates[claudeResult.contractIdx ?? 0] : null;
 
-  if (analysis.score >= cfg.bullEntry) {
-    type = "call";
-    const atm = Math.round(spot / 5) * 5;
-    strike = atm + 5;
-  } else if (analysis.score <= cfg.bearEntry) {
-    type = "put";
-    const atm = Math.round(spot / 5) * 5;
-    strike = atm - 5;
+  if (selectedCandidate) {
+    strike = selectedCandidate.strike;
+    dte = selectedCandidate.dte;
+    expiryDate = selectedCandidate.expiryDate;
+    premium = selectedCandidate.mid;
+    posIv = selectedCandidate.iv || DEFAULT_IV;
+    optionsSource = "finnhub";
+    log(acct, `CONTRACT ${ticker}: $${strike} ${type.toUpperCase()} exp ${selectedCandidate.expiryStr} (${dte}d) @ $${premium} mid | IV ${posIv ? (posIv*100).toFixed(0)+'%' : '?'} | OI ${selectedCandidate.oi} | spread $${selectedCandidate.spread}`);
   } else {
-    return null;
+    // Synthetic fallback: 1 strike OTM, next Friday ≥7 days
+    const atm = Math.round(spot / 5) * 5;
+    strike = isBullish ? atm + 5 : atm - 5;
+    const expiry = nextFridayExpiry(7);
+    dte = expiry.dte;
+    expiryDate = expiry.date.getTime();
+    posIv = DEFAULT_IV;
+    premium = optPrice(spot, strike, dte, DEFAULT_IV, type);
+    optionsSource = "synthetic";
+    log(acct, `OPTIONS ${ticker}: using synthetic pricing — $${strike} ${type} ${dte}d @ $${premium.toFixed(2)}`);
   }
 
-  // Snap to the next real Friday expiration that is at least 7 calendar days away
-  const expiry = nextFridayExpiry(7);
-  let dte = expiry.dte;
-  let expiryDate = expiry.date.getTime();
-  let posIv = DEFAULT_IV;
-  let optionsSource = "synthetic";
-
-  // Try to get real options data from Finnhub
-  try {
-    const optData = await fetchOptionsData(ticker, type, strike, expiryDate, apiKey);
-    await delay(API_DELAY);
-    if (optData) {
-      // Use real premium, IV, and the actual expiry the chain has
-      strike = optData.strike;
-      dte = optData.dte;
-      expiryDate = optData.expiryDate;
-      posIv = optData.iv;
-      optionsSource = "finnhub";
-      log(acct, `OPTIONS ${ticker}: real chain — $${optData.premium} mid, IV ${(optData.iv * 100).toFixed(0)}%, OI ${optData.openInterest}, expiry ${new Date(optData.expiryDate).toLocaleDateString()}`);
-
-      // Use real mid-price directly rather than re-computing
-      const costPer = optData.premium * 100;
-      if (costPer > state.cash) return null;
-      let qty = Math.max(1, Math.floor(maxRisk / costPer));
-      let totalCost = qty * costPer;
-      if (totalCost > state.cash) { qty = Math.floor(state.cash / costPer); totalCost = qty * costPer; }
-
-      const position = {
-        ticker, type, strike, dte,
-        expiryDate,
-        dteRemaining: dte,
-        entryPremium: optData.premium,
-        entrySpot: spot,
-        qty,
-        originalQty: qty,
-        cost: totalCost,
-        openDate: getETDateStr(),
-        openTime: Date.now(),
-        trimLevel: 0,
-        bestPnlPct: 0,
-        claudeConfidence: claudeResult.confidence,
-        setupQuality: setupQuality.quality,
-        iv: posIv,
-        optionsSource,
-      };
-      state.cash -= totalCost;
-      state.positions.push(position);
-      return position;
-    }
-  } catch (e) {
-    log(acct, `OPTIONS ${ticker}: chain fetch failed (${e.message}), using synthetic pricing`);
-  }
-
-  // Fallback: synthetic Black-Scholes approximation
-  log(acct, `OPTIONS ${ticker}: using synthetic pricing (IV ${(DEFAULT_IV * 100).toFixed(0)}%)`);
-  const premium = optPrice(spot, strike, dte, DEFAULT_IV, type);
   const costPer = premium * 100;
+  if (costPer > state.cash) return null;
   let qty = Math.max(1, Math.floor(maxRisk / costPer));
   let totalCost = qty * costPer;
-
-  if (costPer > state.cash) return null;
   if (totalCost > state.cash) { qty = Math.floor(state.cash / costPer); totalCost = qty * costPer; }
 
   const position = {
     ticker, type, strike, dte,
     expiryDate,
     dteRemaining: dte,
-    entryPremium: premium,
+    entryPremium: +premium.toFixed(2),
     entrySpot: spot,
     qty,
     originalQty: qty,
@@ -2127,8 +2156,8 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     bestPnlPct: 0,
     claudeConfidence: claudeResult.confidence,
     setupQuality: setupQuality.quality,
-    iv: DEFAULT_IV,
-    optionsSource: "synthetic",
+    iv: posIv,
+    optionsSource,
   };
 
   state.cash -= totalCost;
