@@ -1397,6 +1397,62 @@ async function fetchCandles(sym, key) {
   }
 }
 
+// ─── Finnhub Options Chain ───
+// Fetches the real options chain and finds the best-matching contract for a given
+// type (call/put), target strike, and target expiry date. Returns real mid-price,
+// actual IV, and the nearest available expiry. Falls back gracefully to null.
+async function fetchOptionsData(sym, type, targetStrike, targetExpiryMs, apiKey) {
+  if (!apiKey) return null;
+  try {
+    const r = await fetch(`https://finnhub.io/api/v1/stock/option-chain?symbol=${sym}&token=${apiKey}`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    if (!data || !Array.isArray(data.data) || data.data.length === 0) return null;
+
+    // Find the expiry date in the chain closest to our target
+    let bestExpiry = null;
+    let bestDiff = Infinity;
+    for (const exp of data.data) {
+      const diff = Math.abs(new Date(exp.expirationDate).getTime() - targetExpiryMs);
+      if (diff < bestDiff) { bestDiff = diff; bestExpiry = exp; }
+    }
+    if (!bestExpiry) return null;
+
+    const contracts = bestExpiry.options?.[type.toUpperCase()] || [];
+    if (contracts.length === 0) return null;
+
+    // Find the contract with the closest strike to our target
+    let best = null;
+    let bestStrikeDiff = Infinity;
+    for (const c of contracts) {
+      const diff = Math.abs((c.strike || 0) - targetStrike);
+      if (diff < bestStrikeDiff) { bestStrikeDiff = diff; best = c; }
+    }
+    if (!best) return null;
+
+    // Use bid/ask midpoint; fall back to lastPrice
+    const mid = (best.bid > 0 && best.ask > 0) ? (best.bid + best.ask) / 2 : best.lastPrice;
+    if (!mid || mid <= 0) return null;
+
+    // Actual expiry timestamp from the chain (4pm ET on that Friday)
+    const actualExpiry = new Date(bestExpiry.expirationDate);
+    actualExpiry.setHours(16, 0, 0, 0);
+
+    return {
+      premium: +Math.max(0.01, mid).toFixed(2),
+      iv: best.impliedVolatility > 0 ? best.impliedVolatility : DEFAULT_IV,
+      strike: best.strike,
+      expiryDate: actualExpiry.getTime(),
+      dte: Math.max(1, Math.round((actualExpiry.getTime() - Date.now()) / 86400_000)),
+      openInterest: best.openInterest || 0,
+      volume: best.volume || 0,
+      source: "finnhub",
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function fetchHistoricalCandles(sym, fromUnix, toUnix) {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?period1=${fromUnix}&period2=${toUnix}&interval=1d`;
   const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
@@ -1439,7 +1495,7 @@ function portfolioValue(state, quotes) {
   for (const pos of state.positions) {
     const q = quotes[pos.ticker];
     const spot = q ? q.c : pos.entrySpot;
-    const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, DEFAULT_IV, pos.type);
+    const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
     val += currentPremium * pos.qty * 100;
   }
   return val;
@@ -1995,9 +2051,59 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
 
   // Snap to the next real Friday expiration that is at least 7 calendar days away
   const expiry = nextFridayExpiry(7);
-  const dte = expiry.dte;
-  const expiryDate = expiry.date.getTime();
+  let dte = expiry.dte;
+  let expiryDate = expiry.date.getTime();
+  let posIv = DEFAULT_IV;
+  let optionsSource = "synthetic";
 
+  // Try to get real options data from Finnhub
+  try {
+    const optData = await fetchOptionsData(ticker, type, strike, expiryDate, apiKey);
+    await delay(API_DELAY);
+    if (optData) {
+      // Use real premium, IV, and the actual expiry the chain has
+      strike = optData.strike;
+      dte = optData.dte;
+      expiryDate = optData.expiryDate;
+      posIv = optData.iv;
+      optionsSource = "finnhub";
+      log(acct, `OPTIONS ${ticker}: real chain — $${optData.premium} mid, IV ${(optData.iv * 100).toFixed(0)}%, OI ${optData.openInterest}, expiry ${new Date(optData.expiryDate).toLocaleDateString()}`);
+
+      // Use real mid-price directly rather than re-computing
+      const costPer = optData.premium * 100;
+      if (costPer > state.cash) return null;
+      let qty = Math.max(1, Math.floor(maxRisk / costPer));
+      let totalCost = qty * costPer;
+      if (totalCost > state.cash) { qty = Math.floor(state.cash / costPer); totalCost = qty * costPer; }
+
+      const position = {
+        ticker, type, strike, dte,
+        expiryDate,
+        dteRemaining: dte,
+        entryPremium: optData.premium,
+        entrySpot: spot,
+        qty,
+        originalQty: qty,
+        cost: totalCost,
+        openDate: getETDateStr(),
+        openTime: Date.now(),
+        trimLevel: 0,
+        bestPnlPct: 0,
+        claudeConfidence: claudeResult.confidence,
+        setupQuality: setupQuality.quality,
+        iv: posIv,
+        optionsSource,
+      };
+      state.cash -= totalCost;
+      state.positions.push(position);
+      return position;
+    }
+  } catch (e) {
+    log(acct, `OPTIONS ${ticker}: chain fetch failed (${e.message}), using synthetic pricing`);
+  }
+
+  // Fallback: synthetic Black-Scholes approximation
+  log(acct, `OPTIONS ${ticker}: using synthetic pricing (IV ${(DEFAULT_IV * 100).toFixed(0)}%)`);
   const premium = optPrice(spot, strike, dte, DEFAULT_IV, type);
   const costPer = premium * 100;
   let qty = Math.max(1, Math.floor(maxRisk / costPer));
@@ -2021,6 +2127,8 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     bestPnlPct: 0,
     claudeConfidence: claudeResult.confidence,
     setupQuality: setupQuality.quality,
+    iv: DEFAULT_IV,
+    optionsSource: "synthetic",
   };
 
   state.cash -= totalCost;
@@ -2164,7 +2272,7 @@ function tryExits(acct, quotes) {
       ? Math.max(0, (pos.expiryDate - now) / 86400_000)
       : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
 
-    const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, DEFAULT_IV, pos.type);
+    const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
     const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
 
     if (!pos.bestPnlPct) pos.bestPnlPct = 0;
@@ -2265,7 +2373,7 @@ function trySignalExits(acct, quotes, analyses) {
 
     const q = quotes[pos.ticker];
     const spot = q ? q.c : pos.entrySpot;
-    const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, DEFAULT_IV, pos.type);
+    const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
 
     const trade = closePosition(acct, pos, currentPremium, "signal reversed");
     if (trade) {
@@ -2296,7 +2404,7 @@ function tryTimeBasedExits(acct, quotes) {
     if (!q) { remaining.push(pos); continue; }
 
     const spot = q.c;
-    const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, DEFAULT_IV, pos.type);
+    const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
     const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
     let reason = null;
 
@@ -2354,7 +2462,7 @@ function tryEMATrailingExits(acct, quotes) {
 
     const q = quotes[pos.ticker];
     const spot = q ? q.c : pos.entrySpot;
-    const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, DEFAULT_IV, pos.type);
+    const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
     let reason = null;
 
     const below8 = pos.type === "call" ? price < ema8[L] : price > ema8[L];
@@ -2429,7 +2537,7 @@ function dashboardHTML(acct) {
       const dteLeft = pos.expiryDate
         ? Math.max(0, (pos.expiryDate - now) / 86400_000)
         : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
-      const curPremium = optPrice(spot, pos.strike, dteLeft, DEFAULT_IV, pos.type);
+      const curPremium = optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type);
       const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
       const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * 100;
       const profitPrice = pos.entryPremium * (1 + PROFIT_TARGET);
@@ -2443,7 +2551,7 @@ function dashboardHTML(acct) {
         pctToProfit: ((profitPrice - curPremium) / curPremium * 100).toFixed(1),
         pctToStop: ((stopPrice - curPremium) / curPremium * 100).toFixed(1),
         pdtStatus,
-        greeks: optGreeks(spot, pos.strike, dteLeft, DEFAULT_IV, pos.type),
+        greeks: optGreeks(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type),
       };
     });
   }
@@ -2464,7 +2572,7 @@ function dashboardHTML(acct) {
       <td style="color:${color}">${p.pnlPct >= 0 ? "+" : ""}${(p.pnlPct * 100).toFixed(1)}% ($${p.pnlDollar.toFixed(0)})</td>
       <td><span style="color:#00ff88">TP $${p.profitTarget.premium}</span> (${p.pctToProfit}% away)</td>
       <td><span style="color:#ff4444">SL $${p.stopLoss.premium}</span> (${p.pctToStop}% away)</td>
-      <td style="font-size:10px;color:#888">δ${p.greeks.delta} θ${p.greeks.theta}<br>${p.pdtStatus}</td>
+      <td style="font-size:10px;color:#888">δ${p.greeks.delta} θ${p.greeks.theta}<br>${p.pdtStatus}<br><span style="color:${p.optionsSource === 'finnhub' ? '#4ecdc4' : '#555'}" title="IV used for pricing">IV ${((p.iv || 0.30) * 100).toFixed(0)}% ${p.optionsSource === 'finnhub' ? '●' : '○'}</span></td>
     </tr>`;
   }).join("") : '<tr><td colspan="12" style="opacity:.5">No open positions</td></tr>';
 
@@ -3649,7 +3757,7 @@ function startDashboard(defaultAcct, apiKey) {
         const a = dashboard.analyses[sym]; const st = dashboard.shortTermAnalyses[sym];
         const pos = state.positions.find(p => p.ticker === sym);
         let posPnl = null;
-        if (pos) { const spot = q ? q.c : pos.entrySpot; const _now = Date.now(); const dteLeft = pos.expiryDate ? Math.max(0, (pos.expiryDate - _now) / 86400_000) : Math.max(0, pos.dte - (_now - pos.openTime) / 86400_000); const curPremium = optPrice(spot, pos.strike, dteLeft, DEFAULT_IV, pos.type); posPnl = { pct: ((curPremium - pos.entryPremium) / pos.entryPremium * 100).toFixed(1), dollar: ((curPremium - pos.entryPremium) * pos.qty * 100).toFixed(0) }; }
+        if (pos) { const spot = q ? q.c : pos.entrySpot; const _now = Date.now(); const dteLeft = pos.expiryDate ? Math.max(0, (pos.expiryDate - _now) / 86400_000) : Math.max(0, pos.dte - (_now - pos.openTime) / 86400_000); const curPremium = optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type); posPnl = { pct: ((curPremium - pos.entryPremium) / pos.entryPremium * 100).toFixed(1), dollar: ((curPremium - pos.entryPremium) * pos.qty * 100).toFixed(0) }; }
         tickers[sym] = { c: q.c, pc: q.pc, d: q.d, dp: q.dp, h: q.h, l: q.l, score: a?.score, signal: a?.signal, stScore: st?.score, mom1d: st?.mom1d, mom3d: st?.mom3d, mom7d: st?.mom7d, held: !!pos, type: pos?.type, posPnl };
       }
       res.end(JSON.stringify({ tickers, pv: portfolioValue(state, dashboard.quotes), cash: state.cash, open: state.positions.length, marketOpen: dashboard.marketOpen, lastCycle: dashboard.lastCycle }));
@@ -4129,7 +4237,7 @@ function buildPositionDetails(acct, quotes) {
     const dteLeft = pos.expiryDate
       ? Math.max(0, (pos.expiryDate - now) / 86400_000)
       : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
-    const curPremium = optPrice(spot, pos.strike, dteLeft, DEFAULT_IV, pos.type);
+    const curPremium = optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type);
     const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
     const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * 100;
     const profitPrice = pos.entryPremium * (1 + cfg.profitTarget);
@@ -4149,7 +4257,7 @@ function buildPositionDetails(acct, quotes) {
       pctToProfit: ((profitPrice - curPremium) / curPremium * 100).toFixed(1),
       pctToStop: ((effectiveStop - curPremium) / curPremium * 100).toFixed(1),
       pdtStatus,
-      greeks: optGreeks(spot, pos.strike, dteLeft, DEFAULT_IV, pos.type),
+      greeks: optGreeks(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type),
     };
   });
 }
@@ -4342,7 +4450,7 @@ async function simTick(sim) {
     positions: acct.state.positions.length,
     regime: regime.mode,
     totalTrades: sim.tradeHistory.filter(t => t.type === "entry").length,
-    openPositions: acct.state.positions.map(p => ({ ticker: p.ticker, type: p.type, strike: p.strike, qty: p.qty, pnlPct: quotes[p.ticker] ? +((optPrice(quotes[p.ticker].c, p.strike, p.dteRemaining, DEFAULT_IV, p.type) - p.entryPremium) / p.entryPremium).toFixed(3) : 0 })),
+    openPositions: acct.state.positions.map(p => ({ ticker: p.ticker, type: p.type, strike: p.strike, qty: p.qty, pnlPct: quotes[p.ticker] ? +((optPrice(quotes[p.ticker].c, p.strike, p.dteRemaining, p.iv || DEFAULT_IV, p.type) - p.entryPremium) / p.entryPremium).toFixed(3) : 0 })),
   });
 
   sim.currentDayIndex++;
