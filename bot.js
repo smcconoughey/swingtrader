@@ -622,13 +622,19 @@ function savePushSubs() {
 async function sendPush(title, message, urgent = false) {
   if (pushSubscriptions.length === 0) return;
   getVapidKeys(); // ensure webpush is initialized
-  const payload = JSON.stringify({ title, body: message, urgent });
+  const tag = `bot-${Date.now()}`;
+  const payload = JSON.stringify({ title, body: message, urgent, tag });
   const dead = [];
   for (const sub of pushSubscriptions) {
     try {
       await webpush.sendNotification(sub, payload);
     } catch (e) {
-      if (e.statusCode === 410 || e.statusCode === 404) dead.push(sub.endpoint);
+      if (e.statusCode === 410 || e.statusCode === 404) {
+        console.log(`  [PUSH] Subscription expired (${sub.endpoint.slice(-20)}), removing`);
+        dead.push(sub.endpoint);
+      } else {
+        console.log(`  [PUSH] Send error (${e.statusCode || e.code}): ${e.message}`);
+      }
     }
   }
   if (dead.length) {
@@ -1269,6 +1275,28 @@ function isMarketOpen() {
 
 function getETDateStr() {
   return getETDate().toISOString().slice(0, 10);
+}
+
+// Returns the next Friday expiration that is at least minCalendarDays away (in ET).
+// Options expire at 4pm ET on the expiry date; we use end-of-day as the timestamp.
+function nextFridayExpiry(minCalendarDays = 7, refDate) {
+  const base = refDate ? new Date(refDate) : getETDate();
+  // Zero out time to midnight
+  base.setHours(0, 0, 0, 0);
+  for (let d = minCalendarDays; d <= minCalendarDays + 7; d++) {
+    const candidate = new Date(base);
+    candidate.setDate(base.getDate() + d);
+    if (candidate.getDay() === 5) { // 5 = Friday
+      // Expiry is at 4pm ET on that Friday
+      candidate.setHours(16, 0, 0, 0);
+      return { date: candidate, dte: d };
+    }
+  }
+  // Fallback (shouldn't happen): just use minCalendarDays
+  const fallback = new Date(base);
+  fallback.setDate(base.getDate() + minCalendarDays);
+  fallback.setHours(16, 0, 0, 0);
+  return { date: fallback, dte: minCalendarDays };
 }
 
 // ─── PDT Enforcement ───
@@ -1951,21 +1979,24 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   const spot = quote.c;
   const maxRisk = state.cash * acct.riskPct;
 
-  let type, strike, dte;
+  let type, strike;
 
   if (analysis.score >= cfg.bullEntry) {
     type = "call";
     const atm = Math.round(spot / 5) * 5;
     strike = atm + 5;
-    dte = 7;
   } else if (analysis.score <= cfg.bearEntry) {
     type = "put";
     const atm = Math.round(spot / 5) * 5;
     strike = atm - 5;
-    dte = 7;
   } else {
     return null;
   }
+
+  // Snap to the next real Friday expiration that is at least 7 calendar days away
+  const expiry = nextFridayExpiry(7);
+  const dte = expiry.dte;
+  const expiryDate = expiry.date.getTime();
 
   const premium = optPrice(spot, strike, dte, DEFAULT_IV, type);
   const costPer = premium * 100;
@@ -1977,6 +2008,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
 
   const position = {
     ticker, type, strike, dte,
+    expiryDate,
     dteRemaining: dte,
     entryPremium: premium,
     entrySpot: spot,
@@ -2036,12 +2068,18 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
 
   const spot = quote.c;
   const maxRisk = state.cash * acct.riskPct;
-  let type, strike, dte;
+  let type, strike;
   if (analysis.score >= cfg.bullEntry) {
-    type = "call"; strike = Math.round(spot / 5) * 5 + 5; dte = 7;
+    type = "call"; strike = Math.round(spot / 5) * 5 + 5;
   } else if (analysis.score <= cfg.bearEntry) {
-    type = "put"; strike = Math.round(spot / 5) * 5 - 5; dte = 7;
+    type = "put"; strike = Math.round(spot / 5) * 5 - 5;
   } else { return null; }
+
+  // Snap to next real Friday expiration >= 7 calendar days out
+  const simNow = acct._simNow ? new Date(acct._simNow) : null;
+  const expiry = nextFridayExpiry(7, simNow);
+  const dte = expiry.dte;
+  const expiryDate = expiry.date.getTime();
 
   const premium = optPrice(spot, strike, dte, DEFAULT_IV, type);
   const costPer = premium * 100;
@@ -2051,7 +2089,7 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
   if (totalCost > state.cash) { qty = Math.floor(state.cash / costPer); totalCost = qty * costPer; }
 
   const position = {
-    ticker, type, strike, dte, dteRemaining: dte,
+    ticker, type, strike, dte, expiryDate, dteRemaining: dte,
     entryPremium: premium, entrySpot: spot, qty, originalQty: qty,
     cost: totalCost, openDate: acct._simDateStr || getETDateStr(),
     openTime: acct._simNow || Date.now(),
@@ -2120,8 +2158,11 @@ function tryExits(acct, quotes) {
     if (!q) { remaining.push(pos); continue; }
 
     const spot = q.c;
-    const elapsed = ((acct._simNow || Date.now()) - pos.openTime) / (86400_000);
-    pos.dteRemaining = Math.max(0, pos.dte - elapsed);
+    const now = acct._simNow || Date.now();
+    // Use stored Friday expiry date if available, otherwise fall back to elapsed-day calculation
+    pos.dteRemaining = pos.expiryDate
+      ? Math.max(0, (pos.expiryDate - now) / 86400_000)
+      : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
 
     const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, DEFAULT_IV, pos.type);
     const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
@@ -2384,8 +2425,10 @@ function dashboardHTML(acct) {
     posSource = state.positions.map(pos => {
       const q = dashboard.quotes[pos.ticker];
       const spot = q ? q.c : pos.entrySpot;
-      const elapsed = (Date.now() - pos.openTime) / 86400_000;
-      const dteLeft = Math.max(0, pos.dte - elapsed);
+      const now = Date.now();
+      const dteLeft = pos.expiryDate
+        ? Math.max(0, (pos.expiryDate - now) / 86400_000)
+        : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
       const curPremium = optPrice(spot, pos.strike, dteLeft, DEFAULT_IV, pos.type);
       const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
       const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * 100;
@@ -3606,7 +3649,7 @@ function startDashboard(defaultAcct, apiKey) {
         const a = dashboard.analyses[sym]; const st = dashboard.shortTermAnalyses[sym];
         const pos = state.positions.find(p => p.ticker === sym);
         let posPnl = null;
-        if (pos) { const spot = q ? q.c : pos.entrySpot; const elapsed = (Date.now() - pos.openTime) / 86400_000; const dteLeft = Math.max(0, pos.dte - elapsed); const curPremium = optPrice(spot, pos.strike, dteLeft, DEFAULT_IV, pos.type); posPnl = { pct: ((curPremium - pos.entryPremium) / pos.entryPremium * 100).toFixed(1), dollar: ((curPremium - pos.entryPremium) * pos.qty * 100).toFixed(0) }; }
+        if (pos) { const spot = q ? q.c : pos.entrySpot; const _now = Date.now(); const dteLeft = pos.expiryDate ? Math.max(0, (pos.expiryDate - _now) / 86400_000) : Math.max(0, pos.dte - (_now - pos.openTime) / 86400_000); const curPremium = optPrice(spot, pos.strike, dteLeft, DEFAULT_IV, pos.type); posPnl = { pct: ((curPremium - pos.entryPremium) / pos.entryPremium * 100).toFixed(1), dollar: ((curPremium - pos.entryPremium) * pos.qty * 100).toFixed(0) }; }
         tickers[sym] = { c: q.c, pc: q.pc, d: q.d, dp: q.dp, h: q.h, l: q.l, score: a?.score, signal: a?.signal, stScore: st?.score, mom1d: st?.mom1d, mom3d: st?.mom3d, mom7d: st?.mom7d, held: !!pos, type: pos?.type, posPnl };
       }
       res.end(JSON.stringify({ tickers, pv: portfolioValue(state, dashboard.quotes), cash: state.cash, open: state.positions.length, marketOpen: dashboard.marketOpen, lastCycle: dashboard.lastCycle }));
@@ -3705,23 +3748,38 @@ function startDashboard(defaultAcct, apiKey) {
     // ─── Web Push endpoints ───
 
     if (pathname === "/sw.js") {
-      res.writeHead(200, { "Content-Type": "application/javascript", "Service-Worker-Allowed": "/" });
+      res.writeHead(200, { "Content-Type": "application/javascript", "Service-Worker-Allowed": "/", "Cache-Control": "no-cache" });
       res.end(`
 self.addEventListener('push', e => {
   const d = e.data ? e.data.json() : { title: 'Bot alert', body: '' };
+  // Use a unique tag per notification so multiple alerts stack instead of replacing each other
+  const tag = d.tag || ('bot-' + Date.now());
   e.waitUntil(self.registration.showNotification(d.title, {
     body: d.body,
     icon: '/favicon.ico',
+    badge: '/favicon.ico',
     requireInteraction: !!d.urgent,
-    tag: 'bot-trade',
+    tag: tag,
+    vibrate: d.urgent ? [200, 100, 200] : [100],
+    timestamp: Date.now(),
   }));
 });
 self.addEventListener('notificationclick', e => {
   e.notification.close();
-  e.waitUntil(clients.matchAll({ type: 'window' }).then(cs => {
-    for (const c of cs) if (c.url === '/' && 'focus' in c) return c.focus();
-    if (clients.openWindow) return clients.openWindow('/');
+  const url = e.notification.data && e.notification.data.url ? e.notification.data.url : '/';
+  e.waitUntil(clients.matchAll({ type: 'window', includeUncontrolled: true }).then(cs => {
+    for (const c of cs) if ('focus' in c) return c.focus();
+    if (clients.openWindow) return clients.openWindow(url);
   }));
+});
+self.addEventListener('pushsubscriptionchange', e => {
+  e.waitUntil(
+    self.registration.pushManager.subscribe(e.oldSubscription.options)
+      .then(sub => fetch('/api/push/subscribe', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(sub)
+      }))
+  );
 });
 `);
       return;
@@ -3741,14 +3799,18 @@ self.addEventListener('notificationclick', e => {
         try {
           const sub = JSON.parse(body);
           if (sub && sub.endpoint) {
-            // deduplicate by endpoint
-            if (!pushSubscriptions.find(s => s.endpoint === sub.endpoint)) {
+            const existingIdx = pushSubscriptions.findIndex(s => s.endpoint === sub.endpoint);
+            if (existingIdx >= 0) {
+              // Upsert: replace with fresh subscription object (keys may have rotated)
+              pushSubscriptions[existingIdx] = sub;
+              console.log(`  [PUSH] Updated existing subscription (total: ${pushSubscriptions.length})`);
+            } else {
               pushSubscriptions.push(sub);
-              savePushSubs();
               console.log(`  [PUSH] New subscription registered (total: ${pushSubscriptions.length})`);
             }
+            savePushSubs();
             res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ ok: true }));
+            res.end(JSON.stringify({ ok: true, total: pushSubscriptions.length }));
           } else {
             res.writeHead(400); res.end("Bad subscription");
           }
@@ -4063,8 +4125,10 @@ function buildPositionDetails(acct, quotes) {
   return state.positions.map(pos => {
     const q = quotes[pos.ticker];
     const spot = q ? q.c : pos.entrySpot;
-    const elapsed = (Date.now() - pos.openTime) / 86400_000;
-    const dteLeft = Math.max(0, pos.dte - elapsed);
+    const now = Date.now();
+    const dteLeft = pos.expiryDate
+      ? Math.max(0, (pos.expiryDate - now) / 86400_000)
+      : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
     const curPremium = optPrice(spot, pos.strike, dteLeft, DEFAULT_IV, pos.type);
     const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
     const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * 100;
