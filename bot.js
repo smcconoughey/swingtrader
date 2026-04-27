@@ -1545,8 +1545,10 @@ function getClaudeCost() {
 }
 
 // ─── Claude Entry Validation Cooldown Cache ───
-// Prevents re-calling Claude for the same ticker every 60s cycle when setup hasn't changed.
-// Key: "<acctId>:<ticker>" → { ts, score, direction, result }
+// ─── Validation Cache ───
+// Caches Claude's decision AND the selected contract so cache hits skip both
+// the Finnhub chain fetch and the Claude call entirely.
+// Key: "<acctId>:<ticker>" → { ts, score, direction, result, selectedCandidate }
 const claudeValidationCache = new Map();
 const CLAUDE_VALIDATION_COOLDOWN_MS = 10 * 60_000; // 10 minutes
 const CLAUDE_VALIDATION_SCORE_DELTA = 5;            // re-validate if score shifts ≥5 pts
@@ -1555,16 +1557,30 @@ function getCachedValidation(acctId, ticker, currentScore, direction) {
   const key = `${acctId}:${ticker}`;
   const cached = claudeValidationCache.get(key);
   if (!cached) return null;
-  const age = Date.now() - cached.ts;
-  if (age > CLAUDE_VALIDATION_COOLDOWN_MS) return null;           // expired
-  if (Math.abs(currentScore - cached.score) >= CLAUDE_VALIDATION_SCORE_DELTA) return null; // score shifted
-  if (cached.direction !== direction) return null;                // direction flipped
-  return cached.result;
+  if (Date.now() - cached.ts > CLAUDE_VALIDATION_COOLDOWN_MS) return null;
+  if (Math.abs(currentScore - cached.score) >= CLAUDE_VALIDATION_SCORE_DELTA) return null;
+  if (cached.direction !== direction) return null;
+  return cached; // returns { result, selectedCandidate }
 }
 
-function setCachedValidation(acctId, ticker, score, direction, result) {
+function setCachedValidation(acctId, ticker, score, direction, result, selectedCandidate = null) {
   const key = `${acctId}:${ticker}`;
-  claudeValidationCache.set(key, { ts: Date.now(), score, direction, result });
+  claudeValidationCache.set(key, { ts: Date.now(), score, direction, result, selectedCandidate });
+}
+
+// ─── Options Chain Cache ───
+// Short-lived per-ticker chain cache so rapid re-attempts don't hammer Finnhub.
+const chainCache = new Map();
+const CHAIN_CACHE_TTL_MS = 5 * 60_000; // 5 minutes
+
+function getCachedChain(ticker) {
+  const cached = chainCache.get(ticker);
+  if (!cached || Date.now() - cached.ts > CHAIN_CACHE_TTL_MS) return null;
+  return cached.chain;
+}
+
+function setCachedChain(ticker, chain) {
+  chainCache.set(ticker, { ts: Date.now(), chain });
 }
 
 async function callClaude(prompt, retries = 3) {
@@ -2060,32 +2076,42 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   const direction = isBullish ? "BULLISH" : "BEARISH";
   const type = isBullish ? "call" : "put";
 
-  // ─── Step 1: Fetch full options chain and build candidate list ───
-  let candidates = [];
-  let chain = null;
-  try {
-    chain = await fetchFullOptionsChain(ticker, apiKey);
-    await delay(API_DELAY);
-    if (chain) {
-      candidates = buildCandidateContracts(chain, type, spot);
-      log(acct, `OPTIONS ${ticker}: chain fetched — ${candidates.length} viable ${type} contracts across ${chain.length} expiries`);
-    }
-  } catch (e) {
-    log(acct, `OPTIONS ${ticker}: chain fetch error — ${e.message}`);
-  }
-
-  // ─── Step 2: Claude validates setup AND selects best contract ───
+  // ─── Step 1: Check validation cache (skips both chain fetch AND Claude call) ───
   let claudeResult = { approve: true, confidence: 70, concerns: [], suggestion: "", contractIdx: 0 };
-  try {
-    const cached = getCachedValidation(acct.id, ticker, analysis.score, direction);
-    if (cached && candidates.length === 0) {
-      // Only use cache if we have no chain (chain data changes, so don't cache contract selection)
-      claudeResult = cached;
-      log(acct, `CLAUDE VALIDATE ${ticker}: CACHED (${claudeResult.approve ? 'APPROVED' : 'REJECTED'} ${claudeResult.confidence}%)`);
-    } else {
+  let selectedCandidate = null;
+
+  const cached = getCachedValidation(acct.id, ticker, analysis.score, direction);
+  if (cached) {
+    claudeResult = cached.result;
+    selectedCandidate = cached.selectedCandidate; // may be null if previously used synthetic
+    log(acct, `CLAUDE VALIDATE ${ticker}: CACHED ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%) — skipping chain fetch + Claude call`);
+    if (!claudeResult.approve) {
+      return { skipped: true, reason: `Claude rejected (cached): ${claudeResult.suggestion}` };
+    }
+  } else {
+    // ─── Step 2: Fetch full options chain (with short-lived cache) ───
+    let candidates = [];
+    try {
+      let chain = getCachedChain(ticker);
+      if (!chain) {
+        chain = await fetchFullOptionsChain(ticker, apiKey);
+        await delay(API_DELAY);
+        if (chain) setCachedChain(ticker, chain);
+      }
+      if (chain) {
+        candidates = buildCandidateContracts(chain, type, spot);
+        log(acct, `OPTIONS ${ticker}: ${candidates.length} viable ${type} contracts (${chain.length} expiries)`);
+      }
+    } catch (e) {
+      log(acct, `OPTIONS ${ticker}: chain error — ${e.message}`);
+    }
+
+    // ─── Step 3: Claude validates setup AND selects best contract ───
+    try {
       claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, candidates);
-      if (candidates.length === 0) setCachedValidation(acct.id, ticker, analysis.score, direction, claudeResult);
-      log(acct, `CLAUDE VALIDATE ${ticker}: ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%)${candidates.length > 0 ? ` — selected contract #${(claudeResult.contractIdx || 0) + 1}` : ''} — ${claudeResult.suggestion}${claudeResult.concerns?.length ? ' | ' + claudeResult.concerns.join(', ') : ''}`);
+      selectedCandidate = candidates.length > 0 ? candidates[claudeResult.contractIdx ?? 0] : null;
+      setCachedValidation(acct.id, ticker, analysis.score, direction, claudeResult, selectedCandidate);
+      log(acct, `CLAUDE VALIDATE ${ticker}: ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%)${selectedCandidate ? ` → $${selectedCandidate.strike} ${selectedCandidate.expiryStr} (${selectedCandidate.dte}d)` : ''} — ${claudeResult.suggestion}${claudeResult.concerns?.length ? ' | ' + claudeResult.concerns.join(', ') : ''}`);
       logClaudeCall({
         type: "entry_validation",
         ticker,
@@ -2100,19 +2126,18 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
         direction,
         regime: regime.label,
       });
+    } catch (e) {
+      log(acct, `CLAUDE VALIDATE ${ticker}: Error — ${e.message}, proceeding anyway`);
     }
-  } catch (e) {
-    log(acct, `CLAUDE VALIDATE ${ticker}: Error — ${e.message}, proceeding anyway`);
+
+    if (!claudeResult.approve) {
+      return { skipped: true, reason: `Claude rejected: ${claudeResult.suggestion} (${(claudeResult.concerns || []).join(', ')})` };
+    }
   }
 
-  if (!claudeResult.approve) {
-    return { skipped: true, reason: `Claude rejected: ${claudeResult.suggestion} (${(claudeResult.concerns || []).join(', ')})` };
-  }
-
-  // ─── Step 3: Use Claude's chosen contract, or fall back to synthetic ───
+  // ─── Step 4: Use selected contract (from cache or fresh) ───
   let strike, dte, expiryDate, premium, posIv, optionsSource;
-
-  const selectedCandidate = candidates.length > 0 ? candidates[claudeResult.contractIdx ?? 0] : null;
+  // selectedCandidate already set above (either from cache or fresh Claude response)
 
   if (selectedCandidate) {
     strike = selectedCandidate.strike;
