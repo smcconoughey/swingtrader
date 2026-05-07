@@ -386,8 +386,8 @@ const DEFAULT_IV = 0.30;
 const EOD_FREEZE_HOUR = 15;    // No new entries after 3:00 PM ET
 const EOD_TIGHTEN_HOUR = 15.5; // Tighten stops after 3:30 PM ET
 const EOW_TRIM_HOUR = 14;      // Friday profit-taking starts at 2:00 PM ET
-const LOW_DTE_THRESHOLD = 3;   // Accelerate exits when DTE <= 3
-const CRITICAL_DTE = 2;        // Force-close when DTE <= 2
+const LOW_DTE_THRESHOLD = 5;   // Accelerate exits when DTE <= 5
+const CRITICAL_DTE = 3;        // Force-close when DTE <= 3 (give exits room before gamma cliff)
 
 const CLAUDE_API_KEY = (process.env.CLAUDE_API_KEY || "").trim();
 
@@ -396,15 +396,15 @@ const CLAUDE_API_KEY = (process.env.CLAUDE_API_KEY || "").trim();
 const DEFAULT_CONFIG = {
   startingCash: 200,
   goal: 200_000,
-  baseRiskPct: 0.15,
-  profitTarget: 0.40,
+  baseRiskPct: 0.08,
+  profitTarget: 0.50,
   stopLoss: -0.35,
-  bullEntry: 65,
-  bearEntry: 35,
+  bullEntry: 68,
+  bearEntry: 32,
   trim1Pct: 0.25,
   trim2Pct: 0.50,
-  maxPositions: null,
-  minSetupQuality: 50,
+  maxPositions: 4,
+  minSetupQuality: 60,
   customPromptSuffix: "",
 };
 
@@ -914,7 +914,7 @@ async function checkEarnings(ticker, apiKey) {
   try {
     const now = getETDate();
     const from = now.toISOString().slice(0, 10);
-    const futureDate = new Date(now.getTime() + 4 * 86400_000); // 4 days out
+    const futureDate = new Date(now.getTime() + 8 * 86400_000); // 8 days out
     const to = futureDate.toISOString().slice(0, 10);
     const r = await fetch(`https://finnhub.io/api/v1/calendar/earnings?from=${from}&to=${to}&symbol=${ticker}&token=${apiKey}`);
     if (!r.ok) return { hasEarnings: false, daysUntil: null };
@@ -924,7 +924,7 @@ async function checkEarnings(ticker, apiKey) {
     const nextEarning = earnings[0];
     const earningDate = new Date(nextEarning.date);
     const daysUntil = Math.ceil((earningDate - now) / 86400_000);
-    return { hasEarnings: daysUntil <= 3, daysUntil, date: nextEarning.date };
+    return { hasEarnings: daysUntil <= 7, daysUntil, date: nextEarning.date };
   } catch {
     return { hasEarnings: false, daysUntil: null };
   }
@@ -1423,7 +1423,7 @@ function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 12) {
     const expiryDt = new Date(exp.expirationDate);
     expiryDt.setHours(16, 0, 0, 0);
     const dte = Math.round((expiryDt.getTime() - now) / 86400_000);
-    if (dte < 3 || dte > 45) continue; // only consider 3-45 DTE
+    if (dte < 10 || dte > 45) continue; // 10-45 DTE — 7DTE bled to theta on flat thesis
 
     const contracts = exp.options?.[typeKey] || [];
     for (const c of contracts) {
@@ -1432,7 +1432,7 @@ function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 12) {
       if ((c.openInterest || 0) < 5) continue;  // completely illiquid
 
       const mid = +((c.bid + c.ask) / 2).toFixed(2);
-      if (mid < 0.02) continue;
+      if (mid < 0.25) continue; // penny options: bid-ask spread alone is 5-10%, kills edge
 
       // Moneyness: positive = OTM (we want to be able to buy OTM or slight ITM)
       const moneyness = typeKey === "CALL"
@@ -1450,7 +1450,7 @@ function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 12) {
       const delta = c.delta != null ? c.delta : null;
 
       // Quality score: penalise wide spreads, illiquidity, very short or very long DTE
-      const dtePenalty = Math.abs(dte - 10); // prefer ~10 DTE
+      const dtePenalty = Math.abs(dte - 21); // prefer ~21 DTE — leaves room for thesis to play out
       const liqScore = Math.log1p((c.openInterest || 0) + (c.volume || 0));
       const quality = liqScore - spreadPct * 3 - dtePenalty * 0.1;
 
@@ -2018,6 +2018,15 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   const cfg = acct.config;
   if (state.positions.some(p => p.ticker === ticker)) return null;
   if (state.cash < 100) return null;
+  // Hard cap on concurrent positions — prevents over-deployment that drained cash to $25
+  if (cfg.maxPositions && state.positions.length >= cfg.maxPositions) {
+    return { skipped: true, reason: `Max positions (${cfg.maxPositions}) already open` };
+  }
+  // Cash floor: stop adding risk once we're below 10% of starting cash. Preserves dry powder
+  // to rotate after exits instead of bleeding the last few dollars on marginal setups.
+  if (state.cash < cfg.startingCash * 0.10) {
+    return { skipped: true, reason: `Cash $${state.cash.toFixed(0)} below 10% of starting cash — preserving capital` };
+  }
 
   // Early exit: skip tickers that aren't actionable (WAIT zone) before any expensive checks
   if (analysis.score < cfg.bullEntry && analysis.score > cfg.bearEntry) return null;
@@ -2148,10 +2157,10 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     optionsSource = "finnhub";
     log(acct, `CONTRACT ${ticker}: $${strike} ${type.toUpperCase()} exp ${selectedCandidate.expiryStr} (${dte}d) @ $${premium} mid | IV ${posIv ? (posIv*100).toFixed(0)+'%' : '?'} | OI ${selectedCandidate.oi} | spread $${selectedCandidate.spread}`);
   } else {
-    // Synthetic fallback: 1 strike OTM, next Friday ≥7 days
+    // Synthetic fallback: 1 strike OTM, next Friday ≥14 days (longer DTE = less theta drag)
     const atm = Math.round(spot / 5) * 5;
     strike = isBullish ? atm + 5 : atm - 5;
-    const expiry = nextFridayExpiry(7);
+    const expiry = nextFridayExpiry(14);
     dte = expiry.dte;
     expiryDate = expiry.date.getTime();
     posIv = DEFAULT_IV;
@@ -2337,8 +2346,24 @@ function tryExits(acct, quotes) {
     let reason = null;
     let fullClose = false;
 
-    if (pos.dteRemaining <= CRITICAL_DTE) {
+    // Spot-based directional stop — exit if the underlying moved against us beyond a threshold,
+    // independent of premium/theta. Prevents the historical pattern of correct-direction trades
+    // bleeding -13% on theta when spot is flat AND wrong-direction trades hiding under the
+    // -35% premium stop until forced critical-DTE close at -50% to -76%.
+    const spotMove = pos.entrySpot ? (spot - pos.entrySpot) / pos.entrySpot : 0;
+    const adverseSpotMove = pos.type === "call" ? -spotMove : spotMove; // +ve = moved against us
+    if (adverseSpotMove >= 0.04) { // 4% adverse move on the underlying
+      reason = `spot stop: underlying ${pos.type === "call" ? "down" : "up"} ${(adverseSpotMove * 100).toFixed(1)}% from entry`;
+      fullClose = true;
+    }
+    else if (pos.dteRemaining <= CRITICAL_DTE) {
       reason = `DTE critical (${pos.dteRemaining.toFixed(1)}d remaining)`;
+      fullClose = true;
+    }
+    // DTE-aware stop tightening: as expiration approaches, accept smaller losses to avoid
+    // the "force-close at -60%" trap. At <=5 DTE, use a -20% stop instead of -35%.
+    else if (pos.dteRemaining <= LOW_DTE_THRESHOLD && pnlPct <= -0.20) {
+      reason = `low-DTE tight stop ${(pnlPct * 100).toFixed(0)}% (${pos.dteRemaining.toFixed(1)}d left, theta accelerating)`;
       fullClose = true;
     }
     else if (pnlPct <= cfg.stopLoss) {
