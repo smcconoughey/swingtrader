@@ -403,7 +403,7 @@ const DEFAULT_CONFIG = {
   bearEntry: 32,
   trim1Pct: 0.25,
   trim2Pct: 0.50,
-  maxPositions: 4,
+  maxPositions: 6,
   minSetupQuality: 60,
   customPromptSuffix: "",
 };
@@ -453,6 +453,30 @@ function createAccountRuntime(id, name, config, state) {
     lastNewsScan: 0,
     latestNewsBrief: "",
   };
+}
+
+// ─── Portfolio History Helpers ───
+
+// Push a point onto the portfolio-value series, with dedup/decimation so it can span weeks
+// without unbounded growth. Robinhood-style: keep the freshest point per ~minute, plus all
+// points where the value changed by more than a tiny threshold (so flat overnight gaps don't
+// dominate the buffer).
+function appendPortfolioPoint(hist, ts, value) {
+  const last = hist[hist.length - 1];
+  if (last) {
+    const dt = ts - last.ts;
+    const dv = Math.abs(value - last.value);
+    // Coalesce: if the latest sample is within 60s of the previous AND value barely changed,
+    // overwrite it instead of appending. Keeps live updates dense without bloating history.
+    if (dt < 60_000 && dv < 0.50) {
+      last.ts = ts;
+      last.value = value;
+      return;
+    }
+  }
+  hist.push({ ts, value });
+  // Hard ceiling: 20k points (~14 days at 1/min, or weeks if coalesced). Drop the oldest.
+  if (hist.length > 20000) hist.splice(0, hist.length - 20000);
 }
 
 // ─── Account Persistence ───
@@ -2189,7 +2213,13 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     trimLevel: 0,
     bestPnlPct: 0,
     claudeConfidence: claudeResult.confidence,
+    claudeSuggestion: claudeResult.suggestion || "",
+    claudeConcerns: claudeResult.concerns || [],
     setupQuality: setupQuality.quality,
+    technicalScore: analysis.score,
+    direction,
+    regimeAtEntry: regime.label,
+    topSignals: (analysis.sigs || []).slice(0, 3).map(s => s.text),
     iv: posIv,
     optionsSource,
   };
@@ -2643,8 +2673,30 @@ function dashboardHTML(acct) {
     const spotColor = spotChg >= 0 ? "#00ff88" : "#ff4444";
     const spotFromEntry = p.spot && p.entrySpot ? ((p.spot - p.entrySpot) / p.entrySpot * 100) : 0;
     const spotFromEntryColor = spotFromEntry >= 0 ? "#00ff88" : "#ff4444";
+    const rowId = `pos-ai-${p.ticker}-${p.strike}-${p.type}`;
+    const sigs = (p.topSignals || []).join(" · ");
+    const concerns = (p.claudeConcerns || []).join(" · ");
+    const hasAI = !!(p.claudeSuggestion || sigs || concerns);
+    const aiToggle = hasAI ? `<button type="button" class="ai-toggle" onclick="toggleRow('${rowId}')" title="Show AI thinking" style="background:none;border:1px solid #a78bfa55;color:#a78bfa;border-radius:3px;padding:1px 6px;font-size:9px;cursor:pointer;margin-left:6px">🧠 AI</button>` : "";
+    const aiRow = hasAI ? `<tr id="${rowId}" style="display:none;background:#a78bfa08">
+      <td colspan="12" style="padding:10px 12px;font-size:11px;color:#bbb;line-height:1.6">
+        <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:flex-start">
+          <div style="flex:1;min-width:240px">
+            <div style="color:#a78bfa;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">Claude's Reasoning ${p.claudeConfidence ? `(${p.claudeConfidence}% confidence)` : ''}</div>
+            <div style="color:#ddd">${p.claudeSuggestion || '<span style="opacity:.5">(no suggestion captured)</span>'}</div>
+            ${concerns ? `<div style="margin-top:6px;color:#ffd93d"><b>Concerns:</b> ${concerns}</div>` : ''}
+          </div>
+          <div style="flex:1;min-width:240px">
+            <div style="color:#a78bfa;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">Setup at Entry</div>
+            <div style="color:#888">Technical score: <span style="color:#fff">${p.technicalScore ?? '?'}/100</span> · Setup quality: <span style="color:#fff">${p.setupQuality ?? '?'}/100</span> · Direction: <span style="color:#fff">${p.direction || (p.type === 'call' ? 'BULLISH' : 'BEARISH')}</span></div>
+            <div style="color:#888">Regime: <span style="color:#fff">${p.regimeAtEntry || '?'}</span></div>
+            ${sigs ? `<div style="margin-top:6px"><b style="color:#4ecdc4">Signals:</b> ${sigs}</div>` : ''}
+          </div>
+        </div>
+      </td>
+    </tr>` : "";
     return `<tr>
-      <td><a href="/ticker/${p.ticker}"><b>${p.ticker}</b></a></td><td>${p.type.toUpperCase()}</td><td>$${p.strike}</td>
+      <td><a href="/ticker/${p.ticker}"><b>${p.ticker}</b></a>${aiToggle}</td><td>${p.type.toUpperCase()}</td><td>$${p.strike}</td>
       <td style="white-space:nowrap">$${p.spot.toFixed(2)}<br><span style="color:${spotColor};font-size:10px">${spotChg >= 0 ? "+" : ""}${spotChg.toFixed(2)} (${spotChgPct >= 0 ? "+" : ""}${spotChgPct.toFixed(1)}%)</span><br><span style="color:${spotFromEntryColor};font-size:10px">from entry: ${spotFromEntry >= 0 ? "+" : ""}${spotFromEntry.toFixed(1)}%</span></td>
       <td>${p.dteLeft.toFixed(1)}d</td><td>${p.qty}</td>
       <td>$${p.entryPremium.toFixed(2)}</td><td>$${p.curPremium.toFixed(2)}</td>
@@ -2652,7 +2704,7 @@ function dashboardHTML(acct) {
       <td><span style="color:#00ff88">TP $${p.profitTarget.premium}</span> (${p.pctToProfit}% away)</td>
       <td><span style="color:#ff4444">SL $${p.stopLoss.premium}</span> (${p.pctToStop}% away)</td>
       <td style="font-size:10px;color:#888">δ${p.greeks.delta} θ${p.greeks.theta}<br>${p.pdtStatus}<br><span style="color:${p.optionsSource === 'finnhub' ? '#4ecdc4' : '#555'}" title="IV used for pricing">IV ${((p.iv || 0.30) * 100).toFixed(0)}% ${p.optionsSource === 'finnhub' ? '●' : '○'}</span></td>
-    </tr>`;
+    </tr>${aiRow}`;
   }).join("") : '<tr><td colspan="12" style="opacity:.5">No open positions</td></tr>';
 
   // Decision reasoning panel
@@ -2693,12 +2745,26 @@ function dashboardHTML(acct) {
       <td>${a.rsi.toFixed(0)}</td><td>${st ? st.rsi.toFixed(0) : '—'}</td><td>${momStr}</td><td>${a.atrPct.toFixed(1)}%</td><td>${a.vr.toFixed(2)}</td></tr>`;
   }).join("") || '<tr><td colspan="10" style="opacity:.5">Waiting for first cycle...</td></tr>';
 
-  const historyRows = state.history.slice(-20).reverse().map(h => {
+  const historyRows = state.history.slice(-20).reverse().map((h, idx) => {
     const color = h.pnlDollar >= 0 ? "#00ff88" : "#ff4444";
-    return `<tr><td>${h.ticker}</td><td>${h.type.toUpperCase()}</td><td>$${h.strike}</td>
+    const sigs = (h.topSignals || []).join(" · ");
+    const concerns = (h.claudeConcerns || []).join(" · ");
+    const hasAI = !!(h.claudeSuggestion || sigs || concerns);
+    const rowId = `hist-ai-${idx}-${h.ticker}-${h.strike}`;
+    const aiToggle = hasAI ? `<button type="button" class="ai-toggle" onclick="toggleRow('${rowId}')" title="Show AI thinking for this trade" style="background:none;border:1px solid #a78bfa55;color:#a78bfa;border-radius:3px;padding:1px 6px;font-size:9px;cursor:pointer;margin-left:4px">🧠</button>` : "";
+    const aiRow = hasAI ? `<tr id="${rowId}" style="display:none;background:#a78bfa08">
+      <td colspan="7" style="padding:10px 12px;font-size:11px;color:#bbb;line-height:1.5">
+        <div style="color:#a78bfa;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">Entry Reasoning ${h.claudeConfidence ? `(${h.claudeConfidence}% confidence)` : ''} — outcome ${h.pnlDollar >= 0 ? 'WIN' : 'LOSS'}</div>
+        <div style="color:#ddd">${h.claudeSuggestion || '<span style="opacity:.5">(no Claude suggestion captured)</span>'}</div>
+        ${concerns ? `<div style="margin-top:4px;color:#ffd93d"><b>Concerns at entry:</b> ${concerns}</div>` : ''}
+        ${sigs ? `<div style="margin-top:4px"><b style="color:#4ecdc4">Signals at entry:</b> ${sigs}</div>` : ''}
+        <div style="margin-top:4px;color:#888">Setup quality <span style="color:#fff">${h.setupQuality ?? '?'}/100</span> · Tech score <span style="color:#fff">${h.technicalScore ?? '?'}/100</span> · Regime <span style="color:#fff">${h.regimeAtEntry || '?'}</span></div>
+      </td>
+    </tr>` : "";
+    return `<tr><td>${h.ticker}${aiToggle}</td><td>${h.type.toUpperCase()}</td><td>$${h.strike}</td>
       <td>$${h.entryPremium.toFixed(2)}</td><td>$${(h.closePremium || 0).toFixed(2)}</td>
       <td style="color:${color}">${h.pnlDollar >= 0 ? "+" : ""}$${h.pnlDollar.toFixed(0)} (${(h.pnlPct * 100).toFixed(0)}%)</td>
-      <td>${h.reason || "—"}</td></tr>`;
+      <td>${h.reason || "—"}</td></tr>${aiRow}`;
   }).join("") || '<tr><td colspan="7" style="opacity:.5">No trades yet</td></tr>';
 
   const hints = acct.activeHints.map(h => {
@@ -2815,11 +2881,42 @@ ${accountActionsHTML(acct.id)}
   <table><tr><th>Ticker</th><th>Type</th><th>Strike</th><th>Stock Price</th><th>DTE</th><th>Qty</th><th>Entry</th><th>Current</th><th>P&L</th><th>Profit Target</th><th>Stop Loss</th><th>Greeks / PDT</th></tr>${posRows}</table>
 </div>
 
-<div class="card" style="margin-bottom:16px">
-  <h2>Bot Thinking — Decision Reasoning</h2>
-  <div style="font-size:10px;color:#555;margin-bottom:8px">Score 50=neutral · ≥${BULL_ENTRY} buy calls · ≤${BEAR_ENTRY} buy puts · Risk: ${(RISK_PCT * 100)}%/trade · TP: +${(PROFIT_TARGET * 100)}% · SL: ${(STOP_LOSS * 100)}%</div>
-  <table><tr><th>Ticker</th><th>Price</th><th>Score (7d/90d→blend→final)</th><th>Decision</th><th>Reasoning</th><th>EMAs (8/21/50)</th><th>7d EMAs (3/5/8)</th><th>Indicators</th><th>Momentum</th></tr>${decisionRows}</table>
+<div class="card" style="margin-bottom:16px" id="bot-thinking-card">
+  <h2 style="display:flex;align-items:center;justify-content:space-between;cursor:pointer;margin:0" onclick="toggleBotThinking()">
+    <span>Bot Thinking — Decision Reasoning <span style="color:#444;font-weight:400;text-transform:none;font-size:10px;letter-spacing:0">(${dashboard.decisions.length} tickers)</span></span>
+    <span id="bot-thinking-caret" style="color:#666;font-size:14px;font-weight:400">▾</span>
+  </h2>
+  <div id="bot-thinking-body" style="margin-top:12px">
+    <div style="font-size:10px;color:#555;margin-bottom:8px">Score 50=neutral · ≥${BULL_ENTRY} buy calls · ≤${BEAR_ENTRY} buy puts · Risk: ${(RISK_PCT * 100)}%/trade · TP: +${(PROFIT_TARGET * 100)}% · SL: ${(STOP_LOSS * 100)}%</div>
+    <table><tr><th>Ticker</th><th>Price</th><th>Score (7d/90d→blend→final)</th><th>Decision</th><th>Reasoning</th><th>EMAs (8/21/50)</th><th>7d EMAs (3/5/8)</th><th>Indicators</th><th>Momentum</th></tr>${decisionRows}</table>
+  </div>
 </div>
+<script>
+function toggleRow(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.style.display = el.style.display === 'none' ? '' : 'none';
+}
+function toggleBotThinking() {
+  const body = document.getElementById('bot-thinking-body');
+  const caret = document.getElementById('bot-thinking-caret');
+  if (!body || !caret) return;
+  const collapsed = body.style.display === 'none';
+  body.style.display = collapsed ? '' : 'none';
+  caret.textContent = collapsed ? '▾' : '▸';
+  try { localStorage.setItem('botThinkingCollapsed', collapsed ? '0' : '1'); } catch {}
+}
+(function restoreBotThinking() {
+  try {
+    if (localStorage.getItem('botThinkingCollapsed') === '1') {
+      const body = document.getElementById('bot-thinking-body');
+      const caret = document.getElementById('bot-thinking-caret');
+      if (body) body.style.display = 'none';
+      if (caret) caret.textContent = '▸';
+    }
+  } catch {}
+})();
+</script>
 
 <div class="grid">
   <div class="card">
@@ -2833,44 +2930,250 @@ ${accountActionsHTML(acct.id)}
 </div>
 
 <div class="card" style="margin-top:16px">
-  <h2>Portfolio Value Over Time</h2>
-  ${(() => {
-      const hist = dashboard.portfolioHistory || [];
-      if (hist.length < 2) return '<span style="opacity:.5;font-size:12px">Collecting data — chart appears after 2+ cycles...</span>';
-      const W = 900, H = 180, PAD = 48;
-      const vals = hist.map(h => h.value);
-      const times = hist.map(h => h.ts);
-      const minV = Math.min(...vals, STARTING_CASH);
-      const maxV = Math.max(...vals, STARTING_CASH * 1.1);
-      const minT = times[0], maxT = times[times.length - 1];
-      const xOf = t => PAD + (t - minT) / Math.max(1, maxT - minT) * (W - PAD * 2);
-      const yOf = v => H - PAD / 2 - (v - minV) / Math.max(1, maxV - minV) * (H - PAD);
-      const pts = hist.map(h => `${xOf(h.ts).toFixed(1)},${yOf(h.value).toFixed(1)}`).join(' ');
-      const lastVal = vals[vals.length - 1];
-      const color = lastVal >= STARTING_CASH ? '#00ff88' : '#ff4444';
-      const startY = yOf(STARTING_CASH).toFixed(1);
-      const goalY = yOf(GOAL) > 0 ? yOf(GOAL).toFixed(1) : '4';
-      const labelTime = t => { const d = new Date(t); return d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true }); };
-      return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;overflow:visible">
-      <defs><linearGradient id="pvgrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="${color}" stop-opacity="0.25"/><stop offset="100%" stop-color="${color}" stop-opacity="0"/></linearGradient></defs>
-      <!-- baseline -->
-      <line x1="${PAD}" y1="${startY}" x2="${W - PAD}" y2="${startY}" stroke="#ffffff22" stroke-width="1" stroke-dasharray="4,4"/>
-      <text x="${PAD - 4}" y="${Number(startY) + 4}" fill="#ffffff44" font-size="10" text-anchor="end">$${STARTING_CASH.toLocaleString()}</text>
-      <!-- goal line -->
-      <line x1="${PAD}" y1="${goalY}" x2="${W - PAD}" y2="${goalY}" stroke="#ffd93d33" stroke-width="1" stroke-dasharray="3,6"/>
-      <!-- area fill -->
-      <polygon points="${pts} ${xOf(maxT).toFixed(1)},${H - PAD / 2} ${xOf(minT).toFixed(1)},${H - PAD / 2}" fill="url(#pvgrad)"/>
-      <!-- line -->
-      <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round"/>
-      <!-- current value dot + label -->
-      <circle cx="${xOf(maxT).toFixed(1)}" cy="${yOf(lastVal).toFixed(1)}" r="4" fill="${color}"/>
-      <text x="${Math.min(xOf(maxT) + 6, W - PAD - 60)}" y="${Math.min(yOf(lastVal) - 6, H - PAD / 2 - 10)}" fill="${color}" font-size="11" font-weight="bold">$${lastVal.toFixed(0)}</text>
-      <!-- x-axis labels -->
-      <text x="${PAD}" y="${H - 6}" fill="#ffffff44" font-size="9">${labelTime(minT)}</text>
-      <text x="${W - PAD}" y="${H - 6}" fill="#ffffff44" font-size="9" text-anchor="end">${labelTime(maxT)}</text>
-    </svg>`;
-    })()}
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px">
+    <h2 style="margin:0">Portfolio Value</h2>
+    <div id="pv-range" style="display:flex;gap:4px;font-size:10px">
+      <button type="button" class="pv-range-btn" data-range="1D">1D</button>
+      <button type="button" class="pv-range-btn" data-range="1W">1W</button>
+      <button type="button" class="pv-range-btn" data-range="1M">1M</button>
+      <button type="button" class="pv-range-btn active" data-range="ALL">ALL</button>
+    </div>
+  </div>
+  <div id="pv-chart-container" style="position:relative">
+    <svg id="pv-chart" viewBox="0 0 900 220" preserveAspectRatio="none" style="width:100%;height:220px;display:block;overflow:visible"></svg>
+    <div id="pv-readout" style="font-size:11px;color:#666;margin-top:6px;display:flex;justify-content:space-between;gap:12px">
+      <span id="pv-readout-time">—</span>
+      <span><span id="pv-readout-value" style="color:#fff;font-weight:700">—</span> <span id="pv-readout-pnl" style="color:#666">—</span></span>
+    </div>
+  </div>
 </div>
+<style>
+  .pv-range-btn{background:#14141e;border:1px solid #222;color:#888;padding:3px 8px;border-radius:4px;cursor:pointer;font-family:inherit;font-size:10px}
+  .pv-range-btn:hover{color:#fff;border-color:#333}
+  .pv-range-btn.active{background:#a78bfa20;color:#a78bfa;border-color:#a78bfa55}
+</style>
+<script>
+(function() {
+  const STARTING_CASH = ${STARTING_CASH};
+  let currentRange = 'ALL';
+  let cachedHistory = null;
+  let cachedAt = 0;
+
+  async function fetchHistory() {
+    // Cache for 4s to avoid hammering when range buttons are pressed quickly
+    if (cachedHistory && Date.now() - cachedAt < 4000) return cachedHistory;
+    try {
+      const r = await fetch('/api/portfolio-history?a=${acct.id}');
+      const d = await r.json();
+      cachedHistory = d;
+      cachedAt = Date.now();
+      return d;
+    } catch { return null; }
+  }
+
+  // Filter to the current range; "1D" = today's session only, etc.
+  function pointsInRange(hist, range) {
+    if (!hist || !hist.length) return [];
+    const now = Date.now();
+    let cutoff = 0;
+    if (range === '1D') cutoff = now - 24 * 3600_000;
+    else if (range === '1W') cutoff = now - 7 * 86400_000;
+    else if (range === '1M') cutoff = now - 30 * 86400_000;
+    if (cutoff === 0) return hist;
+    const pts = hist.filter(p => p.ts >= cutoff);
+    return pts.length ? pts : hist.slice(-1);
+  }
+
+  // ET market hours check — 9:30am to 4:00pm Mon-Fri.
+  function isTradingTime(ts) {
+    // Convert to ET via locale string trick
+    const et = new Date(new Date(ts).toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    const day = et.getDay();
+    if (day === 0 || day === 6) return false;
+    const minutes = et.getHours() * 60 + et.getMinutes();
+    return minutes >= 9 * 60 + 30 && minutes <= 16 * 60;
+  }
+
+  // Group points into ET-session buckets and stitch them along a continuous X axis,
+  // collapsing nights/weekends. Each point gets a sessionIndex so the chart skips dead time.
+  function compressSessions(points) {
+    if (!points.length) return { pts: [], sessions: [], total: 0 };
+    const sessions = []; // { etDate: 'YYYY-MM-DD', start: ts, end: ts }
+    const enriched = [];
+    let curKey = null, curSession = null;
+    for (const p of points) {
+      const et = new Date(new Date(p.ts).toLocaleString('en-US', { timeZone: 'America/New_York' }));
+      const key = et.getFullYear() + '-' + (et.getMonth() + 1) + '-' + et.getDate();
+      if (key !== curKey) {
+        curKey = key;
+        curSession = { key, label: (et.getMonth() + 1) + '/' + et.getDate(), startTs: p.ts, endTs: p.ts };
+        sessions.push(curSession);
+      } else {
+        curSession.endTs = p.ts;
+      }
+      enriched.push({ ts: p.ts, value: p.value, sessionIdx: sessions.length - 1 });
+    }
+    // Within each session, give each point a fractional position [0..1] by raw time.
+    for (const s of sessions) {
+      const span = Math.max(1, s.endTs - s.startTs);
+      for (const p of enriched) {
+        if (p.sessionIdx === sessions.indexOf(s)) {
+          p.frac = (p.ts - s.startTs) / span;
+        }
+      }
+    }
+    // X position = sessionIdx + frac, normalized to [0..1] across total sessions.
+    const totalSlots = Math.max(1, sessions.length);
+    for (const p of enriched) {
+      p.x = (p.sessionIdx + p.frac) / totalSlots;
+    }
+    return { pts: enriched, sessions, total: totalSlots };
+  }
+
+  function renderChart(history) {
+    const svg = document.getElementById('pv-chart');
+    if (!svg) return;
+    const all = (history && history.history) || [];
+    if (all.length < 2) {
+      svg.innerHTML = '<text x="450" y="110" fill="#666" font-size="12" text-anchor="middle">Collecting data — chart appears after 2+ cycles...</text>';
+      return;
+    }
+    const points = pointsInRange(all, currentRange);
+    if (points.length < 2) {
+      svg.innerHTML = '<text x="450" y="110" fill="#666" font-size="12" text-anchor="middle">No data in this range yet.</text>';
+      return;
+    }
+
+    const W = 900, H = 220, PAD_L = 56, PAD_R = 16, PAD_T = 12, PAD_B = 30;
+    const innerW = W - PAD_L - PAD_R;
+    const innerH = H - PAD_T - PAD_B;
+    const vals = points.map(p => p.value);
+    const minV = Math.min(...vals, STARTING_CASH * 0.98);
+    const maxV = Math.max(...vals, STARTING_CASH * 1.02);
+    const vRange = Math.max(1, maxV - minV);
+
+    const compressed = compressSessions(points);
+    const xOf = p => PAD_L + p.x * innerW;
+    const yOf = v => PAD_T + innerH - ((v - minV) / vRange) * innerH;
+
+    const lastVal = vals[vals.length - 1];
+    const firstVal = vals[0];
+    const rangeColor = lastVal >= firstVal ? '#00ff88' : '#ff4444';
+
+    const pts = compressed.pts.map(p => xOf(p) + ',' + yOf(p.value).toFixed(1)).join(' ');
+    const startY = yOf(STARTING_CASH).toFixed(1);
+
+    // Session tick labels (max ~6 to avoid clutter)
+    const tickStride = Math.max(1, Math.ceil(compressed.sessions.length / 6));
+    const tickLabels = compressed.sessions.map((s, i) => {
+      if (i % tickStride !== 0 && i !== compressed.sessions.length - 1) return '';
+      const x = PAD_L + ((i + 0.5) / Math.max(1, compressed.sessions.length)) * innerW;
+      return '<text x="' + x.toFixed(1) + '" y="' + (H - 8) + '" fill="#ffffff33" font-size="9" text-anchor="middle">' + s.label + '</text>';
+    }).join('');
+
+    // Y-axis labels (5 ticks)
+    const yTicks = [0, 0.25, 0.5, 0.75, 1].map(f => {
+      const v = minV + f * vRange;
+      const y = PAD_T + (1 - f) * innerH;
+      return '<text x="' + (PAD_L - 6) + '" y="' + (y + 3) + '" fill="#ffffff33" font-size="9" text-anchor="end">$' + Math.round(v) + '</text>'
+           + '<line x1="' + PAD_L + '" y1="' + y + '" x2="' + (W - PAD_R) + '" y2="' + y + '" stroke="#ffffff0a" stroke-width="1"/>';
+    }).join('');
+
+    const lastX = xOf(compressed.pts[compressed.pts.length - 1]);
+    const lastY = yOf(lastVal);
+
+    svg.innerHTML =
+      '<defs><linearGradient id="pvgrad" x1="0" y1="0" x2="0" y2="1">' +
+        '<stop offset="0%" stop-color="' + rangeColor + '" stop-opacity="0.25"/>' +
+        '<stop offset="100%" stop-color="' + rangeColor + '" stop-opacity="0"/>' +
+      '</linearGradient></defs>' +
+      yTicks +
+      // Starting cash baseline
+      '<line x1="' + PAD_L + '" y1="' + startY + '" x2="' + (W - PAD_R) + '" y2="' + startY + '" stroke="#ffffff22" stroke-width="1" stroke-dasharray="4,4"/>' +
+      '<text x="' + (W - PAD_R - 2) + '" y="' + (Number(startY) - 4) + '" fill="#ffffff55" font-size="9" text-anchor="end">start $' + STARTING_CASH + '</text>' +
+      // Area fill
+      '<polygon points="' + pts + ' ' + lastX.toFixed(1) + ',' + (PAD_T + innerH) + ' ' + xOf(compressed.pts[0]).toFixed(1) + ',' + (PAD_T + innerH) + '" fill="url(#pvgrad)"/>' +
+      // Line
+      '<polyline points="' + pts + '" fill="none" stroke="' + rangeColor + '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>' +
+      // Pulsing current-value dot
+      '<circle cx="' + lastX.toFixed(1) + '" cy="' + lastY.toFixed(1) + '" r="5" fill="' + rangeColor + '" opacity="0.3"><animate attributeName="r" values="5;10;5" dur="2s" repeatCount="indefinite"/><animate attributeName="opacity" values="0.3;0;0.3" dur="2s" repeatCount="indefinite"/></circle>' +
+      '<circle cx="' + lastX.toFixed(1) + '" cy="' + lastY.toFixed(1) + '" r="3.5" fill="' + rangeColor + '"/>' +
+      // Session tick labels
+      tickLabels +
+      // Hover capture (invisible rect with mousemove handler — set up after innerHTML)
+      '<rect id="pv-hover" x="' + PAD_L + '" y="' + PAD_T + '" width="' + innerW + '" height="' + innerH + '" fill="transparent"/>' +
+      '<line id="pv-cursor" x1="0" y1="' + PAD_T + '" x2="0" y2="' + (PAD_T + innerH) + '" stroke="#ffffff33" stroke-width="1" style="display:none"/>' +
+      '<circle id="pv-cursor-dot" cx="0" cy="0" r="3" fill="#fff" style="display:none"/>';
+
+    // Set baseline readout
+    const pnl = lastVal - STARTING_CASH;
+    const pnlPct = (pnl / STARTING_CASH * 100);
+    const valEl = document.getElementById('pv-readout-value');
+    const pnlEl = document.getElementById('pv-readout-pnl');
+    const timeEl = document.getElementById('pv-readout-time');
+    if (valEl) valEl.textContent = '$' + lastVal.toFixed(0);
+    if (pnlEl) { pnlEl.textContent = (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(0) + ' (' + (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(1) + '%)'; pnlEl.style.color = pnl >= 0 ? '#00ff88' : '#ff4444'; }
+    if (timeEl) {
+      const firstD = new Date(points[0].ts);
+      const lastD = new Date(points[points.length - 1].ts);
+      timeEl.textContent = firstD.toLocaleDateString() + ' → ' + lastD.toLocaleString();
+    }
+
+    // Hover interaction — show value at cursor X position
+    const hover = document.getElementById('pv-hover');
+    const cursor = document.getElementById('pv-cursor');
+    const cursorDot = document.getElementById('pv-cursor-dot');
+    if (hover) {
+      hover.addEventListener('mousemove', (e) => {
+        const rect = svg.getBoundingClientRect();
+        const svgX = ((e.clientX - rect.left) / rect.width) * W;
+        const fracX = (svgX - PAD_L) / innerW;
+        if (fracX < 0 || fracX > 1) return;
+        // Find nearest point
+        let nearest = compressed.pts[0], bestD = Infinity;
+        for (const p of compressed.pts) {
+          const d = Math.abs(p.x - fracX);
+          if (d < bestD) { bestD = d; nearest = p; }
+        }
+        const cx = xOf(nearest), cy = yOf(nearest.value);
+        if (cursor) { cursor.setAttribute('x1', cx); cursor.setAttribute('x2', cx); cursor.style.display = ''; }
+        if (cursorDot) { cursorDot.setAttribute('cx', cx); cursorDot.setAttribute('cy', cy); cursorDot.style.display = ''; }
+        const np = nearest.value - STARTING_CASH;
+        const npp = (np / STARTING_CASH * 100);
+        if (valEl) valEl.textContent = '$' + nearest.value.toFixed(0);
+        if (pnlEl) { pnlEl.textContent = (np >= 0 ? '+' : '') + '$' + np.toFixed(0) + ' (' + (npp >= 0 ? '+' : '') + npp.toFixed(1) + '%)'; pnlEl.style.color = np >= 0 ? '#00ff88' : '#ff4444'; }
+        if (timeEl) timeEl.textContent = new Date(nearest.ts).toLocaleString();
+      });
+      hover.addEventListener('mouseleave', () => {
+        if (cursor) cursor.style.display = 'none';
+        if (cursorDot) cursorDot.style.display = 'none';
+        if (valEl) valEl.textContent = '$' + lastVal.toFixed(0);
+        if (pnlEl) { pnlEl.textContent = (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(0) + ' (' + (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(1) + '%)'; pnlEl.style.color = pnl >= 0 ? '#00ff88' : '#ff4444'; }
+        if (timeEl) timeEl.textContent = new Date(points[points.length - 1].ts).toLocaleString();
+      });
+    }
+  }
+
+  async function refresh() {
+    const data = await fetchHistory();
+    if (data) renderChart(data);
+  }
+
+  document.querySelectorAll('.pv-range-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.pv-range-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      currentRange = btn.dataset.range;
+      cachedHistory = null; // force re-fetch on next refresh
+      refresh();
+    });
+  });
+
+  // Initial paint + poll every 10s for live updates
+  refresh();
+  setInterval(refresh, 10_000);
+})();
+</script>
 
 <div class="card" style="margin-top:16px">
   <h2>Live Log</h2>
@@ -2907,16 +3210,50 @@ function urlBase64ToUint8Array(b64) {
   const raw = atob(base64);
   return Uint8Array.from(raw, c => c.charCodeAt(0));
 }
-async function subscribeToPush() {
+// Per-device push state. The server keeps a list of endpoints but each browser/device
+// drives its own subscribe/unsubscribe via this button — independent of other devices.
+function setPushBtnState(state) {
   const btn = document.getElementById('push-btn');
+  if (!btn) return;
+  btn.disabled = false;
+  if (state === 'on') {
+    btn.textContent = '🔔 On';
+    btn.style.borderColor = '#00ff88';
+    btn.style.color = '#00ff88';
+    btn.title = 'Click to disable notifications on this device';
+  } else if (state === 'busy') {
+    btn.textContent = '🔔 …';
+    btn.disabled = true;
+  } else if (state === 'unsupported') {
+    btn.textContent = '🔔 N/A';
+    btn.disabled = true;
+    btn.style.color = '#555';
+  } else {
+    btn.textContent = '🔔 Notify';
+    btn.style.borderColor = '#333';
+    btn.style.color = '#888';
+    btn.title = 'Click to enable notifications on this device';
+  }
+}
+
+async function getDeviceSubscription() {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) return null;
+  try {
+    const reg = await navigator.serviceWorker.getRegistration('/');
+    if (!reg) return null;
+    return await reg.pushManager.getSubscription();
+  } catch { return null; }
+}
+
+async function enablePush() {
   if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
-    alert('Push notifications are not supported in this browser. Use Chrome or Edge.');
+    alert('Push notifications are not supported in this browser.');
     return;
   }
+  setPushBtnState('busy');
   try {
     const perm = await Notification.requestPermission();
-    if (perm !== 'granted') { alert('Notification permission denied.'); return; }
-    if (btn) { btn.textContent = '🔔 Subscribing…'; btn.disabled = true; }
+    if (perm !== 'granted') { alert('Notification permission denied.'); setPushBtnState('off'); return; }
     const reg = await navigator.serviceWorker.register('/sw.js');
     await navigator.serviceWorker.ready;
     const keyRes = await fetch('/api/push/vapid-key');
@@ -2926,27 +3263,74 @@ async function subscribeToPush() {
       applicationServerKey: urlBase64ToUint8Array(publicKey)
     });
     await fetch('/api/push/subscribe', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(sub)
     });
-    if (btn) { btn.textContent = '🔔 On'; btn.style.borderColor = '#00ff88'; btn.style.color = '#00ff88'; btn.disabled = false; }
-    console.log('[Push] Subscribed successfully');
+    setPushBtnState('on');
+    console.log('[Push] Enabled on this device');
   } catch(e) {
-    console.error('[Push] Error:', e);
-    if (btn) { btn.textContent = '🔔 Notify'; btn.disabled = false; }
-    alert('Push subscription failed: ' + e.message);
+    console.error('[Push] Enable error:', e);
+    setPushBtnState('off');
+    alert('Push enable failed: ' + e.message);
   }
 }
-// Auto-check if already subscribed on page load
-navigator.serviceWorker && navigator.serviceWorker.ready.then(reg => {
-  reg.pushManager.getSubscription().then(sub => {
+
+async function disablePush() {
+  setPushBtnState('busy');
+  try {
+    const sub = await getDeviceSubscription();
     if (sub) {
-      const btn = document.getElementById('push-btn');
-      if (btn) { btn.textContent = '🔔 On'; btn.style.borderColor = '#00ff88'; btn.style.color = '#00ff88'; }
+      // Tell the server first so we never get push events after unsubscribing locally
+      await fetch('/api/push/unsubscribe', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ endpoint: sub.endpoint })
+      }).catch(() => {});
+      try { await sub.unsubscribe(); } catch {}
     }
-  });
-}).catch(() => {});
+    setPushBtnState('off');
+    console.log('[Push] Disabled on this device');
+  } catch(e) {
+    console.error('[Push] Disable error:', e);
+    setPushBtnState('off');
+  }
+}
+
+async function togglePush() {
+  const sub = await getDeviceSubscription();
+  if (sub) {
+    // Verify with the server: if the server already forgot this endpoint we still want to clear locally
+    await disablePush();
+  } else {
+    await enablePush();
+  }
+}
+
+// Determine initial state on page load. The button is per-device — only flips to "On"
+// when THIS device has a live subscription that the server also recognizes.
+(async function initPushButton() {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+    setPushBtnState('unsupported');
+    return;
+  }
+  try {
+    const sub = await getDeviceSubscription();
+    if (!sub) { setPushBtnState('off'); return; }
+    const r = await fetch('/api/push/status', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ endpoint: sub.endpoint })
+    });
+    const { subscribed } = await r.json();
+    if (subscribed) {
+      setPushBtnState('on');
+    } else {
+      // Server forgot us (e.g. file wiped on redeploy) — drop the orphan local subscription
+      try { await sub.unsubscribe(); } catch {}
+      setPushBtnState('off');
+    }
+  } catch {
+    setPushBtnState('off');
+  }
+})();
 </script>
 
 </body></html>`;
@@ -3292,7 +3676,7 @@ function accountActionsHTML(acctId) {
     <form method="POST" action="/api/accounts/${acctId}/pause" style="display:inline">
       <button type="submit" class="acct-btn ${acct.paused ? "resume" : "pause"}">${acct.paused ? "▶ Resume" : "⏸ Pause"}</button>
     </form>
-    <button type="button" class="acct-btn" id="push-btn" onclick="subscribeToPush()" title="Get push notifications for every trade">🔔 Notify</button>
+    <button type="button" class="acct-btn" id="push-btn" onclick="togglePush()" title="Toggle push notifications on this device">🔔 Notify</button>
     ${acctId !== "default" ? `<form method="POST" action="/api/accounts/${acctId}/delete" style="display:inline" onsubmit="return confirm('Delete account ${acct.name}? This cannot be undone.')">
       <button type="submit" class="acct-btn delete">🗑 Delete</button>
     </form>` : ""}
@@ -3829,6 +4213,19 @@ function startDashboard(defaultAcct, apiKey) {
       return;
     }
 
+    // Full portfolio-value history for the active account — used by the dashboard chart's
+    // range selectors (1D/1W/1M/ALL) and live re-rendering.
+    if (pathname === "/api/portfolio-history") {
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      const hist = (dashboard.portfolioHistory || []).map(p => ({ ts: p.ts, value: p.value }));
+      res.end(JSON.stringify({
+        startingCash: acct.config.startingCash,
+        createdAt: acct.createdAt,
+        history: hist,
+      }));
+      return;
+    }
+
     if (pathname === "/api/live") {
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       const tickers = {};
@@ -4001,6 +4398,46 @@ self.addEventListener('pushsubscriptionchange', e => {
           } else {
             res.writeHead(400); res.end("Bad subscription");
           }
+        } catch {
+          res.writeHead(400); res.end("Invalid JSON");
+        }
+      });
+      return;
+    }
+
+    if (req.method === "POST" && pathname === "/api/push/unsubscribe") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", () => {
+        try {
+          const { endpoint } = JSON.parse(body);
+          if (!endpoint) { res.writeHead(400); res.end("Missing endpoint"); return; }
+          const before = pushSubscriptions.length;
+          pushSubscriptions = pushSubscriptions.filter(s => s.endpoint !== endpoint);
+          if (pushSubscriptions.length !== before) {
+            savePushSubs();
+            console.log(`  [PUSH] Removed subscription (total: ${pushSubscriptions.length})`);
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, removed: before - pushSubscriptions.length, total: pushSubscriptions.length }));
+        } catch {
+          res.writeHead(400); res.end("Invalid JSON");
+        }
+      });
+      return;
+    }
+
+    // Per-device subscription status: returns whether the endpoint POSTed is currently registered.
+    // Lets each browser/device determine its own button state without relying on server-global flags.
+    if (req.method === "POST" && pathname === "/api/push/status") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", () => {
+        try {
+          const { endpoint } = JSON.parse(body);
+          const subscribed = !!endpoint && pushSubscriptions.some(s => s.endpoint === endpoint);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ subscribed }));
         } catch {
           res.writeHead(400); res.end("Invalid JSON");
         }
@@ -4243,8 +4680,7 @@ async function runCycle(acct, sharedQuotes, apiKey) {
   dash.lastCycle = Date.now();
 
   dash.portfolioHistory = dash.portfolioHistory || [];
-  dash.portfolioHistory.push({ ts: Date.now(), value: pv });
-  if (dash.portfolioHistory.length > 500) dash.portfolioHistory.shift();
+  appendPortfolioPoint(dash.portfolioHistory, Date.now(), pv);
 
   saveAccounts();
 }
@@ -4302,8 +4738,7 @@ async function runPausedCycle(acct, sharedQuotes) {
   log(acct, `[PAUSED] Portfolio: $${pv.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%) | Cash: $${state.cash.toFixed(0)} | ${state.positions.length} open | exits active, no new entries`);
 
   dash.portfolioHistory = dash.portfolioHistory || [];
-  dash.portfolioHistory.push({ ts: Date.now(), value: pv });
-  if (dash.portfolioHistory.length > 500) dash.portfolioHistory.shift();
+  appendPortfolioPoint(dash.portfolioHistory, Date.now(), pv);
 }
 
 function buildPositionDetails(acct, quotes) {
