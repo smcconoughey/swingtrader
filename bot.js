@@ -4219,8 +4219,8 @@ function startDashboard(defaultAcct, apiKey) {
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       const hist = (dashboard.portfolioHistory || []).map(p => ({ ts: p.ts, value: p.value }));
       res.end(JSON.stringify({
-        startingCash: acct.config.startingCash,
-        createdAt: acct.createdAt,
+        startingCash: activeAcct.config.startingCash,
+        createdAt: activeAcct.createdAt,
         history: hist,
       }));
       return;
