@@ -286,19 +286,231 @@ function optGreeks(spot, strike, dte, iv, type = "call") {
 const REGIME_TICKERS = ["SPY", "QQQ"];
 const WATCHLIST_REFRESH_MS = 4 * 60 * 60_000; // refresh every 4 hours
 
-// ─── SRxTrades Curated Watchlist ───
-// Pinned names from @SRxTrades — always analyzed regardless of dynamic screener.
-// Theme: Data Centers (physical AI infrastructure) + Space + key momentum names.
+// ─── Sector Mapping ───
+// Coarse sector lookup for concentration-risk enforcement. Goal isn't perfect taxonomy —
+// it's "if I already hold 2 oil names, don't let me triple-down before the next OPEC headline."
+// Unknown tickers default to "OTHER" which gets no concentration penalty.
+const SECTOR_MAP = {
+  // Energy / oil & gas
+  CL: "ENERGY", XLE: "ENERGY", USO: "ENERGY", UGA: "ENERGY", OIL: "ENERGY", BP: "ENERGY",
+  XOM: "ENERGY", CVX: "ENERGY", OXY: "ENERGY", DVN: "ENERGY", COP: "ENERGY", SLB: "ENERGY",
+  RIG: "ENERGY", HAL: "ENERGY", EOG: "ENERGY", PSX: "ENERGY", MPC: "ENERGY", VLO: "ENERGY",
+  PXD: "ENERGY", FANG: "ENERGY", APA: "ENERGY", HES: "ENERGY", BKR: "ENERGY",
+  // Crypto miners / data-center infra
+  CIFR: "AI_INFRA", WULF: "AI_INFRA", HUT: "AI_INFRA", NBIS: "AI_INFRA", WGMI: "AI_INFRA",
+  CRWV: "AI_INFRA", MARA: "AI_INFRA", RIOT: "AI_INFRA", IREN: "AI_INFRA", BTDR: "AI_INFRA",
+  CORZ: "AI_INFRA", APLD: "AI_INFRA", CLSK: "AI_INFRA", BITF: "AI_INFRA", HIVE: "AI_INFRA",
+  // Space / aerospace mobility
+  BKSY: "SPACE", PL: "SPACE", LUNR: "SPACE", RKLB: "SPACE", ASTS: "SPACE", RDW: "SPACE",
+  SPCE: "SPACE", JOBY: "SPACE", ACHR: "SPACE", PSIX: "SPACE", LILM: "SPACE",
+  // Semiconductors (AI + general)
+  NVDA: "SEMI", AMD: "SEMI", MU: "SEMI", INTC: "SEMI", AMKR: "SEMI", AVGO: "SEMI",
+  TSM: "SEMI", QCOM: "SEMI", NXPI: "SEMI", MXL: "SEMI", AXTI: "SEMI", NVTS: "SEMI",
+  ARM: "SEMI", MRVL: "SEMI", LSCC: "SEMI", ON: "SEMI", SWKS: "SEMI", QRVO: "SEMI",
+  ASML: "SEMI", AMAT: "SEMI", LRCX: "SEMI", KLAC: "SEMI", ADI: "SEMI", TXN: "SEMI",
+  MCHP: "SEMI", SMCI: "SEMI", ALAB: "SEMI", CRDO: "SEMI",
+  // Quantum computing — separate sector since it moves as a group on quantum news
+  IONQ: "QUANTUM", RGTI: "QUANTUM", QBTS: "QUANTUM", QUBT: "QUANTUM", QSI: "QUANTUM",
+  ARQQ: "QUANTUM",
+  // Mega-cap tech
+  AAPL: "MEGA_TECH", MSFT: "MEGA_TECH", GOOGL: "MEGA_TECH", GOOG: "MEGA_TECH",
+  META: "MEGA_TECH", AMZN: "MEGA_TECH", ORCL: "MEGA_TECH", NFLX: "MEGA_TECH",
+  // Enterprise software
+  CRM: "SOFTWARE", NOW: "SOFTWARE", SHOP: "SOFTWARE", TEAM: "SOFTWARE",
+  ZM: "SOFTWARE", DDOG: "SOFTWARE", SNOW: "SOFTWARE", FIG: "SOFTWARE",
+  HUBS: "SOFTWARE", PATH: "SOFTWARE", DOCS: "SOFTWARE", PCOR: "SOFTWARE",
+  ADBE: "SOFTWARE", INTU: "SOFTWARE", WDAY: "SOFTWARE", MDB: "SOFTWARE",
+  ESTC: "SOFTWARE", CFLT: "SOFTWARE", VEEV: "SOFTWARE", SPLK: "SOFTWARE",
+  ASAN: "SOFTWARE", MNDY: "SOFTWARE", BILL: "SOFTWARE", AI: "SOFTWARE",
+  PLTR: "SOFTWARE", APP: "SOFTWARE", ROKU: "SOFTWARE",
+  // Cybersecurity — moves together on breach/CISA headlines
+  CRWD: "CYBER", PANW: "CYBER", ZS: "CYBER", NET: "CYBER", FTNT: "CYBER",
+  S: "CYBER", OKTA: "CYBER", CYBR: "CYBER", RBRK: "CYBER", QLYS: "CYBER",
+  TENB: "CYBER", VRNS: "CYBER",
+  // EV / auto
+  TSLA: "EV_AUTO", F: "EV_AUTO", GM: "EV_AUTO", RIVN: "EV_AUTO", LCID: "EV_AUTO",
+  NIO: "EV_AUTO", LI: "EV_AUTO", XPEV: "EV_AUTO", STLA: "EV_AUTO", TM: "EV_AUTO",
+  CHPT: "EV_AUTO", BLNK: "EV_AUTO",
+  // Pharma / healthcare large-cap
+  PFE: "PHARMA", LLY: "PHARMA", NVO: "PHARMA", MRK: "PHARMA", ABBV: "PHARMA",
+  BMY: "PHARMA", AMGN: "PHARMA", JNJ: "PHARMA", GILD: "PHARMA", BIIB: "PHARMA",
+  REGN: "PHARMA", VRTX: "PHARMA", TEVA: "PHARMA",
+  // Managed care / health services
+  UNH: "HEALTH", HUM: "HEALTH", CNC: "HEALTH", CI: "HEALTH", ELV: "HEALTH",
+  CVS: "HEALTH", DXCM: "HEALTH", ISRG: "HEALTH", MDT: "HEALTH",
+  // Biotech (mid-cap movers)
+  BEAM: "BIOTECH", CRSP: "BIOTECH", NTLA: "BIOTECH", CMPS: "BIOTECH",
+  GHRS: "BIOTECH", MIRM: "BIOTECH", AXSM: "BIOTECH", KNSA: "BIOTECH",
+  IBRX: "BIOTECH", ZLAB: "BIOTECH", APLS: "BIOTECH", MRNS: "BIOTECH",
+  SAVA: "BIOTECH", IOVA: "BIOTECH", DNLI: "BIOTECH", CYTK: "BIOTECH",
+  RVMD: "BIOTECH", VKTX: "BIOTECH",
+  // Banks / payments
+  V: "FINANCIALS", MA: "FINANCIALS", JPM: "FINANCIALS", GS: "FINANCIALS",
+  MS: "FINANCIALS", BAC: "FINANCIALS", WFC: "FINANCIALS", BLK: "FINANCIALS",
+  SCHW: "FINANCIALS", HOOD: "FINANCIALS", SOFI: "FINANCIALS", NU: "FINANCIALS",
+  C: "FINANCIALS", USB: "FINANCIALS", PNC: "FINANCIALS", AXP: "FINANCIALS",
+  PYPL: "FINANCIALS", SQ: "FINANCIALS", AFRM: "FINANCIALS",
+  // Crypto-adjacent (move with BTC, not with broader financials)
+  COIN: "CRYPTO_ADJ", MSTR: "CRYPTO_ADJ", BITX: "CRYPTO_ADJ", IBIT: "CRYPTO_ADJ",
+  GBTC: "CRYPTO_ADJ", ETHE: "CRYPTO_ADJ", BITO: "CRYPTO_ADJ",
+  // Defense / aerospace
+  LMT: "DEFENSE", RTX: "DEFENSE", NOC: "DEFENSE", GD: "DEFENSE", LDOS: "DEFENSE",
+  KTOS: "DEFENSE", AVAV: "DEFENSE", BA: "DEFENSE", HII: "DEFENSE", TDG: "DEFENSE",
+  CW: "DEFENSE",
+  // Industrial / machinery
+  CAT: "INDUSTRIAL", DE: "INDUSTRIAL", MMM: "INDUSTRIAL", HON: "INDUSTRIAL",
+  EMR: "INDUSTRIAL", GE: "INDUSTRIAL", ETN: "INDUSTRIAL", PH: "INDUSTRIAL",
+  ITW: "INDUSTRIAL", ROK: "INDUSTRIAL",
+  // Comms / telecom / media
+  NOK: "COMMS", VZ: "COMMS", T: "COMMS", TMUS: "COMMS", ERIC: "COMMS",
+  CMCSA: "COMMS", DIS: "COMMS", CHTR: "COMMS", WBD: "COMMS", PARA: "COMMS",
+  SPOT: "COMMS",
+  // Indexes
+  SPY: "INDEX", QQQ: "INDEX", QQQM: "INDEX", DIA: "INDEX", IWM: "INDEX",
+  VOO: "INDEX", VTI: "INDEX", MDY: "INDEX",
+  // Bonds / rates / commodities ETFs
+  TLT: "BONDS", SCHP: "BONDS", IEF: "BONDS", AGG: "BONDS", BND: "BONDS",
+  GLD: "PRECIOUS", SLV: "PRECIOUS", GDX: "PRECIOUS", GDXJ: "PRECIOUS",
+  // Homebuilders / real estate
+  TPH: "HOMEBUILDER", LEN: "HOMEBUILDER", DHI: "HOMEBUILDER", NVR: "HOMEBUILDER",
+  KBH: "HOMEBUILDER", PHM: "HOMEBUILDER", TOL: "HOMEBUILDER",
+  // REITs (rate-sensitive)
+  O: "REIT", AMT: "REIT", PLD: "REIT", EQIX: "REIT", SPG: "REIT",
+  PSA: "REIT", CCI: "REIT", WELL: "REIT",
+  // Solar / clean energy
+  ENPH: "SOLAR", SEDG: "SOLAR", FSLR: "SOLAR", RUN: "SOLAR", PLUG: "SOLAR",
+  FCEL: "SOLAR", BE: "SOLAR", NOVA: "SOLAR", ARRY: "SOLAR", SHLS: "SOLAR",
+  // Nuclear / uranium / power-for-AI — hot 2026 theme as AI data centers chase baseload
+  OKLO: "NUCLEAR", SMR: "NUCLEAR", CCJ: "NUCLEAR", UEC: "NUCLEAR", LEU: "NUCLEAR",
+  BWXT: "NUCLEAR", URA: "NUCLEAR", NLR: "NUCLEAR", CEG: "NUCLEAR", VST: "NUCLEAR",
+  TLN: "NUCLEAR", PWR: "NUCLEAR", GEV: "NUCLEAR",
+  // Utilities (rate-sensitive, ex-nuclear)
+  NEE: "UTILITY", DUK: "UTILITY", SO: "UTILITY", D: "UTILITY", AEP: "UTILITY",
+  XEL: "UTILITY", SRE: "UTILITY",
+  // Airlines (move together on fuel + travel demand)
+  AAL: "AIRLINE", UAL: "AIRLINE", DAL: "AIRLINE", LUV: "AIRLINE", JBLU: "AIRLINE",
+  ALK: "AIRLINE", SAVE: "AIRLINE",
+  // China ADRs (move on geopolitical headlines as a bloc)
+  BABA: "CHINA", PDD: "CHINA", JD: "CHINA", BIDU: "CHINA", BILI: "CHINA",
+  TME: "CHINA", IQ: "CHINA", FXI: "CHINA", KWEB: "CHINA",
+  // Consumer discretionary / retail
+  NKE: "CONSUMER", LULU: "CONSUMER", COST: "CONSUMER", WMT: "CONSUMER",
+  TGT: "CONSUMER", ULTA: "CONSUMER", SBUX: "CONSUMER", MCD: "CONSUMER",
+  DPZ: "CONSUMER", CMG: "CONSUMER", HD: "CONSUMER", LOW: "CONSUMER",
+  TJX: "CONSUMER", DECK: "CONSUMER", CROX: "CONSUMER", BBY: "CONSUMER",
+  EBAY: "CONSUMER", ETSY: "CONSUMER",
+  // Travel / hospitality
+  ABNB: "TRAVEL", BKNG: "TRAVEL", EXPE: "TRAVEL", MAR: "TRAVEL", HLT: "TRAVEL",
+  RCL: "TRAVEL", CCL: "TRAVEL", NCLH: "TRAVEL", UBER: "TRAVEL", LYFT: "TRAVEL",
+  // Materials / metals
+  CLF: "MATERIALS", X: "MATERIALS", NUE: "MATERIALS", STLD: "MATERIALS",
+  FCX: "MATERIALS", AA: "MATERIALS", VALE: "MATERIALS", RIO: "MATERIALS",
+  // Robotics / automation
+  SYM: "ROBOTICS", ABB: "ROBOTICS",
+};
+
+function getSector(ticker) {
+  return SECTOR_MAP[ticker] || "OTHER";
+}
+
+function countPositionsInSector(state, sector) {
+  return state.positions.filter(p => getSector(p.ticker) === sector).length;
+}
+
+// Max positions allowed per sector. OTHER is unlimited (no concentration risk for unmapped names).
+const MAX_PER_SECTOR = 2;
+
+// ─── Curated Pinned Watchlist ───
+// Always-analyzed names spanning the major 2026 themes — SRxTrades originals plus the
+// high-volume momentum leaders that dominate options flow right now. The dynamic screener
+// (most-actives, trending, day-gainers/losers) pulls in the rest each cycle.
 const SR_WATCHLIST = [
-  // Data center / physical AI infrastructure
-  "CIFR", "WULF", "HUT", "NBIS", "WGMI",
-  // Space names
-  "BKSY", "PL", "LUNR",
-  // AI / semiconductor
-  "ARM", "CRWV",
-  // Other SRxTrades positions / watchlist
+  // Data center / crypto-miner AI infrastructure (SR core theme)
+  "CIFR", "WULF", "HUT", "NBIS", "WGMI", "IREN", "BTDR", "CRWV", "MARA", "RIOT",
+  // Space / aerospace mobility
+  "BKSY", "PL", "LUNR", "RKLB", "ASTS", "RDW", "ACHR", "JOBY",
+  // AI semiconductors — flow leaders
+  "NVDA", "AVGO", "AMD", "MU", "ARM", "TSM", "SMCI", "MRVL", "INTC", "ALAB",
+  // AI software / agents (PLTR is the perennial flow leader)
+  "PLTR", "AI", "MDB", "ESTC", "APP",
+  // Cybersecurity (option flow on every breach headline)
+  "CRWD", "PANW", "ZS", "NET", "S",
+  // Quantum (group moves on any quantum/IBM/Google headline)
+  "IONQ", "RGTI", "QBTS", "QUBT",
+  // Nuclear / power-for-AI (2026's hottest secondary theme)
+  "OKLO", "SMR", "CEG", "VST", "CCJ", "UEC", "BWXT", "GEV",
+  // Crypto-adjacent (move with BTC, separate from financials)
+  "COIN", "MSTR",
+  // Mega-cap consolidation-to-expansion leaders (May 2026 SR posts)
+  "TSLA", "AAPL", "MSFT", "GOOGL", "META", "AMZN",
+  // EV / clean
+  "RIVN", "ENPH", "SEDG", "FSLR",
+  // Defense (sustained spending cycle)
+  "LMT", "RTX", "KTOS", "AVAV",
+  // Biotech / pharma movers
+  "LLY", "NVO", "VKTX", "VRTX",
+  // Robotics / automation
+  "ISRG", "SYM",
+  // Original SR positions
   "OPTX",
 ];
+
+// Ticker shape validator — rejects obvious non-tickers Claude sometimes emits from news
+// scans (surnames like "WARSH", company names like "CEREBRAS"). Real US tickers are 1-5
+// uppercase letters, optionally with a class suffix like "BRK.B".
+const TICKER_SHAPE = /^[A-Z]{1,5}(\.[A-Z])?$/;
+const GLOBAL_TICKER_BLOCKLIST = new Set([
+  "UVXY", "VIX", "VXX", "SVXY", "VIXY", "UVIX",
+  // Common Claude misfires — names/words that pass shape but aren't tradable tickers.
+  "WARSH", "POWELL", "TRUMP", "BIDEN", "FED",
+]);
+
+function isValidTickerSymbol(sym) {
+  if (!sym || typeof sym !== "string") return false;
+  if (!TICKER_SHAPE.test(sym)) return false;
+  if (GLOBAL_TICKER_BLOCKLIST.has(sym)) return false;
+  return true;
+}
+
+// Centralised add path so all three call sites (hint result, news impact, news newTickers)
+// go through the same validation and respect each account's auto-pruned bad-ticker list.
+function tryAddTicker(acct, sym, source) {
+  if (!isValidTickerSymbol(sym)) {
+    log(acct, `WATCHLIST: rejected "${sym}" from ${source} — invalid shape or blocklisted`);
+    return false;
+  }
+  if (!acct.badTickers) acct.badTickers = {};
+  if (acct.badTickers[sym]?.blocked) {
+    log(acct, `WATCHLIST: rejected "${sym}" from ${source} — previously failed to load`);
+    return false;
+  }
+  if (acct.tickers.includes(sym)) return false;
+  acct.tickers.push(sym);
+  return true;
+}
+
+// Called once per cycle for each ticker that produced "No candle data" / "Insufficient data".
+// After 3 consecutive failures, prune from the watchlist and add to per-account blocklist
+// so news/hint adds can't re-introduce it.
+function markTickerDataFailure(acct, sym) {
+  if (!acct.badTickers) acct.badTickers = {};
+  const rec = acct.badTickers[sym] || { fails: 0, blocked: false };
+  rec.fails += 1;
+  if (rec.fails >= 3 && !rec.blocked) {
+    rec.blocked = true;
+    acct.tickers = acct.tickers.filter(t => t !== sym);
+    acct.dynamicWatchlist = (acct.dynamicWatchlist || []).filter(t => t !== sym);
+    acct.activeHints = (acct.activeHints || []).filter(h => h.ticker !== sym);
+    log(acct, `WATCHLIST: auto-pruned "${sym}" after 3 failed data fetches — added to local blocklist`);
+  }
+  acct.badTickers[sym] = rec;
+}
+
+function markTickerDataSuccess(acct, sym) {
+  if (acct.badTickers && acct.badTickers[sym] && !acct.badTickers[sym].blocked) {
+    delete acct.badTickers[sym];
+  }
+}
 
 async function fetchDynamicWatchlist() {
   const symbols = new Set(REGIME_TICKERS);
@@ -1724,6 +1936,14 @@ function applyHintResult(acct, result, userMessage) {
   if (acct.chatHistory.length > 60) acct.chatHistory = acct.chatHistory.slice(-60);
 
   for (const t of result.tickers || []) {
+    if (!isValidTickerSymbol(t.symbol)) {
+      log(acct, `HINT: rejected "${t.symbol}" — invalid ticker shape`);
+      continue;
+    }
+    if (acct.badTickers?.[t.symbol]?.blocked) {
+      log(acct, `HINT: rejected "${t.symbol}" — on local blocklist (failed to load before)`);
+      continue;
+    }
     if (!acct.tickers.includes(t.symbol)) {
       acct.tickers.push(t.symbol);
       log(acct, `WATCHLIST +${t.symbol} (${t.direction}, bias ${t.bias > 0 ? "+" : ""}${t.bias})`);
@@ -1875,7 +2095,15 @@ Rules:
     }
 
     for (const impact of result.impacts || []) {
-      if (!acct.tickers.includes(impact.ticker) && impact.ticker) {
+      if (!isValidTickerSymbol(impact.ticker)) {
+        log(acct, `NEWS: rejected "${impact.ticker}" — invalid ticker shape`);
+        continue;
+      }
+      if (acct.badTickers?.[impact.ticker]?.blocked) {
+        log(acct, `NEWS: rejected "${impact.ticker}" — on local blocklist`);
+        continue;
+      }
+      if (!acct.tickers.includes(impact.ticker)) {
         acct.tickers.push(impact.ticker);
         log(acct, `NEWS WATCHLIST +${impact.ticker}`);
       }
@@ -1895,10 +2123,7 @@ Rules:
     }
 
     for (const ticker of result.newTickers || []) {
-      if (!acct.tickers.includes(ticker)) {
-        acct.tickers.push(ticker);
-        log(acct, `NEWS WATCHLIST +${ticker}`);
-      }
+      tryAddTicker(acct, ticker, "news scan");
     }
 
     if (result.severity === "critical" || result.severity === "elevated") {
@@ -2045,6 +2270,17 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   // Hard cap on concurrent positions — prevents over-deployment that drained cash to $25
   if (cfg.maxPositions && state.positions.length >= cfg.maxPositions) {
     return { skipped: true, reason: `Max positions (${cfg.maxPositions}) already open` };
+  }
+  // Sector concentration cap — prevent doubling/tripling-down on correlated names.
+  // Example: holding CL+XLE+USO means one bad oil headline unwinds three positions together.
+  // OTHER sector is unlimited (unmapped tickers have unknown correlation).
+  const sector = getSector(ticker);
+  if (sector !== "OTHER") {
+    const inSector = countPositionsInSector(state, sector);
+    if (inSector >= MAX_PER_SECTOR) {
+      const held = state.positions.filter(p => getSector(p.ticker) === sector).map(p => p.ticker).join(",");
+      return { skipped: true, reason: `Sector cap: already ${inSector} ${sector} positions (${held}) — max ${MAX_PER_SECTOR}` };
+    }
   }
   // Cash floor: stop adding risk once we're below 10% of starting cash. Preserves dry powder
   // to rotate after exits instead of bleeding the last few dollars on marginal setups.
@@ -2220,6 +2456,9 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     direction,
     regimeAtEntry: regime.label,
     topSignals: (analysis.sigs || []).slice(0, 3).map(s => s.text),
+    // Capture ATR% at entry so the spot stop can scale to the underlying's normal noise.
+    // Noisy names (AMKR ~5%, NOK ~6%) need a wider stop than calm names (UNH ~2%).
+    entryAtrPct: analysis.atrPct ?? null,
     iv: posIv,
     optionsSource,
   };
@@ -2377,13 +2616,15 @@ function tryExits(acct, quotes) {
     let fullClose = false;
 
     // Spot-based directional stop — exit if the underlying moved against us beyond a threshold,
-    // independent of premium/theta. Prevents the historical pattern of correct-direction trades
-    // bleeding -13% on theta when spot is flat AND wrong-direction trades hiding under the
-    // -35% premium stop until forced critical-DTE close at -50% to -76%.
+    // independent of premium/theta. Threshold is ATR-adaptive: noisy names (AMKR/NOK ~6% ATR)
+    // get a wider stop so normal intraday noise doesn't whipsaw us; calm names (UNH ~2% ATR)
+    // keep the 4% floor. Formula: max(4%, 1.5 × entry-day ATR%).
     const spotMove = pos.entrySpot ? (spot - pos.entrySpot) / pos.entrySpot : 0;
     const adverseSpotMove = pos.type === "call" ? -spotMove : spotMove; // +ve = moved against us
-    if (adverseSpotMove >= 0.04) { // 4% adverse move on the underlying
-      reason = `spot stop: underlying ${pos.type === "call" ? "down" : "up"} ${(adverseSpotMove * 100).toFixed(1)}% from entry`;
+    const atrPct = (pos.entryAtrPct || 0) / 100;
+    const spotStopThreshold = Math.max(0.04, 1.5 * atrPct);
+    if (adverseSpotMove >= spotStopThreshold) {
+      reason = `spot stop: underlying ${pos.type === "call" ? "down" : "up"} ${(adverseSpotMove * 100).toFixed(1)}% from entry (threshold ${(spotStopThreshold * 100).toFixed(1)}%, ATR ${(atrPct * 100).toFixed(1)}%)`;
       fullClose = true;
     }
     else if (pos.dteRemaining <= CRITICAL_DTE) {
@@ -4555,10 +4796,19 @@ async function runCycle(acct, sharedQuotes, apiKey) {
   const decisions = [];
   for (const ticker of allTickers) {
     const candles = acct.candleCache[ticker];
-    if (!candles) { decisions.push({ ticker, action: "SKIP", reason: "No candle data" }); continue; }
+    if (!candles) {
+      markTickerDataFailure(acct, ticker);
+      decisions.push({ ticker, action: "SKIP", reason: "No candle data" });
+      continue;
+    }
     const a = runAnalysis(candles);
     const st = runShortTermAnalysis(candles);
-    if (!a) { decisions.push({ ticker, action: "SKIP", reason: "Insufficient data (<55 candles)" }); continue; }
+    if (!a) {
+      markTickerDataFailure(acct, ticker);
+      decisions.push({ ticker, action: "SKIP", reason: "Insufficient data (<55 candles)" });
+      continue;
+    }
+    markTickerDataSuccess(acct, ticker);
 
     if (st) shortTermAnalyses[ticker] = st;
 
@@ -5039,10 +5289,19 @@ async function runAfterHoursScan(acct, sharedQuotes, apiKey) {
   const decisions = [];
   for (const ticker of allTickers2) {
     const candles = acct.candleCache[ticker];
-    if (!candles) { decisions.push({ ticker, action: "SKIP", reason: "No candle data" }); continue; }
+    if (!candles) {
+      markTickerDataFailure(acct, ticker);
+      decisions.push({ ticker, action: "SKIP", reason: "No candle data" });
+      continue;
+    }
     const a = runAnalysis(candles);
     const st = runShortTermAnalysis(candles);
-    if (!a) { decisions.push({ ticker, action: "SKIP", reason: "Insufficient data" }); continue; }
+    if (!a) {
+      markTickerDataFailure(acct, ticker);
+      decisions.push({ ticker, action: "SKIP", reason: "Insufficient data" });
+      continue;
+    }
+    markTickerDataSuccess(acct, ticker);
 
     if (st) shortTermAnalyses[ticker] = st;
 
