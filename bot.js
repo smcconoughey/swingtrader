@@ -2622,7 +2622,7 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
   if (!acct._simMode) recordDayTrade(state, pos);
 
   const dtUsed = countRecentDayTrades(state);
-  const trade = { ...pos, qty: qty, closePremium: currentPremium, pnlDollar, pnlPct, reason };
+  const trade = { ...pos, qty: qty, closePremium: currentPremium, pnlDollar, pnlPct, reason, closeDate: getETDateStr() };
   if (!acct._simMode) logTrade(trade);
 
   const trimLabel = qty < pos.qty ? `TRIM ${qty}/${pos.qty}` : "EXIT";
@@ -3004,9 +3004,10 @@ function dashboardHTML(acct) {
       <td style="color:${color}">${p.pnlPct >= 0 ? "+" : ""}${(p.pnlPct * 100).toFixed(1)}% ($${p.pnlDollar.toFixed(0)})</td>
       <td><span style="color:#00ff88">TP $${p.profitTarget.premium}</span> (${p.pctToProfit}% away)</td>
       <td><span style="color:#ff4444">SL $${p.stopLoss.premium}</span> (${p.pctToStop}% away)</td>
+      <td style="font-size:10px;color:#888">${p.openDate || '—'}</td>
       <td style="font-size:10px;color:#888">δ${p.greeks.delta} θ${p.greeks.theta}<br>${p.pdtStatus}<br><span style="color:${p.optionsSource === 'finnhub' ? '#4ecdc4' : '#555'}" title="IV used for pricing">IV ${((p.iv || 0.30) * 100).toFixed(0)}% ${p.optionsSource === 'finnhub' ? '●' : '○'}</span></td>
     </tr>${aiRow}`;
-  }).join("") : '<tr><td colspan="12" style="opacity:.5">No open positions</td></tr>';
+  }).join("") : '<tr><td colspan="13" style="opacity:.5">No open positions</td></tr>';
 
   // Decision reasoning panel
   const decisionRows = dashboard.decisions.map(d => {
@@ -3063,10 +3064,11 @@ function dashboardHTML(acct) {
       </td>
     </tr>` : "";
     return `<tr><td>${h.ticker}${aiToggle}</td><td>${h.type.toUpperCase()}</td><td>$${h.strike}</td>
+      <td style="font-size:10px;color:#888;white-space:nowrap">${h.openDate || '—'}<br>→ ${h.closeDate || '—'}</td>
       <td>$${h.entryPremium.toFixed(2)}</td><td>$${(h.closePremium || 0).toFixed(2)}</td>
       <td style="color:${color}">${h.pnlDollar >= 0 ? "+" : ""}$${h.pnlDollar.toFixed(0)} (${(h.pnlPct * 100).toFixed(0)}%)</td>
       <td>${h.reason || "—"}</td></tr>${aiRow}`;
-  }).join("") || '<tr><td colspan="7" style="opacity:.5">No trades yet</td></tr>';
+  }).join("") || '<tr><td colspan="8" style="opacity:.5">No trades yet</td></tr>';
 
   const hints = acct.activeHints.map(h => {
     const mins = Math.round((h.expiresAt - Date.now()) / 60_000);
@@ -3181,7 +3183,7 @@ ${accountActionsHTML(acct.id)}
 
 <div class="card" style="margin-bottom:16px">
   <h2>Open Positions (${state.positions.length})</h2>
-  <table><tr><th>Ticker</th><th>Type</th><th>Strike</th><th>Stock Price</th><th>DTE</th><th>Qty</th><th>Entry</th><th>Current</th><th>P&L</th><th>Profit Target</th><th>Stop Loss</th><th>Greeks / PDT</th></tr>${posRows}</table>
+  <table><tr><th>Ticker</th><th>Type</th><th>Strike</th><th>Stock Price</th><th>DTE</th><th>Qty</th><th>Entry</th><th>Current</th><th>P&L</th><th>Profit Target</th><th>Stop Loss</th><th>Opened</th><th>Greeks / PDT</th></tr>${posRows}</table>
 </div>
 
 <div class="card" style="margin-bottom:16px" id="bot-thinking-card">
@@ -3209,11 +3211,31 @@ function toggleBotThinking() {
   caret.textContent = collapsed ? '▾' : '▸';
   try { localStorage.setItem('botThinkingCollapsed', collapsed ? '0' : '1'); } catch {}
 }
-(function restoreBotThinking() {
+function toggleAnalysis() {
+  const body = document.getElementById('analysis-body');
+  const caret = document.getElementById('analysis-caret');
+  if (!body || !caret) return;
+  const collapsed = body.style.display === 'none';
+  body.style.display = collapsed ? '' : 'none';
+  caret.textContent = collapsed ? '▾' : '▸';
+  try { localStorage.setItem('analysisCollapsed', collapsed ? '0' : '1'); } catch {}
+}
+// Restore collapsed state — both default to collapsed
+(function restoreCollapsibles() {
   try {
-    if (localStorage.getItem('botThinkingCollapsed') === '1') {
+    // Bot Thinking: collapsed by default
+    const btState = localStorage.getItem('botThinkingCollapsed');
+    if (btState !== '0') {
       const body = document.getElementById('bot-thinking-body');
       const caret = document.getElementById('bot-thinking-caret');
+      if (body) body.style.display = 'none';
+      if (caret) caret.textContent = '▸';
+    }
+    // Analysis: collapsed by default
+    const anState = localStorage.getItem('analysisCollapsed');
+    if (anState !== '0') {
+      const body = document.getElementById('analysis-body');
+      const caret = document.getElementById('analysis-caret');
       if (body) body.style.display = 'none';
       if (caret) caret.textContent = '▸';
     }
@@ -3222,13 +3244,18 @@ function toggleBotThinking() {
 </script>
 
 <div class="grid">
-  <div class="card">
-    <h2>Analysis (${Object.keys(dashboard.analyses).length} tickers)</h2>
+<div class="card" style="margin-bottom:16px" id="analysis-card">
+  <h2 style="display:flex;align-items:center;justify-content:space-between;cursor:pointer;margin:0" onclick="toggleAnalysis()">
+    <span>Analysis (${Object.keys(dashboard.analyses).length} tickers)</span>
+    <span id="analysis-caret" style="color:#666;font-size:14px;font-weight:400">▸</span>
+  </h2>
+  <div id="analysis-body" style="display:none;margin-top:12px">
     <table><tr><th>Ticker</th><th>Price</th><th>Score</th><th>7d</th><th>Signal</th><th>RSI(14)</th><th>RSI(5)</th><th>1d Mom</th><th>ATR%</th><th>Vol Ratio</th></tr>${analysisRows}</table>
   </div>
+</div>
   <div class="card">
     <h2>Trade History (last 20)</h2>
-    <table><tr><th>Ticker</th><th>Type</th><th>Strike</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Reason</th></tr>${historyRows}</table>
+    <table><tr><th>Ticker</th><th>Type</th><th>Strike</th><th>Dates</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Reason</th></tr>${historyRows}</table>
   </div>
 </div>
 
