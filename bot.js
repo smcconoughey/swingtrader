@@ -605,7 +605,8 @@ const CLAUDE_API_KEY = (process.env.CLAUDE_API_KEY || "").trim();
 const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || "AIzaSyB1agSJoX1rImf5gYGm6Jh9uZXSHg2AOIE").trim();
 
 // LLM_PROVIDER: "gemini" | "claude" — defaults to gemini when key is available
-const LLM_PROVIDER = (process.env.LLM_PROVIDER || (GEMINI_API_KEY ? "gemini" : "claude")).toLowerCase();
+// Mutable at runtime via dashboard toggle or POST /api/llm-provider
+let LLM_PROVIDER = (process.env.LLM_PROVIDER || (GEMINI_API_KEY ? "gemini" : "claude")).toLowerCase();
 
 // ─── Default Account Config ───
 
@@ -1779,8 +1780,8 @@ let claudeTotalInputTokens = 0;
 let claudeTotalOutputTokens = 0;
 const HAIKU_INPUT_COST = 1.00 / 1_000_000;   // $1.00 per 1M input tokens
 const HAIKU_OUTPUT_COST = 5.00 / 1_000_000;  // $5.00 per 1M output tokens
-const GEMINI_INPUT_COST = 0.10 / 1_000_000;  // $0.10 per 1M input tokens
-const GEMINI_OUTPUT_COST = 0.40 / 1_000_000; // $0.40 per 1M output tokens
+const GEMINI_INPUT_COST = 0.30 / 1_000_000;  // $0.30 per 1M input tokens (Gemini 2.5 Flash)
+const GEMINI_OUTPUT_COST = 2.50 / 1_000_000; // $2.50 per 1M output tokens (Gemini 2.5 Flash)
 
 function getClaudeCost() {
   if (LLM_PROVIDER === "gemini") {
@@ -1790,7 +1791,7 @@ function getClaudeCost() {
 }
 
 function getLLMLabel() {
-  return LLM_PROVIDER === "gemini" ? "Gemini 2.5 Flash-Lite" : "Claude Haiku 4.5";
+  return LLM_PROVIDER === "gemini" ? "Gemini 2.5 Flash" : "Claude Haiku 4.5";
 }
 
 // ─── Claude Entry Validation Cooldown Cache ───
@@ -1872,7 +1873,7 @@ async function callGemini(prompt, retries = 3) {
   if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY not set");
   for (let attempt = 0; attempt <= retries; attempt++) {
     const r = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -3134,11 +3135,13 @@ function dashboardHTML(acct) {
   .acct-btn.pause:hover{border-color:#ffd93d;color:#ffd93d}
   .acct-btn.resume:hover{border-color:#00ff88;color:#00ff88}
   .acct-btn.delete:hover{border-color:#ff4444;color:#ff4444}
+  .llm-toggle{color:#a78bfa;font-size:10px;cursor:pointer;padding:2px 8px;border:1px solid #a78bfa40;border-radius:4px;transition:all .2s}
+  .llm-toggle:hover{background:#a78bfa20;border-color:#a78bfa;color:#c4b5fd}
 </style></head><body>
 ${tabBarHTML(acct.id)}
 ${accountActionsHTML(acct.id)}
 <h1>${acct.name || "Swing Trader"}</h1>
-<div class="sub">$${STARTING_CASH} → $${GOAL.toLocaleString()} Challenge &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}" id="mkt-badge">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; <span id="live-indicator" style="color:#00ff88">LIVE</span> updates every 5s &nbsp;|&nbsp; <span id="pv-header">$${pv.toFixed(0)}</span> <span id="pnl-header" style="color:${pnlPct >= 0 ? '#00ff88' : '#ff4444'}">(${pnlPct >= 0 ? '+' : ''}${pnlPct}%)</span> &nbsp;|&nbsp; <span style="color:${currentRegime.mode === 'risk-on' ? '#00ff88' : currentRegime.mode === 'cautious' ? '#ffd93d' : '#ff4444'};font-size:10px">${currentRegime.mode.toUpperCase()}</span> &nbsp;|&nbsp; <span style="color:#a78bfa;font-size:10px" title="${getLLMLabel()} API calls this session">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>${acct.paused ? ' &nbsp;|&nbsp; <span style="color:#ff4444;font-weight:bold">⏸ PAUSED</span>' : ''}</div>
+<div class="sub">$${STARTING_CASH} → $${GOAL.toLocaleString()} Challenge &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}" id="mkt-badge">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; <span id="live-indicator" style="color:#00ff88">LIVE</span> updates every 5s &nbsp;|&nbsp; <span id="pv-header">$${pv.toFixed(0)}</span> <span id="pnl-header" style="color:${pnlPct >= 0 ? '#00ff88' : '#ff4444'}">(${pnlPct >= 0 ? '+' : ''}${pnlPct}%)</span> &nbsp;|&nbsp; <span style="color:${currentRegime.mode === 'risk-on' ? '#00ff88' : currentRegime.mode === 'cautious' ? '#ffd93d' : '#ff4444'};font-size:10px">${currentRegime.mode.toUpperCase()}</span> &nbsp;|&nbsp; <span class="llm-toggle" onclick="fetch('/api/llm-provider',{method:'POST'}).then(()=>location.reload())" title="Click to switch LLM provider">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>${acct.paused ? ' &nbsp;|&nbsp; <span style="color:#ff4444;font-weight:bold">⏸ PAUSED</span>' : ''}</div>
 
 <div class="grid">
   <div class="card">
@@ -3932,7 +3935,7 @@ function tabBarHTML(activeId) {
   </div>
   <div class="global-stats">
     <span>Total PV: <b>$${totalPV.toFixed(0)}</b></span>
-    <span style="color:#a78bfa">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>
+    <span class="llm-toggle" onclick="fetch('/api/llm-provider',{method:'POST'}).then(()=>location.reload())" title="Click to switch LLM provider">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>
     <span>${accounts.size} account${accounts.size !== 1 ? "s" : ""}</span>
   </div>
 </div>
@@ -4435,6 +4438,26 @@ function startDashboard(defaultAcct, apiKey) {
       for (const [, a] of accounts) { totalPV += portfolioValue(a.state, a.dashboard.quotes); totalPositions += a.state.positions.length; totalTrades += a.state.history.length; }
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       res.end(JSON.stringify({ accounts: accounts.size, totalPV, totalPositions, totalTrades, claudeCalls: claudeCallCount, claudeCost: getClaudeCost(), llmProvider: LLM_PROVIDER, llmLabel: getLLMLabel() }));
+      return;
+    }
+
+    // ─── LLM Provider Toggle ───
+    if (req.method === "POST" && pathname === "/api/llm-provider") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", () => {
+        const params = new URLSearchParams(body);
+        const requested = params.get("provider");
+        if (requested === "gemini" || requested === "claude") {
+          LLM_PROVIDER = requested;
+        } else {
+          // Toggle: no specific provider requested, just flip
+          LLM_PROVIDER = LLM_PROVIDER === "gemini" ? "claude" : "gemini";
+        }
+        console.log(`  LLM Provider switched to: ${getLLMLabel()} (${LLM_PROVIDER})`);
+        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ provider: LLM_PROVIDER, label: getLLMLabel() }));
+      });
       return;
     }
 
