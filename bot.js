@@ -602,6 +602,10 @@ const LOW_DTE_THRESHOLD = 5;   // Accelerate exits when DTE <= 5
 const CRITICAL_DTE = 3;        // Force-close when DTE <= 3 (give exits room before gamma cliff)
 
 const CLAUDE_API_KEY = (process.env.CLAUDE_API_KEY || "").trim();
+const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || "AIzaSyB1agSJoX1rImf5gYGm6Jh9uZXSHg2AOIE").trim();
+
+// LLM_PROVIDER: "gemini" | "claude" — defaults to gemini when key is available
+const LLM_PROVIDER = (process.env.LLM_PROVIDER || (GEMINI_API_KEY ? "gemini" : "claude")).toLowerCase();
 
 // ─── Default Account Config ───
 
@@ -1769,15 +1773,24 @@ function signalLabel(score) {
   return "STRONG SELL";
 }
 
-// ─── Claude API Usage Tracking (global/shared) ───
-let claudeCallCount = 0;
+// ─── LLM API Usage Tracking (global/shared) ───
+let claudeCallCount = 0;  // kept as "claudeCallCount" for backward compat with dashboard/API
 let claudeTotalInputTokens = 0;
 let claudeTotalOutputTokens = 0;
 const HAIKU_INPUT_COST = 1.00 / 1_000_000;   // $1.00 per 1M input tokens
 const HAIKU_OUTPUT_COST = 5.00 / 1_000_000;  // $5.00 per 1M output tokens
+const GEMINI_INPUT_COST = 0.10 / 1_000_000;  // $0.10 per 1M input tokens
+const GEMINI_OUTPUT_COST = 0.40 / 1_000_000; // $0.40 per 1M output tokens
 
 function getClaudeCost() {
+  if (LLM_PROVIDER === "gemini") {
+    return (claudeTotalInputTokens * GEMINI_INPUT_COST + claudeTotalOutputTokens * GEMINI_OUTPUT_COST);
+  }
   return (claudeTotalInputTokens * HAIKU_INPUT_COST + claudeTotalOutputTokens * HAIKU_OUTPUT_COST);
+}
+
+function getLLMLabel() {
+  return LLM_PROVIDER === "gemini" ? "Gemini 2.5 Flash-Lite" : "Claude Haiku 4.5";
 }
 
 // ─── Claude Entry Validation Cooldown Cache ───
@@ -1819,7 +1832,7 @@ function setCachedChain(ticker, chain) {
   chainCache.set(ticker, { ts: Date.now(), chain });
 }
 
-async function callClaude(prompt, retries = 3) {
+async function callClaudeRaw(prompt, retries = 3) {
   if (!CLAUDE_API_KEY) throw new Error("CLAUDE_API_KEY not set");
   for (let attempt = 0; attempt <= retries; attempt++) {
     const r = await fetch("https://api.anthropic.com/v1/messages", {
@@ -1839,8 +1852,8 @@ async function callClaude(prompt, retries = 3) {
       const err = await r.text();
       const retryable = [429, 500, 502, 503, 504, 529].includes(r.status);
       if (retryable && attempt < retries) {
-        const delay = Math.min(1000 * 2 ** attempt, 10000);
-        await new Promise(res => setTimeout(res, delay));
+        const backoff = Math.min(1000 * 2 ** attempt, 10000);
+        await new Promise(res => setTimeout(res, backoff));
         continue;
       }
       throw new Error(`Claude API ${r.status}: ${err}`);
@@ -1853,6 +1866,52 @@ async function callClaude(prompt, retries = 3) {
     }
     return data.content[0].text;
   }
+}
+
+async function callGemini(prompt, retries = 3) {
+  if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY not set");
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const r = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { maxOutputTokens: 1024 },
+        }),
+      }
+    );
+    if (!r.ok) {
+      const err = await r.text();
+      const retryable = [429, 500, 502, 503, 504].includes(r.status);
+      if (retryable && attempt < retries) {
+        const backoff = Math.min(1000 * 2 ** attempt, 10000);
+        await new Promise(res => setTimeout(res, backoff));
+        continue;
+      }
+      throw new Error(`Gemini API ${r.status}: ${err}`);
+    }
+    const data = await r.json();
+    claudeCallCount++;
+    // Gemini reports token usage in usageMetadata
+    if (data.usageMetadata) {
+      claudeTotalInputTokens += data.usageMetadata.promptTokenCount || 0;
+      claudeTotalOutputTokens += data.usageMetadata.candidatesTokenCount || 0;
+    }
+    // Extract text from Gemini response
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) throw new Error("Gemini returned empty response");
+    return text;
+  }
+}
+
+// Unified LLM dispatcher — routes to active provider
+async function callClaude(prompt, retries = 3) {
+  if (LLM_PROVIDER === "gemini") {
+    return callGemini(prompt, retries);
+  }
+  return callClaudeRaw(prompt, retries);
 }
 
 async function processHint(hintText, acct) {
@@ -3079,7 +3138,7 @@ function dashboardHTML(acct) {
 ${tabBarHTML(acct.id)}
 ${accountActionsHTML(acct.id)}
 <h1>${acct.name || "Swing Trader"}</h1>
-<div class="sub">$${STARTING_CASH} → $${GOAL.toLocaleString()} Challenge &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}" id="mkt-badge">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; <span id="live-indicator" style="color:#00ff88">LIVE</span> updates every 5s &nbsp;|&nbsp; <span id="pv-header">$${pv.toFixed(0)}</span> <span id="pnl-header" style="color:${pnlPct >= 0 ? '#00ff88' : '#ff4444'}">(${pnlPct >= 0 ? '+' : ''}${pnlPct}%)</span> &nbsp;|&nbsp; <span style="color:${currentRegime.mode === 'risk-on' ? '#00ff88' : currentRegime.mode === 'cautious' ? '#ffd93d' : '#ff4444'};font-size:10px">${currentRegime.mode.toUpperCase()}</span> &nbsp;|&nbsp; <span style="color:#a78bfa;font-size:10px" title="Claude Haiku 4.5 API calls this session">🤖 ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>${acct.paused ? ' &nbsp;|&nbsp; <span style="color:#ff4444;font-weight:bold">⏸ PAUSED</span>' : ''}</div>
+<div class="sub">$${STARTING_CASH} → $${GOAL.toLocaleString()} Challenge &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}" id="mkt-badge">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; <span id="live-indicator" style="color:#00ff88">LIVE</span> updates every 5s &nbsp;|&nbsp; <span id="pv-header">$${pv.toFixed(0)}</span> <span id="pnl-header" style="color:${pnlPct >= 0 ? '#00ff88' : '#ff4444'}">(${pnlPct >= 0 ? '+' : ''}${pnlPct}%)</span> &nbsp;|&nbsp; <span style="color:${currentRegime.mode === 'risk-on' ? '#00ff88' : currentRegime.mode === 'cautious' ? '#ffd93d' : '#ff4444'};font-size:10px">${currentRegime.mode.toUpperCase()}</span> &nbsp;|&nbsp; <span style="color:#a78bfa;font-size:10px" title="${getLLMLabel()} API calls this session">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>${acct.paused ? ' &nbsp;|&nbsp; <span style="color:#ff4444;font-weight:bold">⏸ PAUSED</span>' : ''}</div>
 
 <div class="grid">
   <div class="card">
@@ -3873,7 +3932,7 @@ function tabBarHTML(activeId) {
   </div>
   <div class="global-stats">
     <span>Total PV: <b>$${totalPV.toFixed(0)}</b></span>
-    <span style="color:#a78bfa">🤖 Claude: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>
+    <span style="color:#a78bfa">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>
     <span>${accounts.size} account${accounts.size !== 1 ? "s" : ""}</span>
   </div>
 </div>
@@ -4375,7 +4434,7 @@ function startDashboard(defaultAcct, apiKey) {
       let totalPV = 0, totalPositions = 0, totalTrades = 0;
       for (const [, a] of accounts) { totalPV += portfolioValue(a.state, a.dashboard.quotes); totalPositions += a.state.positions.length; totalTrades += a.state.history.length; }
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-      res.end(JSON.stringify({ accounts: accounts.size, totalPV, totalPositions, totalTrades, claudeCalls: claudeCallCount, claudeCost: getClaudeCost() }));
+      res.end(JSON.stringify({ accounts: accounts.size, totalPV, totalPositions, totalTrades, claudeCalls: claudeCallCount, claudeCost: getClaudeCost(), llmProvider: LLM_PROVIDER, llmLabel: getLLMLabel() }));
       return;
     }
 
@@ -5407,11 +5466,20 @@ async function main() {
     console.log("  API key valid.\n");
   }
 
-  // Log Claude API key status
-  if (CLAUDE_API_KEY) {
-    console.log(`  Claude API key: ${CLAUDE_API_KEY.slice(0, 12)}...${CLAUDE_API_KEY.slice(-4)} (${CLAUDE_API_KEY.length} chars)`);
+  // Log LLM provider status
+  console.log(`  LLM Provider: ${getLLMLabel()} (LLM_PROVIDER=${LLM_PROVIDER})`);
+  if (LLM_PROVIDER === "gemini") {
+    if (GEMINI_API_KEY) {
+      console.log(`  Gemini API key: ${GEMINI_API_KEY.slice(0, 12)}...${GEMINI_API_KEY.slice(-4)} (${GEMINI_API_KEY.length} chars)`);
+    } else {
+      console.log("  WARNING: No GEMINI_API_KEY set — news scans and entry validation will fail");
+    }
   } else {
-    console.log("  WARNING: No CLAUDE_API_KEY set — news scans and entry validation will fail");
+    if (CLAUDE_API_KEY) {
+      console.log(`  Claude API key: ${CLAUDE_API_KEY.slice(0, 12)}...${CLAUDE_API_KEY.slice(-4)} (${CLAUDE_API_KEY.length} chars)`);
+    } else {
+      console.log("  WARNING: No CLAUDE_API_KEY set — news scans and entry validation will fail");
+    }
   }
 
   // Initialize X/Twitter client
