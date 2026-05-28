@@ -6,6 +6,7 @@ import http from "http";
 import { TwitterApi } from "twitter-api-v2";
 import { Resvg } from "@resvg/resvg-js";
 import webpush from "web-push";
+import { robinhood } from "./robinhood.js";
 
 // ─── Technical Analysis Engine (ported from live-swing-simulator.jsx) ───
 
@@ -607,6 +608,18 @@ const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || "AIzaSyB1agSJoX1rImf5gYGm6
 // LLM_PROVIDER: "gemini" | "claude" — defaults to gemini when key is available
 // Mutable at runtime via dashboard toggle or POST /api/llm-provider
 let LLM_PROVIDER = (process.env.LLM_PROVIDER || (GEMINI_API_KEY ? "gemini" : "claude")).toLowerCase();
+
+// TRADING_MODE: "paper" | "robinhood" — defaults to paper
+// When "robinhood", the bot converts options signals to equity orders via Robinhood's MCP API.
+// Mutable at runtime via dashboard toggle or POST /api/trading-mode
+let TRADING_MODE = (process.env.TRADING_MODE || "paper").toLowerCase();
+
+// RH_REQUIRE_APPROVAL: when true, Robinhood orders are queued for manual approval instead of auto-executing.
+// Default true for safety — you must approve every real-money trade from the dashboard.
+let RH_REQUIRE_APPROVAL = process.env.RH_REQUIRE_APPROVAL !== "false";
+
+// RH_MAX_POSITION_DOLLARS: Maximum dollar amount per Robinhood equity position (safety limit)
+const RH_MAX_POSITION_DOLLARS = parseInt(process.env.RH_MAX_POSITION_DOLLARS) || 500;
 
 // ─── Default Account Config ───
 
@@ -2642,6 +2655,31 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
       pnlDollar < 0 // urgent only for stop losses
     ).catch(() => {});
     tweetTradeExit(acct, pos, trade).catch(e => console.log(`  [X] Exit tweet error: ${e.message}`));
+
+    // ─── Robinhood Agentic Execution (exit) ───
+    if (TRADING_MODE === "robinhood" && robinhood.isConnected) {
+      try {
+        // For exits, sell the corresponding equity shares
+        const isTrimLocal = qty < pos.qty;
+        const equityOrder = {
+          symbol: pos.ticker,
+          side: "sell",
+          quantity: isTrimLocal ? Math.max(1, Math.round(qty)) : Math.max(1, Math.round(pos.qty)),
+          orderType: "market",
+          conversionNote: `${isTrimLocal ? "TRIM" : "EXIT"} ${pos.ticker}: sell ${isTrimLocal ? qty : pos.qty} shares — ${reason}`,
+        };
+        if (RH_REQUIRE_APPROVAL) {
+          const pending = robinhood.queueOrder(equityOrder);
+          log(acct, `RH QUEUED EXIT: ${equityOrder.conversionNote} — awaiting approval (${pending.id.slice(0, 8)})`);
+        } else {
+          robinhood.placeStockOrder(equityOrder.symbol, equityOrder.side, equityOrder.quantity, equityOrder.orderType)
+            .then(() => log(acct, `RH EXECUTED EXIT: ${equityOrder.conversionNote}`))
+            .catch(e => log(acct, `RH EXIT FAILED: ${e.message}`));
+        }
+      } catch (rhErr) {
+        log(acct, `RH ERROR (exit): ${rhErr.message}`);
+      }
+    }
   }
 
   return trade;
@@ -3139,12 +3177,42 @@ function dashboardHTML(acct) {
   .acct-btn.delete:hover{border-color:#ff4444;color:#ff4444}
   .llm-toggle{color:#a78bfa;font-size:10px;cursor:pointer;padding:2px 8px;border:1px solid #a78bfa40;border-radius:4px;transition:all .2s}
   .llm-toggle:hover{background:#a78bfa20;border-color:#a78bfa;color:#c4b5fd}
+  .trading-mode{font-size:10px;cursor:pointer;padding:2px 8px;border:1px solid;border-radius:4px;transition:all .2s}
+  .trading-mode.paper{color:#666;border-color:#33333380}
+  .trading-mode.paper:hover{color:#888;border-color:#555}
+  .trading-mode.robinhood{color:#00d632;border-color:#00d63280;background:#00d63210}
+  .trading-mode.robinhood:hover{background:#00d63225;border-color:#00d632}
+  .rh-pending{background:#1a1a2e;border:1px solid #333;border-radius:8px;padding:16px;margin-top:12px}
+  .rh-pending h3{color:#00d632;font-size:13px;margin:0 0 10px}
+  .rh-pending-item{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:#0a0a12;border:1px solid #222;border-radius:6px;margin-bottom:6px;font-size:12px}
+  .rh-pending-item .symbol{color:#fff;font-weight:700;font-size:14px}
+  .rh-pending-item .details{color:#888;font-size:11px}
+  .rh-btn{padding:4px 12px;border:none;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600}
+  .rh-btn.approve{background:#00d632;color:#000}.rh-btn.approve:hover{background:#00ff3e}
+  .rh-btn.reject{background:#ff444430;color:#ff4444;border:1px solid #ff444450}.rh-btn.reject:hover{background:#ff444450}
 </style></head><body>
 ${tabBarHTML(acct.id)}
 ${accountActionsHTML(acct.id)}
 <h1>${acct.name || "Swing Trader"}</h1>
-<div class="sub">$${STARTING_CASH} → $${GOAL.toLocaleString()} Challenge &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}" id="mkt-badge">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; <span id="live-indicator" style="color:#00ff88">LIVE</span> updates every 5s &nbsp;|&nbsp; <span id="pv-header">$${pv.toFixed(0)}</span> <span id="pnl-header" style="color:${pnlPct >= 0 ? '#00ff88' : '#ff4444'}">(${pnlPct >= 0 ? '+' : ''}${pnlPct}%)</span> &nbsp;|&nbsp; <span style="color:${currentRegime.mode === 'risk-on' ? '#00ff88' : currentRegime.mode === 'cautious' ? '#ffd93d' : '#ff4444'};font-size:10px">${currentRegime.mode.toUpperCase()}</span> &nbsp;|&nbsp; <span class="llm-toggle" onclick="fetch('/api/llm-provider',{method:'POST'}).then(()=>location.reload())" title="Click to switch LLM provider">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>${acct.paused ? ' &nbsp;|&nbsp; <span style="color:#ff4444;font-weight:bold">⏸ PAUSED</span>' : ''}</div>
+<div class="sub">$${STARTING_CASH} → $${GOAL.toLocaleString()} Challenge &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}" id="mkt-badge">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; <span id="live-indicator" style="color:#00ff88">LIVE</span> updates every 5s &nbsp;|&nbsp; <span id="pv-header">$${pv.toFixed(0)}</span> <span id="pnl-header" style="color:${pnlPct >= 0 ? '#00ff88' : '#ff4444'}">(${pnlPct >= 0 ? '+' : ''}${pnlPct}%)</span> &nbsp;|&nbsp; <span style="color:${currentRegime.mode === 'risk-on' ? '#00ff88' : currentRegime.mode === 'cautious' ? '#ffd93d' : '#ff4444'};font-size:10px">${currentRegime.mode.toUpperCase()}</span> &nbsp;|&nbsp; <span class="llm-toggle" onclick="fetch('/api/llm-provider',{method:'POST'}).then(()=>location.reload())" title="Click to switch LLM provider">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span> &nbsp;|&nbsp; <span class="trading-mode ${TRADING_MODE}" onclick="fetch('/api/trading-mode',{method:'POST'}).then(()=>location.reload())" title="Click to toggle Paper/Robinhood trading">${TRADING_MODE === 'robinhood' ? '🟢 ROBINHOOD' : '📄 PAPER'}${TRADING_MODE === 'robinhood' ? (robinhood.isConnected ? ' ✓' : ' ⚠️') : ''}</span>${acct.paused ? ' &nbsp;|&nbsp; <span style="color:#ff4444;font-weight:bold">⏸ PAUSED</span>' : ''}</div>
 
+${TRADING_MODE === 'robinhood' && robinhood.pendingOrders.length > 0 ? `
+<div class="rh-pending">
+  <h3>📋 Pending Robinhood Orders (${robinhood.pendingOrders.length})</h3>
+  ${robinhood.pendingOrders.map(o => `
+    <div class="rh-pending-item">
+      <div>
+        <span class="symbol">${o.side?.toUpperCase()} ${o.quantity} ${o.symbol}</span>
+        <div class="details">${o.conversionNote || ''} · ${new Date(o.createdAt).toLocaleTimeString()}</div>
+      </div>
+      <div style="display:flex;gap:6px">
+        <button class="rh-btn approve" onclick="fetch('/api/rh-approve/${o.id}',{method:'POST'}).then(()=>location.reload())">✓ Approve</button>
+        <button class="rh-btn reject" onclick="fetch('/api/rh-reject/${o.id}',{method:'POST'}).then(()=>location.reload())">✕ Reject</button>
+      </div>
+    </div>
+  `).join('')}
+</div>
+` : ''}
 <div class="grid">
   <div class="card">
     <h2>Portfolio</h2>
@@ -4464,7 +4532,7 @@ function startDashboard(defaultAcct, apiKey) {
       let totalPV = 0, totalPositions = 0, totalTrades = 0;
       for (const [, a] of accounts) { totalPV += portfolioValue(a.state, a.dashboard.quotes); totalPositions += a.state.positions.length; totalTrades += a.state.history.length; }
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-      res.end(JSON.stringify({ accounts: accounts.size, totalPV, totalPositions, totalTrades, claudeCalls: claudeCallCount, claudeCost: getClaudeCost(), llmProvider: LLM_PROVIDER, llmLabel: getLLMLabel() }));
+      res.end(JSON.stringify({ accounts: accounts.size, totalPV, totalPositions, totalTrades, claudeCalls: claudeCallCount, claudeCost: getClaudeCost(), llmProvider: LLM_PROVIDER, llmLabel: getLLMLabel(), tradingMode: TRADING_MODE, rhConnected: robinhood.isConnected, rhPending: robinhood.pendingOrders.length }));
       return;
     }
 
@@ -4484,6 +4552,111 @@ function startDashboard(defaultAcct, apiKey) {
         console.log(`  LLM Provider switched to: ${getLLMLabel()} (${LLM_PROVIDER})`);
         res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
         res.end(JSON.stringify({ provider: LLM_PROVIDER, label: getLLMLabel() }));
+      });
+      return;
+    }
+
+    // ─── Trading Mode Toggle ───
+    if (req.method === "POST" && pathname === "/api/trading-mode") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", () => {
+        const params = new URLSearchParams(body);
+        const requested = params.get("mode");
+        if (requested === "paper" || requested === "robinhood") {
+          TRADING_MODE = requested;
+        } else {
+          TRADING_MODE = TRADING_MODE === "paper" ? "robinhood" : "paper";
+        }
+        console.log(`  Trading Mode switched to: ${TRADING_MODE.toUpperCase()}`);
+        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ mode: TRADING_MODE, connected: robinhood.isConnected }));
+      });
+      return;
+    }
+
+    // ─── Robinhood: Toggle Approval Mode ───
+    if (req.method === "POST" && pathname === "/api/rh-approval") {
+      RH_REQUIRE_APPROVAL = !RH_REQUIRE_APPROVAL;
+      console.log(`  RH Approval Mode: ${RH_REQUIRE_APPROVAL ? "ON (manual)" : "OFF (auto)"}`);
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ requireApproval: RH_REQUIRE_APPROVAL }));
+      return;
+    }
+
+    // ─── Robinhood: Get Status & Pending Orders ───
+    if (pathname === "/api/rh-status") {
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({
+        mode: TRADING_MODE,
+        connected: robinhood.isConnected,
+        authenticated: robinhood.isAuthenticated,
+        requireApproval: RH_REQUIRE_APPROVAL,
+        maxPositionDollars: RH_MAX_POSITION_DOLLARS,
+        pendingOrders: robinhood.pendingOrders,
+      }));
+      return;
+    }
+
+    // ─── Robinhood: Approve Pending Order ───
+    if (req.method === "POST" && pathname.startsWith("/api/rh-approve/")) {
+      const orderId = pathname.split("/api/rh-approve/")[1];
+      try {
+        const result = await robinhood.approveOrder(orderId);
+        console.log(`  RH Order ${orderId.slice(0, 8)} APPROVED → ${result.status}`);
+        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+      return;
+    }
+
+    // ─── Robinhood: Reject Pending Order ───
+    if (req.method === "POST" && pathname.startsWith("/api/rh-reject/")) {
+      const orderId = pathname.split("/api/rh-reject/")[1];
+      try {
+        const result = robinhood.rejectOrder(orderId);
+        console.log(`  RH Order ${orderId.slice(0, 8)} REJECTED`);
+        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+      return;
+    }
+
+    // ─── Robinhood: Get Portfolio (real positions) ───
+    if (pathname === "/api/rh-portfolio") {
+      try {
+        const portfolio = await robinhood.getPortfolio();
+        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify(portfolio));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+      return;
+    }
+
+    // ─── Robinhood: Set Access Token (from dashboard) ───
+    if (req.method === "POST" && pathname === "/api/rh-token") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", async () => {
+        const params = new URLSearchParams(body);
+        const token = params.get("token");
+        if (token) {
+          robinhood.setToken(token);
+          const connected = await robinhood.init();
+          res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+          res.end(JSON.stringify({ connected, message: connected ? "Robinhood connected!" : "Token saved but MCP init failed" }));
+        } else {
+          res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+          res.end(JSON.stringify({ error: "No token provided" }));
+        }
       });
       return;
     }
@@ -5019,6 +5192,39 @@ async function runCycle(acct, sharedQuotes, apiKey) {
       const st = shortTermAnalyses[ticker];
       const q = quotes[ticker];
       tweetTradeEntry(acct, result, entryA, st, q).catch(e => console.log(`  [X] Entry tweet error: ${e.message}`));
+
+      // ─── Robinhood Agentic Execution (entry) ───
+      if (TRADING_MODE === "robinhood" && robinhood.isConnected) {
+        try {
+          const equityOrder = robinhood.convertOptionsToEquity(
+            result.ticker,
+            result.direction || (result.type === "call" ? "BULLISH" : "BEARISH"),
+            result.entrySpot,
+            Math.min(result.cost, RH_MAX_POSITION_DOLLARS)
+          );
+          if (RH_REQUIRE_APPROVAL) {
+            const pending = robinhood.queueOrder(equityOrder);
+            log(acct, `RH QUEUED: ${equityOrder.conversionNote} — awaiting approval (${pending.id.slice(0, 8)})`);
+            sendPush(
+              `📋 RH PENDING: ${equityOrder.side.toUpperCase()} ${equityOrder.quantity} ${equityOrder.symbol}`,
+              `${equityOrder.conversionNote}\nApprove from dashboard`,
+              true
+            ).catch(() => {});
+          } else {
+            const orderResult = await robinhood.placeStockOrder(
+              equityOrder.symbol, equityOrder.side, equityOrder.quantity, equityOrder.orderType
+            );
+            log(acct, `RH EXECUTED: ${equityOrder.conversionNote}`);
+            sendPush(
+              `✅ RH BUY: ${equityOrder.quantity} ${equityOrder.symbol} FILLED`,
+              equityOrder.conversionNote,
+              true
+            ).catch(() => {});
+          }
+        } catch (rhErr) {
+          log(acct, `RH ERROR (entry): ${rhErr.message}`);
+        }
+      }
     }
   }
 
@@ -5538,6 +5744,23 @@ async function main() {
     console.log(`  X/Twitter: LIVE mode — tweets enabled (cap: ${X_DAILY_CAP}/day)`);
   } else if (!ENABLE_TWEETS) {
     console.log("  X/Twitter: DRY-RUN mode — set ENABLE_TWEETS=true to post live");
+  }
+
+  // Initialize Robinhood Agentic Trading
+  console.log(`  Trading Mode: ${TRADING_MODE.toUpperCase()}`);
+  if (TRADING_MODE === "robinhood" || process.env.ROBINHOOD_ACCESS_TOKEN) {
+    const rhOk = await robinhood.init();
+    if (rhOk) {
+      console.log(`  Robinhood: CONNECTED ✓ (approval: ${RH_REQUIRE_APPROVAL ? "MANUAL" : "AUTO"}, max: $${RH_MAX_POSITION_DOLLARS}/position)`);
+    } else {
+      console.log("  Robinhood: NOT CONNECTED — set ROBINHOOD_ACCESS_TOKEN or authenticate from dashboard");
+      if (TRADING_MODE === "robinhood") {
+        console.log("  WARNING: Trading mode is ROBINHOOD but no connection — orders will fail. Falling back to PAPER.");
+        TRADING_MODE = "paper";
+      }
+    }
+  } else {
+    console.log("  Robinhood: PAPER mode — no live trading. Toggle from dashboard to enable.");
   }
 
   // Store apiKey in each account state for backwards compat
