@@ -298,6 +298,30 @@ const robinhood = {
     return extractContent(result);
   },
 
+  /**
+   * Get options chain for a symbol
+   */
+  async getOptions(symbol) {
+    const result = await callTool("robinhood_get_options", { symbol: symbol.toUpperCase() });
+    return extractContent(result);
+  },
+
+  /**
+   * Get historical price data for a symbol
+   */
+  async getHistoricals(symbol, span = "year", interval = "day") {
+    const result = await callTool("robinhood_get_historicals", { symbol: symbol.toUpperCase(), span, interval });
+    return extractContent(result);
+  },
+
+  /**
+   * Get all accounts info
+   */
+  async getAccounts() {
+    const result = await callTool("robinhood_get_accounts");
+    return extractContent(result);
+  },
+
   // ─── Approval Queue ───
 
   /**

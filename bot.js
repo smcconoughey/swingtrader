@@ -3177,42 +3177,12 @@ function dashboardHTML(acct) {
   .acct-btn.delete:hover{border-color:#ff4444;color:#ff4444}
   .llm-toggle{color:#a78bfa;font-size:10px;cursor:pointer;padding:2px 8px;border:1px solid #a78bfa40;border-radius:4px;transition:all .2s}
   .llm-toggle:hover{background:#a78bfa20;border-color:#a78bfa;color:#c4b5fd}
-  .trading-mode{font-size:10px;cursor:pointer;padding:2px 8px;border:1px solid;border-radius:4px;transition:all .2s}
-  .trading-mode.paper{color:#666;border-color:#33333380}
-  .trading-mode.paper:hover{color:#888;border-color:#555}
-  .trading-mode.robinhood{color:#00d632;border-color:#00d63280;background:#00d63210}
-  .trading-mode.robinhood:hover{background:#00d63225;border-color:#00d632}
-  .rh-pending{background:#1a1a2e;border:1px solid #333;border-radius:8px;padding:16px;margin-top:12px}
-  .rh-pending h3{color:#00d632;font-size:13px;margin:0 0 10px}
-  .rh-pending-item{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:#0a0a12;border:1px solid #222;border-radius:6px;margin-bottom:6px;font-size:12px}
-  .rh-pending-item .symbol{color:#fff;font-weight:700;font-size:14px}
-  .rh-pending-item .details{color:#888;font-size:11px}
-  .rh-btn{padding:4px 12px;border:none;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600}
-  .rh-btn.approve{background:#00d632;color:#000}.rh-btn.approve:hover{background:#00ff3e}
-  .rh-btn.reject{background:#ff444430;color:#ff4444;border:1px solid #ff444450}.rh-btn.reject:hover{background:#ff444450}
 </style></head><body>
 ${tabBarHTML(acct.id)}
 ${accountActionsHTML(acct.id)}
 <h1>${acct.name || "Swing Trader"}</h1>
-<div class="sub">$${STARTING_CASH} → $${GOAL.toLocaleString()} Challenge &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}" id="mkt-badge">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; <span id="live-indicator" style="color:#00ff88">LIVE</span> updates every 5s &nbsp;|&nbsp; <span id="pv-header">$${pv.toFixed(0)}</span> <span id="pnl-header" style="color:${pnlPct >= 0 ? '#00ff88' : '#ff4444'}">(${pnlPct >= 0 ? '+' : ''}${pnlPct}%)</span> &nbsp;|&nbsp; <span style="color:${currentRegime.mode === 'risk-on' ? '#00ff88' : currentRegime.mode === 'cautious' ? '#ffd93d' : '#ff4444'};font-size:10px">${currentRegime.mode.toUpperCase()}</span> &nbsp;|&nbsp; <span class="llm-toggle" onclick="fetch('/api/llm-provider',{method:'POST'}).then(()=>location.reload())" title="Click to switch LLM provider">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span> &nbsp;|&nbsp; <span class="trading-mode ${TRADING_MODE}" onclick="fetch('/api/trading-mode',{method:'POST'}).then(()=>location.reload())" title="Click to toggle Paper/Robinhood trading">${TRADING_MODE === 'robinhood' ? '🟢 ROBINHOOD' : '📄 PAPER'}${TRADING_MODE === 'robinhood' ? (robinhood.isConnected ? ' ✓' : ' ⚠️') : ''}</span>${acct.paused ? ' &nbsp;|&nbsp; <span style="color:#ff4444;font-weight:bold">⏸ PAUSED</span>' : ''}</div>
+<div class="sub">$${STARTING_CASH} → $${GOAL.toLocaleString()} Challenge &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}" id="mkt-badge">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; <span id="live-indicator" style="color:#00ff88">LIVE</span> updates every 5s &nbsp;|&nbsp; <span id="pv-header">$${pv.toFixed(0)}</span> <span id="pnl-header" style="color:${pnlPct >= 0 ? '#00ff88' : '#ff4444'}">(${pnlPct >= 0 ? '+' : ''}${pnlPct}%)</span> &nbsp;|&nbsp; <span style="color:${currentRegime.mode === 'risk-on' ? '#00ff88' : currentRegime.mode === 'cautious' ? '#ffd93d' : '#ff4444'};font-size:10px">${currentRegime.mode.toUpperCase()}</span> &nbsp;|&nbsp; <span class="llm-toggle" onclick="fetch('/api/llm-provider',{method:'POST'}).then(()=>location.reload())" title="Click to switch LLM provider">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>${acct.paused ? ' &nbsp;|&nbsp; <span style="color:#ff4444;font-weight:bold">⏸ PAUSED</span>' : ''}</div>
 
-${TRADING_MODE === 'robinhood' && robinhood.pendingOrders.length > 0 ? `
-<div class="rh-pending">
-  <h3>📋 Pending Robinhood Orders (${robinhood.pendingOrders.length})</h3>
-  ${robinhood.pendingOrders.map(o => `
-    <div class="rh-pending-item">
-      <div>
-        <span class="symbol">${o.side?.toUpperCase()} ${o.quantity} ${o.symbol}</span>
-        <div class="details">${o.conversionNote || ''} · ${new Date(o.createdAt).toLocaleTimeString()}</div>
-      </div>
-      <div style="display:flex;gap:6px">
-        <button class="rh-btn approve" onclick="fetch('/api/rh-approve/${o.id}',{method:'POST'}).then(()=>location.reload())">✓ Approve</button>
-        <button class="rh-btn reject" onclick="fetch('/api/rh-reject/${o.id}',{method:'POST'}).then(()=>location.reload())">✕ Reject</button>
-      </div>
-    </div>
-  `).join('')}
-</div>
-` : ''}
 <div class="grid">
   <div class="card">
     <h2>Portfolio</h2>
@@ -4004,6 +3974,346 @@ ${pos ? '<div class="card" style="margin-top:16px"><h2>Position Details</h2>' + 
 </body></html>`;
 }
 
+// ─── Robinhood Page (PIN-protected) ───
+
+function robinhoodPageHTML() {
+  const connected = robinhood.isConnected;
+  const pending = robinhood.pendingOrders;
+
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Robinhood Agentic Trading</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:#0a0a12;color:#ccc;font-family:'Inter','SF Pro',system-ui,sans-serif;padding:0}
+  #pin-gate{display:flex;align-items:center;justify-content:center;min-height:100vh;flex-direction:column;gap:20px}
+  #pin-gate h1{color:#00d632;font-size:28px;letter-spacing:2px}
+  #pin-gate .subtitle{color:#666;font-size:13px}
+  #pin-input{width:200px;padding:14px;text-align:center;font-size:24px;letter-spacing:12px;background:#14141e;border:2px solid #333;border-radius:12px;color:#fff;font-family:monospace}
+  #pin-input:focus{outline:none;border-color:#00d632}
+  #pin-input.error{border-color:#ff4444;animation:shake .3s}
+  @keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-8px)}75%{transform:translateX(8px)}}
+  #rh-app{display:none;padding:20px;max-width:1200px;margin:0 auto}
+  .rh-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid #222}
+  .rh-header h1{color:#00d632;font-size:22px;display:flex;align-items:center;gap:10px}
+  .rh-header h1 img{width:28px;height:28px}
+  .rh-back{color:#666;text-decoration:none;font-size:13px;padding:6px 14px;border:1px solid #333;border-radius:6px}
+  .rh-back:hover{color:#fff;border-color:#555}
+  .rh-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(350px,1fr));gap:16px;margin-bottom:16px}
+  .rh-card{background:#14141e;border:1px solid #222;border-radius:12px;padding:20px}
+  .rh-card h2{color:#fff;font-size:14px;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+  .rh-card h2 .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+  .rh-card h2 .dot.green{background:#00d632}
+  .rh-card h2 .dot.red{background:#ff4444}
+  .rh-card h2 .dot.yellow{background:#ffd93d}
+  .rh-stat{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #111;font-size:13px}
+  .rh-stat .label{color:#888}
+  .rh-stat .value{color:#fff;font-weight:600}
+  .rh-table{width:100%;border-collapse:collapse;font-size:12px}
+  .rh-table th{color:#888;text-align:left;padding:8px 6px;border-bottom:1px solid #222;font-weight:500}
+  .rh-table td{padding:8px 6px;border-bottom:1px solid #111;color:#ccc}
+  .rh-table tr:hover td{background:#1a1a2e}
+  .rh-input{width:100%;padding:8px 12px;background:#0a0a12;border:1px solid #333;border-radius:6px;color:#fff;font-size:13px}
+  .rh-input:focus{outline:none;border-color:#00d632}
+  .rh-btn{padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;transition:all .2s}
+  .rh-btn.primary{background:#00d632;color:#000}
+  .rh-btn.primary:hover{background:#00ff3e}
+  .rh-btn.danger{background:#ff444430;color:#ff4444;border:1px solid #ff444450}
+  .rh-btn.danger:hover{background:#ff444450}
+  .rh-btn.secondary{background:#222;color:#ccc;border:1px solid #333}
+  .rh-btn.secondary:hover{background:#333;color:#fff}
+  .rh-btn.small{padding:4px 10px;font-size:11px}
+  .rh-toggle{display:flex;align-items:center;gap:10px;padding:8px 0}
+  .rh-toggle label{color:#888;font-size:12px;flex:1}
+  .rh-toggle .switch{width:40px;height:22px;background:#333;border-radius:11px;cursor:pointer;position:relative;transition:background .2s}
+  .rh-toggle .switch.on{background:#00d632}
+  .rh-toggle .switch::after{content:'';width:18px;height:18px;background:#fff;border-radius:50%;position:absolute;top:2px;left:2px;transition:left .2s}
+  .rh-toggle .switch.on::after{left:20px}
+  .rh-pending-item{display:flex;align-items:center;justify-content:space-between;padding:10px;background:#0a0a12;border:1px solid #222;border-radius:8px;margin-bottom:8px}
+  .rh-pending-item .sym{color:#fff;font-weight:700;font-size:15px}
+  .rh-pending-item .detail{color:#888;font-size:11px;margin-top:2px}
+  .rh-empty{color:#555;font-size:12px;text-align:center;padding:20px}
+  #options-results{max-height:400px;overflow-y:auto}
+  #orders-list{max-height:300px;overflow-y:auto}
+  .rh-loading{color:#555;font-size:12px;text-align:center;padding:12px}
+  .rh-full-width{grid-column:1/-1}
+</style>
+</head><body>
+
+<!-- PIN Gate -->
+<div id="pin-gate">
+  <h1>🔒 ROBINHOOD</h1>
+  <div class="subtitle">Enter PIN to access trading controls</div>
+  <input type="password" id="pin-input" maxlength="4" inputmode="numeric" pattern="[0-9]*" autocomplete="off" autofocus>
+</div>
+
+<!-- Main App (hidden until PIN verified) -->
+<div id="rh-app">
+  <div class="rh-header">
+    <h1>🟢 Robinhood Agentic Trading</h1>
+    <div style="display:flex;gap:8px;align-items:center">
+      <span id="rh-conn-badge" style="font-size:11px;padding:4px 10px;border-radius:4px;border:1px solid ${connected ? '#00d63280' : '#ff444480'};color:${connected ? '#00d632' : '#ff4444'}">${connected ? '● CONNECTED' : '● DISCONNECTED'}</span>
+      <a href="/" class="rh-back">← Dashboard</a>
+    </div>
+  </div>
+
+  <div class="rh-grid">
+    <!-- Connection & Auth -->
+    <div class="rh-card">
+      <h2><span class="dot ${connected ? 'green' : 'red'}"></span> Connection</h2>
+      <div class="rh-stat"><span class="label">Status</span><span class="value" style="color:${connected ? '#00d632' : '#ff4444'}">${connected ? 'Connected' : 'Disconnected'}</span></div>
+      <div class="rh-stat"><span class="label">MCP Endpoint</span><span class="value" style="font-size:10px;color:#888">agent.robinhood.com</span></div>
+      <div class="rh-stat"><span class="label">Trading Mode</span><span class="value" style="color:${TRADING_MODE === 'robinhood' ? '#00d632' : '#888'}">${TRADING_MODE.toUpperCase()}</span></div>
+      <div style="margin-top:12px">
+        <input type="password" class="rh-input" id="rh-token" placeholder="Paste access token..." style="margin-bottom:8px">
+        <div style="display:flex;gap:8px">
+          <button class="rh-btn primary" onclick="connectRH()">Connect</button>
+          <button class="rh-btn danger" onclick="disconnectRH()">Disconnect</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Account Overview -->
+    <div class="rh-card" id="account-card">
+      <h2>💰 Account</h2>
+      <div id="account-data" class="rh-loading">Loading account data...</div>
+    </div>
+
+    <!-- Positions -->
+    <div class="rh-card rh-full-width" id="positions-card">
+      <h2>📊 Positions</h2>
+      <div id="positions-data" class="rh-loading">Loading positions...</div>
+    </div>
+
+    <!-- Options Chain Lookup -->
+    <div class="rh-card rh-full-width">
+      <h2>📋 Options Chain</h2>
+      <div style="display:flex;gap:8px;margin-bottom:12px">
+        <input type="text" class="rh-input" id="options-symbol" placeholder="Enter ticker (e.g. AAPL)" style="width:200px;text-transform:uppercase">
+        <button class="rh-btn primary" onclick="lookupOptions()">Lookup</button>
+      </div>
+      <div id="options-results" class="rh-empty">Enter a ticker above to fetch the options chain from Robinhood</div>
+    </div>
+
+    <!-- Pending Orders -->
+    <div class="rh-card">
+      <h2>⏳ Pending Orders <span style="color:#888;font-weight:400;font-size:11px">(${pending.length})</span></h2>
+      <div id="pending-list">
+        ${pending.length === 0 ? '<div class="rh-empty">No pending orders</div>' : pending.map(o => `
+          <div class="rh-pending-item">
+            <div>
+              <div class="sym">${o.side?.toUpperCase()} ${o.quantity} ${o.symbol}</div>
+              <div class="detail">${o.conversionNote || ''} · ${new Date(o.createdAt).toLocaleTimeString()}</div>
+            </div>
+            <div style="display:flex;gap:6px">
+              <button class="rh-btn primary small" onclick="approveOrder('${o.id}')">✓</button>
+              <button class="rh-btn danger small" onclick="rejectOrder('${o.id}')">✕</button>
+            </div>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+
+    <!-- Trading Controls -->
+    <div class="rh-card">
+      <h2>⚙️ Controls</h2>
+      <div class="rh-toggle">
+        <label>Trading Mode</label>
+        <div class="switch ${TRADING_MODE === 'robinhood' ? 'on' : ''}" onclick="toggleMode()" title="${TRADING_MODE === 'robinhood' ? 'Click to switch to PAPER' : 'Click to switch to ROBINHOOD'}"></div>
+        <span style="font-size:11px;color:${TRADING_MODE === 'robinhood' ? '#00d632' : '#888'};min-width:80px">${TRADING_MODE.toUpperCase()}</span>
+      </div>
+      <div class="rh-toggle">
+        <label>Require Approval</label>
+        <div class="switch ${RH_REQUIRE_APPROVAL ? 'on' : ''}" onclick="toggleApproval()" title="${RH_REQUIRE_APPROVAL ? 'Manual approval ON' : 'Auto-execution ON'}"></div>
+        <span style="font-size:11px;color:${RH_REQUIRE_APPROVAL ? '#00d632' : '#ffd93d'};min-width:80px">${RH_REQUIRE_APPROVAL ? 'MANUAL' : 'AUTO'}</span>
+      </div>
+      <div class="rh-stat"><span class="label">Max Position</span><span class="value">$${RH_MAX_POSITION_DOLLARS}</span></div>
+      <div style="margin-top:12px">
+        <button class="rh-btn danger" onclick="killSwitch()" style="width:100%">🛑 Cancel All Pending</button>
+      </div>
+    </div>
+
+    <!-- Recent Orders -->
+    <div class="rh-card rh-full-width">
+      <h2>📜 Recent Orders</h2>
+      <div id="orders-list" class="rh-loading">Loading orders...</div>
+    </div>
+  </div>
+</div>
+
+<script>
+// PIN Gate
+const PIN = '1738';
+const pinInput = document.getElementById('pin-input');
+const gate = document.getElementById('pin-gate');
+const app = document.getElementById('rh-app');
+
+// Check if already authenticated
+if (sessionStorage.getItem('rh-pin') === PIN) { gate.style.display='none'; app.style.display='block'; initApp(); }
+
+pinInput.addEventListener('input', function() {
+  if (this.value.length === 4) {
+    if (this.value === PIN) {
+      sessionStorage.setItem('rh-pin', PIN);
+      gate.style.display = 'none';
+      app.style.display = 'block';
+      initApp();
+    } else {
+      this.classList.add('error');
+      setTimeout(() => { this.classList.remove('error'); this.value = ''; }, 400);
+    }
+  }
+});
+
+function initApp() {
+  loadAccount();
+  loadPositions();
+  loadOrders();
+}
+
+async function loadAccount() {
+  const el = document.getElementById('account-data');
+  try {
+    const r = await fetch('/api/rh-account');
+    const d = await r.json();
+    if (d.error) { el.innerHTML = '<div class="rh-empty">'+d.error+'</div>'; return; }
+    if (typeof d === 'string') { el.innerHTML = '<div style="font-size:12px;white-space:pre-wrap;color:#ccc">'+d+'</div>'; return; }
+    let html = '';
+    for (const [k,v] of Object.entries(d)) {
+      const label = k.replace(/_/g,' ').replace(/\\b\\w/g,l=>l.toUpperCase());
+      html += '<div class="rh-stat"><span class="label">'+label+'</span><span class="value">'+v+'</span></div>';
+    }
+    el.innerHTML = html || '<div class="rh-empty">No data</div>';
+  } catch(e) { el.innerHTML = '<div class="rh-empty">Not connected</div>'; }
+}
+
+async function loadPositions() {
+  const el = document.getElementById('positions-data');
+  try {
+    const r = await fetch('/api/rh-portfolio');
+    const d = await r.json();
+    if (d.error) { el.innerHTML = '<div class="rh-empty">'+d.error+'</div>'; return; }
+    if (typeof d === 'string') { el.innerHTML = '<div style="font-size:12px;white-space:pre-wrap;color:#ccc">'+d+'</div>'; return; }
+    if (Array.isArray(d) && d.length === 0) { el.innerHTML = '<div class="rh-empty">No positions</div>'; return; }
+    if (Array.isArray(d)) {
+      let html = '<table class="rh-table"><tr><th>Symbol</th><th>Qty</th><th>Avg Cost</th><th>Current</th><th>P&L</th></tr>';
+      for (const p of d) {
+        const pnl = p.pnl || p.unrealized_pnl || '—';
+        const color = parseFloat(pnl) >= 0 ? '#00ff88' : '#ff4444';
+        html += '<tr><td style="color:#fff;font-weight:600">'+p.symbol+'</td><td>'+p.quantity+'</td><td>$'+(p.average_cost||'?')+'</td><td>$'+(p.current_price||'?')+'</td><td style="color:'+color+'">'+pnl+'</td></tr>';
+      }
+      html += '</table>';
+      el.innerHTML = html;
+    } else {
+      let html = '';
+      for (const [k,v] of Object.entries(d)) {
+        html += '<div class="rh-stat"><span class="label">'+k+'</span><span class="value">'+JSON.stringify(v).slice(0,100)+'</span></div>';
+      }
+      el.innerHTML = html;
+    }
+  } catch(e) { el.innerHTML = '<div class="rh-empty">Not connected</div>'; }
+}
+
+async function loadOrders() {
+  const el = document.getElementById('orders-list');
+  try {
+    const r = await fetch('/api/rh-orders');
+    const d = await r.json();
+    if (d.error) { el.innerHTML = '<div class="rh-empty">'+d.error+'</div>'; return; }
+    if (typeof d === 'string') { el.innerHTML = '<div style="font-size:12px;white-space:pre-wrap;color:#ccc">'+d+'</div>'; return; }
+    if (Array.isArray(d) && d.length === 0) { el.innerHTML = '<div class="rh-empty">No recent orders</div>'; return; }
+    if (Array.isArray(d)) {
+      let html = '<table class="rh-table"><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Type</th><th>Status</th><th>Price</th></tr>';
+      for (const o of d.slice(0, 20)) {
+        const statusColor = o.status === 'filled' ? '#00ff88' : o.status === 'cancelled' ? '#ff4444' : '#ffd93d';
+        html += '<tr><td style="color:#fff;font-weight:600">'+(o.symbol||'?')+'</td><td>'+(o.side||'?')+'</td><td>'+(o.quantity||'?')+'</td><td>'+(o.order_type||o.type||'?')+'</td><td style="color:'+statusColor+'">'+(o.status||'?')+'</td><td>$'+(o.price||o.average_price||'—')+'</td></tr>';
+      }
+      html += '</table>';
+      el.innerHTML = html;
+    } else {
+      let html = '';
+      for (const [k,v] of Object.entries(d)) {
+        html += '<div class="rh-stat"><span class="label">'+k+'</span><span class="value">'+JSON.stringify(v).slice(0,100)+'</span></div>';
+      }
+      el.innerHTML = html;
+    }
+  } catch(e) { el.innerHTML = '<div class="rh-empty">Not connected</div>'; }
+}
+
+async function lookupOptions() {
+  const sym = document.getElementById('options-symbol').value.trim().toUpperCase();
+  if (!sym) return;
+  const el = document.getElementById('options-results');
+  el.innerHTML = '<div class="rh-loading">Fetching options for '+sym+'...</div>';
+  try {
+    const r = await fetch('/api/rh-options?symbol='+sym);
+    const d = await r.json();
+    if (d.error) { el.innerHTML = '<div class="rh-empty">'+d.error+'</div>'; return; }
+    if (typeof d === 'string') {
+      el.innerHTML = '<div style="font-size:11px;white-space:pre-wrap;color:#ccc;max-height:400px;overflow-y:auto">'+d+'</div>';
+    } else if (Array.isArray(d)) {
+      let html = '<table class="rh-table"><tr><th>Type</th><th>Strike</th><th>Exp</th><th>Bid</th><th>Ask</th><th>Vol</th><th>OI</th></tr>';
+      for (const o of d.slice(0, 50)) {
+        html += '<tr><td style="color:'+(o.type==='call'?'#00ff88':'#ff4444')+'">'+(o.type||'?')+'</td><td>$'+(o.strike||'?')+'</td><td>'+(o.expiry||o.expiration_date||'?')+'</td><td>'+(o.bid||'—')+'</td><td>'+(o.ask||'—')+'</td><td>'+(o.volume||'—')+'</td><td>'+(o.open_interest||'—')+'</td></tr>';
+      }
+      html += '</table>';
+      el.innerHTML = html;
+    } else {
+      el.innerHTML = '<div style="font-size:11px;white-space:pre-wrap;color:#ccc">'+JSON.stringify(d, null, 2)+'</div>';
+    }
+  } catch(e) { el.innerHTML = '<div class="rh-empty">Error: '+e.message+'</div>'; }
+}
+
+async function connectRH() {
+  const token = document.getElementById('rh-token').value.trim();
+  if (!token) { alert('Enter a token first'); return; }
+  try {
+    const r = await fetch('/api/rh-token', { method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'}, body: 'token='+encodeURIComponent(token) });
+    const d = await r.json();
+    alert(d.message || d.error || 'Done');
+    location.reload();
+  } catch(e) { alert('Error: '+e.message); }
+}
+
+function disconnectRH() {
+  if (!confirm('Disconnect from Robinhood? This will clear your token.')) return;
+  fetch('/api/rh-token', { method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'}, body: 'token=' }).then(()=>location.reload());
+}
+
+async function toggleMode() {
+  await fetch('/api/trading-mode', { method: 'POST' });
+  location.reload();
+}
+
+async function toggleApproval() {
+  await fetch('/api/rh-approval', { method: 'POST' });
+  location.reload();
+}
+
+async function approveOrder(id) {
+  await fetch('/api/rh-approve/'+id, { method: 'POST' });
+  location.reload();
+}
+
+async function rejectOrder(id) {
+  await fetch('/api/rh-reject/'+id, { method: 'POST' });
+  location.reload();
+}
+
+async function killSwitch() {
+  if (!confirm('Cancel ALL pending orders?')) return;
+  const status = await fetch('/api/rh-status').then(r=>r.json());
+  for (const o of (status.pendingOrders || [])) {
+    await fetch('/api/rh-reject/'+o.id, { method: 'POST' });
+  }
+  location.reload();
+}
+
+// Auto-refresh every 30s
+setInterval(() => { loadAccount(); loadPositions(); loadOrders(); }, 30000);
+</script>
+</body></html>`;
+}
+
 // ─── Tab Bar HTML ───
 
 function tabBarHTML(activeId) {
@@ -4027,6 +4337,7 @@ function tabBarHTML(activeId) {
   <div class="tab-row">${tabs.join("")}
     <a href="#" class="acct-tab new-tab" onclick="document.getElementById('acct-modal').style.display='flex';return false">+ New Account</a>
     <a href="/?sim=new" class="acct-tab new-tab" style="border-color:#a78bfa40;color:#a78bfa">&#x1F9EA; Simulator</a>
+    <a href="/robinhood" class="acct-tab new-tab" style="border-color:#00d63240;color:#00d632">🔒 Robinhood</a>
   </div>
   <div class="global-stats">
     <span>Total PV: <b>$${totalPV.toFixed(0)}</b></span>
@@ -4532,7 +4843,7 @@ function startDashboard(defaultAcct, apiKey) {
       let totalPV = 0, totalPositions = 0, totalTrades = 0;
       for (const [, a] of accounts) { totalPV += portfolioValue(a.state, a.dashboard.quotes); totalPositions += a.state.positions.length; totalTrades += a.state.history.length; }
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-      res.end(JSON.stringify({ accounts: accounts.size, totalPV, totalPositions, totalTrades, claudeCalls: claudeCallCount, claudeCost: getClaudeCost(), llmProvider: LLM_PROVIDER, llmLabel: getLLMLabel(), tradingMode: TRADING_MODE, rhConnected: robinhood.isConnected, rhPending: robinhood.pendingOrders.length }));
+      res.end(JSON.stringify({ accounts: accounts.size, totalPV, totalPositions, totalTrades, claudeCalls: claudeCallCount, claudeCost: getClaudeCost(), llmProvider: LLM_PROVIDER, llmLabel: getLLMLabel() }));
       return;
     }
 
@@ -4965,6 +5276,71 @@ self.addEventListener('pushsubscriptionchange', e => {
           res.writeHead(400); res.end("Invalid JSON");
         }
       });
+      return;
+    }
+
+    // ─── Robinhood: Get Account Info ───
+    if (pathname === "/api/rh-account") {
+      try {
+        const acctInfo = await robinhood.getAccount();
+        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify(acctInfo));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+      return;
+    }
+
+    // ─── Robinhood: Get Options Chain ───
+    if (pathname === "/api/rh-options") {
+      const sym = url.searchParams.get("symbol");
+      if (!sym) { res.writeHead(400); res.end(JSON.stringify({ error: "symbol required" })); return; }
+      try {
+        const options = await robinhood.getOptions(sym);
+        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify(options));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+      return;
+    }
+
+    // ─── Robinhood: Get Orders ───
+    if (pathname === "/api/rh-orders") {
+      try {
+        const orders = await robinhood.getOrders();
+        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify(orders));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+      return;
+    }
+
+    // ─── Robinhood: Get Historicals ───
+    if (pathname === "/api/rh-historicals") {
+      const sym = url.searchParams.get("symbol");
+      if (!sym) { res.writeHead(400); res.end(JSON.stringify({ error: "symbol required" })); return; }
+      const span = url.searchParams.get("span") || "year";
+      const interval = url.searchParams.get("interval") || "day";
+      try {
+        const hist = await robinhood.getHistoricals(sym, span, interval);
+        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify(hist));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+      return;
+    }
+
+    // ─── Robinhood Page (PIN-protected) ───
+    if (pathname === "/robinhood") {
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(robinhoodPageHTML());
       return;
     }
 
