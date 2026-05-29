@@ -1567,12 +1567,12 @@ function getBusinessDaysAgo(n) {
 }
 
 function cleanDayTrades(state) {
-  const cutoff = getBusinessDaysAgo(5);
+  const cutoff = getBusinessDaysAgo(3);
   state.dayTrades = state.dayTrades.filter(dt => dt.date >= cutoff);
 }
 
 function countRecentDayTrades(state) {
-  const cutoff = getBusinessDaysAgo(5);
+  const cutoff = getBusinessDaysAgo(3);
   return state.dayTrades.filter(dt => dt.date >= cutoff).length;
 }
 
@@ -2056,7 +2056,7 @@ function getActiveHintsSummary(acct) {
   if (acct.activeHints.length === 0) return "";
   return " | Hints: " + acct.activeHints.map(h => {
     const mins = Math.round((h.expiresAt - now) / 60_000);
-    return `${h.ticker} ${h.bias > 0 ? "+" : ""}${h.bias} (${mins}m left)`;
+    return `${h.ticker} ${h.bias > 0 ? "+" : ""}${h.bias} (${mins}m left on watch)`;
   }).join(", ");
 }
 
@@ -3110,7 +3110,7 @@ function dashboardHTML(acct) {
 
   const hints = acct.activeHints.map(h => {
     const mins = Math.round((h.expiresAt - Date.now()) / 60_000);
-    return `<span class="hint">${h.ticker} ${h.bias > 0 ? "+" : ""}${h.bias} (${h.direction}, ${mins}m left) — ${h.reasoning}</span>`;
+    return `<span class="hint">${h.ticker} ${h.bias > 0 ? "+" : ""}${h.bias} (${h.direction}, ${mins}m watch) — ${h.reasoning}</span>`;
   }).join("") || '<span style="opacity:.5">None active. Write to hint.txt to add.</span>';
 
   const logLines = dashboard.cycleLog.slice(-50).reverse().map(l =>

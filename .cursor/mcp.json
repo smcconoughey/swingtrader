@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "robinhood": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://agent.robinhood.com/mcp/trading"
+      ]
+    }
+  }
+}
