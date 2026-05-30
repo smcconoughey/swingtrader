@@ -3,3 +3,7 @@ node_modules/
 state.json
 state.json.backup
 accounts.json
+rh_tokens.json
+rh_pending.json
+tradier_tokens.json
+tradier_pending.json

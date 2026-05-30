@@ -7,6 +7,7 @@ import { TwitterApi } from "twitter-api-v2";
 import { Resvg } from "@resvg/resvg-js";
 import webpush from "web-push";
 import { robinhood } from "./robinhood.js";
+import { tradier } from "./tradier.js";
 
 // ─── Technical Analysis Engine (ported from live-swing-simulator.jsx) ───
 
@@ -601,6 +602,33 @@ const EOD_TIGHTEN_HOUR = 15.5; // Tighten stops after 3:30 PM ET
 const EOW_TRIM_HOUR = 14;      // Friday profit-taking starts at 2:00 PM ET
 const LOW_DTE_THRESHOLD = 5;   // Accelerate exits when DTE <= 5
 const CRITICAL_DTE = 3;        // Force-close when DTE <= 3 (give exits room before gamma cliff)
+
+// ─── Trust-Scaled Cash Reserve ───
+// Keep a minimum cash buffer sized as a fraction of total portfolio value. The buffer starts
+// defensive (CASH_RESERVE_MAX) and only shrinks toward CASH_RESERVE_MIN as conviction ("trust")
+// in a setup rises. Low-trust setups must respect the full 50% buffer; only the highest-trust
+// setups may deploy down to a 25% buffer. This prevents over-deployment (the $148-cash trap).
+const CASH_RESERVE_MAX = 0.50; // default minimum cash on hand (low trust)
+const CASH_RESERVE_MIN = 0.25; // floor minimum cash on hand (max trust)
+
+// ─── Day-Trade (PDT) Discipline ───
+// Day trades are scarce (3 per rolling window). Spend them only on big profits or loss-cuts,
+// never on marginal same-day exits or same-day re-entries.
+const DAY_TRADE_BIG_PROFIT = 0.30; // a same-day exit must be >= +30% to justify burning a day trade
+
+// ─── Expiration Cadence / DTE Staggering ───
+const TARGET_DTE = 21;     // preferred swing horizon (days to expiration)
+const MIN_SWING_DTE = 7;   // never open a swing shorter than one week
+const MAX_DTE = 45;        // never look past this horizon for an expiry
+const MAX_PER_EXPIRY = 3;  // stagger: cap positions sharing the exact same expiration date
+
+// Tickers with daily (every-trading-day) option expirations.
+const DAILY_EXPIRY_TICKERS = new Set(["SPY", "QQQ", "IWM", "DIA", "SPX", "XSP", "NDX", "QQQM"]);
+// Tickers with Mon/Wed/Fri weekly expirations (high-volume single names + select ETFs).
+const MWF_EXPIRY_TICKERS = new Set([
+  "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL", "GOOG", "AMD", "NFLX",
+  "F", "INTC", "AAL", "PLTR", "BAC", "GLD", "SLV", "USO", "TLT", "HOOD", "COIN", "MARA", "RIOT",
+]);
 
 const CLAUDE_API_KEY = (process.env.CLAUDE_API_KEY || "").trim();
 const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || "AIzaSyB1agSJoX1rImf5gYGm6Jh9uZXSHg2AOIE").trim();
@@ -1553,6 +1581,69 @@ function nextFridayExpiry(minCalendarDays = 7, refDate) {
   return { date: fallback, dte: minCalendarDays };
 }
 
+// ─── Expiration Cadence Model ───
+// Real options don't all expire on the same Friday: index ETFs expire daily, many large caps
+// expire Mon/Wed/Fri, and the long tail expires weekly on Fridays. Modeling this (and capping how
+// many open positions may share one expiry) prevents the whole book from synchronizing onto a
+// single expiration and bleeding theta in lockstep (the "all 13 DTE" trap).
+function getExpiryCadence(ticker) {
+  const t = (ticker || "").toUpperCase();
+  if (DAILY_EXPIRY_TICKERS.has(t)) return "daily";
+  if (MWF_EXPIRY_TICKERS.has(t)) return "mwf";
+  return "weekly";
+}
+
+// Generates upcoming expiration dates (as {date, dte}) for a ticker out to horizonDays,
+// honoring its expiration cadence. Dates are timestamped at 4pm ET on the expiry day.
+function generateExpiries(ticker, refDate, horizonDays = MAX_DTE) {
+  const cadence = getExpiryCadence(ticker);
+  const base = refDate ? new Date(refDate) : getETDate();
+  base.setHours(0, 0, 0, 0);
+  const out = [];
+  for (let d = 1; d <= horizonDays; d++) {
+    const cand = new Date(base);
+    cand.setDate(base.getDate() + d);
+    const day = cand.getDay(); // 0 Sun .. 6 Sat
+    if (day === 0 || day === 6) continue; // options expire on trading days only
+    let ok;
+    if (cadence === "daily") ok = true;
+    else if (cadence === "mwf") ok = (day === 1 || day === 3 || day === 5);
+    else ok = (day === 5); // weekly Fridays
+    if (!ok) continue;
+    cand.setHours(16, 0, 0, 0);
+    out.push({ date: cand, dte: d });
+  }
+  return out;
+}
+
+// Counts open positions whose expiration falls on the same calendar day as expiryTs.
+function countPositionsAtExpiry(state, expiryTs) {
+  const day = new Date(expiryTs); day.setHours(0, 0, 0, 0);
+  const target = day.getTime();
+  return state.positions.filter(p => {
+    if (!p.expiryDate) return false;
+    const d = new Date(p.expiryDate); d.setHours(0, 0, 0, 0);
+    return d.getTime() === target;
+  }).length;
+}
+
+// Picks the expiration closest to targetDTE (>= MIN_SWING_DTE) honoring the ticker's cadence.
+// If the best date is already over-concentrated in the book, steps to the next available expiry
+// so positions stagger across multiple expirations instead of synchronizing.
+function nextExpiry(ticker, { targetDTE = TARGET_DTE, refDate = null, state = null } = {}) {
+  const expiries = generateExpiries(ticker, refDate).filter(e => e.dte >= MIN_SWING_DTE);
+  if (expiries.length === 0) {
+    return nextFridayExpiry(MIN_SWING_DTE, refDate); // safety net
+  }
+  expiries.sort((a, b) => Math.abs(a.dte - targetDTE) - Math.abs(b.dte - targetDTE));
+  if (state) {
+    for (const e of expiries) {
+      if (countPositionsAtExpiry(state, e.date.getTime()) < MAX_PER_EXPIRY) return e;
+    }
+  }
+  return expiries[0];
+}
+
 // ─── PDT Enforcement ───
 
 function getBusinessDaysAgo(n) {
@@ -1599,6 +1690,13 @@ function recordDayTrade(state, position) {
 // ─── API Layer ───
 
 async function fetchQuote(sym, key) {
+  // Primary: Tradier (real-time, fill-accurate) when the arm is connected.
+  if (tradier.isConnected) {
+    try {
+      const q = await tradier.getQuote(sym);
+      if (q && q.c > 0) return q;
+    } catch { }
+  }
   try {
     const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${key}`);
     if (r.ok) {
@@ -1617,7 +1715,14 @@ async function fetchQuote(sym, key) {
 }
 
 async function fetchCandles(sym, key) {
-  // Try Finnhub first
+  // Primary: Tradier daily history when connected.
+  if (tradier.isConnected) {
+    try {
+      const candles = await tradier.getHistoricals(sym, 90);
+      if (candles && candles.length > 0) return candles;
+    } catch { }
+  }
+  // Try Finnhub next
   try {
     const to = Math.floor(Date.now() / 1000);
     const from = to - 90 * 86400;
@@ -1651,9 +1756,17 @@ async function fetchCandles(sym, key) {
   }
 }
 
-// ─── Finnhub Options Chain ───
+// ─── Options Chain (Tradier primary, Finnhub fallback) ───
 
 async function fetchFullOptionsChain(sym, apiKey) {
+  // Primary: Tradier — real-time chain with ORATS Greeks/IV, normalized to the Finnhub shape.
+  if (tradier.isConnected) {
+    try {
+      const chain = await tradier.getOptionsChainNormalized(sym);
+      if (chain && chain.length > 0) return chain;
+    } catch { }
+  }
+  // Fallback: Finnhub option chain.
   if (!apiKey) return null;
   try {
     const r = await fetch(`https://finnhub.io/api/v1/stock/option-chain?symbol=${sym}&token=${apiKey}`);
@@ -1777,6 +1890,44 @@ function portfolioValue(state, quotes) {
     val += currentPremium * pos.qty * 100;
   }
   return val;
+}
+
+// ─── Trust-Scaled Cash Reserve ───
+// "Trust" blends the conviction signals available at entry into a 0..1 score. Higher trust lets
+// the bot draw the cash buffer down from CASH_RESERVE_MAX toward CASH_RESERVE_MIN.
+function computeTradeTrust({ claudeConfidence = null, setupQuality = 50, technicalScore = 50, isBullish = true, cfg = {}, regime = null }) {
+  const clamp01 = x => Math.max(0, Math.min(1, x));
+  // Claude confidence: 50% → 0, 100% → 1. If unavailable, treat as neutral 0.5.
+  const conf = claudeConfidence == null ? 0.5 : clamp01((claudeConfidence - 50) / 50);
+  // Setup quality: minSetupQuality → 0, 100 → 1.
+  const minQ = cfg.minSetupQuality ?? 50;
+  const setup = clamp01((setupQuality - minQ) / Math.max(1, 100 - minQ));
+  // Technical extremity past the entry threshold.
+  let tech;
+  if (isBullish) {
+    const lo = cfg.bullEntry ?? 68;
+    tech = clamp01((technicalScore - lo) / Math.max(1, 100 - lo));
+  } else {
+    const hi = cfg.bearEntry ?? 32;
+    tech = clamp01((hi - technicalScore) / Math.max(1, hi));
+  }
+  // Weighted blend — Claude conviction and setup quality carry the most weight.
+  let trust = 0.45 * conf + 0.35 * setup + 0.20 * tech;
+  // Risk-off regime caps trust so we stay defensive on the cash buffer.
+  if (regime && regime.mode === "risk-off") trust = Math.min(trust, 0.4);
+  return clamp01(trust);
+}
+
+// Maps trust (0..1) onto the required cash-reserve fraction (CASH_RESERVE_MAX..CASH_RESERVE_MIN).
+function cashReservePct(trust) {
+  return CASH_RESERVE_MAX - trust * (CASH_RESERVE_MAX - CASH_RESERVE_MIN);
+}
+
+// Cash available to deploy after honoring the trust-scaled reserve buffer (sized off portfolio value).
+function deployableCash(state, pv, trust) {
+  const reservePct = cashReservePct(trust);
+  const requiredReserve = pv * reservePct;
+  return { deployable: Math.max(0, state.cash - requiredReserve), reservePct, requiredReserve };
 }
 
 function signalLabel(score) {
@@ -2340,6 +2491,11 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   const cfg = acct.config;
   if (state.positions.some(p => p.ticker === ticker)) return null;
   if (state.cash < 100) return null;
+  // PDT discipline: don't re-enter a name we already closed today. Same-day round-trips burn
+  // scarce day trades — wait for a fresh session before re-engaging.
+  if (state.lastClosed && state.lastClosed[ticker] === getETDateStr()) {
+    return { skipped: true, reason: `PDT preserve: closed ${ticker} earlier today — avoiding same-day re-entry` };
+  }
   // Hard cap on concurrent positions — prevents over-deployment that drained cash to $25
   if (cfg.maxPositions && state.positions.length >= cfg.maxPositions) {
     return { skipped: true, reason: `Max positions (${cfg.maxPositions}) already open` };
@@ -2355,11 +2511,8 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
       return { skipped: true, reason: `Sector cap: already ${inSector} ${sector} positions (${held}) — max ${MAX_PER_SECTOR}` };
     }
   }
-  // Cash floor: stop adding risk once we're below 10% of starting cash. Preserves dry powder
-  // to rotate after exits instead of bleeding the last few dollars on marginal setups.
-  if (state.cash < cfg.startingCash * 0.10) {
-    return { skipped: true, reason: `Cash $${state.cash.toFixed(0)} below 10% of starting cash — preserving capital` };
-  }
+  // Note: the trust-scaled cash reserve (computed at sizing time below) is the primary capital
+  // guard — it keeps 25%–50% of portfolio value in cash depending on conviction.
 
   // Early exit: skip tickers that aren't actionable (WAIT zone) before any expensive checks
   if (analysis.score < cfg.bullEntry && analysis.score > cfg.bearEntry) return null;
@@ -2452,6 +2605,17 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     try {
       claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, candidates);
       selectedCandidate = candidates.length > 0 ? candidates[claudeResult.contractIdx ?? 0] : null;
+      // Stagger expirations: if Claude's pick lands on an over-concentrated expiry, prefer an
+      // equally-valid candidate on a less-crowded expiration date.
+      if (selectedCandidate && countPositionsAtExpiry(state, selectedCandidate.expiryDate) >= MAX_PER_EXPIRY) {
+        const alt = candidates
+          .filter(c => countPositionsAtExpiry(state, c.expiryDate) < MAX_PER_EXPIRY)
+          .sort((a, b) => Math.abs(a.dte - TARGET_DTE) - Math.abs(b.dte - TARGET_DTE))[0];
+        if (alt) {
+          log(acct, `DTE STAGGER ${ticker}: ${selectedCandidate.expiryStr} over-concentrated — switching to ${alt.expiryStr} (${alt.dte}d)`);
+          selectedCandidate = alt;
+        }
+      }
       setCachedValidation(acct.id, ticker, analysis.score, direction, claudeResult, selectedCandidate);
       log(acct, `CLAUDE VALIDATE ${ticker}: ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%)${selectedCandidate ? ` → $${selectedCandidate.strike} ${selectedCandidate.expiryStr} (${selectedCandidate.dte}d)` : ''} — ${claudeResult.suggestion}${claudeResult.concerns?.length ? ' | ' + claudeResult.concerns.join(', ') : ''}`);
       logClaudeCall({
@@ -2490,10 +2654,11 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     optionsSource = "finnhub";
     log(acct, `CONTRACT ${ticker}: $${strike} ${type.toUpperCase()} exp ${selectedCandidate.expiryStr} (${dte}d) @ $${premium} mid | IV ${posIv ? (posIv*100).toFixed(0)+'%' : '?'} | OI ${selectedCandidate.oi} | spread $${selectedCandidate.spread}`);
   } else {
-    // Synthetic fallback: 1 strike OTM, next Friday ≥14 days (longer DTE = less theta drag)
+    // Synthetic fallback: 1 strike OTM, expiry chosen from the ticker's cadence near TARGET_DTE
+    // and staggered away from over-concentrated expirations.
     const atm = Math.round(spot / 5) * 5;
     strike = isBullish ? atm + 5 : atm - 5;
-    const expiry = nextFridayExpiry(14);
+    const expiry = nextExpiry(ticker, { targetDTE: TARGET_DTE, state });
     dte = expiry.dte;
     expiryDate = expiry.date.getTime();
     posIv = DEFAULT_IV;
@@ -2504,9 +2669,28 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
 
   const costPer = premium * 100;
   if (costPer > state.cash) return null;
-  let qty = Math.max(1, Math.floor(maxRisk / costPer));
+
+  // ─── Trust-scaled cash reserve ───
+  // Only high-conviction setups may draw the buffer toward 25%; low-trust setups respect 50%.
+  const pv = portfolioValue(state, acct.dashboard?.quotes || {});
+  const trust = computeTradeTrust({
+    claudeConfidence: claudeResult.confidence,
+    setupQuality: effectiveQuality,
+    technicalScore: analysis.score,
+    isBullish,
+    cfg,
+    regime,
+  });
+  const { deployable, reservePct } = deployableCash(state, pv, trust);
+  if (deployable < costPer) {
+    return { skipped: true, reason: `Cash reserve: ${(reservePct * 100).toFixed(0)}% buffer required (trust ${(trust * 100).toFixed(0)}%) — only $${deployable.toFixed(0)} of $${state.cash.toFixed(0)} cash deployable, need $${costPer.toFixed(0)}/contract` };
+  }
+
+  const budget = Math.min(maxRisk, deployable);
+  let qty = Math.max(1, Math.floor(budget / costPer));
   let totalCost = qty * costPer;
-  if (totalCost > state.cash) { qty = Math.floor(state.cash / costPer); totalCost = qty * costPer; }
+  if (totalCost > deployable) { qty = Math.floor(deployable / costPer); totalCost = qty * costPer; }
+  if (qty < 1) return { skipped: true, reason: `Cash reserve: insufficient deployable cash for 1 contract (buffer ${(reservePct * 100).toFixed(0)}%)` };
 
   const position = {
     ticker, type, strike, dte,
@@ -2588,18 +2772,34 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
     type = "put"; strike = Math.round(spot / 5) * 5 - 5;
   } else { return null; }
 
-  // Snap to next real Friday expiration >= 7 calendar days out
+  // Pick an expiry from the ticker's cadence near TARGET_DTE, staggered off crowded expirations.
   const simNow = acct._simNow ? new Date(acct._simNow) : null;
-  const expiry = nextFridayExpiry(7, simNow);
+  const expiry = nextExpiry(ticker, { targetDTE: TARGET_DTE, refDate: simNow, state });
   const dte = expiry.dte;
   const expiryDate = expiry.date.getTime();
 
   const premium = optPrice(spot, strike, dte, DEFAULT_IV, type);
   const costPer = premium * 100;
-  let qty = Math.max(1, Math.floor(maxRisk / costPer));
-  let totalCost = qty * costPer;
   if (costPer > state.cash) return null;
-  if (totalCost > state.cash) { qty = Math.floor(state.cash / costPer); totalCost = qty * costPer; }
+
+  // Trust-scaled cash reserve (mirrors live logic so backtests reflect the same capital discipline).
+  const isBull = analysis.score >= cfg.bullEntry;
+  const pv = portfolioValue(state, acct.dashboard?.quotes || {});
+  const trust = computeTradeTrust({
+    claudeConfidence: claudeResult.confidence,
+    setupQuality: effectiveQuality,
+    technicalScore: analysis.score,
+    isBullish: isBull,
+    cfg,
+    regime,
+  });
+  const { deployable } = deployableCash(state, pv, trust);
+  if (deployable < costPer) return { skipped: true, reason: `Cash reserve buffer — only $${deployable.toFixed(0)} deployable` };
+  const budget = Math.min(maxRisk, deployable);
+  let qty = Math.max(1, Math.floor(budget / costPer));
+  let totalCost = qty * costPer;
+  if (totalCost > deployable) { qty = Math.floor(deployable / costPer); totalCost = qty * costPer; }
+  if (qty < 1) return { skipped: true, reason: `Cash reserve — insufficient deployable cash for 1 contract` };
 
   const position = {
     ticker, type, strike, dte, expiryDate, dteRemaining: dte,
@@ -2623,16 +2823,31 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
   const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
   const pnlDollar = (currentPremium - pos.entryPremium) * qty * 100;
 
-  if (!acct._simMode && !canClosePDT(state, pos)) {
-    const used = countRecentDayTrades(state);
-    log(acct, `PDT BLOCKED: Cannot close ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} — ${used}/3 day trades used`);
-    return null;
+  if (!acct._simMode && wouldBeDayTrade(pos)) {
+    // This close is a same-day round-trip = a day trade. Day trades are scarce, so spend them
+    // only on big profits or loss-cuts. Marginal same-day gains are held into the next session.
+    const bigProfit = pnlPct >= DAY_TRADE_BIG_PROFIT;
+    const lossExit = pnlPct <= 0;
+    if (!bigProfit && !lossExit) {
+      log(acct, `PDT PRESERVE: Holding ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} — same-day exit at +${(pnlPct * 100).toFixed(0)}% not worth a day trade (need +${(DAY_TRADE_BIG_PROFIT * 100).toFixed(0)}% or a loss)`);
+      return null;
+    }
+    if (countRecentDayTrades(state) >= 3) {
+      const used = countRecentDayTrades(state);
+      log(acct, `PDT BLOCKED: Cannot close ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} — ${used}/3 day trades used`);
+      return null;
+    }
   }
 
   const proceeds = currentPremium * qty * 100;
   state.cash += proceeds;
   state.realizedPnl = (state.realizedPnl || 0) + pnlDollar;
-  if (!acct._simMode) recordDayTrade(state, pos);
+  if (!acct._simMode) {
+    recordDayTrade(state, pos);
+    // Track the close date per ticker so tryEntry can block same-day re-entry (PDT preservation).
+    if (!state.lastClosed) state.lastClosed = {};
+    state.lastClosed[pos.ticker] = getETDateStr();
+  }
 
   const dtUsed = countRecentDayTrades(state);
   const trade = { ...pos, qty: qty, closePremium: currentPremium, pnlDollar, pnlPct, reason, closeDate: getETDateStr() };
@@ -4338,6 +4553,7 @@ function tabBarHTML(activeId) {
     <a href="#" class="acct-tab new-tab" onclick="document.getElementById('acct-modal').style.display='flex';return false">+ New Account</a>
     <a href="/?sim=new" class="acct-tab new-tab" style="border-color:#a78bfa40;color:#a78bfa">&#x1F9EA; Simulator</a>
     <a href="/robinhood" class="acct-tab new-tab" style="border-color:#00d63240;color:#00d632">🔒 Robinhood</a>
+    <a href="/tradier" class="acct-tab new-tab" style="border-color:#3b82f640;color:#3b82f6">📈 Tradier</a>
   </div>
   <div class="global-stats">
     <span>Total PV: <b>$${totalPV.toFixed(0)}</b></span>
@@ -4415,6 +4631,92 @@ function accountActionsHTML(acctId) {
       </form>
     </div>
   </div>`;
+}
+
+// ─── Tradier Page ───
+
+function tradierPageHTML() {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tradier Data + Execution</title>
+<style>
+  body{background:#0a0a0f;color:#e5e7eb;font-family:-apple-system,system-ui,sans-serif;margin:0;padding:24px;max-width:900px;margin:0 auto}
+  h1{font-size:22px;margin:0 0 4px}
+  a.back{color:#3b82f6;text-decoration:none;font-size:13px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:18px 0}
+  .stat{background:#13131a;border:1px solid #262633;border-radius:10px;padding:14px}
+  .stat .label{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.04em}
+  .stat .value{font-size:18px;font-weight:700;margin-top:4px}
+  .ok{color:#22c55e}.bad{color:#ef4444}.muted{color:#888}
+  .card{background:#13131a;border:1px solid #262633;border-radius:10px;padding:16px;margin-top:16px}
+  input{padding:9px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff}
+  button{padding:9px 14px;background:#3b82f6;color:#fff;border:none;border-radius:6px;font-weight:600;cursor:pointer}
+  pre{background:#0a0a0f;border:1px solid #262633;border-radius:8px;padding:12px;overflow:auto;font-size:12px;max-height:360px}
+  table{width:100%;border-collapse:collapse;font-size:12px}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #1f1f29}
+</style></head>
+<body>
+  <a class="back" href="/">&larr; Back to dashboard</a>
+  <h1>📈 Tradier — Market Data + Execution Arm</h1>
+  <div class="muted" style="font-size:13px">Real-time quotes, candles & option chains (with Greeks/IV) feed the bot when connected. LLM analysis & news intel stay on the existing pipeline.</div>
+
+  <div class="grid" id="stats"><div class="stat"><div class="label">Status</div><div class="value muted">Loading…</div></div></div>
+
+  <div class="card">
+    <h3 style="margin:0 0 10px;font-size:15px">Quote / Option-Chain Lookup</h3>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <input id="sym" placeholder="Ticker e.g. SPY" value="SPY">
+      <button onclick="lookupQuote()">Quote</button>
+      <button onclick="lookupChain()" style="background:#6366f1">Option Chain</button>
+    </div>
+    <div id="lookup" style="margin-top:12px"></div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin:0 0 10px;font-size:15px">Pending Orders</h3>
+    <div id="pending" class="muted">None</div>
+  </div>
+
+<script>
+async function refresh(){
+  try{
+    const r = await fetch('/api/tradier-status'); const d = await r.json();
+    const conn = d.connected ? '<span class="ok">CONNECTED</span>' : '<span class="bad">NOT CONNECTED</span>';
+    const bp = d.balances ? ('$'+(d.balances.total_cash ?? d.balances.cash?.cash_available ?? '—')) : '—';
+    const pv = d.balances ? ('$'+(d.balances.total_equity ?? '—')) : '—';
+    document.getElementById('stats').innerHTML =
+      stat('Status', conn) +
+      stat('Environment', (d.environment||'—').toUpperCase()) +
+      stat('Account', d.accountId || 'data-only') +
+      stat('Market', d.marketState || '—') +
+      stat('Cash', bp) +
+      stat('Equity', pv);
+    const po = d.pendingOrders||[];
+    document.getElementById('pending').innerHTML = po.length ? '<pre>'+JSON.stringify(po,null,2)+'</pre>' : '<span class="muted">None</span>';
+  }catch(e){ document.getElementById('stats').innerHTML = stat('Status','<span class="bad">error</span>'); }
+}
+function stat(l,v){return '<div class="stat"><div class="label">'+l+'</div><div class="value">'+v+'</div></div>';}
+async function lookupQuote(){
+  const sym=document.getElementById('sym').value.trim().toUpperCase();
+  document.getElementById('lookup').innerHTML='Loading…';
+  const r=await fetch('/api/tradier-quote?sym='+sym); const d=await r.json();
+  document.getElementById('lookup').innerHTML='<pre>'+JSON.stringify(d,null,2)+'</pre>';
+}
+async function lookupChain(){
+  const sym=document.getElementById('sym').value.trim().toUpperCase();
+  document.getElementById('lookup').innerHTML='Loading chain…';
+  const r=await fetch('/api/tradier-chain?sym='+sym); const d=await r.json();
+  if(d.error){document.getElementById('lookup').innerHTML='<span class="bad">'+d.error+'</span>';return;}
+  let rows='';
+  for(const exp of (d.chain||[])){
+    rows+='<tr><td colspan="6" style="color:#3b82f6;font-weight:700">'+exp.expirationDate+'</td></tr>';
+    for(const c of (exp.options.CALL||[]).slice(0,4)){
+      rows+='<tr><td>CALL</td><td>$'+c.strike+'</td><td>'+c.bid+'/'+c.ask+'</td><td>IV '+(c.impliedVolatility!=null?(c.impliedVolatility*100).toFixed(0)+'%':'—')+'</td><td>δ'+(c.delta??'—')+'</td><td>OI '+c.openInterest+'</td></tr>';
+    }
+  }
+  document.getElementById('lookup').innerHTML='<table>'+rows+'</table>';
+}
+refresh(); setInterval(refresh, 8000);
+</script>
+</body></html>`;
 }
 
 let lastSimConfig = null;
@@ -4895,6 +5197,46 @@ function startDashboard(defaultAcct, apiKey) {
       return;
     }
 
+    // ─── Tradier: Data/Execution Arm Status ───
+    if (pathname === "/api/tradier-status") {
+      let clock = null, balances = null;
+      if (tradier.isConnected) {
+        try { clock = await tradier.getClock(); } catch { }
+        if (tradier.accountId) { try { balances = await tradier.getAccount(); } catch { } }
+      }
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({
+        connected: tradier.isConnected,
+        authenticated: tradier.isAuthenticated,
+        environment: tradier.environment,
+        accountId: tradier.accountId,
+        marketState: clock?.state || null,
+        balances,
+        pendingOrders: tradier.pendingOrders,
+      }));
+      return;
+    }
+
+    // ─── Tradier: Quote Lookup ───
+    if (pathname === "/api/tradier-quote") {
+      const sym = (url.searchParams.get("sym") || "SPY").toUpperCase();
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      if (!tradier.isConnected) { res.end(JSON.stringify({ error: "Tradier not connected" })); return; }
+      try { res.end(JSON.stringify(await tradier.getQuote(sym))); }
+      catch (e) { res.end(JSON.stringify({ error: e.message })); }
+      return;
+    }
+
+    // ─── Tradier: Option Chain Lookup ───
+    if (pathname === "/api/tradier-chain") {
+      const sym = (url.searchParams.get("sym") || "SPY").toUpperCase();
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      if (!tradier.isConnected) { res.end(JSON.stringify({ error: "Tradier not connected" })); return; }
+      try { res.end(JSON.stringify({ chain: await tradier.getOptionsChainNormalized(sym) })); }
+      catch (e) { res.end(JSON.stringify({ error: e.message })); }
+      return;
+    }
+
     // ─── Robinhood: Get Status & Pending Orders ───
     if (pathname === "/api/rh-status") {
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -5341,6 +5683,13 @@ self.addEventListener('pushsubscriptionchange', e => {
     if (pathname === "/robinhood") {
       res.writeHead(200, { "Content-Type": "text/html" });
       res.end(robinhoodPageHTML());
+      return;
+    }
+
+    // ─── Tradier Page ───
+    if (pathname === "/tradier") {
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(tradierPageHTML());
       return;
     }
 
@@ -6137,6 +6486,18 @@ async function main() {
     }
   } else {
     console.log("  Robinhood: PAPER mode — no live trading. Toggle from dashboard to enable.");
+  }
+
+  // Initialize Tradier data + execution arm (primary market-data feed when connected)
+  if (process.env.TRADIER_ACCESS_TOKEN || fs.existsSync("tradier_tokens.json")) {
+    const trOk = await tradier.init();
+    if (trOk) {
+      console.log(`  Tradier: DATA FEED ACTIVE ✓ (${tradier.environment}) — quotes, candles & option chains routed through Tradier`);
+    } else {
+      console.log("  Tradier: NOT CONNECTED — falling back to Finnhub/Yahoo for market data");
+    }
+  } else {
+    console.log("  Tradier: not configured — set TRADIER_ACCESS_TOKEN to use real-time data. Using Finnhub/Yahoo.");
   }
 
   // Store apiKey in each account state for backwards compat
