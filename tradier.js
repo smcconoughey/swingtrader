@@ -31,10 +31,17 @@ import crypto from "crypto";
 
 // ─── Configuration ───
 
-const ENV = (process.env.TRADIER_ENV || "production").toLowerCase();
-const BASE_URL = ENV === "sandbox"
+let ENV = (process.env.TRADIER_ENV || "production").toLowerCase();
+let BASE_URL = ENV === "sandbox"
   ? "https://sandbox.tradier.com/v1"
   : "https://api.tradier.com/v1";
+
+function applyEnvironment(env) {
+  ENV = (env || "production").toLowerCase();
+  BASE_URL = ENV === "sandbox"
+    ? "https://sandbox.tradier.com/v1"
+    : "https://api.tradier.com/v1";
+}
 
 const TOKEN_FILE = "tradier_tokens.json";
 const PENDING_ORDERS_FILE = "tradier_pending.json";
@@ -50,6 +57,7 @@ const CHAIN_MAX_EXPIRIES = 8;
 let accessToken = null;
 let accountId = null;
 let connected = false;
+let lastError = null;
 let pendingOrders = [];
 
 // ─── HTTP Transport ───
@@ -158,6 +166,20 @@ function buildOCC(symbol, expiration, type, strike) {
   return `${symbol.toUpperCase()}${yy}${mm}${dd}${cp}${strikeStr}`;
 }
 
+// Inverse of buildOCC. e.g. "SPY260619C00450000" → { ticker:"SPY", expiration:"2026-06-19", type:"call", strike:450 }
+// Returns null if the symbol is not a valid OCC option symbol (e.g. a plain equity ticker).
+function parseOCC(occ) {
+  const m = (occ || "").toUpperCase().match(/^([A-Z]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})$/);
+  if (!m) return null;
+  const [, ticker, yy, mm, dd, cp, strikeStr] = m;
+  return {
+    ticker,
+    expiration: `20${yy}-${mm}-${dd}`,
+    type: cp === "C" ? "call" : "put",
+    strike: parseInt(strikeStr, 10) / 1000,
+  };
+}
+
 // ─── Public API ───
 
 const tradier = {
@@ -165,32 +187,46 @@ const tradier = {
   get isAuthenticated() { return !!accessToken; },
   get environment() { return ENV; },
   get accountId() { return accountId; },
+  get lastError() { return lastError; },
+  get baseUrl() { return BASE_URL; },
   get pendingOrders() { return [...pendingOrders]; },
 
   /**
    * Verify the token, discover the account id, and mark the arm connected.
+   * Account discovery is non-fatal: if /user/profile is unavailable, the arm still connects
+   * in data-only mode as long as market data responds.
    */
   async init() {
-    if (!loadTokens()) {
+    // Keep a runtime-provided token (from the dashboard) over re-reading env/file.
+    if (!accessToken && !loadTokens()) {
+      lastError = "No token found. Set TRADIER_ACCESS_TOKEN.";
       console.log("  [TR] No Tradier token found. Set TRADIER_ACCESS_TOKEN env var.");
       return false;
     }
-    try {
-      // Discover the account id from the user profile unless one was provided.
-      if (!accountId) {
+
+    // Account discovery (non-fatal — many sandbox/data tokens lack brokerage scope).
+    if (!accountId) {
+      try {
         const profile = await apiGet("/user/profile");
         const accts = asArray(profile?.profile?.account);
         if (accts.length > 0) accountId = accts[0].account_number;
+      } catch (e) {
+        console.log(`  [TR] profile lookup failed (continuing data-only): ${e.message}`);
       }
-      // A market-data probe doubles as an auth check.
+    }
+
+    // Market-data probe doubles as the auth/connectivity check.
+    try {
       await apiGet("/markets/clock");
       connected = true;
+      lastError = null;
       loadPendingOrders();
       console.log(`  [TR] Tradier connected ✓ (${ENV}${accountId ? `, account ${accountId}` : ", data-only"})`);
       return true;
     } catch (e) {
-      console.log(`  [TR] init failed: ${e.message}`);
       connected = false;
+      lastError = e.message;
+      console.log(`  [TR] init failed: ${e.message}`);
       return false;
     }
   },
@@ -460,12 +496,19 @@ const tradier = {
   },
 
   setToken(token, acctId = null) {
-    accessToken = token;
-    if (acctId) accountId = acctId;
+    accessToken = (token || "").trim() || null;
+    accountId = acctId || null;
+    connected = false;
     saveTokens();
   },
 
+  setEnvironment(env) {
+    applyEnvironment(env);
+    connected = false;
+  },
+
   buildOCC,
+  parseOCC,
 };
 
 function normalizeQuote(q) {

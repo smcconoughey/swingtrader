@@ -664,6 +664,13 @@ const DEFAULT_CONFIG = {
   maxPositions: 6,
   minSetupQuality: 60,
   customPromptSuffix: "",
+  // Broker binding: "paper" (simulated) | "tradier" (live, broker is source of truth) | "robinhood"
+  broker: "paper",
+  // When false, the trust-scaled 50%->25% cash reserve gate is bypassed (per-trade sizing,
+  // max positions, sector caps, PDT and DTE staggering still apply). Toggleable per account.
+  useCashReserve: true,
+  // When true, broker orders execute live with no manual approval step.
+  autoExecute: false,
 };
 
 // ─── Multi-Account Runtime ───
@@ -1886,7 +1893,7 @@ function portfolioValue(state, quotes) {
   for (const pos of state.positions) {
     const q = quotes[pos.ticker];
     const spot = q ? q.c : pos.entrySpot;
-    const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
+    const currentPremium = pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
     val += currentPremium * pos.qty * 100;
   }
   return val;
@@ -2651,7 +2658,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     expiryDate = selectedCandidate.expiryDate;
     premium = selectedCandidate.mid;
     posIv = selectedCandidate.iv || DEFAULT_IV;
-    optionsSource = "finnhub";
+    optionsSource = tradier.isConnected ? "tradier" : "finnhub";
     log(acct, `CONTRACT ${ticker}: $${strike} ${type.toUpperCase()} exp ${selectedCandidate.expiryStr} (${dte}d) @ $${premium} mid | IV ${posIv ? (posIv*100).toFixed(0)+'%' : '?'} | OI ${selectedCandidate.oi} | spread $${selectedCandidate.spread}`);
   } else {
     // Synthetic fallback: 1 strike OTM, expiry chosen from the ticker's cadence near TARGET_DTE
@@ -2681,7 +2688,14 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     cfg,
     regime,
   });
-  const { deployable, reservePct } = deployableCash(state, pv, trust);
+  // Cash reserve is toggleable per account. When disabled, deploy full cash (other limits still apply).
+  let deployable, reservePct;
+  if (cfg.useCashReserve === false) {
+    deployable = state.cash;
+    reservePct = 0;
+  } else {
+    ({ deployable, reservePct } = deployableCash(state, pv, trust));
+  }
   if (deployable < costPer) {
     return { skipped: true, reason: `Cash reserve: ${(reservePct * 100).toFixed(0)}% buffer required (trust ${(trust * 100).toFixed(0)}%) — only $${deployable.toFixed(0)} of $${state.cash.toFixed(0)} cash deployable, need $${costPer.toFixed(0)}/contract` };
   }
@@ -2690,7 +2704,16 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   let qty = Math.max(1, Math.floor(budget / costPer));
   let totalCost = qty * costPer;
   if (totalCost > deployable) { qty = Math.floor(deployable / costPer); totalCost = qty * costPer; }
-  if (qty < 1) return { skipped: true, reason: `Cash reserve: insufficient deployable cash for 1 contract (buffer ${(reservePct * 100).toFixed(0)}%)` };
+  if (qty < 1) return { skipped: true, reason: `Insufficient deployable cash for 1 contract${cfg.useCashReserve === false ? "" : ` (buffer ${(reservePct * 100).toFixed(0)}%)`}` };
+
+  // ─── Broker accounts: place a REAL buy_to_open and let the next sync reconcile state ───
+  // Broker is the source of truth, so we do NOT push a synthetic position or mutate cash here.
+  if (cfg.broker === "tradier") {
+    return await placeBrokerEntry(acct, {
+      ticker, type, strike, expiryDate, dte, qty, premium, direction,
+      setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence,
+    });
+  }
 
   const position = {
     ticker, type, strike, dte,
@@ -2839,6 +2862,12 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
     }
   }
 
+  // Broker (live) accounts: place a real sell_to_close and let the next sync reconcile.
+  // Returns null so the exit loop keeps the position until the fill is confirmed by Tradier.
+  if (!acct._simMode && acct.config.broker === "tradier") {
+    return placeBrokerExit(acct, pos, currentPremium, reason, qty, pnlPct, pnlDollar);
+  }
+
   const proceeds = currentPremium * qty * 100;
   state.cash += proceeds;
   state.realizedPnl = (state.realizedPnl || 0) + pnlDollar;
@@ -2872,7 +2901,8 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
     tweetTradeExit(acct, pos, trade).catch(e => console.log(`  [X] Exit tweet error: ${e.message}`));
 
     // ─── Robinhood Agentic Execution (exit) ───
-    if (TRADING_MODE === "robinhood" && robinhood.isConnected) {
+    // Skip for Tradier broker accounts — they execute natively via placeBrokerExit (and return early).
+    if (acct.config.broker !== "tradier" && TRADING_MODE === "robinhood" && robinhood.isConnected) {
       try {
         // For exits, sell the corresponding equity shares
         const isTrimLocal = qty < pos.qty;
@@ -2917,7 +2947,7 @@ function tryExits(acct, quotes) {
       ? Math.max(0, (pos.expiryDate - now) / 86400_000)
       : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
 
-    const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
+    const currentPremium = pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
     const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
 
     if (!pos.bestPnlPct) pos.bestPnlPct = 0;
@@ -3036,7 +3066,7 @@ function trySignalExits(acct, quotes, analyses) {
 
     const q = quotes[pos.ticker];
     const spot = q ? q.c : pos.entrySpot;
-    const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
+    const currentPremium = pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
 
     const trade = closePosition(acct, pos, currentPremium, "signal reversed");
     if (trade) {
@@ -3067,7 +3097,7 @@ function tryTimeBasedExits(acct, quotes) {
     if (!q) { remaining.push(pos); continue; }
 
     const spot = q.c;
-    const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
+    const currentPremium = pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
     const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
     let reason = null;
 
@@ -3125,7 +3155,7 @@ function tryEMATrailingExits(acct, quotes) {
 
     const q = quotes[pos.ticker];
     const spot = q ? q.c : pos.entrySpot;
-    const currentPremium = optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
+    const currentPremium = pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
     let reason = null;
 
     const below8 = pos.type === "call" ? price < ema8[L] : price > ema8[L];
@@ -3258,7 +3288,7 @@ function dashboardHTML(acct) {
       <td><span style="color:#00ff88">TP $${p.profitTarget.premium}</span> (${p.pctToProfit}% away)</td>
       <td><span style="color:#ff4444">SL $${p.stopLoss.premium}</span> (${p.pctToStop}% away)</td>
       <td style="font-size:10px;color:#888">${p.openDate || '—'}</td>
-      <td style="font-size:10px;color:#888">δ${p.greeks.delta} θ${p.greeks.theta}<br>${p.pdtStatus}<br><span style="color:${p.optionsSource === 'finnhub' ? '#4ecdc4' : '#555'}" title="IV used for pricing">IV ${((p.iv || 0.30) * 100).toFixed(0)}% ${p.optionsSource === 'finnhub' ? '●' : '○'}</span></td>
+      <td style="font-size:10px;color:#888">δ${p.greeks.delta} θ${p.greeks.theta}<br>${p.pdtStatus}<br><span style="color:${p.optionsSource === 'synthetic' ? '#555' : '#4ecdc4'}" title="Source / IV used for pricing">${(p.optionsSource || 'synthetic').toUpperCase()} IV ${((p.iv || 0.30) * 100).toFixed(0)}% ${p.optionsSource === 'synthetic' ? '○' : '●'}</span></td>
     </tr>${aiRow}`;
   }).join("") : '<tr><td colspan="13" style="opacity:.5">No open positions</td></tr>';
 
@@ -3338,7 +3368,12 @@ function dashboardHTML(acct) {
 
   return `<!DOCTYPE html><html><head><meta charset="utf-8">
 <title>Swing Trader Dashboard</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="SwingTrader">
+<meta name="theme-color" content="#0a0a0f">
 <meta http-equiv="refresh" content="30">
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
@@ -3392,6 +3427,25 @@ function dashboardHTML(acct) {
   .acct-btn.delete:hover{border-color:#ff4444;color:#ff4444}
   .llm-toggle{color:#a78bfa;font-size:10px;cursor:pointer;padding:2px 8px;border:1px solid #a78bfa40;border-radius:4px;transition:all .2s}
   .llm-toggle:hover{background:#a78bfa20;border-color:#a78bfa;color:#c4b5fd}
+  body{padding-left:max(20px,env(safe-area-inset-left));padding-right:max(20px,env(safe-area-inset-right));padding-top:max(20px,env(safe-area-inset-top))}
+  /* Wide data tables scroll horizontally inside their card instead of breaking the layout */
+  .card{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  @media(max-width:600px){
+    body{font-size:13px;padding:10px;padding-left:max(10px,env(safe-area-inset-left));padding-right:max(10px,env(safe-area-inset-right))}
+    h1{font-size:17px}
+    .sub{font-size:10px;line-height:1.7}
+    .card{padding:12px}
+    .stat{margin-right:14px}
+    .stat .val{font-size:18px}
+    table{min-width:560px}
+    .global-stats{flex-wrap:wrap;gap:8px 14px}
+    .acct-tab{min-width:84px;padding:6px 10px 5px}
+    .acct-actions{flex-wrap:wrap}
+    /* 16px inputs stop iOS from auto-zooming when a field is focused */
+    .hint-form input{width:100%;margin-bottom:8px;font-size:16px}
+    .hint-form button{width:100%}
+    input,select,textarea{font-size:16px}
+  }
 </style></head><body>
 ${tabBarHTML(acct.id)}
 ${accountActionsHTML(acct.id)}
@@ -4079,11 +4133,17 @@ function tickerDetailHTML(sym, acct) {
 
   return `<!DOCTYPE html><html><head><meta charset="utf-8">
 <title>${sym} — Swing Trader</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0a0a0f">
 <meta http-equiv="refresh" content="30">
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
   body{background:#0a0a0f;color:#e0e0e0;font-family:'SF Mono',Menlo,Monaco,monospace;font-size:13px;padding:20px}
+  table{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch}
+  @media(max-width:600px){body{padding:12px}input,select,textarea,button{font-size:16px}}
   h1{color:#00ff88;font-size:20px;margin-bottom:4px}
   a{color:#4ecdc4;text-decoration:none}a:hover{text-decoration:underline}
   .sub{color:#666;font-size:11px;margin-bottom:20px}
@@ -4195,11 +4255,18 @@ function robinhoodPageHTML() {
   const connected = robinhood.isConnected;
   const pending = robinhood.pendingOrders;
 
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Robinhood">
+<meta name="theme-color" content="#0a0a12">
 <title>Robinhood Agentic Trading</title>
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
   body{background:#0a0a12;color:#ccc;font-family:'Inter','SF Pro',system-ui,sans-serif;padding:0}
+  #rh-app{overflow-x:auto}
+  @media(max-width:600px){#rh-app{padding:12px}input,button,select{font-size:16px}}
   #pin-gate{display:flex;align-items:center;justify-content:center;min-height:100vh;flex-direction:column;gap:20px}
   #pin-gate h1{color:#00d632;font-size:28px;letter-spacing:2px}
   #pin-gate .subtitle{color:#666;font-size:13px}
@@ -4541,9 +4608,12 @@ function tabBarHTML(activeId) {
     const color = pnl >= 0 ? "#00ff88" : "#ff4444";
     const isActive = id === activeId;
     const statusDot = acct.paused ? "🔴" : "🟢";
-    tabs.push(`<a href="/?a=${id}" class="acct-tab ${isActive ? "active" : ""}" title="${acct.name}">
+    const liveBadge = acct.config.broker === "tradier"
+      ? `<span class="tab-live" style="background:#00ff8822;color:#00ff88;border:1px solid #00ff8855;border-radius:4px;padding:0 4px;font-size:9px;font-weight:bold;margin-left:4px">LIVE</span>`
+      : "";
+    tabs.push(`<a href="/?a=${id}" class="acct-tab ${isActive ? "active" : ""}" title="${acct.name}${acct.config.broker === "tradier" ? " — LIVE Tradier account" : ""}">
       <span class="tab-status">${statusDot}</span>
-      <span class="tab-name">${acct.name}</span>
+      <span class="tab-name">${acct.name}</span>${liveBadge}
       <span class="tab-pv">$${pv.toFixed(0)}</span>
       <span class="tab-pnl" style="color:${color}">${pnl >= 0 ? "+" : ""}${pnl}%</span>
     </a>`);
@@ -4583,6 +4653,13 @@ function tabBarHTML(activeId) {
       <input name="minSetupQuality" type="number" value="50" min="0" max="100" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:12px;box-sizing:border-box">
       <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Custom Prompt Suffix (optional)</label>
       <input name="customPromptSuffix" value="" placeholder="e.g. Focus on tech sector only" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:16px;box-sizing:border-box">
+      <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Broker (execution)</label>
+      <select name="broker" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:12px;box-sizing:border-box">
+        <option value="paper">Paper (simulated)</option>
+        <option value="tradier">Tradier (LIVE — real money)</option>
+      </select>
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#ccc"><input type="checkbox" name="useCashReserve" checked> Use cash reserve (50%→25% buffer)</label>
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:16px;font-size:13px;color:#ccc"><input type="checkbox" name="autoExecute"> Auto-execute broker orders (full autonomy)</label>
       <div style="display:flex;gap:8px">
         <button type="submit" style="flex:1;padding:10px;background:#00ff88;color:#000;border:none;border-radius:6px;font-weight:bold;cursor:pointer">Create Account</button>
         <button type="button" onclick="document.getElementById('acct-modal').style.display='none'" style="flex:1;padding:10px;background:#333;color:#fff;border:none;border-radius:6px;cursor:pointer">Cancel</button>
@@ -4624,6 +4701,13 @@ function accountActionsHTML(acctId) {
         <input name="minSetupQuality" type="number" value="${cfg.minSetupQuality ?? 50}" min="0" max="100" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:12px;box-sizing:border-box">
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#888">Custom Prompt Suffix</label>
         <input name="customPromptSuffix" value="${(cfg.customPromptSuffix || "").replace(/"/g, "&quot;")}" placeholder="e.g. Focus on tech sector only" style="width:100%;padding:8px;background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;margin-bottom:16px;box-sizing:border-box">
+        <input type="hidden" name="configForm" value="1">
+        <div style="border-top:1px solid #2a2a3a;margin:4px 0 14px;padding-top:14px">
+          <div style="font-size:12px;color:#888;margin-bottom:10px">Broker: <strong style="color:${cfg.broker === "tradier" ? "#00ff88" : "#aaa"}">${(cfg.broker || "paper").toUpperCase()}${cfg.broker === "tradier" ? " · LIVE" : ""}</strong></div>
+          <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#ccc"><input type="checkbox" name="useCashReserve" ${cfg.useCashReserve ? "checked" : ""}> Use cash reserve (50%→25% buffer)</label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#ccc"><input type="checkbox" name="autoExecute" ${cfg.autoExecute ? "checked" : ""}> Auto-execute broker orders (full autonomy)</label>
+          ${cfg.broker === "tradier" ? `<p style="font-size:11px;color:#f59e0b;margin:10px 0 0">⚠ LIVE account — orders execute with real money. Use <strong>Pause</strong> as the kill switch (blocks new entries; exits still run to protect open positions).</p>` : ""}
+        </div>
         <div style="display:flex;gap:8px">
           <button type="submit" style="flex:1;padding:10px;background:#a78bfa;color:#000;border:none;border-radius:6px;font-weight:bold;cursor:pointer">Save Settings</button>
           <button type="button" onclick="document.getElementById('edit-modal').style.display='none'" style="flex:1;padding:10px;background:#333;color:#fff;border:none;border-radius:6px;cursor:pointer">Cancel</button>
@@ -4636,10 +4720,22 @@ function accountActionsHTML(acctId) {
 // ─── Tradier Page ───
 
 function tradierPageHTML() {
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Tradier">
+<meta name="theme-color" content="#0a0a0f">
 <title>Tradier Data + Execution</title>
 <style>
   body{background:#0a0a0f;color:#e5e7eb;font-family:-apple-system,system-ui,sans-serif;margin:0;padding:24px;max-width:900px;margin:0 auto}
+  .card{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  @media(max-width:600px){
+    body{padding:14px}
+    h1{font-size:18px}
+    input,button{font-size:16px}
+    .grid{grid-template-columns:1fr 1fr}
+  }
   h1{font-size:22px;margin:0 0 4px}
   a.back{color:#3b82f6;text-decoration:none;font-size:13px}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:18px 0}
@@ -4659,6 +4755,22 @@ function tradierPageHTML() {
   <div class="muted" style="font-size:13px">Real-time quotes, candles & option chains (with Greeks/IV) feed the bot when connected. LLM analysis & news intel stay on the existing pipeline.</div>
 
   <div class="grid" id="stats"><div class="stat"><div class="label">Status</div><div class="value muted">Loading…</div></div></div>
+
+  <div id="errbox" style="display:none;background:#3a1414;border:1px solid #ef444455;border-radius:10px;padding:12px;margin-top:8px;font-size:12px;color:#fca5a5"></div>
+
+  <div class="card">
+    <h3 style="margin:0 0 10px;font-size:15px">Connection</h3>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <select id="env" style="background:#0a0a0f;border:1px solid #333;border-radius:6px;color:#fff;padding:9px">
+        <option value="sandbox">sandbox</option>
+        <option value="production">production</option>
+      </select>
+      <input id="token" placeholder="Paste Tradier access token (optional)" style="flex:1;min-width:200px">
+      <button onclick="saveToken()">Save &amp; Connect</button>
+      <button onclick="reconnect()" style="background:#6366f1">Reconnect</button>
+    </div>
+    <div class="muted" style="font-size:11px;margin-top:8px">Leave the token blank to reconnect using the <code>TRADIER_ACCESS_TOKEN</code> env var. A token entered here is stored on the server (tradier_tokens.json).</div>
+  </div>
 
   <div class="card">
     <h3 style="margin:0 0 10px;font-size:15px">Quote / Option-Chain Lookup</h3>
@@ -4689,11 +4801,28 @@ async function refresh(){
       stat('Market', d.marketState || '—') +
       stat('Cash', bp) +
       stat('Equity', pv);
+    const eb = document.getElementById('errbox');
+    if(!d.connected && d.lastError){ eb.style.display='block'; eb.innerHTML='<b>Connection error:</b> '+d.lastError+'<br><span style="color:#888">Endpoint: '+(d.baseUrl||'')+'</span><br><span style="color:#888">A 401 usually means the token doesn\\'t match the selected environment (sandbox token vs production token).</span>'; }
+    else { eb.style.display='none'; }
+    if(d.environment){ const sel=document.getElementById('env'); if(sel) sel.value=d.environment; }
     const po = d.pendingOrders||[];
     document.getElementById('pending').innerHTML = po.length ? '<pre>'+JSON.stringify(po,null,2)+'</pre>' : '<span class="muted">None</span>';
   }catch(e){ document.getElementById('stats').innerHTML = stat('Status','<span class="bad">error</span>'); }
 }
 function stat(l,v){return '<div class="stat"><div class="label">'+l+'</div><div class="value">'+v+'</div></div>';}
+async function reconnect(){
+  const btn=event.target; btn.textContent='…';
+  await fetch('/api/tradier-reconnect',{method:'POST'});
+  btn.textContent='Reconnect'; refresh();
+}
+async function saveToken(){
+  const token=document.getElementById('token').value.trim();
+  const env=document.getElementById('env').value;
+  const body='token='+encodeURIComponent(token)+'&env='+encodeURIComponent(env);
+  await fetch('/api/tradier-token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});
+  document.getElementById('token').value='';
+  refresh();
+}
 async function lookupQuote(){
   const sym=document.getElementById('sym').value.trim().toUpperCase();
   document.getElementById('lookup').innerHTML='Loading…';
@@ -4772,10 +4901,16 @@ function simulatorPageHTML(simId) {
 
     return `<!DOCTYPE html><html><head><meta charset="utf-8">
 <title>Historical Simulator — Swing Trader</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0a0a0f">
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
   body{background:#0a0a0f;color:#e0e0e0;font-family:'SF Mono',Menlo,Monaco,monospace;font-size:13px;padding:20px}
+  table{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch}
+  @media(max-width:600px){body{padding:12px}input,select,textarea,button{font-size:16px}}
   h1{color:#a78bfa;font-size:20px;margin-bottom:4px}
   .sub{color:#666;font-size:11px;margin-bottom:20px}
   .card{background:#12121a;border:1px solid #1e1e2e;border-radius:8px;padding:24px;max-width:600px;margin:0 auto}
@@ -4870,10 +5005,16 @@ function reuse(id) {
 
   return `<!DOCTYPE html><html><head><meta charset="utf-8">
 <title>Sim #${sim.id} — Swing Trader</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0a0a0f">
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
   body{background:#0a0a0f;color:#e0e0e0;font-family:'SF Mono',Menlo,Monaco,monospace;font-size:13px;padding:20px}
+  table{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch}
+  @media(max-width:600px){body{padding:12px}input,select,textarea,button{font-size:16px}}
   h1{color:#a78bfa;font-size:20px;margin-bottom:4px}
   .sub{color:#666;font-size:11px;margin-bottom:20px}
   .grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:16px}
@@ -5072,6 +5213,9 @@ function startDashboard(defaultAcct, apiKey) {
           bullEntry: 65, bearEntry: 35, trim1Pct: 0.25, trim2Pct: 0.50,
           minSetupQuality: parseInt(params.get("minSetupQuality")) || 50,
           customPromptSuffix: params.get("customPromptSuffix") || "",
+          broker: ["paper", "tradier", "robinhood"].includes(params.get("broker")) ? params.get("broker") : "paper",
+          useCashReserve: params.get("useCashReserve") === "on" || params.get("useCashReserve") === "true",
+          autoExecute: params.get("autoExecute") === "on" || params.get("autoExecute") === "true",
         };
         const newAcct = createAccountRuntime(id, name, config);
         newAcct.state.apiKey = apiKey;
@@ -5121,6 +5265,12 @@ function startDashboard(defaultAcct, apiKey) {
         else cfg.maxPositions = null;
         if (params.has("minSetupQuality")) cfg.minSetupQuality = parseInt(params.get("minSetupQuality")) ?? 50;
         cfg.customPromptSuffix = params.get("customPromptSuffix") || "";
+        // Broker binding + live-trading toggles. Checkboxes only POST when checked.
+        if (params.has("broker") && ["paper", "tradier", "robinhood"].includes(params.get("broker"))) cfg.broker = params.get("broker");
+        if (params.has("configForm")) {
+          cfg.useCashReserve = params.get("useCashReserve") === "on" || params.get("useCashReserve") === "true";
+          cfg.autoExecute = params.get("autoExecute") === "on" || params.get("autoExecute") === "true";
+        }
         target.riskPct = cfg.baseRiskPct * (target.currentRegime?.riskScale || 0.5);
         saveAccounts();
         console.log(`  [${id}] Config updated: risk=${(cfg.baseRiskPct * 100).toFixed(1)}% target=${(cfg.profitTarget * 100)}% stop=${(cfg.stopLoss * 100)}% minQuality=${cfg.minSetupQuality}`);
@@ -5209,11 +5359,39 @@ function startDashboard(defaultAcct, apiKey) {
         connected: tradier.isConnected,
         authenticated: tradier.isAuthenticated,
         environment: tradier.environment,
+        baseUrl: tradier.baseUrl,
         accountId: tradier.accountId,
         marketState: clock?.state || null,
         balances,
+        lastError: tradier.lastError,
         pendingOrders: tradier.pendingOrders,
       }));
+      return;
+    }
+
+    // ─── Tradier: Reconnect / Test ───
+    if (req.method === "POST" && pathname === "/api/tradier-reconnect") {
+      const ok = await tradier.init();
+      console.log(`  Tradier reconnect: ${ok ? "CONNECTED" : "FAILED"}${tradier.lastError ? ` — ${tradier.lastError}` : ""}`);
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ connected: tradier.isConnected, error: tradier.lastError, accountId: tradier.accountId, environment: tradier.environment }));
+      return;
+    }
+
+    // ─── Tradier: Set Token / Environment at runtime ───
+    if (req.method === "POST" && pathname === "/api/tradier-token") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", async () => {
+        const params = new URLSearchParams(body);
+        const token = (params.get("token") || "").trim();
+        const env = (params.get("env") || "").trim();
+        if (env) tradier.setEnvironment(env);
+        if (token) tradier.setToken(token);
+        if (token || env) await tradier.init();
+        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ connected: tradier.isConnected, error: tradier.lastError, environment: tradier.environment }));
+      });
       return;
     }
 
@@ -5761,6 +5939,286 @@ async function fetchSharedMarketData(apiKey, sharedCandleCache) {
   return { sharedQuotes, tickerList };
 }
 
+// ─── Broker (Tradier) Live Account Helpers ───
+
+// Extract usable cash from a Tradier balances object. Account type varies (cash / margin / pdt),
+// so the buying-power field lives in different places. Prefer option buying power when present.
+function brokerCashFromBalances(bal) {
+  if (!bal) return null;
+  const candidates = [
+    bal.margin?.option_buying_power,
+    bal.pdt?.option_buying_power,
+    bal.option_buying_power,
+    bal.cash?.cash_available,
+    bal.total_cash,
+    bal.cash_available,
+  ];
+  for (const c of candidates) if (typeof c === "number" && !Number.isNaN(c)) return c;
+  return null;
+}
+
+// Ensure a first-class live account bound to Tradier exists, seeded from the real balance.
+// Idempotent: re-running just refreshes the seeded cash; positions are derived each sync.
+async function ensureTradierAccount() {
+  if (!tradier.isConnected) return;
+  let seedCash = null;
+  try {
+    const bal = await tradier.getAccount();
+    seedCash = brokerCashFromBalances(bal);
+  } catch (e) { console.log(`  Tradier: balance fetch failed during provision — ${e.message}`); }
+
+  if (accounts.has("tradier")) {
+    const acct = accounts.get("tradier");
+    acct.config.broker = "tradier";
+    if (acct.config.autoExecute === undefined) acct.config.autoExecute = true;
+    if (typeof seedCash === "number") acct.state.cash = seedCash;
+    console.log(`  Tradier: live account present — cash $${acct.state.cash.toFixed(2)} (${tradier.environment})`);
+    return;
+  }
+
+  const config = {
+    ...DEFAULT_CONFIG,
+    broker: "tradier",
+    useCashReserve: false, // off by default for the live account; toggle on from settings
+    autoExecute: true,     // full autonomy (Pause remains the kill switch)
+    startingCash: typeof seedCash === "number" ? seedCash : DEFAULT_CONFIG.startingCash,
+  };
+  const state = {
+    cash: typeof seedCash === "number" ? seedCash : DEFAULT_CONFIG.startingCash,
+    positions: [],
+    history: [],
+    dayTrades: [],
+    meta: {},
+  };
+  const acct = createAccountRuntime("tradier", `Tradier Live (${tradier.environment})`, config, state);
+  accounts.set("tradier", acct);
+  saveAccounts();
+  console.log(`  Tradier: provisioned LIVE account ✓ — seeded cash $${state.cash.toFixed(2)} (${tradier.environment}), autoExecute ON`);
+}
+
+// Set of underlying tickers that currently have an OPEN (unfilled/working) Tradier order.
+// Used to de-dupe so we don't fire a second entry/exit while one is still working.
+async function brokerOpenOrderTickers(acct) {
+  const tickers = new Set();
+  if (acct.config.broker !== "tradier" || !tradier.isConnected) return tickers;
+  try {
+    const orders = await tradier.getOrders();
+    for (const o of orders) {
+      const status = (o.status || "").toLowerCase();
+      if (["filled", "canceled", "cancelled", "rejected", "expired"].includes(status)) continue;
+      const sym = (o.symbol || o.option_symbol || "").toUpperCase();
+      const parsed = tradier.parseOCC(o.option_symbol || o.symbol || "");
+      tickers.add(parsed ? parsed.ticker : sym);
+    }
+  } catch (e) { log(acct, `TRADIER: open-orders check failed — ${e.message}`); }
+  return tickers;
+}
+
+// Place a real buy_to_open on Tradier for a bot entry decision. Broker is the source of truth,
+// so we pre-seed side-metadata (entry context) keyed by OCC and let the next sync surface the fill.
+async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, dte, qty, premium, direction, setupQuality = 0, claudeConfidence = 0 }) {
+  const expStr = new Date(expiryDate).toISOString().slice(0, 10);
+  const occ = tradier.buildOCC(ticker, expStr, type, strike);
+
+  // In-flight de-dupe: skip if a working order already exists for this underlying. The set is
+  // refreshed once per cycle in syncBrokerAccount; fall back to a fresh fetch if unavailable.
+  const inFlight = acct._inflightTickers || await brokerOpenOrderTickers(acct);
+  if (inFlight.has(ticker.toUpperCase())) {
+    return { skipped: true, reason: `Tradier: working order already open for ${ticker} — skipping duplicate entry` };
+  }
+
+  if (!acct.config.autoExecute) {
+    return { skipped: true, reason: `Tradier: autoExecute off — entry for ${ticker} not sent (enable on the account)` };
+  }
+
+  // Seed metadata so the post-fill sync keeps entry context (stops/trails depend on it).
+  if (!acct.state.meta) acct.state.meta = {};
+  acct.state.meta[occ] = {
+    entryPremium: +premium.toFixed(2),
+    entrySpot: acct.dashboard?.quotes?.[ticker]?.c ?? null,
+    dte,
+    originalQty: qty,
+    openDate: getETDateStr(),
+    openTime: Date.now(),
+    trimLevel: 0,
+    bestPnlPct: 0,
+    entryAtrPct: acct.dashboard?.analyses?.[ticker]?.atrPct ?? null,
+    setupQuality,
+  };
+
+  try {
+    const limit = +premium.toFixed(2);
+    const res = await tradier.placeOptionOrder(ticker, expStr, type, strike, "buy_to_open", qty, "limit", limit);
+    if (acct._inflightTickers) acct._inflightTickers.add(ticker.toUpperCase());
+    log(acct, `TRADIER ENTRY: BUY ${qty}x ${occ} @ $${limit} limit — order ${res?.id || JSON.stringify(res).slice(0, 80)}`);
+
+    // Optimistic in-cycle accounting (reconciled & overwritten by the next syncBrokerAccount):
+    // decrement cash and add a placeholder position so further entries this cycle correctly
+    // respect cash sizing, maxPositions, sector caps and same-ticker de-dupe.
+    const totalCost = qty * premium * 100;
+    acct.state.cash = Math.max(0, acct.state.cash - totalCost);
+    acct.state.positions.push({
+      occSymbol: occ, ticker, type, strike, dte,
+      expiryDate, dteRemaining: dte,
+      entryPremium: +premium.toFixed(2), entrySpot: acct.dashboard?.quotes?.[ticker]?.c ?? null,
+      qty, originalQty: qty, cost: totalCost,
+      openDate: getETDateStr(), openTime: Date.now(),
+      trimLevel: 0, bestPnlPct: 0,
+      entryAtrPct: acct.dashboard?.analyses?.[ticker]?.atrPct ?? null,
+      iv: DEFAULT_IV, liveMark: +premium.toFixed(2), optionsSource: "tradier", direction,
+      _pendingFill: true,
+    });
+
+    return { ticker, type, strike, dte, qty, entryPremium: +premium.toFixed(2), cost: totalCost, direction, optionsSource: "tradier", setupQuality, claudeConfidence, brokerOrder: true };
+  } catch (e) {
+    delete acct.state.meta[occ];
+    log(acct, `TRADIER ENTRY FAILED ${ticker}: ${e.message}`);
+    return { skipped: true, reason: `Tradier entry rejected: ${e.message}` };
+  }
+}
+
+// Place a real sell_to_close on Tradier. Broker is the source of truth: we record the trade to
+// history + day-trade ledger and log it, but DO NOT mutate state.cash/state.positions — the next
+// sync reconciles. Returns null so exit-loop callers keep the position until the fill is confirmed.
+function placeBrokerExit(acct, pos, currentPremium, reason, qty, pnlPct, pnlDollar) {
+  const state = acct.state;
+  const ticker = pos.ticker;
+
+  // In-flight de-dupe (set refreshed once per cycle in syncBrokerAccount) prevents a second
+  // sell order while a working one exists or was placed earlier this cycle.
+  if (!acct._inflightTickers) acct._inflightTickers = new Set();
+  if (acct._inflightTickers.has(ticker.toUpperCase())) {
+    log(acct, `TRADIER: working order already open for ${ticker} — skipping duplicate exit`);
+    return null;
+  }
+  if (!acct.config.autoExecute) {
+    log(acct, `TRADIER: autoExecute off — exit for ${ticker} not sent`);
+    return null;
+  }
+
+  const expStr = new Date(pos.expiryDate).toISOString().slice(0, 10);
+  acct._inflightTickers.add(ticker.toUpperCase());
+  const limit = +currentPremium.toFixed(2);
+  tradier.placeOptionOrder(ticker, expStr, pos.type, pos.strike, "sell_to_close", qty, "limit", limit)
+    .then(res => log(acct, `TRADIER EXIT: SELL ${qty}x ${pos.occSymbol || ticker} @ $${limit} — order ${res?.id || "ok"} (${reason})`))
+    .catch(e => {
+      acct._inflightTickers.delete(ticker.toUpperCase());
+      log(acct, `TRADIER EXIT FAILED ${ticker}: ${e.message}`);
+    });
+
+  // Bookkeeping (no balance/position mutation — sync is authoritative).
+  recordDayTrade(state, pos);
+  if (!state.lastClosed) state.lastClosed = {};
+  state.lastClosed[ticker] = getETDateStr();
+  state.realizedPnl = (state.realizedPnl || 0) + pnlDollar;
+
+  const trade = { ...pos, qty, closePremium: currentPremium, pnlDollar, pnlPct, reason, closeDate: getETDateStr() };
+  logTrade(trade);
+  state.history.push(trade);
+
+  const trimLabel = qty < pos.qty ? `TRIM ${qty}/${pos.qty}` : "EXIT";
+  log(acct, `${trimLabel} (LIVE): ${ticker} $${pos.strike} ${pos.type.toUpperCase()} ${pnlDollar >= 0 ? "+" : ""}$${pnlDollar.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${(pnlPct * 100).toFixed(0)}%) — ${reason}`);
+
+  const emoji = pnlDollar >= 0 ? "✅" : "🛑";
+  const label = qty < pos.qty ? "TRIM" : (pnlDollar >= 0 ? "EXIT TP" : "EXIT SL");
+  sendPush(
+    `${emoji} ${label} (LIVE): ${ticker} ${pos.type.toUpperCase()} $${pos.strike} [${acct.name}]`,
+    `P&L: ${pnlDollar >= 0 ? "+" : ""}$${pnlDollar.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${(pnlPct * 100).toFixed(0)}%)\n${reason}`,
+    pnlDollar < 0
+  ).catch(() => {});
+  tweetTradeExit(acct, pos, trade).catch(e => console.log(`  [X] Exit tweet error: ${e.message}`));
+
+  return null; // keep position locally; sync reconciles after fill
+}
+
+// Mirror the real Tradier account into acct.state: cash from balances, positions (option legs only)
+// from holdings with live option marks. Bot-only side-metadata is merged back by OCC each cycle.
+async function syncBrokerAccount(acct, quotes) {
+  if (acct.config.broker !== "tradier" || !tradier.isConnected) return;
+  const state = acct.state;
+  if (!state.meta) state.meta = {};
+
+  // Refresh in-flight order set once per cycle for synchronous exit/entry de-dupe checks.
+  acct._inflightTickers = await brokerOpenOrderTickers(acct);
+
+  try {
+    const bal = await tradier.getAccount();
+    if (bal) {
+      const cash = brokerCashFromBalances(bal);
+      if (typeof cash === "number") state.cash = cash;
+      if (typeof bal.total_equity === "number") state.brokerEquity = bal.total_equity;
+    }
+  } catch (e) { log(acct, `TRADIER SYNC: balance error — ${e.message}`); }
+
+  try {
+    const raw = await tradier.getPositions();
+    const now = Date.now();
+    const positions = [];
+    const seen = new Set();
+    for (const p of raw) {
+      const occ = p.symbol;
+      const parsed = tradier.parseOCC(occ);
+      if (!parsed) continue;                       // skip equity / non-option holdings
+      const qtyContracts = Math.round(Math.abs(p.quantity));
+      if (qtyContracts < 1) continue;
+      const entryPremium = p.cost_basis && qtyContracts ? Math.abs(p.cost_basis) / (qtyContracts * 100) : 0;
+
+      let mark = null, greeks = null, iv = DEFAULT_IV;
+      try {
+        const oq = await tradier.getOptionQuote(occ);
+        if (oq) { mark = oq.mid ?? oq.last; iv = oq.iv ?? DEFAULT_IV; greeks = { delta: oq.delta ?? 0, theta: oq.theta ?? 0 }; }
+      } catch { }
+
+      const expiryDate = new Date(`${parsed.expiration}T16:00:00`).getTime();
+      const dteRemaining = Math.max(0, (expiryDate - now) / 86400_000);
+      const meta = state.meta[occ] || {};
+      const spot = quotes[parsed.ticker]?.c ?? meta.entrySpot ?? null;
+
+      const pos = {
+        occSymbol: occ,
+        ticker: parsed.ticker,
+        type: parsed.type,
+        strike: parsed.strike,
+        expiryDate,
+        dte: meta.dte ?? Math.round(dteRemaining),
+        dteRemaining,
+        entryPremium: meta.entryPremium ?? +entryPremium.toFixed(2),
+        entrySpot: meta.entrySpot ?? spot,
+        qty: qtyContracts,
+        originalQty: meta.originalQty ?? qtyContracts,
+        cost: Math.abs(p.cost_basis || entryPremium * qtyContracts * 100),
+        openDate: meta.openDate ?? (p.date_acquired ? String(p.date_acquired).slice(0, 10) : getETDateStr()),
+        openTime: meta.openTime ?? (p.date_acquired ? new Date(p.date_acquired).getTime() : now),
+        trimLevel: meta.trimLevel ?? 0,
+        bestPnlPct: meta.bestPnlPct ?? 0,
+        entryAtrPct: meta.entryAtrPct ?? null,
+        iv,
+        liveMark: mark != null ? +mark.toFixed(2) : null,
+        liveGreeks: greeks,
+        optionsSource: "tradier",
+        direction: parsed.type === "call" ? "BULLISH" : "BEARISH",
+      };
+
+      if (pos.liveMark != null && pos.entryPremium > 0) {
+        const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
+        if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
+      }
+
+      positions.push(pos);
+      state.meta[occ] = {
+        entryPremium: pos.entryPremium, entrySpot: pos.entrySpot, dte: pos.dte,
+        originalQty: pos.originalQty, openDate: pos.openDate, openTime: pos.openTime,
+        trimLevel: pos.trimLevel, bestPnlPct: pos.bestPnlPct, entryAtrPct: pos.entryAtrPct,
+      };
+      seen.add(occ);
+    }
+    // Prune metadata for positions that no longer exist at the broker.
+    for (const k of Object.keys(state.meta)) if (!seen.has(k)) delete state.meta[k];
+    state.positions = positions;
+    log(acct, `TRADIER SYNC: cash $${state.cash.toFixed(2)} | ${positions.length} live position(s)`);
+  } catch (e) { log(acct, `TRADIER SYNC: positions error — ${e.message}`); }
+}
+
 // ─── Main Trading Cycle ───
 
 async function runCycle(acct, sharedQuotes, apiKey) {
@@ -5878,6 +6336,9 @@ async function runCycle(acct, sharedQuotes, apiKey) {
 
   cleanDayTrades(state);
 
+  // Broker accounts: mirror real balance + positions before any exit/entry decisions.
+  if (cfg.broker === "tradier") await syncBrokerAccount(acct, quotes);
+
   const regime = getMarketRegime(acct.candleCache);
   acct.currentRegime = regime;
   acct.riskPct = cfg.baseRiskPct * regime.riskScale;
@@ -5919,7 +6380,8 @@ async function runCycle(acct, sharedQuotes, apiKey) {
       tweetTradeEntry(acct, result, entryA, st, q).catch(e => console.log(`  [X] Entry tweet error: ${e.message}`));
 
       // ─── Robinhood Agentic Execution (entry) ───
-      if (TRADING_MODE === "robinhood" && robinhood.isConnected) {
+      // Skip for Tradier broker accounts — they already executed natively via placeBrokerEntry.
+      if (acct.config.broker !== "tradier" && TRADING_MODE === "robinhood" && robinhood.isConnected) {
         try {
           const equityOrder = robinhood.convertOptionsToEquity(
             result.ticker,
@@ -6041,7 +6503,7 @@ function buildPositionDetails(acct, quotes) {
     const dteLeft = pos.expiryDate
       ? Math.max(0, (pos.expiryDate - now) / 86400_000)
       : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
-    const curPremium = optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type);
+    const curPremium = pos.liveMark ?? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type);
     const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
     const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * 100;
     const profitPrice = pos.entryPremium * (1 + cfg.profitTarget);
@@ -6061,7 +6523,9 @@ function buildPositionDetails(acct, quotes) {
       pctToProfit: ((profitPrice - curPremium) / curPremium * 100).toFixed(1),
       pctToStop: ((effectiveStop - curPremium) / curPremium * 100).toFixed(1),
       pdtStatus,
-      greeks: optGreeks(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type),
+      greeks: pos.liveGreeks
+        ? { delta: (pos.liveGreeks.delta ?? 0).toFixed(3), theta: (pos.liveGreeks.theta ?? 0).toFixed(3) }
+        : optGreeks(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type),
     };
   });
 }
@@ -6493,6 +6957,7 @@ async function main() {
     const trOk = await tradier.init();
     if (trOk) {
       console.log(`  Tradier: DATA FEED ACTIVE ✓ (${tradier.environment}) — quotes, candles & option chains routed through Tradier`);
+      await ensureTradierAccount();
     } else {
       console.log("  Tradier: NOT CONNECTED — falling back to Finnhub/Yahoo for market data");
     }
