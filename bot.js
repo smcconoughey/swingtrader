@@ -2543,8 +2543,10 @@ Evaluate:
 3. Best contract choice and why (DTE, strike depth)?
 ${contractInstruction}
 
-Respond with ONLY valid JSON (no markdown, no backticks):
-{"approve": true, "confidence": 75, "concerns": [], "suggestion": "brief rationale"${candidates?.length > 0 ? ', "contractIdx": 1' : ''}}`;
+Respond with ONLY valid JSON (no markdown, no backticks). "reasoning" must be your FULL thought
+process: walk through the setup assessment, the technical/regime read, the specific risks, and why
+you chose (or rejected) the contract — several sentences. "suggestion" stays a one-line takeaway:
+{"approve": true, "confidence": 75, "concerns": [], "reasoning": "full step-by-step thought process", "suggestion": "one-line takeaway"${candidates?.length > 0 ? ', "contractIdx": 1' : ''}}`;
 
   try {
     const raw = await callClaude(promptText);
@@ -2558,7 +2560,7 @@ Respond with ONLY valid JSON (no markdown, no backticks):
     return result;
   } catch (e) {
     log(acct, `CLAUDE VALIDATE WARN: Parse failed — ${e.message}. Defaulting to approve.`);
-    return { approve: true, confidence: 50, concerns: ["validation parse failed"], suggestion: "proceeding with caution", contractIdx: 0 };
+    return { approve: true, confidence: 50, concerns: ["validation parse failed"], reasoning: "AI response could not be parsed; proceeding with caution on technicals alone.", suggestion: "proceeding with caution", contractIdx: 0 };
   }
 }
 
@@ -2711,7 +2713,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   const type = isBullish ? "call" : "put";
 
   // ─── Step 1: Check validation cache (skips both chain fetch AND Claude call) ───
-  let claudeResult = { approve: true, confidence: 70, concerns: [], suggestion: "", contractIdx: 0 };
+  let claudeResult = { approve: true, confidence: 70, concerns: [], reasoning: "", suggestion: "", contractIdx: 0 };
   let selectedCandidate = null;
 
   const cached = getCachedValidation(acct.id, ticker, analysis.score, direction);
@@ -2838,6 +2840,25 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   if (totalCost > deployable) { qty = Math.floor(deployable / costPer); totalCost = qty * costPer; }
   if (qty < 1) return { skipped: true, reason: `Insufficient deployable cash for 1 contract${cfg.useCashReserve === false ? "" : ` (buffer ${(reservePct * 100).toFixed(0)}%)`}` };
 
+  // Full AI/decision thought process captured at entry, attached to the trade for the life of the
+  // position and into trade history. If the LLM wasn't called (or returned no prose), synthesize a
+  // readable thesis from the technical signals so every trade still documents WHY it was opened.
+  const topSignals = (analysis.sigs || []).slice(0, 5).map(s => s.text);
+  const claudeReasoning = (claudeResult.reasoning || "").trim()
+    || `No LLM prose for this entry. Opened on technicals: ${direction} setup, score ${analysis.score}/100, setup quality ${setupQuality.quality}/100, regime ${regime.label}. Signals: ${topSignals.join("; ") || "n/a"}.`;
+  const aiThesis = {
+    claudeConfidence: claudeResult.confidence,
+    claudeReasoning,
+    claudeSuggestion: claudeResult.suggestion || "",
+    claudeConcerns: claudeResult.concerns || [],
+    setupQuality: setupQuality.quality,
+    technicalScore: analysis.score,
+    direction,
+    regimeAtEntry: regime.label,
+    topSignals,
+    entryAtrPct: analysis.atrPct ?? null,
+  };
+
   // ─── Broker accounts: place a REAL buy_to_open and let the next sync reconcile state ───
   // Broker is the source of truth, so we do NOT push a synthetic position or mutate cash here.
   if (cfg.broker === "tradier") {
@@ -2850,6 +2871,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
       ticker, type, strike, expiryDate, dte, qty, premium, direction,
       bid: selectedCandidate.bid, ask: selectedCandidate.ask,
       setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence,
+      aiThesis,
     });
   }
 
@@ -2866,17 +2888,9 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     openTime: Date.now(),
     trimLevel: 0,
     bestPnlPct: 0,
-    claudeConfidence: claudeResult.confidence,
-    claudeSuggestion: claudeResult.suggestion || "",
-    claudeConcerns: claudeResult.concerns || [],
-    setupQuality: setupQuality.quality,
-    technicalScore: analysis.score,
-    direction,
-    regimeAtEntry: regime.label,
-    topSignals: (analysis.sigs || []).slice(0, 3).map(s => s.text),
+    ...aiThesis,
     // Capture ATR% at entry so the spot stop can scale to the underlying's normal noise.
     // Noisy names (AMKR ~5%, NOK ~6%) need a wider stop than calm names (UNH ~2%).
-    entryAtrPct: analysis.atrPct ?? null,
     iv: posIv,
     optionsSource,
   };
@@ -2916,7 +2930,7 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
   const maxRange = (analysis.aligned && isBullish) || (analysis.bearish && isBearish) ? 60 : 15;
   if (parseFloat(sq.rangePct) > maxRange) return { skipped: true, reason: `Range too wide ${sq.rangePct}%` };
 
-  let claudeResult = { approve: true, confidence: 70, concerns: [], suggestion: "" };
+  let claudeResult = { approve: true, confidence: 70, concerns: [], reasoning: "", suggestion: "" };
   if (useClaude && CLAUDE_API_KEY) {
     try {
       claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, sq, { hasEarnings: false }, regime);
@@ -2969,7 +2983,14 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
     openTime: acct._simNow || Date.now(),
     trimLevel: 0, bestPnlPct: 0,
     claudeConfidence: claudeResult.confidence,
+    claudeReasoning: (claudeResult.reasoning || "").trim() || `Backtest entry on technicals: ${isBull ? "BULLISH" : "BEARISH"} setup, score ${analysis.score}/100, setup quality ${sq.quality}/100, regime ${regime.label}.`,
+    claudeSuggestion: claudeResult.suggestion || "",
+    claudeConcerns: claudeResult.concerns || [],
     setupQuality: sq.quality,
+    technicalScore: analysis.score,
+    direction: isBull ? "BULLISH" : "BEARISH",
+    regimeAtEntry: regime.label,
+    topSignals: (analysis.sigs || []).slice(0, 5).map(s => s.text),
   };
   state.cash -= totalCost;
   state.positions.push(position);
@@ -3406,18 +3427,18 @@ function dashboardHTML(acct) {
     const rowId = `pos-ai-${p.ticker}-${p.strike}-${p.type}`;
     const sigs = (p.topSignals || []).join(" · ");
     const concerns = (p.claudeConcerns || []).join(" · ");
-    const hasAI = !!(p.claudeSuggestion || sigs || concerns);
+    const hasAI = !!(p.claudeReasoning || p.claudeSuggestion || sigs || concerns);
     const aiToggle = hasAI ? `<button type="button" class="ai-toggle" onclick="toggleRow('${rowId}')" title="Show AI thinking" style="background:none;border:1px solid #6a4df455;color:#6a4df4;border-radius:3px;padding:1px 6px;font-size:9px;cursor:pointer;margin-left:6px">🧠 AI</button>` : "";
     const aiRow = hasAI ? `<tr id="${rowId}" style="display:none;background:#6a4df412">
       <td colspan="12" style="padding:10px 12px;font-size:11px;color:#4a4b52;line-height:1.6">
+        <div style="color:#6a4df4;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">AI Thought Process at Entry ${p.claudeConfidence ? `(${p.claudeConfidence}% confidence)` : ''}</div>
+        <div style="color:#2f3037;margin-bottom:8px">${p.claudeReasoning || p.claudeSuggestion || '<span style="opacity:.5">(no reasoning captured)</span>'}</div>
         <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:flex-start">
           <div style="flex:1;min-width:240px">
-            <div style="color:#6a4df4;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">Claude's Reasoning ${p.claudeConfidence ? `(${p.claudeConfidence}% confidence)` : ''}</div>
-            <div style="color:#2f3037">${p.claudeSuggestion || '<span style="opacity:.5">(no suggestion captured)</span>'}</div>
+            ${p.claudeSuggestion ? `<div><b style="color:#6a4df4">Takeaway:</b> ${p.claudeSuggestion}</div>` : ''}
             ${concerns ? `<div style="margin-top:6px;color:#b07400"><b>Concerns:</b> ${concerns}</div>` : ''}
           </div>
           <div style="flex:1;min-width:240px">
-            <div style="color:#6a4df4;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">Setup at Entry</div>
             <div style="color:#6b7280">Technical score: <span style="color:#1c1d22">${p.technicalScore ?? '?'}/100</span> · Setup quality: <span style="color:#1c1d22">${p.setupQuality ?? '?'}/100</span> · Direction: <span style="color:#1c1d22">${p.direction || (p.type === 'call' ? 'BULLISH' : 'BEARISH')}</span></div>
             <div style="color:#6b7280">Regime: <span style="color:#1c1d22">${p.regimeAtEntry || '?'}</span></div>
             ${sigs ? `<div style="margin-top:6px"><b style="color:#138f86">Signals:</b> ${sigs}</div>` : ''}
@@ -3480,13 +3501,14 @@ function dashboardHTML(acct) {
     const color = h.pnlDollar >= 0 ? "#00a843" : "#e8473f";
     const sigs = (h.topSignals || []).join(" · ");
     const concerns = (h.claudeConcerns || []).join(" · ");
-    const hasAI = !!(h.claudeSuggestion || sigs || concerns);
+    const hasAI = !!(h.claudeReasoning || h.claudeSuggestion || sigs || concerns);
     const rowId = `hist-ai-${idx}-${h.ticker}-${h.strike}`;
     const aiToggle = hasAI ? `<button type="button" class="ai-toggle" onclick="toggleRow('${rowId}')" title="Show AI thinking for this trade" style="background:none;border:1px solid #6a4df455;color:#6a4df4;border-radius:3px;padding:1px 6px;font-size:9px;cursor:pointer;margin-left:4px">🧠</button>` : "";
     const aiRow = hasAI ? `<tr id="${rowId}" style="display:none;background:#6a4df412">
       <td colspan="7" style="padding:10px 12px;font-size:11px;color:#4a4b52;line-height:1.5">
-        <div style="color:#6a4df4;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">Entry Reasoning ${h.claudeConfidence ? `(${h.claudeConfidence}% confidence)` : ''} — outcome ${h.pnlDollar >= 0 ? 'WIN' : 'LOSS'}</div>
-        <div style="color:#2f3037">${h.claudeSuggestion || '<span style="opacity:.5">(no Claude suggestion captured)</span>'}</div>
+        <div style="color:#6a4df4;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">AI Thought Process at Entry ${h.claudeConfidence ? `(${h.claudeConfidence}% confidence)` : ''} — outcome ${h.pnlDollar >= 0 ? 'WIN' : 'LOSS'}</div>
+        <div style="color:#2f3037">${h.claudeReasoning || h.claudeSuggestion || '<span style="opacity:.5">(no reasoning captured)</span>'}</div>
+        ${h.claudeReasoning && h.claudeSuggestion ? `<div style="margin-top:4px"><b style="color:#6a4df4">Takeaway:</b> ${h.claudeSuggestion}</div>` : ''}
         ${concerns ? `<div style="margin-top:4px;color:#b07400"><b>Concerns at entry:</b> ${concerns}</div>` : ''}
         ${sigs ? `<div style="margin-top:4px"><b style="color:#138f86">Signals at entry:</b> ${sigs}</div>` : ''}
         <div style="margin-top:4px;color:#6b7280">Setup quality <span style="color:#1c1d22">${h.setupQuality ?? '?'}/100</span> · Tech score <span style="color:#1c1d22">${h.technicalScore ?? '?'}/100</span> · Regime <span style="color:#1c1d22">${h.regimeAtEntry || '?'}</span></div>
@@ -4431,7 +4453,7 @@ function robinhoodPageHTML() {
   #pin-input:focus{outline:none;border-color:#00a843}
   #pin-input.error{border-color:#e8473f;animation:shake .3s}
   @keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-8px)}75%{transform:translateX(8px)}}
-  #rh-app{display:none;padding:20px;max-width:1200px;margin:0 auto}
+  #rh-app{display:block;padding:20px;max-width:1200px;margin:0 auto}
   .rh-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid #e3e6ea}
   .rh-header h1{color:#00a843;font-size:22px;display:flex;align-items:center;gap:10px}
   .rh-header h1 img{width:28px;height:28px}
@@ -4478,14 +4500,7 @@ function robinhoodPageHTML() {
 </style>
 </head><body>
 
-<!-- PIN Gate -->
-<div id="pin-gate">
-  <h1>🔒 ROBINHOOD</h1>
-  <div class="subtitle">Enter PIN to access trading controls</div>
-  <input type="password" id="pin-input" maxlength="4" inputmode="numeric" pattern="[0-9]*" autocomplete="off" autofocus>
-</div>
-
-<!-- Main App (hidden until PIN verified) -->
+<!-- Main App (site-wide server auth gates access; no separate PIN) -->
 <div id="rh-app">
   <div class="rh-header">
     <h1>🟢 Robinhood Agentic Trading</h1>
@@ -4580,28 +4595,8 @@ function robinhoodPageHTML() {
 </div>
 
 <script>
-// PIN Gate
-const PIN = '1738';
-const pinInput = document.getElementById('pin-input');
-const gate = document.getElementById('pin-gate');
-const app = document.getElementById('rh-app');
-
-// Check if already authenticated
-if (sessionStorage.getItem('rh-pin') === PIN) { gate.style.display='none'; app.style.display='block'; initApp(); }
-
-pinInput.addEventListener('input', function() {
-  if (this.value.length === 4) {
-    if (this.value === PIN) {
-      sessionStorage.setItem('rh-pin', PIN);
-      gate.style.display = 'none';
-      app.style.display = 'block';
-      initApp();
-    } else {
-      this.classList.add('error');
-      setTimeout(() => { this.classList.remove('error'); this.value = ''; }, 400);
-    }
-  }
-});
+// Access is gated site-wide by the server-side password (signed cookie), so the app loads directly.
+initApp();
 
 function initApp() {
   loadAccount();
@@ -6310,7 +6305,7 @@ function effectivePositionCount(acct) {
 
 // Place a real buy_to_open on Tradier for a bot entry decision. Broker is the source of truth,
 // so we pre-seed side-metadata (entry context) keyed by OCC and let the next sync surface the fill.
-async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, dte, qty, premium, direction, bid = null, ask = null, setupQuality = 0, claudeConfidence = 0 }) {
+async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, dte, qty, premium, direction, bid = null, ask = null, setupQuality = 0, claudeConfidence = 0, aiThesis = null }) {
   const expStr = new Date(expiryDate).toISOString().slice(0, 10);
   const occ = tradier.buildOCC(ticker, expStr, type, strike);
 
@@ -6338,6 +6333,9 @@ async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, dte, q
     bestPnlPct: 0,
     entryAtrPct: acct.dashboard?.analyses?.[ticker]?.atrPct ?? null,
     setupQuality,
+    // Persist the full AI thought process so it survives the broker round-trip and shows up on the
+    // live position (and later in trade history) exactly like paper trades.
+    ai: aiThesis || null,
   };
 
   try {
@@ -6495,6 +6493,9 @@ async function syncBrokerAccount(acct, quotes) {
       const spot = quotes[parsed.ticker]?.c ?? meta.entrySpot ?? null;
 
       const pos = {
+        // Full AI thought process captured at entry (reasoning, concerns, signals, scores). Spread
+        // first so the live fields below always win; surfaces the thesis on the live position.
+        ...(meta.ai || {}),
         occSymbol: occ,
         ticker: parsed.ticker,
         type: parsed.type,
@@ -6526,11 +6527,35 @@ async function syncBrokerAccount(acct, quotes) {
         if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
       }
 
+      // Backfill AI metadata for positions that pre-date the aiThesis feature (or were
+      // opened outside the bot). Synthesize a basic thesis from current analysis data so
+      // the 🧠 AI toggle always appears on the dashboard, matching paper account behavior.
+      let aiData = meta.ai || null;
+      if (!aiData) {
+        const curAnalysis = acct.dashboard?.analyses?.[parsed.ticker];
+        if (curAnalysis) {
+          const topSigs = (curAnalysis.sigs || []).slice(0, 5).map(s => s.text);
+          aiData = {
+            claudeReasoning: `Position synced from Tradier (no bot-entry reasoning captured). Current technicals: ${parsed.type === "call" ? "BULLISH" : "BEARISH"} setup, score ${curAnalysis.score}/100, RSI ${curAnalysis.rsi?.toFixed(0) ?? "?"}, ATR ${curAnalysis.atrPct?.toFixed(1) ?? "?"}%. Signals: ${topSigs.join("; ") || "n/a"}.`,
+            claudeSuggestion: "",
+            claudeConcerns: [],
+            setupQuality: curAnalysis.score ?? null,
+            technicalScore: curAnalysis.score ?? null,
+            direction: parsed.type === "call" ? "BULLISH" : "BEARISH",
+            regimeAtEntry: acct.currentRegime?.label ?? "unknown",
+            topSignals: topSigs,
+          };
+          // Spread the synthesized AI data onto the position
+          Object.assign(pos, aiData);
+        }
+      }
+
       positions.push(pos);
       state.meta[occ] = {
         entryPremium: pos.entryPremium, entrySpot: pos.entrySpot, dte: pos.dte,
         originalQty: pos.originalQty, openDate: pos.openDate, openTime: pos.openTime,
         trimLevel: pos.trimLevel, bestPnlPct: pos.bestPnlPct, entryAtrPct: pos.entryAtrPct,
+        ai: aiData, // keep the captured (or backfilled) AI thought process across syncs
       };
       seen.add(occ);
     }
