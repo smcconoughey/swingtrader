@@ -671,6 +671,9 @@ const DEFAULT_CONFIG = {
   useCashReserve: true,
   // When true, broker orders execute live with no manual approval step.
   autoExecute: false,
+  // When true, this account runs the full trading cycle (entries + exits) even while the market
+  // is closed — intended for testing live execution against a broker sandbox on weekends/after hours.
+  tradeWhenClosed: false,
 };
 
 // ─── Multi-Account Runtime ───
@@ -2318,43 +2321,46 @@ Rules:
 
     const sevColor = result.severity === "critical" ? "!!!" : result.severity === "elevated" ? "!!" : "";
     log(acct, `NEWS ${sevColor}${result.severity.toUpperCase()}: ${result.summary}`);
-    acct.latestNewsBrief = `[${result.severity.toUpperCase()}] ${result.summary}`;
 
     if (result.blackSwan) {
       log(acct, "BLACK SWAN DETECTED — Claude recommends defensive action");
       log(acct, `ACTION ADVICE: ${result.actionAdvice}`);
     }
 
-    for (const impact of result.impacts || []) {
-      if (!isValidTickerSymbol(impact.ticker)) {
-        log(acct, `NEWS: rejected "${impact.ticker}" — invalid ticker shape`);
-        continue;
-      }
-      if (acct.badTickers?.[impact.ticker]?.blocked) {
-        log(acct, `NEWS: rejected "${impact.ticker}" — on local blocklist`);
-        continue;
-      }
-      if (!acct.tickers.includes(impact.ticker)) {
-        acct.tickers.push(impact.ticker);
-        log(acct, `NEWS WATCHLIST +${impact.ticker}`);
+    // The news scan runs once globally (3h gate), so broadcast the brief + bias hints to EVERY
+    // account — otherwise only the first account that runs it would show news / get the hints.
+    const brief = `[${result.severity.toUpperCase()}] ${result.summary}`;
+    for (const [, a] of accounts) {
+      a.latestNewsBrief = brief;
+
+      for (const impact of result.impacts || []) {
+        if (!isValidTickerSymbol(impact.ticker)) {
+          if (a === acct) log(acct, `NEWS: rejected "${impact.ticker}" — invalid ticker shape`);
+          continue;
+        }
+        if (a.badTickers?.[impact.ticker]?.blocked) continue;
+        if (!a.tickers.includes(impact.ticker)) {
+          a.tickers.push(impact.ticker);
+          if (a === acct) log(acct, `NEWS WATCHLIST +${impact.ticker}`);
+        }
+
+        const existing = a.activeHints.findIndex(h => h.ticker === impact.ticker);
+        const hint = {
+          ticker: impact.ticker,
+          bias: impact.bias,
+          direction: impact.direction,
+          reasoning: `[NEWS] ${impact.reasoning}`,
+          expiresAt: Date.now() + 3 * 60 * 60_000,
+        };
+        if (existing >= 0) a.activeHints[existing] = hint;
+        else a.activeHints.push(hint);
+
+        if (a === acct) log(acct, `NEWS BIAS: ${impact.ticker} ${impact.bias > 0 ? "+" : ""}${impact.bias} (${impact.direction}) — ${impact.reasoning}`);
       }
 
-      const existing = acct.activeHints.findIndex(h => h.ticker === impact.ticker);
-      const hint = {
-        ticker: impact.ticker,
-        bias: impact.bias,
-        direction: impact.direction,
-        reasoning: `[NEWS] ${impact.reasoning}`,
-        expiresAt: Date.now() + 3 * 60 * 60_000,
-      };
-      if (existing >= 0) acct.activeHints[existing] = hint;
-      else acct.activeHints.push(hint);
-
-      log(acct, `NEWS BIAS: ${impact.ticker} ${impact.bias > 0 ? "+" : ""}${impact.bias} (${impact.direction}) — ${impact.reasoning}`);
-    }
-
-    for (const ticker of result.newTickers || []) {
-      tryAddTicker(acct, ticker, "news scan");
+      for (const ticker of result.newTickers || []) {
+        tryAddTicker(a, ticker, "news scan");
+      }
     }
 
     if (result.severity === "critical" || result.severity === "elevated") {
@@ -4659,7 +4665,8 @@ function tabBarHTML(activeId) {
         <option value="tradier">Tradier (LIVE — real money)</option>
       </select>
       <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#ccc"><input type="checkbox" name="useCashReserve" checked> Use cash reserve (50%→25% buffer)</label>
-      <label style="display:flex;align-items:center;gap:8px;margin-bottom:16px;font-size:13px;color:#ccc"><input type="checkbox" name="autoExecute"> Auto-execute broker orders (full autonomy)</label>
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#ccc"><input type="checkbox" name="autoExecute"> Auto-execute broker orders (full autonomy)</label>
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:16px;font-size:13px;color:#ccc"><input type="checkbox" name="tradeWhenClosed"> Trade when market closed (testing/sandbox)</label>
       <div style="display:flex;gap:8px">
         <button type="submit" style="flex:1;padding:10px;background:#00ff88;color:#000;border:none;border-radius:6px;font-weight:bold;cursor:pointer">Create Account</button>
         <button type="button" onclick="document.getElementById('acct-modal').style.display='none'" style="flex:1;padding:10px;background:#333;color:#fff;border:none;border-radius:6px;cursor:pointer">Cancel</button>
@@ -4705,7 +4712,8 @@ function accountActionsHTML(acctId) {
         <div style="border-top:1px solid #2a2a3a;margin:4px 0 14px;padding-top:14px">
           <div style="font-size:12px;color:#888;margin-bottom:10px">Broker: <strong style="color:${cfg.broker === "tradier" ? "#00ff88" : "#aaa"}">${(cfg.broker || "paper").toUpperCase()}${cfg.broker === "tradier" ? " · LIVE" : ""}</strong></div>
           <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#ccc"><input type="checkbox" name="useCashReserve" ${cfg.useCashReserve ? "checked" : ""}> Use cash reserve (50%→25% buffer)</label>
-          <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#ccc"><input type="checkbox" name="autoExecute" ${cfg.autoExecute ? "checked" : ""}> Auto-execute broker orders (full autonomy)</label>
+          <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#ccc"><input type="checkbox" name="autoExecute" ${cfg.autoExecute ? "checked" : ""}> Auto-execute broker orders (full autonomy)</label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#ccc"><input type="checkbox" name="tradeWhenClosed" ${cfg.tradeWhenClosed ? "checked" : ""}> Trade when market closed (testing/sandbox)</label>
           ${cfg.broker === "tradier" ? `<p style="font-size:11px;color:#f59e0b;margin:10px 0 0">⚠ LIVE account — orders execute with real money. Use <strong>Pause</strong> as the kill switch (blocks new entries; exits still run to protect open positions).</p>` : ""}
         </div>
         <div style="display:flex;gap:8px">
@@ -5216,6 +5224,7 @@ function startDashboard(defaultAcct, apiKey) {
           broker: ["paper", "tradier", "robinhood"].includes(params.get("broker")) ? params.get("broker") : "paper",
           useCashReserve: params.get("useCashReserve") === "on" || params.get("useCashReserve") === "true",
           autoExecute: params.get("autoExecute") === "on" || params.get("autoExecute") === "true",
+          tradeWhenClosed: params.get("tradeWhenClosed") === "on" || params.get("tradeWhenClosed") === "true",
         };
         const newAcct = createAccountRuntime(id, name, config);
         newAcct.state.apiKey = apiKey;
@@ -5270,6 +5279,7 @@ function startDashboard(defaultAcct, apiKey) {
         if (params.has("configForm")) {
           cfg.useCashReserve = params.get("useCashReserve") === "on" || params.get("useCashReserve") === "true";
           cfg.autoExecute = params.get("autoExecute") === "on" || params.get("autoExecute") === "true";
+          cfg.tradeWhenClosed = params.get("tradeWhenClosed") === "on" || params.get("tradeWhenClosed") === "true";
         }
         target.riskPct = cfg.baseRiskPct * (target.currentRegime?.riskScale || 0.5);
         saveAccounts();
@@ -5971,8 +5981,9 @@ async function ensureTradierAccount() {
     const acct = accounts.get("tradier");
     acct.config.broker = "tradier";
     if (acct.config.autoExecute === undefined) acct.config.autoExecute = true;
+    if (acct.config.tradeWhenClosed === undefined) acct.config.tradeWhenClosed = tradier.environment === "sandbox";
     if (typeof seedCash === "number") acct.state.cash = seedCash;
-    console.log(`  Tradier: live account present — cash $${acct.state.cash.toFixed(2)} (${tradier.environment})`);
+    console.log(`  Tradier: live account present — cash $${acct.state.cash.toFixed(2)} (${tradier.environment})${acct.config.tradeWhenClosed ? " · trades-when-closed ON" : ""}`);
     return;
   }
 
@@ -5981,6 +5992,8 @@ async function ensureTradierAccount() {
     broker: "tradier",
     useCashReserve: false, // off by default for the live account; toggle on from settings
     autoExecute: true,     // full autonomy (Pause remains the kill switch)
+    // Sandbox accounts trade when closed by default so you can test execution outside market hours.
+    tradeWhenClosed: tradier.environment === "sandbox",
     startingCash: typeof seedCash === "number" ? seedCash : DEFAULT_CONFIG.startingCash,
   };
   const state = {
@@ -6225,8 +6238,9 @@ async function runCycle(acct, sharedQuotes, apiKey) {
   const state = acct.state;
   const cfg = acct.config;
   const dash = acct.dashboard;
-  log(acct, "MARKET OPEN — Starting auto-trade cycle");
-  dash.marketOpen = true;
+  const mktOpen = isMarketOpen();
+  log(acct, mktOpen ? "MARKET OPEN — Starting auto-trade cycle" : "MARKET CLOSED — Starting trade cycle (trade-when-closed)");
+  dash.marketOpen = mktOpen;
 
   const quotes = {};
   const analyses = {};
@@ -7018,9 +7032,15 @@ async function main() {
     }
     lastCycleTime = Date.now();
 
-    if (isMarketOpen()) {
+    const marketOpen = isMarketOpen();
+    // Accounts may opt into trading while closed (e.g. broker sandbox testing). If any non-paused
+    // account does, we run the fast cycle so its full runCycle (entries+exits) executes now.
+    const forcedAccts = [...accounts.values()].filter(a => !a.paused && a.config.tradeWhenClosed);
+    const activeCycle = marketOpen || forcedAccts.length > 0;
+
+    if (activeCycle) {
       const today = getETDateStr();
-      if (lastCandleDate !== today) {
+      if (marketOpen && lastCandleDate !== today) {
         sharedCandleCache = {};
         for (const [, acct] of accounts) acct.candleCache = {};
         lastCandleDate = today;
@@ -7037,10 +7057,14 @@ async function main() {
 
         for (const [, acct] of accounts) {
           try {
+            const tradeThis = marketOpen || acct.config.tradeWhenClosed;
             if (acct.paused) {
               await runPausedCycle(acct, sharedQuotes);
-            } else {
+            } else if (tradeThis) {
+              if (!marketOpen) log(acct, "TRADE-WHEN-CLOSED — running full cycle while market is closed (test mode)");
               await runCycle(acct, sharedQuotes, apiKey);
+            } else {
+              await runAfterHoursScan(acct, sharedQuotes, apiKey);
             }
           } catch (e) {
             log(acct, `ERROR in cycle: ${e.message}`);
