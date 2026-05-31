@@ -596,6 +596,20 @@ const CYCLE_MS = 60_000;       // 60s between cycles
 const API_DELAY = 150;         // 150ms between API calls (Finnhub free tier)
 const DEFAULT_IV = 0.30;
 
+// Per-contract options commission (Tradier Lite = $0.35/contract). Used as a SMALL bias against
+// low-priced/small-cap underlyings in contract scoring — fees are a larger % of a cheap premium.
+const FEE_PER_CONTRACT = 0.35;
+
+// Live market-data provenance counters so the UI can show whether the bot is on Tradier (live,
+// fill-accurate) data or has fallen back to Finnhub/Yahoo. Reset is not needed — these are running
+// totals since process start; the dashboard shows the current primary + fallback counts.
+const marketDataStats = { tradier: 0, finnhub: 0, yahoo: 0, lastSource: "—", lastAt: 0 };
+function noteDataSource(src) {
+  if (marketDataStats[src] != null) marketDataStats[src]++;
+  marketDataStats.lastSource = src;
+  marketDataStats.lastAt = Date.now();
+}
+
 // ─── Trimming & EOD/EOW Constants ───
 const EOD_FREEZE_HOUR = 15;    // No new entries after 3:00 PM ET
 const EOD_TIGHTEN_HOUR = 15.5; // Tighten stops after 3:30 PM ET
@@ -1704,14 +1718,14 @@ async function fetchQuote(sym, key) {
   if (tradier.isConnected) {
     try {
       const q = await tradier.getQuote(sym);
-      if (q && q.c > 0) return q;
+      if (q && q.c > 0) { noteDataSource("tradier"); return q; }
     } catch { }
   }
   try {
     const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${key}`);
     if (r.ok) {
       const data = await r.json();
-      if (data && data.c > 0) return data;
+      if (data && data.c > 0) { noteDataSource("finnhub"); return data; }
     }
   } catch { }
   // Fallback: Yahoo Finance realtime quote
@@ -1721,6 +1735,7 @@ async function fetchQuote(sym, key) {
   const d = await r.json();
   const meta = d.chart?.result?.[0]?.meta;
   if (!meta || !meta.regularMarketPrice) throw new Error(`No Yahoo quote for ${sym}`);
+  noteDataSource("yahoo");
   return { c: meta.regularMarketPrice, h: meta.regularMarketDayHigh || meta.regularMarketPrice, l: meta.regularMarketDayLow || meta.regularMarketPrice, o: meta.regularMarketOpen || meta.regularMarketPrice, pc: meta.chartPreviousClose || meta.previousClose || 0 };
 }
 
@@ -1826,10 +1841,18 @@ function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 12) {
       const iv = c.impliedVolatility > 0 ? c.impliedVolatility : null;
       const delta = c.delta != null ? c.delta : null;
 
-      // Quality score: penalise wide spreads, illiquidity, very short or very long DTE
+      // Commission drag: a round-trip (buy + sell) costs ~2 contracts of commission. As a fraction
+      // of premium this is far larger on cheap options (small caps), so it doubles as a SMALL bias
+      // against small-cap/low-priced names — exactly what the user asked for.
+      const feeDragPct = mid > 0 ? (2 * FEE_PER_CONTRACT) / (mid * 100) : 0;
+      // Extra gentle bias against low-priced underlyings (small caps tend to be wider/thinner).
+      const smallCapPenalty = spotPrice < 10 ? 0.6 : spotPrice < 20 ? 0.3 : 0;
+
+      // Quality score: penalise wide spreads, illiquidity, very short or very long DTE, plus the
+      // small fee/small-cap bias (kept small so it only breaks otherwise-close ties).
       const dtePenalty = Math.abs(dte - 21); // prefer ~21 DTE — leaves room for thesis to play out
       const liqScore = Math.log1p((c.openInterest || 0) + (c.volume || 0));
-      const quality = liqScore - spreadPct * 3 - dtePenalty * 0.1;
+      const quality = liqScore - spreadPct * 3 - dtePenalty * 0.1 - feeDragPct * 4 - smallCapPenalty;
 
       candidates.push({
         strike: c.strike,
@@ -1845,6 +1868,7 @@ function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 12) {
         volume: c.volume || 0,
         spread,
         spreadPct: +(spreadPct * 100).toFixed(1),
+        feeDragPct: +(feeDragPct * 100).toFixed(1),
         quality,
       });
     }
@@ -1889,9 +1913,48 @@ function prompt(question) {
   return new Promise(resolve => rl.question(question, ans => { rl.close(); resolve(ans.trim()); }));
 }
 
+// A trustworthy option mark requires a real two-sided market: both bid AND ask present and > 0,
+// and not crossed. We deliberately do NOT fall back to `last` (which can be a stale trade from
+// days ago on illiquid contracts) — an unreliable mark returns null so callers can hold instead
+// of acting on a fabricated price with real money.
+function reliableOptionMark(oq) {
+  if (!oq) return null;
+  const { bid, ask } = oq;
+  if (typeof bid === "number" && typeof ask === "number" && bid > 0 && ask > 0 && ask >= bid) {
+    return +(((bid + ask) / 2)).toFixed(2);
+  }
+  return null;
+}
+
+// Entry limit price for a live options buy, trading like a disciplined human: when conviction is
+// high AND we aren't day-trade constrained, lean toward the ask (even crossing to it) to actually
+// get filled; when conviction is low or PDT risk is high, sit patiently at the mid. Never pays
+// through the offer. conviction is 0..1; falls back to mid if we lack a real two-sided market.
+function entryLimitPrice(bid, ask, mid, conviction, pdtRiskLow) {
+  const m = +(+mid).toFixed(2);
+  if (!(bid > 0) || !(ask > 0) || ask < bid) return m;
+  let aggr = Math.max(0, Math.min(1, conviction));
+  if (!pdtRiskLow) aggr = Math.min(aggr, 0.25); // stay near mid when day-trade headroom is tight
+  const px = mid + aggr * (ask - mid);
+  return +Math.min(ask, Math.max(bid, px)).toFixed(2);
+}
+
+// PDT (pattern-day-trader) risk is only a real constraint on MARGIN accounts under $25k. Cash
+// accounts aren't subject to PDT at all (their constraint is T+1 settlement, handled by only
+// deploying settled cash). So PDT risk is "low" for cash accounts, or when we still have day-trade
+// headroom on a margin account.
+function pdtRiskLow(state) {
+  if (state.accountType === "cash") return true;
+  return countRecentDayTrades(state) < 2; // leave a buffer below the 3-in-5 limit
+}
+
 // ─── Portfolio Helpers ───
 
 function portfolioValue(state, quotes) {
+  // Broker accounts: trust Tradier's own total_equity. It already nets settled cash, filled
+  // positions, AND capital reserved by working (unfilled) orders — so nothing appears to "vanish"
+  // into pending orders the way cash+positions alone would.
+  if (typeof state.brokerEquity === "number" && state.brokerEquity > 0) return state.brokerEquity;
   let val = state.cash;
   for (const pos of state.positions) {
     const q = quotes[pos.ticker];
@@ -2504,14 +2567,21 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   const cfg = acct.config;
   if (state.positions.some(p => p.ticker === ticker)) return null;
   if (state.cash < 100) return null;
+  // Broker accounts: also skip names with a working (unfilled) order this cycle so we don't
+  // stack duplicate orders while an earlier one is still resting.
+  if (cfg.broker === "tradier" && acct._inflightTickers?.has(ticker.toUpperCase())) {
+    return { skipped: true, reason: `Tradier: working order already open for ${ticker}` };
+  }
   // PDT discipline: don't re-enter a name we already closed today. Same-day round-trips burn
   // scarce day trades — wait for a fresh session before re-engaging.
   if (state.lastClosed && state.lastClosed[ticker] === getETDateStr()) {
     return { skipped: true, reason: `PDT preserve: closed ${ticker} earlier today — avoiding same-day re-entry` };
   }
-  // Hard cap on concurrent positions — prevents over-deployment that drained cash to $25
-  if (cfg.maxPositions && state.positions.length >= cfg.maxPositions) {
-    return { skipped: true, reason: `Max positions (${cfg.maxPositions}) already open` };
+  // Hard cap on concurrent positions — prevents over-deployment that drained cash to $25.
+  // For broker accounts this counts filled positions PLUS working orders (effectivePositionCount).
+  const openCount = cfg.broker === "tradier" ? effectivePositionCount(acct) : state.positions.length;
+  if (cfg.maxPositions && openCount >= cfg.maxPositions) {
+    return { skipped: true, reason: `Max positions (${cfg.maxPositions}) already open or pending` };
   }
   // Sector concentration cap — prevent doubling/tripling-down on correlated names.
   // Example: holding CL+XLE+USO means one bad oil headline unwinds three positions together.
@@ -2665,7 +2735,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     premium = selectedCandidate.mid;
     posIv = selectedCandidate.iv || DEFAULT_IV;
     optionsSource = tradier.isConnected ? "tradier" : "finnhub";
-    log(acct, `CONTRACT ${ticker}: $${strike} ${type.toUpperCase()} exp ${selectedCandidate.expiryStr} (${dte}d) @ $${premium} mid | IV ${posIv ? (posIv*100).toFixed(0)+'%' : '?'} | OI ${selectedCandidate.oi} | spread $${selectedCandidate.spread}`);
+    log(acct, `CONTRACT ${ticker}: $${strike} ${type.toUpperCase()} exp ${selectedCandidate.expiryStr} (${dte}d) @ $${premium} mid | IV ${posIv ? (posIv*100).toFixed(0)+'%' : '?'} | OI ${selectedCandidate.oi} | spread $${selectedCandidate.spread}${selectedCandidate.feeDragPct != null ? ` | fee drag ${selectedCandidate.feeDragPct}% RT` : ''}`);
   } else {
     // Synthetic fallback: 1 strike OTM, expiry chosen from the ticker's cadence near TARGET_DTE
     // and staggered away from over-concentrated expirations.
@@ -2715,8 +2785,14 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   // ─── Broker accounts: place a REAL buy_to_open and let the next sync reconcile state ───
   // Broker is the source of truth, so we do NOT push a synthetic position or mutate cash here.
   if (cfg.broker === "tradier") {
+    // Never place a live order on fabricated pricing. Require a real chosen contract with a real
+    // two-sided mid; synthetic Black-Scholes pricing (DEFAULT_IV) is for paper simulation only.
+    if (optionsSource === "synthetic" || !selectedCandidate || !(premium > 0)) {
+      return { skipped: true, reason: `Tradier: no real option market for ${ticker} (source ${optionsSource}) — refusing to trade on synthetic pricing` };
+    }
     return await placeBrokerEntry(acct, {
       ticker, type, strike, expiryDate, dte, qty, premium, direction,
+      bid: selectedCandidate.bid, ask: selectedCandidate.ask,
       setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence,
     });
   }
@@ -2943,6 +3019,8 @@ function tryExits(acct, quotes) {
   const remaining = [];
 
   for (const pos of state.positions) {
+    if (pos._pending) { remaining.push(pos); continue; } // unfilled broker order, not a holding
+    if (acct.config.broker === "tradier" && pos.liveMark == null) { remaining.push(pos); continue; } // no reliable mark — hold, don't act on synthetic price
     const q = quotes[pos.ticker];
     if (!q) { remaining.push(pos); continue; }
 
@@ -3061,6 +3139,8 @@ function trySignalExits(acct, quotes, analyses) {
   const remaining = [];
 
   for (const pos of state.positions) {
+    if (pos._pending) { remaining.push(pos); continue; } // unfilled broker order, not a holding
+    if (acct.config.broker === "tradier" && pos.liveMark == null) { remaining.push(pos); continue; } // no reliable mark — hold
     const a = analyses[pos.ticker];
     if (!a) { remaining.push(pos); continue; }
 
@@ -3099,6 +3179,8 @@ function tryTimeBasedExits(acct, quotes) {
   const remaining = [];
 
   for (const pos of state.positions) {
+    if (pos._pending) { remaining.push(pos); continue; } // unfilled broker order, not a holding
+    if (acct.config.broker === "tradier" && pos.liveMark == null) { remaining.push(pos); continue; } // no reliable mark — hold
     const q = quotes[pos.ticker];
     if (!q) { remaining.push(pos); continue; }
 
@@ -3148,6 +3230,8 @@ function tryEMATrailingExits(acct, quotes) {
   const remaining = [];
 
   for (const pos of state.positions) {
+    if (pos._pending) { remaining.push(pos); continue; } // unfilled broker order, not a holding
+    if (acct.config.broker === "tradier" && pos.liveMark == null) { remaining.push(pos); continue; } // no reliable mark — hold
     if ((pos.trimLevel || 0) < 2) { remaining.push(pos); continue; }
 
     const candles = acct.candleCache[pos.ticker];
@@ -3294,7 +3378,7 @@ function dashboardHTML(acct) {
       <td><span style="color:#00ff88">TP $${p.profitTarget.premium}</span> (${p.pctToProfit}% away)</td>
       <td><span style="color:#ff4444">SL $${p.stopLoss.premium}</span> (${p.pctToStop}% away)</td>
       <td style="font-size:10px;color:#888">${p.openDate || '—'}</td>
-      <td style="font-size:10px;color:#888">δ${p.greeks.delta} θ${p.greeks.theta}<br>${p.pdtStatus}<br><span style="color:${p.optionsSource === 'synthetic' ? '#555' : '#4ecdc4'}" title="Source / IV used for pricing">${(p.optionsSource || 'synthetic').toUpperCase()} IV ${((p.iv || 0.30) * 100).toFixed(0)}% ${p.optionsSource === 'synthetic' ? '○' : '●'}</span></td>
+      <td style="font-size:10px;color:#888">δ${p.greeks.delta} θ${p.greeks.theta}<br>${p.pdtStatus}<br><span style="color:${p.optionsSource === 'synthetic' ? '#555' : '#4ecdc4'}" title="Source / IV used for pricing">${(p.optionsSource || 'synthetic').toUpperCase()} IV ${((p.iv || 0.30) * 100).toFixed(0)}% ${p.optionsSource === 'synthetic' ? '○' : '●'}</span>${(p.liveBid != null && p.liveAsk != null) ? `<br><span title="Live option bid/ask used for marks & fills">b $${(+p.liveBid).toFixed(2)} / a $${(+p.liveAsk).toFixed(2)}${(p.liveBid > 0 && p.liveAsk > 0) ? ` · ${(((p.liveAsk - p.liveBid) / ((p.liveAsk + p.liveBid) / 2)) * 100).toFixed(0)}% wide` : ''}</span>` : (p.optionsSource === 'tradier' && !p._pending ? `<br><span style="color:#ff8c42" title="No reliable two-sided market — position is HELD, not acted on">⚠ no live mark</span>` : '')}</td>
     </tr>${aiRow}`;
   }).join("") : '<tr><td colspan="13" style="opacity:.5">No open positions</td></tr>';
 
@@ -3463,10 +3547,21 @@ ${accountActionsHTML(acct.id)}
     <h2>Portfolio</h2>
     <div class="stat ${pnlPct >= 0 ? "" : "neg"}"><div class="val">$${pv.toFixed(0)}</div><div class="lbl">Total Value</div></div>
     <div class="stat ${pnlPct >= 0 ? "" : "neg"}"><div class="val">${pnlPct >= 0 ? "+" : ""}${pnlPct}%</div><div class="lbl">P&L</div></div>
-    <div class="stat"><div class="val">$${state.cash.toFixed(0)}</div><div class="lbl">Cash</div></div>
+    <div class="stat"><div class="val">$${state.cash.toFixed(0)}</div><div class="lbl">${cfg.broker === "tradier" ? "Settled Cash" : "Cash"}</div></div>
     <div class="stat warn"><div class="val">${dtCount}/3</div><div class="lbl">PDT Used</div></div>
+    ${cfg.broker === "tradier" ? `
+    <div class="stat"><div class="val" style="font-size:14px;color:${(state.accountType || "") === "cash" ? "#00ff88" : "#ffd93d"}">${(state.accountType || "?").toUpperCase()}</div><div class="lbl">Account Type</div></div>
+    ${state.unsettledCash > 0 ? `<div class="stat"><div class="val" style="font-size:14px;color:#ffd93d">$${state.unsettledCash.toFixed(0)}</div><div class="lbl">Unsettled (T+1)</div></div>` : ""}
+    ${state.reservedBuyingPower > 0 ? `<div class="stat"><div class="val" style="font-size:14px;color:#ff8c42">$${state.reservedBuyingPower.toFixed(0)}</div><div class="lbl">Reserved (working orders)</div></div>` : ""}
+    ${(state.accountType && state.accountType !== "cash") ? `<div style="font-size:11px;color:#ffd93d;margin-top:6px">⚠️ This is a ${state.accountType.toUpperCase()} account — PDT &amp; margin/leverage apply. You wanted a cash account.</div>` : ""}` : ""}
     <div class="progress"><div class="progress-bar" style="width:${Math.min(100, progress)}%"></div></div>
     <div style="font-size:11px;color:#666">${progress}% to $${GOAL.toLocaleString()} goal</div>
+    <div style="font-size:10px;color:#555;margin-top:6px" title="Where price/option data came from this session">
+      📡 Data: <span style="color:${tradier.isConnected ? "#4ecdc4" : "#ff8c42"}">${tradier.isConnected ? "Tradier LIVE" : "Finnhub/Yahoo (fallback)"}</span>
+      · last quote via <b>${(marketDataStats.lastSource || "—").toUpperCase()}</b>
+      · usage T:${marketDataStats.tradier} F:${marketDataStats.finnhub} Y:${marketDataStats.yahoo}
+      ${cfg.broker === "tradier" ? `· marks: bid/ask mid (synthetic refused)` : ""}
+    </div>
   </div>
   <div class="card">
     <h2>AI Assistant &amp; News Intel</h2>
@@ -4776,6 +4871,7 @@ function tradierPageHTML() {
       <input id="token" placeholder="Paste Tradier access token (optional)" style="flex:1;min-width:200px">
       <button onclick="saveToken()">Save &amp; Connect</button>
       <button onclick="reconnect()" style="background:#6366f1">Reconnect</button>
+      <button onclick="cancelAllOrders()" style="background:#ef4444">Cancel All Orders</button>
     </div>
     <div class="muted" style="font-size:11px;margin-top:8px">Leave the token blank to reconnect using the <code>TRADIER_ACCESS_TOKEN</code> env var. A token entered here is stored on the server (tradier_tokens.json).</div>
   </div>
@@ -4800,15 +4896,25 @@ async function refresh(){
   try{
     const r = await fetch('/api/tradier-status'); const d = await r.json();
     const conn = d.connected ? '<span class="ok">CONNECTED</span>' : '<span class="bad">NOT CONNECTED</span>';
-    const bp = d.balances ? ('$'+(d.balances.total_cash ?? d.balances.cash?.cash_available ?? '—')) : '—';
-    const pv = d.balances ? ('$'+(d.balances.total_equity ?? '—')) : '—';
+    const bi = d.balanceInfo || {};
+    const fmt = v => (v == null ? '—' : '$'+Number(v).toFixed(2));
+    const acctType = bi.accountType ? bi.accountType.toUpperCase() : '—';
+    const acctTypeHtml = bi.accountType === 'cash' ? '<span class="ok">CASH</span>'
+      : (bi.accountType && bi.accountType !== 'unknown') ? '<span class="bad">'+acctType+' ⚠</span>' : '—';
+    const ds = d.dataSource || {};
+    const dsHtml = d.connected
+      ? '<span class="ok">Tradier LIVE</span> <span class="muted">(last: '+((ds.lastSource||'—').toUpperCase())+' · T:'+(ds.tradier||0)+' F:'+(ds.finnhub||0)+' Y:'+(ds.yahoo||0)+')</span>'
+      : '<span class="bad">Finnhub/Yahoo fallback</span>';
     document.getElementById('stats').innerHTML =
       stat('Status', conn) +
       stat('Environment', (d.environment||'—').toUpperCase()) +
       stat('Account', d.accountId || 'data-only') +
+      stat('Account Type', acctTypeHtml) +
       stat('Market', d.marketState || '—') +
-      stat('Cash', bp) +
-      stat('Equity', pv);
+      stat('Settled Cash (BP)', fmt(bi.settledCash)) +
+      stat('Unsettled (T+1)', fmt(bi.unsettledCash)) +
+      stat('Equity', fmt(bi.totalEquity)) +
+      stat('Data Source', dsHtml);
     const eb = document.getElementById('errbox');
     if(!d.connected && d.lastError){ eb.style.display='block'; eb.innerHTML='<b>Connection error:</b> '+d.lastError+'<br><span style="color:#888">Endpoint: '+(d.baseUrl||'')+'</span><br><span style="color:#888">A 401 usually means the token doesn\\'t match the selected environment (sandbox token vs production token).</span>'; }
     else { eb.style.display='none'; }
@@ -4822,6 +4928,13 @@ async function reconnect(){
   const btn=event.target; btn.textContent='…';
   await fetch('/api/tradier-reconnect',{method:'POST'});
   btn.textContent='Reconnect'; refresh();
+}
+async function cancelAllOrders(){
+  if(!confirm('Cancel ALL working Tradier orders? This will release reserved buying power.'))return;
+  const btn=event.target; const t=btn.textContent; btn.textContent='Canceling…';
+  const r=await fetch('/api/tradier-cancel-orders',{method:'POST'}); const d=await r.json();
+  btn.textContent=t; alert('Canceled '+d.canceled+' order(s)'+(d.errors&&d.errors.length?(' ('+d.errors.length+' error(s))'):''));
+  refresh();
 }
 async function saveToken(){
   const token=document.getElementById('token').value.trim();
@@ -5373,6 +5486,8 @@ function startDashboard(defaultAcct, apiKey) {
         accountId: tradier.accountId,
         marketState: clock?.state || null,
         balances,
+        balanceInfo: brokerBalanceInfo(balances),
+        dataSource: { ...marketDataStats },
         lastError: tradier.lastError,
         pendingOrders: tradier.pendingOrders,
       }));
@@ -5385,6 +5500,23 @@ function startDashboard(defaultAcct, apiKey) {
       console.log(`  Tradier reconnect: ${ok ? "CONNECTED" : "FAILED"}${tradier.lastError ? ` — ${tradier.lastError}` : ""}`);
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       res.end(JSON.stringify({ connected: tradier.isConnected, error: tradier.lastError, accountId: tradier.accountId, environment: tradier.environment }));
+      return;
+    }
+
+    // ─── Tradier: Cancel ALL working orders (reset / kill switch) ───
+    if (req.method === "POST" && pathname === "/api/tradier-cancel-orders") {
+      let canceled = 0; const errors = [];
+      try {
+        const orders = await tradier.getOrders();
+        for (const o of orders) {
+          if (ORDER_DONE_STATUSES.includes((o.status || "").toLowerCase())) continue;
+          try { await tradier.cancelOrder(o.id); canceled++; }
+          catch (e) { errors.push(`${o.id}: ${e.message}`); }
+        }
+      } catch (e) { errors.push(e.message); }
+      console.log(`  Tradier: canceled ${canceled} working order(s)${errors.length ? ` (${errors.length} error(s))` : ""}`);
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ canceled, errors }));
       return;
     }
 
@@ -5953,18 +6085,38 @@ async function fetchSharedMarketData(apiKey, sharedCandleCache) {
 
 // Extract usable cash from a Tradier balances object. Account type varies (cash / margin / pdt),
 // so the buying-power field lives in different places. Prefer option buying power when present.
-function brokerCashFromBalances(bal) {
+// Parse a Tradier balances object into the figures the bot trades on. The guiding rule for a CASH
+// account is: only ever deploy SETTLED cash (cash_available), never unsettled proceeds — that is
+// exactly what prevents Good-Faith Violations. We also surface account type + unsettled funds so
+// the dashboard can show them and warn if the account isn't actually a cash account.
+function brokerBalanceInfo(bal) {
   if (!bal) return null;
-  const candidates = [
-    bal.margin?.option_buying_power,
-    bal.pdt?.option_buying_power,
-    bal.option_buying_power,
-    bal.cash?.cash_available,
-    bal.total_cash,
-    bal.cash_available,
-  ];
-  for (const c of candidates) if (typeof c === "number" && !Number.isNaN(c)) return c;
-  return null;
+  const num = v => (typeof v === "number" && !Number.isNaN(v)) ? v : null;
+  const accountType = String(bal.account_type || (bal.cash ? "cash" : bal.margin ? "margin" : "")).toLowerCase() || "unknown";
+  const unsettledCash = num(bal.cash?.unsettled_funds) ?? 0;
+
+  let settledCash;
+  if (accountType === "cash") {
+    // cash_available is settled buying power; total_cash includes unsettled, so prefer the former.
+    settledCash = num(bal.cash?.cash_available) ?? num(bal.cash_available) ?? num(bal.total_cash);
+  } else {
+    // Margin/unknown: long options can't be bought on margin, so option_buying_power ≈ usable cash.
+    settledCash = num(bal.margin?.option_buying_power) ?? num(bal.option_buying_power) ?? num(bal.cash?.cash_available) ?? num(bal.total_cash);
+  }
+
+  return {
+    accountType,
+    buyingPower: settledCash,   // what the bot is allowed to deploy (settled only)
+    settledCash,
+    unsettledCash,
+    totalCash: num(bal.total_cash),
+    totalEquity: num(bal.total_equity),
+  };
+}
+
+function brokerCashFromBalances(bal) {
+  const info = brokerBalanceInfo(bal);
+  return info ? info.buyingPower : null;
 }
 
 // Ensure a first-class live account bound to Tradier exists, seeded from the real balance.
@@ -6009,27 +6161,56 @@ async function ensureTradierAccount() {
   console.log(`  Tradier: provisioned LIVE account ✓ — seeded cash $${state.cash.toFixed(2)} (${tradier.environment}), autoExecute ON`);
 }
 
+const ORDER_DONE_STATUSES = ["filled", "canceled", "cancelled", "rejected", "expired", "error"];
+
+// Returns the list of currently WORKING (unfilled) Tradier orders, normalized.
+async function brokerWorkingOrders(acct) {
+  if (acct.config.broker !== "tradier" || !tradier.isConnected) return [];
+  try {
+    const orders = await tradier.getOrders();
+    return orders
+      .filter(o => !ORDER_DONE_STATUSES.includes((o.status || "").toLowerCase()))
+      .map(o => {
+        const occ = o.option_symbol || o.symbol || "";
+        const parsed = tradier.parseOCC(occ);
+        const qty = Math.round(Math.abs(o.quantity || o.remaining_quantity || 0));
+        const price = o.price ?? o.avg_fill_price ?? null;
+        return {
+          id: o.id,
+          status: (o.status || "").toLowerCase(),
+          side: (o.side || "").toLowerCase(),
+          occ,
+          ticker: parsed ? parsed.ticker : occ.toUpperCase(),
+          parsed,
+          qty,
+          price,
+          createDate: o.create_date ? new Date(o.create_date).getTime() : null,
+          reserved: parsed && price ? qty * price * 100 : 0,
+        };
+      });
+  } catch (e) { log(acct, `TRADIER: open-orders check failed — ${e.message}`); return []; }
+}
+
 // Set of underlying tickers that currently have an OPEN (unfilled/working) Tradier order.
 // Used to de-dupe so we don't fire a second entry/exit while one is still working.
 async function brokerOpenOrderTickers(acct) {
   const tickers = new Set();
-  if (acct.config.broker !== "tradier" || !tradier.isConnected) return tickers;
-  try {
-    const orders = await tradier.getOrders();
-    for (const o of orders) {
-      const status = (o.status || "").toLowerCase();
-      if (["filled", "canceled", "cancelled", "rejected", "expired"].includes(status)) continue;
-      const sym = (o.symbol || o.option_symbol || "").toUpperCase();
-      const parsed = tradier.parseOCC(o.option_symbol || o.symbol || "");
-      tickers.add(parsed ? parsed.ticker : sym);
-    }
-  } catch (e) { log(acct, `TRADIER: open-orders check failed — ${e.message}`); }
+  for (const o of await brokerWorkingOrders(acct)) tickers.add(o.ticker.toUpperCase());
   return tickers;
+}
+
+// How many distinct underlyings the account is effectively committed to: filled positions PLUS
+// working (unfilled) orders. Counting working orders prevents the bot from stacking new orders
+// every cycle while earlier limit orders are still unfilled (which would drain buying power).
+function effectivePositionCount(acct) {
+  const tickers = new Set(acct.state.positions.filter(p => !p._pending).map(p => p.ticker.toUpperCase()));
+  if (acct._inflightTickers) for (const t of acct._inflightTickers) tickers.add(t);
+  return tickers.size;
 }
 
 // Place a real buy_to_open on Tradier for a bot entry decision. Broker is the source of truth,
 // so we pre-seed side-metadata (entry context) keyed by OCC and let the next sync surface the fill.
-async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, dte, qty, premium, direction, setupQuality = 0, claudeConfidence = 0 }) {
+async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, dte, qty, premium, direction, bid = null, ask = null, setupQuality = 0, claudeConfidence = 0 }) {
   const expStr = new Date(expiryDate).toISOString().slice(0, 10);
   const occ = tradier.buildOCC(ticker, expStr, type, strike);
 
@@ -6060,29 +6241,26 @@ async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, dte, q
   };
 
   try {
-    const limit = +premium.toFixed(2);
+    // Conviction-/PDT-aware fill: high conviction + low PDT risk → price toward the ask to fill;
+    // otherwise sit at the mid. Falls back to mid when we don't have a real bid/ask.
+    const conviction = Math.max(0, Math.min(1, (claudeConfidence || 0) / 100));
+    const lowPdt = pdtRiskLow(acct.state);
+    const limit = entryLimitPrice(bid, ask, premium, conviction, lowPdt);
+    const aggrLabel = limit >= (ask || limit) ? "at ask" : limit > premium ? "toward ask" : "at mid";
     const res = await tradier.placeOptionOrder(ticker, expStr, type, strike, "buy_to_open", qty, "limit", limit);
-    if (acct._inflightTickers) acct._inflightTickers.add(ticker.toUpperCase());
-    log(acct, `TRADIER ENTRY: BUY ${qty}x ${occ} @ $${limit} limit — order ${res?.id || JSON.stringify(res).slice(0, 80)}`);
+    // Mark this underlying in-flight so the rest of THIS cycle counts it toward maxPositions
+    // (via effectivePositionCount) and won't place a duplicate. The next sync reconciles fully.
+    if (!acct._inflightTickers) acct._inflightTickers = new Set();
+    acct._inflightTickers.add(ticker.toUpperCase());
+    log(acct, `TRADIER ENTRY: BUY ${qty}x ${occ} @ $${limit} (${aggrLabel}; conviction ${(conviction * 100).toFixed(0)}%, PDT ${lowPdt ? "ok" : "tight"}; bid ${bid ?? "?"}/ask ${ask ?? "?"}/mid ${premium}) — order ${res?.id || JSON.stringify(res).slice(0, 80)}`);
 
-    // Optimistic in-cycle accounting (reconciled & overwritten by the next syncBrokerAccount):
-    // decrement cash and add a placeholder position so further entries this cycle correctly
-    // respect cash sizing, maxPositions, sector caps and same-ticker de-dupe.
-    const totalCost = qty * premium * 100;
+    // Optimistic in-cycle cash decrement so additional entries this cycle size off remaining
+    // buying power. Reconciled (overwritten) by the next syncBrokerAccount. No placeholder
+    // position is pushed — working orders are surfaced as pending positions during sync instead.
+    const totalCost = qty * limit * 100; // worst-case fill (limit) so further sizing this cycle is conservative
     acct.state.cash = Math.max(0, acct.state.cash - totalCost);
-    acct.state.positions.push({
-      occSymbol: occ, ticker, type, strike, dte,
-      expiryDate, dteRemaining: dte,
-      entryPremium: +premium.toFixed(2), entrySpot: acct.dashboard?.quotes?.[ticker]?.c ?? null,
-      qty, originalQty: qty, cost: totalCost,
-      openDate: getETDateStr(), openTime: Date.now(),
-      trimLevel: 0, bestPnlPct: 0,
-      entryAtrPct: acct.dashboard?.analyses?.[ticker]?.atrPct ?? null,
-      iv: DEFAULT_IV, liveMark: +premium.toFixed(2), optionsSource: "tradier", direction,
-      _pendingFill: true,
-    });
 
-    return { ticker, type, strike, dte, qty, entryPremium: +premium.toFixed(2), cost: totalCost, direction, optionsSource: "tradier", setupQuality, claudeConfidence, brokerOrder: true };
+    return { ticker, type, strike, dte, qty, entryPremium: +limit.toFixed(2), cost: totalCost, direction, optionsSource: "tradier", setupQuality, claudeConfidence, brokerOrder: true };
   } catch (e) {
     delete acct.state.meta[occ];
     log(acct, `TRADIER ENTRY FAILED ${ticker}: ${e.message}`);
@@ -6109,11 +6287,23 @@ function placeBrokerExit(acct, pos, currentPremium, reason, qty, pnlPct, pnlDoll
     return null;
   }
 
-  const expStr = new Date(pos.expiryDate).toISOString().slice(0, 10);
   acct._inflightTickers.add(ticker.toUpperCase());
-  const limit = +currentPremium.toFixed(2);
-  tradier.placeOptionOrder(ticker, expStr, pos.type, pos.strike, "sell_to_close", qty, "limit", limit)
-    .then(res => log(acct, `TRADIER EXIT: SELL ${qty}x ${pos.occSymbol || ticker} @ $${limit} — order ${res?.id || "ok"} (${reason})`))
+
+  // Protective exits (losses, stops, DTE/critical, signal reversals) must actually FILL, so price
+  // them at the live bid (marketable) rather than mid where they could rest unfilled while the
+  // position keeps bleeding. Profit-taking exits can be patient and use the mid.
+  const protective = pnlPct <= 0 || /stop|critical|expir|reversed|breakeven|low-dte|theta/i.test(reason);
+  let limit = +currentPremium.toFixed(2);
+  if (protective && typeof pos.liveBid === "number" && pos.liveBid > 0) {
+    limit = +pos.liveBid.toFixed(2);
+  } else if (protective) {
+    log(acct, `TRADIER EXIT WARN ${ticker}: no live bid for protective exit — using mid $${limit} (fill not guaranteed)`);
+  }
+
+  // Use the EXACT held OCC symbol so we can never target the wrong contract via reconstruction.
+  const occForExit = pos.occSymbol || tradier.buildOCC(ticker, new Date(pos.expiryDate).toISOString().slice(0, 10), pos.type, pos.strike);
+  tradier.placeOptionOrderByOCC(occForExit, "sell_to_close", qty, "limit", limit)
+    .then(res => log(acct, `TRADIER EXIT: SELL ${qty}x ${occForExit} @ $${limit}${protective ? " (marketable)" : ""} — order ${res?.id || "ok"} (${reason})`))
     .catch(e => {
       acct._inflightTickers.delete(ticker.toUpperCase());
       log(acct, `TRADIER EXIT FAILED ${ticker}: ${e.message}`);
@@ -6151,15 +6341,26 @@ async function syncBrokerAccount(acct, quotes) {
   const state = acct.state;
   if (!state.meta) state.meta = {};
 
-  // Refresh in-flight order set once per cycle for synchronous exit/entry de-dupe checks.
-  acct._inflightTickers = await brokerOpenOrderTickers(acct);
+  // Fetch working orders once per cycle: drives the in-flight de-dupe set, the position-count cap,
+  // and the pending-position rows below.
+  const workingOrders = await brokerWorkingOrders(acct);
+  acct._inflightTickers = new Set(workingOrders.map(o => o.ticker.toUpperCase()));
 
   try {
     const bal = await tradier.getAccount();
-    if (bal) {
-      const cash = brokerCashFromBalances(bal);
-      if (typeof cash === "number") state.cash = cash;
-      if (typeof bal.total_equity === "number") state.brokerEquity = bal.total_equity;
+    const info = brokerBalanceInfo(bal);
+    if (info) {
+      if (typeof info.buyingPower === "number") state.cash = info.buyingPower; // settled funds only
+      if (typeof info.totalEquity === "number") state.brokerEquity = info.totalEquity;
+      state.accountType = info.accountType;
+      state.settledCash = info.settledCash;
+      state.unsettledCash = info.unsettledCash;
+      state.totalCash = info.totalCash;
+      // Warn once per change if the live account isn't a cash account (margin → PDT + leverage risk).
+      if (info.accountType !== "cash" && state._lastAcctTypeWarned !== info.accountType) {
+        log(acct, `⚠️ TRADIER: account type is "${info.accountType.toUpperCase()}", not CASH — PDT rule and margin/leverage apply. You wanted a cash account.`);
+        state._lastAcctTypeWarned = info.accountType;
+      }
     }
   } catch (e) { log(acct, `TRADIER SYNC: balance error — ${e.message}`); }
 
@@ -6176,10 +6377,16 @@ async function syncBrokerAccount(acct, quotes) {
       if (qtyContracts < 1) continue;
       const entryPremium = p.cost_basis && qtyContracts ? Math.abs(p.cost_basis) / (qtyContracts * 100) : 0;
 
-      let mark = null, greeks = null, iv = DEFAULT_IV;
+      let mark = null, bid = null, ask = null, greeks = null, iv = DEFAULT_IV;
       try {
         const oq = await tradier.getOptionQuote(occ);
-        if (oq) { mark = oq.mid ?? oq.last; iv = oq.iv ?? DEFAULT_IV; greeks = { delta: oq.delta ?? 0, theta: oq.theta ?? 0 }; }
+        if (oq) {
+          bid = typeof oq.bid === "number" ? oq.bid : null;
+          ask = typeof oq.ask === "number" ? oq.ask : null;
+          mark = reliableOptionMark(oq);   // null if no real two-sided market
+          iv = oq.iv ?? DEFAULT_IV;
+          greeks = { delta: oq.delta ?? 0, theta: oq.theta ?? 0 };
+        }
       } catch { }
 
       const expiryDate = new Date(`${parsed.expiration}T16:00:00`).getTime();
@@ -6207,6 +6414,8 @@ async function syncBrokerAccount(acct, quotes) {
         entryAtrPct: meta.entryAtrPct ?? null,
         iv,
         liveMark: mark != null ? +mark.toFixed(2) : null,
+        liveBid: bid,
+        liveAsk: ask,
         liveGreeks: greeks,
         optionsSource: "tradier",
         direction: parsed.type === "call" ? "BULLISH" : "BEARISH",
@@ -6225,10 +6434,50 @@ async function syncBrokerAccount(acct, quotes) {
       };
       seen.add(occ);
     }
+    // Surface working (unfilled) BUY orders as pending positions so they show on the dashboard
+    // and count toward limits. They are skipped by exit logic (see _pending guards).
+    let reserved = 0;
+    for (const o of workingOrders) {
+      if (o.side !== "buy_to_open" && o.side !== "buy") continue;
+      if (!o.parsed || o.qty < 1) continue;
+      if (seen.has(o.occ)) continue; // already a filled position
+      reserved += o.reserved;
+      const expiryDate = new Date(`${o.parsed.expiration}T16:00:00`).getTime();
+      positions.push({
+        occSymbol: o.occ,
+        ticker: o.parsed.ticker,
+        type: o.parsed.type,
+        strike: o.parsed.strike,
+        expiryDate,
+        dte: Math.round(Math.max(0, (expiryDate - now) / 86400_000)),
+        dteRemaining: Math.max(0, (expiryDate - now) / 86400_000),
+        entryPremium: o.price || 0,
+        entrySpot: quotes[o.parsed.ticker]?.c ?? null,
+        qty: o.qty,
+        originalQty: o.qty,
+        cost: o.reserved,
+        openDate: getETDateStr(),
+        openTime: o.createDate || now,
+        trimLevel: 0,
+        bestPnlPct: 0,
+        iv: DEFAULT_IV,
+        liveMark: o.price || 0,
+        optionsSource: "tradier",
+        direction: o.parsed.type === "call" ? "BULLISH" : "BEARISH",
+        _pending: true,
+        orderStatus: o.status,
+      });
+    }
+
     // Prune metadata for positions that no longer exist at the broker.
     for (const k of Object.keys(state.meta)) if (!seen.has(k)) delete state.meta[k];
     state.positions = positions;
-    log(acct, `TRADIER SYNC: cash $${state.cash.toFixed(2)} | ${positions.length} live position(s)`);
+    state.workingOrderCount = workingOrders.length;
+    state.reservedBuyingPower = reserved;
+    const filled = positions.filter(p => !p._pending).length;
+    const pending = positions.length - filled;
+    const unsettledStr = state.unsettledCash > 0 ? ` | unsettled $${state.unsettledCash.toFixed(0)}` : "";
+    log(acct, `TRADIER SYNC [${(state.accountType || "?").toUpperCase()}]: equity $${(state.brokerEquity ?? portfolioValue(state, quotes)).toFixed(2)} | settled BP $${state.cash.toFixed(2)}${unsettledStr} | ${filled} filled, ${pending} pending order(s)${reserved > 0 ? ` reserving $${reserved.toFixed(0)}` : ""}`);
   } catch (e) { log(acct, `TRADIER SYNC: positions error — ${e.message}`); }
 }
 
@@ -6517,6 +6766,19 @@ function buildPositionDetails(acct, quotes) {
     const dteLeft = pos.expiryDate
       ? Math.max(0, (pos.expiryDate - now) / 86400_000)
       : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
+
+    // Pending (unfilled) broker orders: show flat, tagged as a working order — no P&L/greeks math.
+    if (pos._pending) {
+      return {
+        ...pos, spot, dteLeft, curPremium: pos.entryPremium, pnlPct: 0, pnlDollar: 0,
+        profitTarget: { pct: "—", premium: "—" },
+        stopLoss: { pct: "—", premium: "—" },
+        pctToProfit: "0.0", pctToStop: "0.0",
+        pdtStatus: `⏳ WORKING ORDER${pos.orderStatus ? ` (${pos.orderStatus})` : ""}`,
+        greeks: { delta: "—", theta: "—" },
+      };
+    }
+
     const curPremium = pos.liveMark ?? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type);
     const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
     const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * 100;

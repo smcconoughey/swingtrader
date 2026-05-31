@@ -436,6 +436,29 @@ const tradier = {
     return data?.order || data;
   },
 
+  /**
+   * Place an options order using an EXACT OCC option symbol (no rebuild). Use this to close a
+   * known holding so we can never target the wrong contract due to date/strike reconstruction.
+   */
+  async placeOptionOrderByOCC(occSymbol, side, quantity, orderType = "limit", limitPrice = null, duration = "day") {
+    if (!accountId) throw new Error("No Tradier account id — cannot place orders with a data-only token.");
+    const parsed = parseOCC(occSymbol);
+    if (!parsed) throw new Error(`Invalid OCC symbol: ${occSymbol}`);
+    const form = {
+      class: "option",
+      symbol: parsed.ticker,
+      option_symbol: occSymbol.toUpperCase(),
+      side,
+      quantity,
+      type: orderType,
+      duration,
+    };
+    if ((orderType === "limit" || orderType === "stop_limit") && limitPrice) form.price = limitPrice;
+    console.log(`  [TR] OPTION ${side.toUpperCase()} ${quantity} ${occSymbol} (${orderType}${limitPrice ? ` @ $${limitPrice}` : ""})`);
+    const data = await apiSend("POST", `/accounts/${accountId}/orders`, form);
+    return data?.order || data;
+  },
+
   async cancelOrder(orderId) {
     if (!accountId) throw new Error("No Tradier account id.");
     const data = await apiSend("DELETE", `/accounts/${accountId}/orders/${orderId}`);
