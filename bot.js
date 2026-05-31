@@ -633,9 +633,9 @@ const MWF_EXPIRY_TICKERS = new Set([
 const CLAUDE_API_KEY = (process.env.CLAUDE_API_KEY || "").trim();
 const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || "AIzaSyB1agSJoX1rImf5gYGm6Jh9uZXSHg2AOIE").trim();
 
-// LLM_PROVIDER: "gemini" | "claude" — defaults to gemini when key is available
+// LLM_PROVIDER: "gemini" | "claude" — defaults to Claude (Haiku)
 // Mutable at runtime via dashboard toggle or POST /api/llm-provider
-let LLM_PROVIDER = (process.env.LLM_PROVIDER || (GEMINI_API_KEY ? "gemini" : "claude")).toLowerCase();
+let LLM_PROVIDER = (process.env.LLM_PROVIDER || "claude").toLowerCase();
 
 // TRADING_MODE: "paper" | "robinhood" — defaults to paper
 // When "robinhood", the bot converts options signals to equity orders via Robinhood's MCP API.
@@ -2223,7 +2223,7 @@ function getActiveHintsSummary(acct) {
 
 // ─── Auto News Scanner (runs every 3 hours) ───
 
-const NEWS_INTERVAL = 3 * 60 * 60_000; // 3 hours
+const NEWS_INTERVAL = 60 * 60_000; // 1 hour
 let globalLastNewsScan = 0; // shared across all accounts to avoid duplicate Claude calls
 
 async function fetchMarketNews(apiKey, tickers) {
@@ -3470,7 +3470,7 @@ ${accountActionsHTML(acct.id)}
   </div>
   <div class="card">
     <h2>AI Assistant &amp; News Intel</h2>
-    <div style="margin-bottom:8px;padding:6px 10px;background:#0a0a0f;border-radius:4px;font-size:11px;border-left:3px solid ${(acct.latestNewsBrief || "").includes("CRITICAL") ? "#ff4444" : (acct.latestNewsBrief || "").includes("ELEVATED") ? "#ffd93d" : "#333"}">${acct.latestNewsBrief || '<span style="opacity:.4">News scan runs every 3 hours...</span>'}</div>
+    <div style="margin-bottom:8px;padding:6px 10px;background:#0a0a0f;border-radius:4px;font-size:11px;border-left:3px solid ${(acct.latestNewsBrief || "").includes("CRITICAL") ? "#ff4444" : (acct.latestNewsBrief || "").includes("ELEVATED") ? "#ffd93d" : "#333"}">${acct.latestNewsBrief || '<span style="opacity:.4">News scan runs hourly...</span>'}</div>
     ${hints ? `<div style="margin-bottom:8px">${hints}</div>` : ''}
     ${(() => {
       const history = (acct.chatHistory || []).slice(-10);
