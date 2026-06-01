@@ -2840,6 +2840,19 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   if (totalCost > deployable) { qty = Math.floor(deployable / costPer); totalCost = qty * costPer; }
   if (qty < 1) return { skipped: true, reason: `Insufficient deployable cash for 1 contract${cfg.useCashReserve === false ? "" : ` (buffer ${(reservePct * 100).toFixed(0)}%)`}` };
 
+  // Circuit Breaker: Max Trade Size
+  const maxSize = cfg.maxTradeSize || 500;
+  if (totalCost > maxSize) {
+    if (cfg.broker === "tradier") {
+      acct.paused = true; // Hard stop for real money
+      saveAccounts();
+      const msg = `🚨 CIRCUIT BREAKER TRIPPED: Trade for ${ticker} costs $${totalCost.toFixed(2)} (exceeds $${maxSize} max). Account is now PAUSED.`;
+      log(acct, msg);
+      sendPush(`🚨 Circuit Breaker [${acct.name}]`, msg, true).catch(()=>{});
+    }
+    return { skipped: true, reason: `Trade size $${totalCost.toFixed(2)} exceeds maxTradeSize of $${maxSize}.` };
+  }
+
   // Full AI/decision thought process captured at entry, attached to the trade for the life of the
   // position and into trade history. If the LLM wasn't called (or returned no prose), synthesize a
   // readable thesis from the technical signals so every trade still documents WHY it was opened.
@@ -4850,6 +4863,8 @@ function accountActionsHTML(acctId) {
         <input name="goal" type="number" value="${cfg.goal}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Max Positions (blank = unlimited)</label>
         <input name="maxPositions" type="number" value="${cfg.maxPositions || ""}" placeholder="unlimited" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
+        <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Max Trade Size ($ Circuit Breaker)</label>
+        <input name="maxTradeSize" type="number" value="${cfg.maxTradeSize || 500}" placeholder="500" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Min Setup Quality (0=trade anything, 50=default, 100=perfect setups only)</label>
         <input name="minSetupQuality" type="number" value="${cfg.minSetupQuality ?? 50}" min="0" max="100" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Custom Prompt Suffix</label>
@@ -5480,6 +5495,8 @@ function startDashboard(defaultAcct, apiKey) {
         if (params.has("goal")) cfg.goal = parseFloat(params.get("goal")) || cfg.goal;
         if (params.get("maxPositions")) cfg.maxPositions = parseInt(params.get("maxPositions")) || null;
         else cfg.maxPositions = null;
+        if (params.get("maxTradeSize")) cfg.maxTradeSize = parseFloat(params.get("maxTradeSize")) || null;
+        else cfg.maxTradeSize = null;
         if (params.has("minSetupQuality")) cfg.minSetupQuality = parseInt(params.get("minSetupQuality")) ?? 50;
         cfg.customPromptSuffix = params.get("customPromptSuffix") || "";
         // Broker binding + live-trading toggles. Checkboxes only POST when checked.
@@ -6230,22 +6247,22 @@ async function ensureTradierAccount() {
     if (acct.config.autoExecute === undefined) acct.config.autoExecute = true;
     if (acct.config.tradeWhenClosed === undefined) acct.config.tradeWhenClosed = tradier.environment === "sandbox";
 
-    // Detect environment change (sandbox ↔ production) and update the account accordingly.
+    // Detect environment change (sandbox ↔ production) OR a massive equity mismatch (stale sandbox state)
     const expectedName = `Tradier Live (${tradier.environment})`;
     const envChanged = acct.name !== expectedName;
-    if (envChanged) {
-      console.log(`  Tradier: environment changed → ${tradier.environment} — resetting account`);
+    const staleEquity = acct.state.brokerEquity > 0 && typeof seedCash === "number" && Math.abs(acct.state.brokerEquity - seedCash) > 5000;
+    
+    if (envChanged || staleEquity) {
+      console.log(`  Tradier: state reset triggered (envChanged=${envChanged}, staleEquity=${staleEquity})`);
       acct.name = expectedName;
-      // Reset starting cash to real balance so P&L tracks from the correct base.
       if (typeof seedCash === "number") acct.config.startingCash = seedCash;
-      // Production: disable trade-when-closed (live money). Sandbox: enable for testing.
       acct.config.tradeWhenClosed = tradier.environment === "sandbox";
       // Clear sandbox positions/history/cached broker state — production data comes from the real broker.
       acct.state.positions = [];
       acct.state.history = [];
       acct.state.meta = {};
       acct.state.dayTrades = [];
-      delete acct.state.brokerEquity;    // stale sandbox equity — portfolioValue() falls back to cash
+      delete acct.state.brokerEquity;
       delete acct.state.settledCash;
       delete acct.state.unsettledCash;
       delete acct.state.totalCash;
