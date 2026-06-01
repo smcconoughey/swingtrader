@@ -6229,6 +6229,24 @@ async function ensureTradierAccount() {
     acct.config.broker = "tradier";
     if (acct.config.autoExecute === undefined) acct.config.autoExecute = true;
     if (acct.config.tradeWhenClosed === undefined) acct.config.tradeWhenClosed = tradier.environment === "sandbox";
+
+    // Detect environment change (sandbox ↔ production) and update the account accordingly.
+    const expectedName = `Tradier Live (${tradier.environment})`;
+    const envChanged = acct.name !== expectedName;
+    if (envChanged) {
+      console.log(`  Tradier: environment changed → ${tradier.environment} — resetting account`);
+      acct.name = expectedName;
+      // Reset starting cash to real balance so P&L tracks from the correct base.
+      if (typeof seedCash === "number") acct.config.startingCash = seedCash;
+      // Production: disable trade-when-closed (live money). Sandbox: enable for testing.
+      acct.config.tradeWhenClosed = tradier.environment === "sandbox";
+      // Clear sandbox positions/history — production positions come from the real broker.
+      acct.state.positions = [];
+      acct.state.history = [];
+      acct.state.meta = {};
+      saveAccounts();
+    }
+
     if (typeof seedCash === "number") acct.state.cash = seedCash;
     console.log(`  Tradier: live account present — cash $${acct.state.cash.toFixed(2)} (${tradier.environment})${acct.config.tradeWhenClosed ? " · trades-when-closed ON" : ""}`);
     return;
