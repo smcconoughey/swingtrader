@@ -1627,16 +1627,42 @@ function getETDate() {
   return new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
 }
 
+function getETParts() {
+  const parts = new Intl.DateTimeFormat("en-US", { 
+    timeZone: "America/New_York", 
+    year: "numeric", month: "numeric", day: "numeric",
+    hour: "numeric", minute: "numeric", second: "numeric",
+    hour12: false, weekday: "short"
+  }).formatToParts(new Date());
+  const get = type => parts.find(p => p.type === type)?.value;
+  return {
+    day: get("weekday"),
+    h: parseInt(get("hour"), 10),
+    m: parseInt(get("minute"), 10),
+    dateStr: `${get("year")}-${get("month").padStart(2, "0")}-${get("day").padStart(2, "0")}`
+  };
+}
+
 function isMarketOpen() {
-  const et = getETDate();
-  const day = et.getDay(); // 0=Sun, 6=Sat
-  if (day === 0 || day === 6) return false;
-  const mins = et.getHours() * 60 + et.getMinutes();
-  return mins >= 570 && mins < 960; // 9:30 AM (570) to 4:00 PM (960)
+  try {
+    const { day, h, m } = getETParts();
+    if (day === "Sat" || day === "Sun") return false;
+    const mins = h * 60 + m;
+    return mins >= 570 && mins < 960; // 9:30 AM (570) to 4:00 PM (960)
+  } catch (e) {
+    // Fallback if Intl is broken
+    const d = new Date();
+    const mins = d.getUTCHours() * 60 + d.getUTCMinutes() - 240; // Approx ET (EDT is UTC-4)
+    return mins >= 570 && mins < 960;
+  }
 }
 
 function getETDateStr() {
-  return getETDate().toISOString().slice(0, 10);
+  try {
+    return getETParts().dateStr;
+  } catch (e) {
+    return new Date().toISOString().slice(0, 10);
+  }
 }
 
 // Returns the next Friday expiration that is at least minCalendarDays away (in ET).
@@ -6878,6 +6904,12 @@ async function runPausedCycle(acct, sharedQuotes) {
   const state = acct.state;
   const cfg = acct.config;
   const dash = acct.dashboard;
+  dash.marketOpen = isMarketOpen();
+
+  // Keep dashboard quotes alive so PV and UI don't freeze while paused
+  for (const ticker of globalTickers) {
+    if (sharedQuotes[ticker]) dash.quotes[ticker] = sharedQuotes[ticker];
+  }
 
   if (state.positions.length === 0) return;
 
@@ -7221,7 +7253,12 @@ async function runAfterHoursScan(acct, sharedQuotes, apiKey) {
   const state = acct.state;
   const cfg = acct.config;
   const dash = acct.dashboard;
+  dash.marketOpen = false; // By definition, after-hours scan means the market is closed.
   log(acct, "AFTER-HOURS SCAN — Fetching data for analysis (no trades)");
+
+  for (const ticker of globalTickers) {
+    if (sharedQuotes[ticker]) dash.quotes[ticker] = sharedQuotes[ticker];
+  }
 
   const quotes = {};
   const analyses = {};
