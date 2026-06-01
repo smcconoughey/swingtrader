@@ -7569,7 +7569,14 @@ async function main() {
       }
 
       saveAccounts();
-      await delay(900_000); // 15 min after hours
+      // Sleep for 15 minutes after hours, but wake up immediately if the market opens
+      for (let i = 0; i < 15; i++) {
+        await delay(60_000);
+        if (isMarketOpen()) {
+          console.log("  [WAKE] Market opened during after-hours sleep cycle!");
+          break;
+        }
+      }
     }
   }
 }
