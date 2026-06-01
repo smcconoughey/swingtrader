@@ -6240,10 +6240,22 @@ async function ensureTradierAccount() {
       if (typeof seedCash === "number") acct.config.startingCash = seedCash;
       // Production: disable trade-when-closed (live money). Sandbox: enable for testing.
       acct.config.tradeWhenClosed = tradier.environment === "sandbox";
-      // Clear sandbox positions/history — production positions come from the real broker.
+      // Clear sandbox positions/history/cached broker state — production data comes from the real broker.
       acct.state.positions = [];
       acct.state.history = [];
       acct.state.meta = {};
+      acct.state.dayTrades = [];
+      delete acct.state.brokerEquity;    // stale sandbox equity — portfolioValue() falls back to cash
+      delete acct.state.settledCash;
+      delete acct.state.unsettledCash;
+      delete acct.state.totalCash;
+      delete acct.state.accountType;
+      delete acct.state.reservedBuyingPower;
+      delete acct.state.workingOrderCount;
+      acct.dashboard.portfolioHistory = [];
+      acct.dashboard.positionDetails = [];
+      acct.dashboard.decisions = [];
+      acct.dashboard.cycleLog = [];
       saveAccounts();
     }
 
