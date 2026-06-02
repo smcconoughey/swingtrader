@@ -1981,6 +1981,16 @@ function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 12) {
   return candidates.slice(0, maxCandidates);
 }
 
+function chooseAffordableCandidate(candidates, selected, maxContractCost, state) {
+  if (!(maxContractCost > 0)) return selected || null;
+  const affordable = (candidates || [])
+    .filter(c => c && c.mid > 0 && c.mid * 100 <= maxContractCost)
+    .filter(c => !state || countPositionsAtExpiry(state, c.expiryDate) < MAX_PER_EXPIRY)
+    .sort((a, b) => b.quality - a.quality);
+  if (selected && selected.mid > 0 && selected.mid * 100 <= maxContractCost) return selected;
+  return affordable[0] || null;
+}
+
 async function fetchHistoricalCandles(sym, fromUnix, toUnix) {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?period1=${fromUnix}&period2=${toUnix}&interval=1d`;
   const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
@@ -2671,7 +2681,6 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   const state = acct.state;
   const cfg = acct.config;
   if (state.positions.some(p => p.ticker === ticker)) return null;
-  if (state.cash < 100) return null;
   // Broker accounts: also skip names with a working (unfilled) order this cycle so we don't
   // stack duplicate orders while an earlier one is still resting.
   if (cfg.broker === "tradier" && acct._inflightTickers?.has(ticker.toUpperCase())) {
@@ -2762,18 +2771,29 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   // ─── Step 1: Check validation cache (skips both chain fetch AND Claude call) ───
   let claudeResult = { approve: true, confidence: 70, concerns: [], reasoning: "", suggestion: "", contractIdx: 0 };
   let selectedCandidate = null;
+  let candidates = [];
 
   const cached = getCachedValidation(acct.id, ticker, analysis.score, direction);
   if (cached) {
     claudeResult = cached.result;
     selectedCandidate = cached.selectedCandidate; // may be null if previously used synthetic
-    log(acct, `CLAUDE VALIDATE ${ticker}: CACHED ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%) — skipping chain fetch + Claude call`);
+    log(acct, `CLAUDE VALIDATE ${ticker}: CACHED ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%) — skipping Claude call`);
     if (!claudeResult.approve) {
       return { skipped: true, reason: `Claude rejected (cached): ${claudeResult.suggestion}` };
     }
+    try {
+      let chain = getCachedChain(ticker);
+      if (!chain) {
+        chain = await fetchFullOptionsChain(ticker, apiKey);
+        await delay(API_DELAY);
+        if (chain) setCachedChain(ticker, chain);
+      }
+      if (chain) candidates = buildCandidateContracts(chain, type, spot, 60);
+    } catch (e) {
+      log(acct, `OPTIONS ${ticker}: cached affordability refresh failed — ${e.message}`);
+    }
   } else {
     // ─── Step 2: Fetch full options chain (with short-lived cache) ───
-    let candidates = [];
     try {
       let chain = getCachedChain(ticker);
       if (!chain) {
@@ -2782,7 +2802,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
         if (chain) setCachedChain(ticker, chain);
       }
       if (chain) {
-        candidates = buildCandidateContracts(chain, type, spot);
+        candidates = buildCandidateContracts(chain, type, spot, 60);
         log(acct, `OPTIONS ${ticker}: ${candidates.length} viable ${type} contracts (${chain.length} expiries)`);
       }
     } catch (e) {
@@ -2829,7 +2849,31 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     }
   }
 
-  // ─── Step 4: Use selected contract (from cache or fresh) ───
+  // ─── Step 4: Pick an affordable real contract before sizing ───
+  const pv = portfolioValue(state, acct.dashboard?.quotes || {});
+  const trust = computeTradeTrust({
+    claudeConfidence: claudeResult.confidence,
+    setupQuality: effectiveQuality,
+    technicalScore: analysis.score,
+    isBullish,
+    cfg,
+    regime,
+  });
+  let deployable, reservePct;
+  if (cfg.useCashReserve === false) {
+    deployable = state.cash;
+    reservePct = 0;
+  } else {
+    ({ deployable, reservePct } = deployableCash(state, pv, trust));
+  }
+  const maxSize = cfg.maxTradeSize || 500;
+  const maxContractCost = Math.min(maxRisk, deployable, maxSize);
+  const originalCandidate = selectedCandidate;
+  selectedCandidate = chooseAffordableCandidate(candidates, selectedCandidate, maxContractCost, state);
+  if (selectedCandidate && originalCandidate && selectedCandidate !== originalCandidate) {
+    log(acct, `AFFORDABLE CONTRACT ${ticker}: Claude pick cost $${(originalCandidate.mid * 100).toFixed(0)} > budget $${maxContractCost.toFixed(0)} — switching to ${selectedCandidate.strike} ${type.toUpperCase()} ${selectedCandidate.expiryStr} @ $${selectedCandidate.mid}`);
+  }
+
   let strike, dte, expiryDate, premium, posIv, optionsSource;
   // selectedCandidate already set above (either from cache or fresh Claude response)
 
@@ -2856,27 +2900,8 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   }
 
   const costPer = premium * 100;
-  if (costPer > state.cash) return null;
+  if (costPer > state.cash) return { skipped: true, reason: `No affordable contract: cheapest selected contract costs $${costPer.toFixed(0)} but spend limit is $${state.cash.toFixed(0)}` };
 
-  // ─── Trust-scaled cash reserve ───
-  // Only high-conviction setups may draw the buffer toward 25%; low-trust setups respect 50%.
-  const pv = portfolioValue(state, acct.dashboard?.quotes || {});
-  const trust = computeTradeTrust({
-    claudeConfidence: claudeResult.confidence,
-    setupQuality: effectiveQuality,
-    technicalScore: analysis.score,
-    isBullish,
-    cfg,
-    regime,
-  });
-  // Cash reserve is toggleable per account. When disabled, deploy full cash (other limits still apply).
-  let deployable, reservePct;
-  if (cfg.useCashReserve === false) {
-    deployable = state.cash;
-    reservePct = 0;
-  } else {
-    ({ deployable, reservePct } = deployableCash(state, pv, trust));
-  }
   if (deployable < costPer) {
     return { skipped: true, reason: `Cash reserve: ${(reservePct * 100).toFixed(0)}% buffer required (trust ${(trust * 100).toFixed(0)}%) — only $${deployable.toFixed(0)} of $${state.cash.toFixed(0)} cash deployable, need $${costPer.toFixed(0)}/contract` };
   }
@@ -2888,7 +2913,6 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   if (qty < 1) return { skipped: true, reason: `Insufficient deployable cash for 1 contract${cfg.useCashReserve === false ? "" : ` (buffer ${(reservePct * 100).toFixed(0)}%)`}` };
 
   // Circuit Breaker: Max Trade Size
-  const maxSize = cfg.maxTradeSize || 500;
   if (totalCost > maxSize) {
     if (cfg.broker === "tradier") {
       acct.paused = true; // Hard stop for real money
@@ -6908,7 +6932,6 @@ async function runCycle(acct, sharedQuotes, apiKey) {
 
     const dec = { ticker, price: q?.c, rawScore, finalScore, signal: a.signal, hintBias };
     const alreadyHeld = state.positions.some(p => p.ticker === ticker);
-    const lowCash = state.cash < 100;
 
     dec.bullScore = a.bullScore; dec.bearScore = a.bearScore;
     dec.shortTermScore = st ? st.score : null;
@@ -6917,11 +6940,9 @@ async function runCycle(acct, sharedQuotes, apiKey) {
 
     if (finalScore >= cfg.bullEntry) {
       if (alreadyHeld) { dec.action = "HOLD"; dec.reason = "Already in position"; }
-      else if (lowCash) { dec.action = "BLOCKED"; dec.reason = `Insufficient cash ($${state.cash.toFixed(0)})`; }
       else { dec.action = "BUY CALL"; dec.reason = `Bullish ${finalScore}/100 (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`; }
     } else if (finalScore <= cfg.bearEntry) {
       if (alreadyHeld) { dec.action = "HOLD"; dec.reason = "Already in position"; }
-      else if (lowCash) { dec.action = "BLOCKED"; dec.reason = `Insufficient cash ($${state.cash.toFixed(0)})`; }
       else { dec.action = "BUY PUT"; dec.reason = `Bearish ${finalScore}/100 (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`; }
     } else {
       dec.action = "WAIT";
