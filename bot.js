@@ -689,6 +689,10 @@ const DEFAULT_CONFIG = {
   // When true, this account runs the full trading cycle (entries + exits) even while the market
   // is closed — intended for testing live execution against a broker sandbox on weekends/after hours.
   tradeWhenClosed: false,
+  // Margin safety rails: when Tradier reports zero option BP on a margin account, allow a small
+  // explicit spend limit without ever planning beyond this max negative-cash floor.
+  marginZeroCashSpendLimit: 200,
+  marginMaxDebt: 250,
 };
 
 // ─── Multi-Account Runtime ───
@@ -774,6 +778,9 @@ const AUTH_SECRET = process.env.AUTH_SECRET || `swingtrader::${DASHBOARD_PASSWOR
 function authToken() {
   return crypto.createHmac("sha256", AUTH_SECRET).update("dashboard-session-v1").digest("hex").slice(0, 40);
 }
+function spectatorToken() {
+  return crypto.createHmac("sha256", AUTH_SECRET).update("dashboard-spectator-v1").digest("hex").slice(0, 40);
+}
 function parseCookies(req) {
   const out = {};
   for (const part of (req.headers.cookie || "").split(";")) {
@@ -782,8 +789,14 @@ function parseCookies(req) {
   }
   return out;
 }
+function authRole(req) {
+  const token = parseCookies(req)[AUTH_COOKIE];
+  if (token === authToken()) return "admin";
+  if (token === spectatorToken()) return "spectator";
+  return null;
+}
 function isAuthed(req) {
-  return parseCookies(req)[AUTH_COOKIE] === authToken();
+  return !!authRole(req);
 }
 function loginPageHTML(error = "") {
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Sign in · Swing Trader</title>
@@ -799,14 +812,22 @@ function loginPageHTML(error = "") {
   input:focus{border-color:#00c805;box-shadow:0 0 0 3px #00c80522}
   button{width:100%;margin-top:16px;padding:13px;border:none;border-radius:10px;background:#00c805;color:#1c1d22;font-size:15px;font-weight:700;cursor:pointer}
   button:hover{background:#00b104}
+  .spectator{background:#eef1f4;color:#3a3b42;border:1px solid #d7d9e0}
+  .spectator:hover{background:#e3e6ea}
+  .divider{display:flex;align-items:center;gap:10px;color:#a0a6b2;font-size:11px;margin:18px 0 0}
+  .divider:before,.divider:after{content:"";height:1px;background:#e7e8ec;flex:1}
+  .note{font-size:11px;color:#8a909b;margin-top:8px;line-height:1.4}
   .err{color:#e8473f;font-size:12px;margin-top:12px;text-align:center}
 </style></head><body>
   <form class="box" method="POST" action="/login">
     <h1>🔒 Swing Trader</h1>
-    <p>Enter your password to access the portfolio.</p>
+    <p>Enter your password to manage the portfolio, or watch read-only as a spectator.</p>
     <label for="pw">Password</label>
     <input id="pw" name="password" type="password" autocomplete="current-password" autofocus inputmode="numeric">
     <button type="submit">Sign in</button>
+    <div class="divider">or</div>
+    <button class="spectator" type="submit" name="mode" value="spectator">Watch as spectator</button>
+    <div class="note">Spectator mode can view dashboards only. Settings, broker tokens, order controls, notifications, and AI prompts are blocked server-side.</div>
     ${error ? `<div class="err">${error}</div>` : ""}
   </form>
 </body></html>`;
@@ -1960,6 +1981,16 @@ function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 12) {
   return candidates.slice(0, maxCandidates);
 }
 
+function chooseAffordableCandidate(candidates, selected, maxContractCost, state) {
+  if (!(maxContractCost > 0)) return selected || null;
+  const affordable = (candidates || [])
+    .filter(c => c && c.mid > 0 && c.mid * 100 <= maxContractCost)
+    .filter(c => !state || countPositionsAtExpiry(state, c.expiryDate) < MAX_PER_EXPIRY)
+    .sort((a, b) => b.quality - a.quality);
+  if (selected && selected.mid > 0 && selected.mid * 100 <= maxContractCost) return selected;
+  return affordable[0] || null;
+}
+
 async function fetchHistoricalCandles(sym, fromUnix, toUnix) {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?period1=${fromUnix}&period2=${toUnix}&interval=1d`;
   const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
@@ -2650,7 +2681,6 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   const state = acct.state;
   const cfg = acct.config;
   if (state.positions.some(p => p.ticker === ticker)) return null;
-  if (state.cash < 100) return null;
   // Broker accounts: also skip names with a working (unfilled) order this cycle so we don't
   // stack duplicate orders while an earlier one is still resting.
   if (cfg.broker === "tradier" && acct._inflightTickers?.has(ticker.toUpperCase())) {
@@ -2741,18 +2771,29 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   // ─── Step 1: Check validation cache (skips both chain fetch AND Claude call) ───
   let claudeResult = { approve: true, confidence: 70, concerns: [], reasoning: "", suggestion: "", contractIdx: 0 };
   let selectedCandidate = null;
+  let candidates = [];
 
   const cached = getCachedValidation(acct.id, ticker, analysis.score, direction);
   if (cached) {
     claudeResult = cached.result;
     selectedCandidate = cached.selectedCandidate; // may be null if previously used synthetic
-    log(acct, `CLAUDE VALIDATE ${ticker}: CACHED ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%) — skipping chain fetch + Claude call`);
+    log(acct, `CLAUDE VALIDATE ${ticker}: CACHED ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%) — skipping Claude call`);
     if (!claudeResult.approve) {
       return { skipped: true, reason: `Claude rejected (cached): ${claudeResult.suggestion}` };
     }
+    try {
+      let chain = getCachedChain(ticker);
+      if (!chain) {
+        chain = await fetchFullOptionsChain(ticker, apiKey);
+        await delay(API_DELAY);
+        if (chain) setCachedChain(ticker, chain);
+      }
+      if (chain) candidates = buildCandidateContracts(chain, type, spot, 60);
+    } catch (e) {
+      log(acct, `OPTIONS ${ticker}: cached affordability refresh failed — ${e.message}`);
+    }
   } else {
     // ─── Step 2: Fetch full options chain (with short-lived cache) ───
-    let candidates = [];
     try {
       let chain = getCachedChain(ticker);
       if (!chain) {
@@ -2761,7 +2802,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
         if (chain) setCachedChain(ticker, chain);
       }
       if (chain) {
-        candidates = buildCandidateContracts(chain, type, spot);
+        candidates = buildCandidateContracts(chain, type, spot, 60);
         log(acct, `OPTIONS ${ticker}: ${candidates.length} viable ${type} contracts (${chain.length} expiries)`);
       }
     } catch (e) {
@@ -2808,7 +2849,31 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     }
   }
 
-  // ─── Step 4: Use selected contract (from cache or fresh) ───
+  // ─── Step 4: Pick an affordable real contract before sizing ───
+  const pv = portfolioValue(state, acct.dashboard?.quotes || {});
+  const trust = computeTradeTrust({
+    claudeConfidence: claudeResult.confidence,
+    setupQuality: effectiveQuality,
+    technicalScore: analysis.score,
+    isBullish,
+    cfg,
+    regime,
+  });
+  let deployable, reservePct;
+  if (cfg.useCashReserve === false) {
+    deployable = state.cash;
+    reservePct = 0;
+  } else {
+    ({ deployable, reservePct } = deployableCash(state, pv, trust));
+  }
+  const maxSize = cfg.maxTradeSize || 500;
+  const maxContractCost = Math.min(maxRisk, deployable, maxSize);
+  const originalCandidate = selectedCandidate;
+  selectedCandidate = chooseAffordableCandidate(candidates, selectedCandidate, maxContractCost, state);
+  if (selectedCandidate && originalCandidate && selectedCandidate !== originalCandidate) {
+    log(acct, `AFFORDABLE CONTRACT ${ticker}: Claude pick cost $${(originalCandidate.mid * 100).toFixed(0)} > budget $${maxContractCost.toFixed(0)} — switching to ${selectedCandidate.strike} ${type.toUpperCase()} ${selectedCandidate.expiryStr} @ $${selectedCandidate.mid}`);
+  }
+
   let strike, dte, expiryDate, premium, posIv, optionsSource;
   // selectedCandidate already set above (either from cache or fresh Claude response)
 
@@ -2835,27 +2900,8 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   }
 
   const costPer = premium * 100;
-  if (costPer > state.cash) return null;
+  if (costPer > state.cash) return { skipped: true, reason: `No affordable contract: cheapest selected contract costs $${costPer.toFixed(0)} but spend limit is $${state.cash.toFixed(0)}` };
 
-  // ─── Trust-scaled cash reserve ───
-  // Only high-conviction setups may draw the buffer toward 25%; low-trust setups respect 50%.
-  const pv = portfolioValue(state, acct.dashboard?.quotes || {});
-  const trust = computeTradeTrust({
-    claudeConfidence: claudeResult.confidence,
-    setupQuality: effectiveQuality,
-    technicalScore: analysis.score,
-    isBullish,
-    cfg,
-    regime,
-  });
-  // Cash reserve is toggleable per account. When disabled, deploy full cash (other limits still apply).
-  let deployable, reservePct;
-  if (cfg.useCashReserve === false) {
-    deployable = state.cash;
-    reservePct = 0;
-  } else {
-    ({ deployable, reservePct } = deployableCash(state, pv, trust));
-  }
   if (deployable < costPer) {
     return { skipped: true, reason: `Cash reserve: ${(reservePct * 100).toFixed(0)}% buffer required (trust ${(trust * 100).toFixed(0)}%) — only $${deployable.toFixed(0)} of $${state.cash.toFixed(0)} cash deployable, need $${costPer.toFixed(0)}/contract` };
   }
@@ -2867,7 +2913,6 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   if (qty < 1) return { skipped: true, reason: `Insufficient deployable cash for 1 contract${cfg.useCashReserve === false ? "" : ` (buffer ${(reservePct * 100).toFixed(0)}%)`}` };
 
   // Circuit Breaker: Max Trade Size
-  const maxSize = cfg.maxTradeSize || 500;
   if (totalCost > maxSize) {
     if (cfg.broker === "tradier") {
       acct.paused = true; // Hard stop for real money
@@ -3409,7 +3454,7 @@ function tryEMATrailingExits(acct, quotes) {
 
 const DASH_PORT = parseInt(process.env.PORT) || 3000;
 
-function dashboardHTML(acct) {
+function dashboardHTML(acct, { spectator = false } = {}) {
   const state = acct.state;
   const dashboard = acct.dashboard;
   const cfg = acct.config;
@@ -3425,6 +3470,9 @@ function dashboardHTML(acct) {
   const pnlPct = ((pv - STARTING_CASH) / STARTING_CASH * 100).toFixed(1);
   const progress = ((pv / GOAL) * 100).toFixed(1);
   const dtCount = countRecentDayTrades(state);
+  const llmBadge = spectator
+    ? `<span class="llm-toggle" title="Read-only in spectator mode">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>`
+    : `<span class="llm-toggle" onclick="fetch('/api/llm-provider',{method:'POST'}).then(()=>location.reload())" title="Click to switch LLM provider">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>`;
 
   // Build position details on-the-fly if no cycle has run yet
   let posSource = dashboard.positionDetails;
@@ -3654,21 +3702,22 @@ function dashboardHTML(acct) {
     input,select,textarea{font-size:16px}
   }
 </style></head><body>
-${tabBarHTML(acct.id)}
-${accountActionsHTML(acct.id)}
+${tabBarHTML(acct.id, { spectator })}
+${accountActionsHTML(acct.id, { spectator })}
 <h1>${acct.name || "Swing Trader"}</h1>
+${spectator ? '<div style="margin:8px 0 12px;padding:8px 12px;border:1px solid #2f6fed40;background:#2f6fed12;color:#2f6fed;border-radius:8px;font-size:12px;font-weight:700">Spectator mode: read-only dashboard. Settings, broker controls, notifications, and AI prompts are disabled.</div>' : ''}
 <div class="sub">$${STARTING_CASH} → $${GOAL.toLocaleString()} Challenge &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}" id="mkt-badge">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; <span id="live-indicator" style="color:#00a843">LIVE</span> updates every 5s &nbsp;|&nbsp; <span id="pv-header">$${pv.toFixed(0)}</span> <span id="pnl-header" style="color:${pnlPct >= 0 ? '#00a843' : '#e8473f'}">(${pnlPct >= 0 ? '+' : ''}${pnlPct}%)</span> &nbsp;|&nbsp; <span style="color:${currentRegime.mode === 'risk-on' ? '#00a843' : currentRegime.mode === 'cautious' ? '#b07400' : '#e8473f'};font-size:10px">${currentRegime.mode.toUpperCase()}</span> &nbsp;|&nbsp; <span class="llm-toggle" onclick="fetch('/api/llm-provider',{method:'POST'}).then(()=>location.reload())" title="Click to switch LLM provider">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>${acct.paused ? ' &nbsp;|&nbsp; <span style="color:#e8473f;font-weight:bold">⏸ PAUSED</span>' : ''}</div>
 
 <div class="grid">
   <div class="card">
     <h2>Portfolio</h2>
-    <div class="stat ${pnlPct >= 0 ? "" : "neg"}"><div class="val">$${pv.toFixed(0)}</div><div class="lbl">Total Value</div></div>
-    <div class="stat ${pnlPct >= 0 ? "" : "neg"}"><div class="val">${pnlPct >= 0 ? "+" : ""}${pnlPct}%</div><div class="lbl">P&L</div></div>
-    <div class="stat"><div class="val">$${state.cash.toFixed(0)}</div><div class="lbl">${cfg.broker === "tradier" ? "Settled Cash" : "Cash"}</div></div>
+    <div class="stat ${pnlPct >= 0 ? "" : "neg"}" id="pv-card-wrap"><div class="val" id="pv-card">$${pv.toFixed(0)}</div><div class="lbl">Total Value</div></div>
+    <div class="stat ${pnlPct >= 0 ? "" : "neg"}" id="pnl-card-wrap"><div class="val" id="pnl-card">${pnlPct >= 0 ? "+" : ""}${pnlPct}%</div><div class="lbl">P&L</div></div>
+    <div class="stat"><div class="val" id="cash-card">$${state.cash.toFixed(0)}</div><div class="lbl">${cfg.broker === "tradier" ? ((state.accountType || "") === "cash" ? "Settled Cash" : "Spend Limit") : "Cash"}</div></div>
     <div class="stat warn"><div class="val">${dtCount}/3</div><div class="lbl">PDT Used</div></div>
     ${cfg.broker === "tradier" ? `
     <div class="stat"><div class="val" style="font-size:14px;color:${(state.accountType || "") === "cash" ? "#00a843" : "#b07400"}">${(state.accountType || "?").toUpperCase()}</div><div class="lbl">Account Type</div></div>
-    ${state.unsettledCash > 0 ? `<div class="stat"><div class="val" style="font-size:14px;color:#b07400">$${state.unsettledCash.toFixed(0)}</div><div class="lbl">Unsettled (T+1)</div></div>` : ""}
+    ${state.unsettledCash > 0 ? `<div class="stat"><div class="val" id="unsettled-card" style="font-size:14px;color:#b07400">${state.unsettledCash.toFixed(0)}</div><div class="lbl">Unsettled (T+1)</div></div>` : ""}
     ${state.reservedBuyingPower > 0 ? `<div class="stat"><div class="val" style="font-size:14px;color:#d2691e">$${state.reservedBuyingPower.toFixed(0)}</div><div class="lbl">Reserved (working orders)</div></div>` : ""}
     ${(state.accountType && state.accountType !== "cash") ? `<div style="font-size:11px;color:#b07400;margin-top:6px">⚠️ This is a ${state.accountType.toUpperCase()} account — PDT &amp; margin/leverage apply. You wanted a cash account.</div>` : ""}` : ""}
     <div class="progress"><div class="progress-bar" style="width:${Math.min(100, progress)}%"></div></div>
@@ -3698,11 +3747,11 @@ ${accountActionsHTML(acct.id)}
           </div>`;
         }).join('') + '</div>';
     })()}
-    <form class="hint-form" method="POST" action="/hint?a=${acct.id}">
+    ${spectator ? `<div style="color:#8a909b;font-size:11px;margin-top:8px">Spectator mode: AI prompts are disabled.</div>` : `<form class="hint-form" method="POST" action="/hint?a=${acct.id}">
       <input name="hint" placeholder='Ask anything: "should I buy NVDA?" or "watch PLTR bullish"' autocomplete="off">
       <button type="submit">Ask AI</button>
     </form>
-    <div style="color:#aab0bb;font-size:10px;margin-top:4px">Ask questions or give directives · Watches expire in 4h</div>
+    <div style="color:#aab0bb;font-size:10px;margin-top:4px">Ask questions or give directives · Watches expire in 4h</div>`}
   </div>
 </div>
 
@@ -4049,6 +4098,11 @@ async function pollLive() {
       const pnl = ((d.pv - ${STARTING_CASH}) / ${STARTING_CASH} * 100).toFixed(1);
       pnlEl.textContent = '(' + (pnl >= 0 ? '+' : '') + pnl + '%)';
       pnlEl.style.color = pnl >= 0 ? '#00a843' : '#e8473f';
+      const pvCard = document.getElementById('pv-card');
+      const pnlCard = document.getElementById('pnl-card');
+      const pvWrap = document.getElementById('pv-card-wrap');
+      const pnlWrap = document.getElementById('pnl-card-wrap');
+      if (pvCard) pvCard.textContent = '
     }
     // Pulse indicator
     const ind = document.getElementById('live-indicator');
@@ -4163,6 +4217,7 @@ async function togglePush() {
 // Determine initial state on page load. The button is per-device — only flips to "On"
 // when THIS device has a live subscription that the server also recognizes.
 (async function initPushButton() {
+  if (${spectator ? "true" : "false"}) return;
   if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
     setPushBtnState('unsupported');
     return;
@@ -4191,7 +4246,7 @@ async function togglePush() {
 </body></html>`;
 }
 
-function tickerDetailHTML(sym, acct) {
+function tickerDetailHTML(sym, acct, { spectator = false } = {}) {
   const state = acct.state;
   const dashboard = acct.dashboard;
   const candles = dashboard.candles[sym];
@@ -4456,12 +4511,12 @@ ${pos ? '<div class="card" style="margin-top:16px"><h2>Position Details</h2>' + 
     ${onDemandAnalysis.question ? `<div style="color:#6b7280;font-size:10px;margin-bottom:6px">Q: ${onDemandAnalysis.question} &nbsp;<span style="color:#aab0bb">${Math.round((Date.now() - onDemandAnalysis.ts) / 60000)}m ago</span></div>` : `<div style="color:#6b7280;font-size:10px;margin-bottom:6px">General analysis &nbsp;<span style="color:#aab0bb">${Math.round((Date.now() - onDemandAnalysis.ts) / 60000)}m ago</span></div>`}
     <div style="color:#3a3b42;font-size:12px;line-height:1.7;white-space:pre-wrap">${onDemandAnalysis.response}</div>
   </div>` : ''}
-  <form method="POST" action="/api/ticker/${sym}/analyze?a=${acct.id}" style="display:flex;gap:8px;margin-top:4px">
+  ${spectator ? `<div style="color:#8a909b;font-size:11px;margin-top:6px">Spectator mode: on-demand AI prompts are disabled.</div>` : `<form method="POST" action="/api/ticker/${sym}/analyze?a=${acct.id}" style="display:flex;gap:8px;margin-top:4px">
     <input name="question" placeholder='e.g. "Should I enter now?" or "What are the key risks?"'
       style="flex:1;background:#f6f7f9;border:1px solid #6a4df440;color:#23242a;padding:8px 12px;border-radius:4px;font-family:inherit;font-size:12px">
     <button type="submit" style="background:#6a4df4;color:#000;border:none;padding:8px 16px;border-radius:4px;cursor:pointer;font-weight:700;font-size:12px;white-space:nowrap">Ask Claude</button>
   </form>
-  <div style="color:#aab0bb;font-size:10px;margin-top:6px">Leave blank for a full setup analysis · Uses Claude Haiku</div>
+  <div style="color:#aab0bb;font-size:10px;margin-top:6px">Leave blank for a full setup analysis · Uses Claude Haiku</div>`}
 </div>
 
 </body></html>`;
@@ -4469,7 +4524,7 @@ ${pos ? '<div class="card" style="margin-top:16px"><h2>Position Details</h2>' + 
 
 // ─── Robinhood Page (PIN-protected) ───
 
-function robinhoodPageHTML() {
+function robinhoodPageHTML({ spectator = false } = {}) {
   const connected = robinhood.isConnected;
   const pending = robinhood.pendingOrders;
 
@@ -4556,13 +4611,13 @@ function robinhoodPageHTML() {
       <div class="rh-stat"><span class="label">Status</span><span class="value" style="color:${connected ? '#00a843' : '#e8473f'}">${connected ? 'Connected' : 'Disconnected'}</span></div>
       <div class="rh-stat"><span class="label">MCP Endpoint</span><span class="value" style="font-size:10px;color:#6b7280">agent.robinhood.com</span></div>
       <div class="rh-stat"><span class="label">Trading Mode</span><span class="value" style="color:${TRADING_MODE === 'robinhood' ? '#00a843' : '#6b7280'}">${TRADING_MODE.toUpperCase()}</span></div>
-      <div style="margin-top:12px">
+      ${spectator ? `<div style="margin-top:12px;color:#8a909b;font-size:12px">Spectator mode: token entry and connection controls are hidden.</div>` : `<div style="margin-top:12px">
         <input type="password" class="rh-input" id="rh-token" placeholder="Paste access token..." style="margin-bottom:8px">
         <div style="display:flex;gap:8px">
           <button class="rh-btn primary" onclick="connectRH()">Connect</button>
           <button class="rh-btn danger" onclick="disconnectRH()">Disconnect</button>
         </div>
-      </div>
+      </div>`}
     </div>
 
     <!-- Account Overview -->
@@ -4597,10 +4652,10 @@ function robinhoodPageHTML() {
               <div class="sym">${o.side?.toUpperCase()} ${o.quantity} ${o.symbol}</div>
               <div class="detail">${o.conversionNote || ''} · ${new Date(o.createdAt).toLocaleTimeString()}</div>
             </div>
-            <div style="display:flex;gap:6px">
+            ${spectator ? '' : `<div style="display:flex;gap:6px">
               <button class="rh-btn primary small" onclick="approveOrder('${o.id}')">✓</button>
               <button class="rh-btn danger small" onclick="rejectOrder('${o.id}')">✕</button>
-            </div>
+            </div>`}
           </div>
         `).join('')}
       </div>
@@ -4609,6 +4664,7 @@ function robinhoodPageHTML() {
     <!-- Trading Controls -->
     <div class="rh-card">
       <h2>⚙️ Controls</h2>
+      ${spectator ? `<div class="rh-empty">Spectator mode: trading controls are read-only and disabled.</div>` : `
       <div class="rh-toggle">
         <label>Trading Mode</label>
         <div class="switch ${TRADING_MODE === 'robinhood' ? 'on' : ''}" onclick="toggleMode()" title="${TRADING_MODE === 'robinhood' ? 'Click to switch to PAPER' : 'Click to switch to ROBINHOOD'}"></div>
@@ -4623,6 +4679,7 @@ function robinhoodPageHTML() {
       <div style="margin-top:12px">
         <button class="rh-btn danger" onclick="killSwitch()" style="width:100%">🛑 Cancel All Pending</button>
       </div>
+      `}
     </div>
 
     <!-- Recent Orders -->
@@ -4789,7 +4846,7 @@ setInterval(() => { loadAccount(); loadPositions(); loadOrders(); }, 30000);
 
 // ─── Tab Bar HTML ───
 
-function tabBarHTML(activeId) {
+function tabBarHTML(activeId, { spectator = false } = {}) {
   let totalPV = 0;
   const tabs = [];
   for (const [id, acct] of accounts) {
@@ -4809,22 +4866,26 @@ function tabBarHTML(activeId) {
       <span class="tab-pnl" style="color:${color}">${pnl >= 0 ? "+" : ""}${pnl}%</span>
     </a>`);
   }
+  const llmBadge = spectator
+    ? `<span class="llm-toggle" title="Read-only in spectator mode">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>`
+    : `<span class="llm-toggle" onclick="fetch('/api/llm-provider',{method:'POST'}).then(()=>location.reload())" title="Click to switch LLM provider">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>`;
   return `<div class="tab-bar">
   <div class="tab-row">${tabs.join("")}
-    <a href="#" class="acct-tab new-tab" onclick="document.getElementById('acct-modal').style.display='flex';return false">+ New Account</a>
-    <a href="/?sim=new" class="acct-tab new-tab" style="border-color:#6a4df440;color:#6a4df4">&#x1F9EA; Simulator</a>
+    ${spectator ? "" : `<a href="#" class="acct-tab new-tab" onclick="document.getElementById('acct-modal').style.display='flex';return false">+ New Account</a>
+    <a href="/?sim=new" class="acct-tab new-tab" style="border-color:#6a4df440;color:#6a4df4">&#x1F9EA; Simulator</a>`}
     <a href="/robinhood" class="acct-tab new-tab" style="border-color:#00a84330;color:#00a843">🔒 Robinhood</a>
     <a href="/tradier" class="acct-tab new-tab" style="border-color:#2f6fed40;color:#2f6fed">📈 Tradier</a>
   </div>
   <div class="global-stats">
     <span>Total PV: <b>$${totalPV.toFixed(0)}</b></span>
-    <span class="llm-toggle" onclick="fetch('/api/llm-provider',{method:'POST'}).then(()=>location.reload())" title="Click to switch LLM provider">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>
+    ${llmBadge}
     <span>${accounts.size} account${accounts.size !== 1 ? "s" : ""}</span>
+    ${spectator ? '<span style="color:#2f6fed;font-weight:700">Spectator</span>' : ''}
   </div>
 </div>
 
 <!-- Account Management Modal -->
-<div id="acct-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:999;align-items:center;justify-content:center">
+${spectator ? "" : `<div id="acct-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:999;align-items:center;justify-content:center">
   <div style="background:#ffffff;border:1px solid #d4d8e0;border-radius:12px;padding:24px;max-width:420px;width:90%">
     <h2 style="margin:0 0 16px;color:#1c1d22">New Account</h2>
     <form method="POST" action="/api/accounts">
@@ -4851,20 +4912,31 @@ function tabBarHTML(activeId) {
       </select>
       <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="useCashReserve" checked> Use cash reserve (50%→25% buffer)</label>
       <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="autoExecute"> Auto-execute broker orders (full autonomy)</label>
-      <label style="display:flex;align-items:center;gap:8px;margin-bottom:16px;font-size:13px;color:#3a3b42"><input type="checkbox" name="tradeWhenClosed"> Trade when market closed (testing/sandbox)</label>
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="tradeWhenClosed"> Trade when market closed (testing/sandbox)</label>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px">
+        <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">0-cash spend limit ($)</label><input name="marginZeroCashSpendLimit" type="number" value="200" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+        <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Max margin debt ($)</label><input name="marginMaxDebt" type="number" value="250" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+      </div>
       <div style="display:flex;gap:8px">
         <button type="submit" style="flex:1;padding:10px;background:#00a843;color:#000;border:none;border-radius:6px;font-weight:bold;cursor:pointer">Create Account</button>
         <button type="button" onclick="document.getElementById('acct-modal').style.display='none'" style="flex:1;padding:10px;background:#d4d8e0;color:#1c1d22;border:none;border-radius:6px;cursor:pointer">Cancel</button>
       </div>
     </form>
   </div>
-</div>`;
+</div>`}
+`;
 }
 
-function accountActionsHTML(acctId) {
+function accountActionsHTML(acctId, { spectator = false } = {}) {
   const acct = accounts.get(acctId);
   if (!acct) return "";
   const cfg = acct.config;
+  if (spectator) {
+    return `<div class="acct-actions">
+      <a href="/logout" class="acct-btn" style="text-decoration:none">Exit spectator mode</a>
+      <span style="font-size:11px;color:#8a909b;align-self:center">Read-only: settings, pause/delete, notifications, broker tokens, and AI prompts are unavailable.</span>
+    </div>`;
+  }
   return `<div class="acct-actions">
     <button type="button" class="acct-btn edit" onclick="document.getElementById('edit-modal').style.display='flex'">⚙ Settings</button>
     <form method="POST" action="/api/accounts/${acctId}/pause" style="display:inline">
@@ -4901,7 +4973,10 @@ function accountActionsHTML(acctId) {
           <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="useCashReserve" ${cfg.useCashReserve ? "checked" : ""}> Use cash reserve (50%→25% buffer)</label>
           <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="autoExecute" ${cfg.autoExecute ? "checked" : ""}> Auto-execute broker orders (full autonomy)</label>
           <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#3a3b42"><input type="checkbox" name="tradeWhenClosed" ${cfg.tradeWhenClosed ? "checked" : ""}> Trade when market closed (testing/sandbox)</label>
-          ${cfg.broker === "tradier" ? `<p style="font-size:11px;color:#b07400;margin:10px 0 0">⚠ LIVE account — orders execute with real money. Use <strong>Pause</strong> as the kill switch (blocks new entries; exits still run to protect open positions).</p>` : ""}
+          ${cfg.broker === "tradier" ? `<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px">
+            <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">0-cash spend limit ($)</label><input name="marginZeroCashSpendLimit" type="number" step="1" value="${cfg.marginZeroCashSpendLimit ?? DEFAULT_CONFIG.marginZeroCashSpendLimit}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+            <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Max margin debt ($)</label><input name="marginMaxDebt" type="number" step="1" value="${cfg.marginMaxDebt ?? DEFAULT_CONFIG.marginMaxDebt}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          </div><p style="font-size:11px;color:#b07400;margin:10px 0 0">⚠ LIVE account — orders execute with real money. Margin spend is capped by these limits. Use <strong>Pause</strong> as the kill switch (blocks new entries; exits still run to protect open positions).</p>` : ""}
         </div>
         <div style="display:flex;gap:8px">
           <button type="submit" style="flex:1;padding:10px;background:#6a4df4;color:#000;border:none;border-radius:6px;font-weight:bold;cursor:pointer">Save Settings</button>
@@ -4914,7 +4989,7 @@ function accountActionsHTML(acctId) {
 
 // ─── Tradier Page ───
 
-function tradierPageHTML() {
+function tradierPageHTML({ spectator = false } = {}) {
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
@@ -4955,7 +5030,7 @@ function tradierPageHTML() {
 
   <div class="card">
     <h3 style="margin:0 0 10px;font-size:15px">Connection</h3>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    ${spectator ? `<div class="muted" style="font-size:12px">Spectator mode: environment, token, reconnect, and cancel-order controls are hidden.</div>` : `<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
       <select id="env" style="background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;padding:9px">
         <option value="sandbox">sandbox</option>
         <option value="production">production</option>
@@ -4965,7 +5040,7 @@ function tradierPageHTML() {
       <button onclick="reconnect()" style="background:#5457e6">Reconnect</button>
       <button onclick="cancelAllOrders()" style="background:#e8473f">Cancel All Orders</button>
     </div>
-    <div class="muted" style="font-size:11px;margin-top:8px">Leave the token blank to reconnect using the <code>TRADIER_ACCESS_TOKEN</code> env var. A token entered here is stored on the server (tradier_tokens.json).</div>
+    <div class="muted" style="font-size:11px;margin-top:8px">Leave the token blank to reconnect using the <code>TRADIER_ACCESS_TOKEN</code> env var. A token entered here is stored on the server (tradier_tokens.json).</div>`}
   </div>
 
   <div class="card">
@@ -5003,10 +5078,11 @@ async function refresh(){
       stat('Account', d.accountId || 'data-only') +
       stat('Account Type', acctTypeHtml) +
       stat('Market', d.marketState || '—') +
-      stat(bi.accountType === 'cash' ? 'Settled Cash' : 'Cash / BP', fmt(bi.settledCash)) +
+      stat('Usable BP', fmt(bi.buyingPower)) +
       stat('Options BP', fmt(bi.optionBuyingPower)) +
       (bi.rawOptionBuyingPower === 0 && bi.optionBuyingPower > 0 ? stat('Raw Options BP', '<span class="muted">$0.00 normalized</span>') : '') +
       stat('Unsettled (T+1)', fmt(bi.unsettledCash)) +
+      (bi.accountType && bi.accountType !== 'cash' ? stat('Broker Cash', fmt(bi.marginCashAvailable ?? bi.totalCash)) + stat('Margin Cap', fmt(bi.marginSpendLimit)) : '') +
       stat('Equity', fmt(bi.totalEquity)) +
       stat('Data Source', dsHtml);
     const eb = document.getElementById('errbox');
@@ -5412,7 +5488,16 @@ function startDashboard(defaultAcct, apiKey) {
         let body = "";
         req.on("data", c => body += c);
         req.on("end", () => {
-          const pw = new URLSearchParams(body).get("password") || "";
+          const params = new URLSearchParams(body);
+          if (params.get("mode") === "spectator") {
+            res.writeHead(302, {
+              "Set-Cookie": `${AUTH_COOKIE}=${spectatorToken()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`,
+              Location: "/",
+            });
+            res.end();
+            return;
+          }
+          const pw = params.get("password") || "";
           if (pw === DASHBOARD_PASSWORD) {
             res.writeHead(302, {
               "Set-Cookie": `${AUTH_COOKIE}=${authToken()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`,
@@ -5446,6 +5531,13 @@ function startDashboard(defaultAcct, apiKey) {
       }
       return;
     }
+    const role = authRole(req);
+    const spectator = role === "spectator";
+    if (spectator && req.method !== "GET" && req.method !== "HEAD") {
+      res.writeHead(403, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ error: "spectator_mode_read_only" }));
+      return;
+    }
 
     // Resolve active account from ?a= param
     const acctId = url.searchParams.get("a") || accounts.keys().next().value;
@@ -5476,6 +5568,8 @@ function startDashboard(defaultAcct, apiKey) {
           useCashReserve: params.get("useCashReserve") === "on" || params.get("useCashReserve") === "true",
           autoExecute: params.get("autoExecute") === "on" || params.get("autoExecute") === "true",
           tradeWhenClosed: params.get("tradeWhenClosed") === "on" || params.get("tradeWhenClosed") === "true",
+          marginZeroCashSpendLimit: Math.max(0, parseFloat(params.get("marginZeroCashSpendLimit")) || DEFAULT_CONFIG.marginZeroCashSpendLimit),
+          marginMaxDebt: Math.max(0, parseFloat(params.get("marginMaxDebt")) || DEFAULT_CONFIG.marginMaxDebt),
         };
         const newAcct = createAccountRuntime(id, name, config);
         newAcct.state.apiKey = apiKey;
@@ -5525,6 +5619,8 @@ function startDashboard(defaultAcct, apiKey) {
         else cfg.maxPositions = null;
         if (params.get("maxTradeSize")) cfg.maxTradeSize = parseFloat(params.get("maxTradeSize")) || null;
         else cfg.maxTradeSize = null;
+        if (params.has("marginZeroCashSpendLimit")) cfg.marginZeroCashSpendLimit = Math.max(0, parseFloat(params.get("marginZeroCashSpendLimit")) || 0);
+        if (params.has("marginMaxDebt")) cfg.marginMaxDebt = Math.max(0, parseFloat(params.get("marginMaxDebt")) || 0);
         if (params.has("minSetupQuality")) cfg.minSetupQuality = parseInt(params.get("minSetupQuality")) ?? 50;
         cfg.customPromptSuffix = params.get("customPromptSuffix") || "";
         // Broker binding + live-trading toggles. Checkboxes only POST when checked.
@@ -5626,7 +5722,7 @@ function startDashboard(defaultAcct, apiKey) {
         accountId: tradier.accountId,
         marketState: clock?.state || null,
         balances,
-        balanceInfo: brokerBalanceInfo(balances),
+        balanceInfo: brokerBalanceInfo(balances, (accounts.get("tradier") || activeAcct)?.config || DEFAULT_CONFIG),
         dataSource: { ...marketDataStats },
         lastError: tradier.lastError,
         pendingOrders: tradier.pendingOrders,
@@ -5839,11 +5935,12 @@ function startDashboard(defaultAcct, apiKey) {
         }
       } catch (e) { log(activeAcct, `WARN: On-demand fetch for ${sym} failed — ${e.message}`); }
       res.writeHead(200, { "Content-Type": "text/html" });
-      res.end(tickerDetailHTML(sym, activeAcct));
+      res.end(tickerDetailHTML(sym, activeAcct, { spectator }));
       return;
     }
 
     if (pathname === "/api/state") {
+      await refreshBrokerBalances(activeAcct, { logErrors: true });
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       res.end(JSON.stringify({ cash: state.cash, positions: state.positions, history: state.history.slice(-50), dayTrades: state.dayTrades, quotes: dashboard.quotes, analyses: Object.fromEntries(Object.entries(dashboard.analyses).map(([k, v]) => [k, { score: v.score, signal: v.signal, price: v.price, rsi: v.rsi }])), activeHints: activeAcct.activeHints, portfolioValue: portfolioValue(state, dashboard.quotes), marketOpen: dashboard.marketOpen, log: dashboard.cycleLog.slice(-50) }));
       return;
@@ -5863,6 +5960,10 @@ function startDashboard(defaultAcct, apiKey) {
     }
 
     if (pathname === "/api/live") {
+      const balanceInfo = await refreshBrokerBalances(activeAcct, { logErrors: true });
+      if (activeAcct.config.broker === "tradier") {
+        appendPortfolioPoint(dashboard.portfolioHistory, Date.now(), portfolioValue(state, dashboard.quotes));
+      }
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       const tickers = {};
       for (const [sym, q] of Object.entries(dashboard.quotes)) {
@@ -5872,7 +5973,7 @@ function startDashboard(defaultAcct, apiKey) {
         if (pos) { const spot = q ? q.c : pos.entrySpot; const _now = Date.now(); const dteLeft = pos.expiryDate ? Math.max(0, (pos.expiryDate - _now) / 86400_000) : Math.max(0, pos.dte - (_now - pos.openTime) / 86400_000); const curPremium = optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type); posPnl = { pct: ((curPremium - pos.entryPremium) / pos.entryPremium * 100).toFixed(1), dollar: ((curPremium - pos.entryPremium) * pos.qty * 100).toFixed(0) }; }
         tickers[sym] = { c: q.c, pc: q.pc, d: q.d, dp: q.dp, h: q.h, l: q.l, score: a?.score, signal: a?.signal, stScore: st?.score, mom1d: st?.mom1d, mom3d: st?.mom3d, mom7d: st?.mom7d, held: !!pos, type: pos?.type, posPnl };
       }
-      res.end(JSON.stringify({ tickers, pv: portfolioValue(state, dashboard.quotes), cash: state.cash, open: state.positions.length, marketOpen: dashboard.marketOpen, lastCycle: dashboard.lastCycle }));
+      res.end(JSON.stringify({ tickers, pv: portfolioValue(state, dashboard.quotes), cash: state.cash, balanceInfo, open: state.positions.length, marketOpen: dashboard.marketOpen, lastCycle: dashboard.lastCycle }));
       return;
     }
 
@@ -6142,14 +6243,14 @@ self.addEventListener('pushsubscriptionchange', e => {
     // ─── Robinhood Page (PIN-protected) ───
     if (pathname === "/robinhood") {
       res.writeHead(200, { "Content-Type": "text/html" });
-      res.end(robinhoodPageHTML());
+      res.end(robinhoodPageHTML({ spectator }));
       return;
     }
 
     // ─── Tradier Page ───
     if (pathname === "/tradier") {
       res.writeHead(200, { "Content-Type": "text/html" });
-      res.end(tradierPageHTML());
+      res.end(tradierPageHTML({ spectator }));
       return;
     }
 
@@ -6162,8 +6263,9 @@ self.addEventListener('pushsubscriptionchange', e => {
     }
 
     // Dashboard HTML
+    await refreshBrokerBalances(activeAcct, { logErrors: true });
     res.writeHead(200, { "Content-Type": "text/html" });
-    res.end(dashboardHTML(activeAcct));
+    res.end(dashboardHTML(activeAcct, { spectator }));
   });
 
   server.listen(DASH_PORT, () => { console.log(`  Dashboard running at http://localhost:${DASH_PORT}`); });
@@ -6229,7 +6331,7 @@ async function fetchSharedMarketData(apiKey, sharedCandleCache) {
 // account is: only ever deploy SETTLED cash (cash_available), never unsettled proceeds — that is
 // exactly what prevents Good-Faith Violations. We also surface account type + unsettled funds so
 // the dashboard can show them and warn if the account isn't actually a cash account.
-function brokerBalanceInfo(bal) {
+function brokerBalanceInfo(bal, cfg = {}) {
   if (!bal) return null;
   const num = v => {
     if (typeof v === "number" && Number.isFinite(v)) return v;
@@ -6239,27 +6341,35 @@ function brokerBalanceInfo(bal) {
     }
     return null;
   };
+  const firstNumber = (...vals) => vals.find(v => typeof v === "number") ?? null;
+  const firstPositive = (...vals) => vals.find(v => typeof v === "number" && v > 0) ?? firstNumber(...vals);
   const accountType = String(bal.account_type || (bal.cash ? "cash" : bal.margin ? "margin" : "")).toLowerCase() || "unknown";
   const unsettledCash = num(bal.cash?.unsettled_funds) ?? num(bal.unsettled_funds) ?? 0;
   const totalCash = num(bal.total_cash);
-  const cashAvailable = num(bal.cash?.cash_available) ?? num(bal.cash_available);
-  const marginCashAvailable = num(bal.margin?.cash_available);
+  const totalEquity = num(bal.total_equity);
   const rawOptionBuyingPower = num(bal.margin?.option_buying_power) ?? num(bal.option_buying_power);
   const stockBuyingPower = num(bal.margin?.stock_buying_power) ?? num(bal.stock_buying_power);
+  const marginCashAvailable = num(bal.margin?.cash_available) ?? num(bal.cash?.cash_available) ?? num(bal.cash_available);
 
   let settledCash;
-  let optionBuyingPower;
+  let marginSpendLimit = null;
   if (accountType === "cash") {
     // cash_available is settled buying power; total_cash includes unsettled, so prefer the former.
-    settledCash = cashAvailable ?? totalCash;
-    optionBuyingPower = settledCash;
+    settledCash = num(bal.cash?.cash_available) ?? num(bal.cash_available) ?? totalCash;
   } else {
-    // Tradier margin accounts can report option_buying_power as 0 even when cash is usable.
-    // Treat cash-like buying power as authoritative and expose the raw zero separately.
-    const cashLikeBuyingPower = marginCashAvailable ?? cashAvailable ?? totalCash ?? stockBuyingPower;
-    optionBuyingPower = rawOptionBuyingPower && rawOptionBuyingPower > 0 ? rawOptionBuyingPower : cashLikeBuyingPower;
-    settledCash = optionBuyingPower;
+    const zeroCashSpendLimit = Math.max(0, Number(cfg.marginZeroCashSpendLimit ?? DEFAULT_CONFIG.marginZeroCashSpendLimit ?? 200) || 0);
+    const maxDebt = Math.max(0, Number(cfg.marginMaxDebt ?? DEFAULT_CONFIG.marginMaxDebt ?? 250) || 0);
+    const cashBase = firstNumber(marginCashAvailable, totalCash, 0) ?? 0;
+    marginSpendLimit = Math.max(0, Math.min(cashBase + zeroCashSpendLimit, cashBase + maxDebt));
+    const brokerBuyingPower = firstPositive(rawOptionBuyingPower, marginCashAvailable, totalCash, stockBuyingPower);
+    // Tradier margin accounts can report option_buying_power as literal 0 even while cash is usable.
+    // Use positive cash/BP first, then fall back to the explicit capped margin spend limit.
+    settledCash = (typeof brokerBuyingPower === "number" && brokerBuyingPower > 0)
+      ? Math.min(brokerBuyingPower, marginSpendLimit || brokerBuyingPower)
+      : marginSpendLimit;
   }
+
+  const optionBuyingPower = settledCash;
 
   return {
     accountType,
@@ -6267,16 +6377,65 @@ function brokerBalanceInfo(bal) {
     settledCash,
     unsettledCash,
     totalCash,
-    totalEquity: num(bal.total_equity),
+    totalEquity,
     optionBuyingPower,
     rawOptionBuyingPower,
-    marginCashAvailable,
     stockBuyingPower,
+    marginCashAvailable,
+    marginSpendLimit,
+    marginZeroCashSpendLimit: cfg.marginZeroCashSpendLimit ?? DEFAULT_CONFIG.marginZeroCashSpendLimit,
+    marginMaxDebt: cfg.marginMaxDebt ?? DEFAULT_CONFIG.marginMaxDebt,
   };
 }
-function brokerCashFromBalances(bal) {
-  const info = brokerBalanceInfo(bal);
+function brokerCashFromBalances(bal, cfg = {}) {
+  const info = brokerBalanceInfo(bal, cfg);
   return info ? info.buyingPower : null;
+}
+
+function applyBrokerBalanceInfo(acct, info, { warn = false } = {}) {
+  if (!acct || !info) return;
+  const state = acct.state;
+  if (typeof info.buyingPower === "number") state.cash = info.buyingPower; // settled funds only
+  if (typeof info.totalEquity === "number") state.brokerEquity = info.totalEquity;
+  state.accountType = info.accountType;
+  state.settledCash = info.settledCash;
+  state.unsettledCash = info.unsettledCash;
+  state.totalCash = info.totalCash;
+  state.optionBuyingPower = info.optionBuyingPower;
+  state.rawOptionBuyingPower = info.rawOptionBuyingPower;
+  state.marginCashAvailable = info.marginCashAvailable;
+  state.marginSpendLimit = info.marginSpendLimit;
+  state.marginZeroCashSpendLimit = info.marginZeroCashSpendLimit;
+  state.marginMaxDebt = info.marginMaxDebt;
+  if (warn && info.accountType !== "cash" && state._lastAcctTypeWarned !== info.accountType) {
+    log(acct, "⚠️ TRADIER: account type is \"" + info.accountType.toUpperCase() + "\", not CASH — PDT rule and margin/leverage apply. You wanted a cash account.");
+    state._lastAcctTypeWarned = info.accountType;
+  }
+}
+
+async function refreshBrokerBalances(acct, { maxAgeMs = 4000, logErrors = false } = {}) {
+  if (!acct || acct.config.broker !== "tradier" || !tradier.isConnected || !tradier.accountId) return null;
+  const now = Date.now();
+  if (acct._brokerBalanceRefreshPromise) return acct._brokerBalanceRefreshPromise;
+  if (acct._brokerBalanceRefreshedAt && now - acct._brokerBalanceRefreshedAt < maxAgeMs) {
+    return acct._brokerBalanceInfo || null;
+  }
+  acct._brokerBalanceRefreshPromise = (async () => {
+    try {
+      const bal = await tradier.getAccount();
+      const info = brokerBalanceInfo(bal, acct.config);
+      applyBrokerBalanceInfo(acct, info);
+      acct._brokerBalanceInfo = info;
+      acct._brokerBalanceRefreshedAt = Date.now();
+      return info;
+    } catch (e) {
+      if (logErrors) log(acct, "TRADIER LIVE REFRESH: balance error — " + e.message);
+      return acct._brokerBalanceInfo || null;
+    } finally {
+      acct._brokerBalanceRefreshPromise = null;
+    }
+  })();
+  return acct._brokerBalanceRefreshPromise;
 }
 
 // Ensure a first-class live account bound to Tradier exists, seeded from the real balance.
@@ -6294,6 +6453,8 @@ async function ensureTradierAccount() {
     acct.config.broker = "tradier";
     if (acct.config.autoExecute === undefined) acct.config.autoExecute = true;
     if (acct.config.tradeWhenClosed === undefined) acct.config.tradeWhenClosed = tradier.environment === "sandbox";
+    if (acct.config.marginZeroCashSpendLimit === undefined) acct.config.marginZeroCashSpendLimit = DEFAULT_CONFIG.marginZeroCashSpendLimit;
+    if (acct.config.marginMaxDebt === undefined) acct.config.marginMaxDebt = DEFAULT_CONFIG.marginMaxDebt;
 
     // Detect environment change (sandbox ↔ production) OR a massive equity mismatch (stale sandbox state)
     const expectedName = `Tradier Live (${tradier.environment})`;
@@ -6337,6 +6498,8 @@ async function ensureTradierAccount() {
     // Sandbox accounts trade when closed by default so you can test execution outside market hours.
     tradeWhenClosed: tradier.environment === "sandbox",
     startingCash: typeof seedCash === "number" ? seedCash : DEFAULT_CONFIG.startingCash,
+    marginZeroCashSpendLimit: DEFAULT_CONFIG.marginZeroCashSpendLimit,
+    marginMaxDebt: DEFAULT_CONFIG.marginMaxDebt,
   };
   const state = {
     cash: typeof seedCash === "number" ? seedCash : DEFAULT_CONFIG.startingCash,
@@ -6541,23 +6704,10 @@ async function syncBrokerAccount(acct, quotes) {
 
   try {
     const bal = await tradier.getAccount();
-    const info = brokerBalanceInfo(bal);
-    if (info) {
-      if (typeof info.buyingPower === "number") state.cash = info.buyingPower; // settled funds only
-      if (typeof info.totalEquity === "number") state.brokerEquity = info.totalEquity;
-      state.accountType = info.accountType;
-      state.settledCash = info.settledCash;
-      state.unsettledCash = info.unsettledCash;
-      state.totalCash = info.totalCash;
-      state.optionBuyingPower = info.optionBuyingPower;
-      state.rawOptionBuyingPower = info.rawOptionBuyingPower;
-      state.marginCashAvailable = info.marginCashAvailable;
-      // Warn once per change if the live account isn't a cash account (margin → PDT + leverage risk).
-      if (info.accountType !== "cash" && state._lastAcctTypeWarned !== info.accountType) {
-        log(acct, `⚠️ TRADIER: account type is "${info.accountType.toUpperCase()}", not CASH — PDT rule and margin/leverage apply. You wanted a cash account.`);
-        state._lastAcctTypeWarned = info.accountType;
-      }
-    }
+    const info = brokerBalanceInfo(bal, acct.config);
+    applyBrokerBalanceInfo(acct, info, { warn: true });
+    acct._brokerBalanceInfo = info;
+    acct._brokerBalanceRefreshedAt = Date.now();
   } catch (e) { log(acct, `TRADIER SYNC: balance error — ${e.message}`); }
 
   try {
@@ -6700,8 +6850,7 @@ async function syncBrokerAccount(acct, quotes) {
     const filled = positions.filter(p => !p._pending).length;
     const pending = positions.length - filled;
     const unsettledStr = state.unsettledCash > 0 ? ` | unsettled $${state.unsettledCash.toFixed(0)}` : "";
-    const bpLabel = state.accountType === "cash" ? "settled BP" : "usable BP";
-    log(acct, `TRADIER SYNC [${(state.accountType || "?").toUpperCase()}]: equity $${(state.brokerEquity ?? portfolioValue(state, quotes)).toFixed(2)} | ${bpLabel} $${state.cash.toFixed(2)}${unsettledStr} | ${filled} filled, ${pending} pending order(s)${reserved > 0 ? ` reserving $${reserved.toFixed(0)}` : ""}`);
+    log(acct, `TRADIER SYNC [${(state.accountType || "?").toUpperCase()}]: equity $${(state.brokerEquity ?? portfolioValue(state, quotes)).toFixed(2)} | settled BP $${state.cash.toFixed(2)}${unsettledStr} | ${filled} filled, ${pending} pending order(s)${reserved > 0 ? ` reserving $${reserved.toFixed(0)}` : ""}`);
   } catch (e) { log(acct, `TRADIER SYNC: positions error — ${e.message}`); }
 }
 
@@ -6789,7 +6938,6 @@ async function runCycle(acct, sharedQuotes, apiKey) {
 
     const dec = { ticker, price: q?.c, rawScore, finalScore, signal: a.signal, hintBias };
     const alreadyHeld = state.positions.some(p => p.ticker === ticker);
-    const lowCash = state.cash < 100;
 
     dec.bullScore = a.bullScore; dec.bearScore = a.bearScore;
     dec.shortTermScore = st ? st.score : null;
@@ -6798,11 +6946,9 @@ async function runCycle(acct, sharedQuotes, apiKey) {
 
     if (finalScore >= cfg.bullEntry) {
       if (alreadyHeld) { dec.action = "HOLD"; dec.reason = "Already in position"; }
-      else if (lowCash) { dec.action = "BLOCKED"; dec.reason = `Insufficient cash ($${state.cash.toFixed(0)})`; }
       else { dec.action = "BUY CALL"; dec.reason = `Bullish ${finalScore}/100 (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`; }
     } else if (finalScore <= cfg.bearEntry) {
       if (alreadyHeld) { dec.action = "HOLD"; dec.reason = "Already in position"; }
-      else if (lowCash) { dec.action = "BLOCKED"; dec.reason = `Insufficient cash ($${state.cash.toFixed(0)})`; }
       else { dec.action = "BUY PUT"; dec.reason = `Bearish ${finalScore}/100 (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`; }
     } else {
       dec.action = "WAIT";
