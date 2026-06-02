@@ -1,25 +1,33 @@
 /**
- * robinhood.js — Lightweight Robinhood Agentic Trading MCP Client
+ * robinhood.js — Robinhood Agentic Trading MCP Client
  *
  * Communicates with Robinhood's official MCP server over Streamable HTTP.
  * MCP = Model Context Protocol (JSON-RPC 2.0 over HTTP).
+ *
+ * Supports equity trading via the 10 official MCP tools:
+ *   get_accounts, get_portfolio, get_equity_positions, get_equity_quotes,
+ *   get_equity_orders, get_equity_tradability, review_equity_order,
+ *   place_equity_order, cancel_equity_order, search
+ *
+ * Auth: OAuth tokens cached by mcp-remote in ~/.mcp-auth/, or ROBINHOOD_ACCESS_TOKEN env var.
  *
  * Usage:
  *   import { robinhood } from './robinhood.js';
  *   await robinhood.init();
  *   const acct = await robinhood.getAccount();
- *   await robinhood.placeStockOrder('AAPL', 'buy', 10, 'market');
+ *   await robinhood.placeEquityOrder({ symbol: 'AAPL', side: 'buy', type: 'limit', quantity: '10', limitPrice: '150.00' });
  */
 
 import fetch from "node-fetch";
 import fs from "fs";
+import path from "path";
 import crypto from "crypto";
+import os from "os";
 
 // ─── Configuration ───
 
 const MCP_ENDPOINT = "https://agent.robinhood.com/mcp/trading";
 const TOKEN_FILE = "rh_tokens.json";
-const PENDING_ORDERS_FILE = "rh_pending.json";
 
 // ─── State ───
 
@@ -27,16 +35,14 @@ let accessToken = null;
 let refreshToken = null;
 let sessionId = null;
 let mcpInitialized = false;
-
-// Pending orders awaiting user approval
-let pendingOrders = [];
+let discoveredAccountNumber = null;
 
 // ─── MCP Transport Layer ───
 
 let rpcId = 1;
 
 async function mcpCall(method, params = {}) {
-  if (!accessToken) throw new Error("Robinhood not authenticated. Set ROBINHOOD_ACCESS_TOKEN or run auth flow.");
+  if (!accessToken) throw new Error("Robinhood not authenticated. Set ROBINHOOD_ACCESS_TOKEN or connect via mcp-remote.");
 
   const body = {
     jsonrpc: "2.0",
@@ -50,7 +56,6 @@ async function mcpCall(method, params = {}) {
     "Authorization": `Bearer ${accessToken}`,
   };
 
-  // Include Mcp-Session-Id if we have one (required after initialize)
   if (sessionId) {
     headers["Mcp-Session-Id"] = sessionId;
   }
@@ -72,7 +77,7 @@ async function mcpCall(method, params = {}) {
 
   const contentType = res.headers.get("content-type") || "";
 
-  // Handle SSE responses (text/event-stream) — some MCP servers use SSE for tool results
+  // Handle SSE responses (text/event-stream)
   if (contentType.includes("text/event-stream")) {
     const text = await res.text();
     const lines = text.split("\n");
@@ -115,10 +120,10 @@ function extractContent(result) {
   try { return JSON.parse(combined); } catch { return combined; }
 }
 
-// ─── Token Persistence ───
+// ─── Token Loading ───
 
 function loadTokens() {
-  // Priority: env var > file
+  // Priority 1: env var
   const envToken = (process.env.ROBINHOOD_ACCESS_TOKEN || "").trim();
   if (envToken) {
     accessToken = envToken;
@@ -126,14 +131,42 @@ function loadTokens() {
     return true;
   }
 
+  // Priority 2: local token file (written by bot dashboard)
   try {
     if (fs.existsSync(TOKEN_FILE)) {
       const data = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf-8"));
-      accessToken = data.accessToken || null;
-      refreshToken = data.refreshToken || null;
-      return !!accessToken;
+      if (data.accessToken) {
+        accessToken = data.accessToken;
+        refreshToken = data.refreshToken || null;
+        return true;
+      }
     }
   } catch { }
+
+  // Priority 3: mcp-remote cached tokens (from Cursor MCP connection)
+  try {
+    const mcpAuthDir = path.join(os.homedir(), ".mcp-auth");
+    if (fs.existsSync(mcpAuthDir)) {
+      // Find the most recent token file across all mcp-remote versions
+      const dirs = fs.readdirSync(mcpAuthDir).filter(d => d.startsWith("mcp-remote"));
+      for (const dir of dirs) {
+        const dirPath = path.join(mcpAuthDir, dir);
+        const files = fs.readdirSync(dirPath).filter(f => f.endsWith("_tokens.json"));
+        for (const file of files) {
+          try {
+            const data = JSON.parse(fs.readFileSync(path.join(dirPath, file), "utf-8"));
+            if (data.access_token) {
+              accessToken = data.access_token;
+              refreshToken = data.refresh_token || null;
+              console.log(`  [RH] Loaded token from mcp-remote cache: ${dir}/${file}`);
+              return true;
+            }
+          } catch { }
+        }
+      }
+    }
+  } catch { }
+
   return false;
 }
 
@@ -149,49 +182,29 @@ function saveTokens() {
   }
 }
 
-// ─── Pending Orders (approval queue) ───
-
-function loadPendingOrders() {
-  try {
-    if (fs.existsSync(PENDING_ORDERS_FILE)) {
-      pendingOrders = JSON.parse(fs.readFileSync(PENDING_ORDERS_FILE, "utf-8"));
-    }
-  } catch { pendingOrders = []; }
-}
-
-function savePendingOrders() {
-  try {
-    fs.writeFileSync(PENDING_ORDERS_FILE, JSON.stringify(pendingOrders, null, 2));
-  } catch { }
-}
-
 // ─── Public API ───
 
 const robinhood = {
-  // Whether the module is connected and ready
   get isConnected() { return !!accessToken && mcpInitialized; },
   get isAuthenticated() { return !!accessToken; },
-  get pendingOrders() { return [...pendingOrders]; },
+  get accountNumber() { return discoveredAccountNumber; },
 
   /**
-   * Initialize the MCP session.
-   * Must be called once before any tool calls.
+   * Initialize the MCP session. Must be called once before any tool calls.
    */
   async init() {
     if (!loadTokens()) {
-      console.log("  [RH] No Robinhood token found. Set ROBINHOOD_ACCESS_TOKEN env var.");
-      console.log("  [RH] To authenticate: visit https://agent.robinhood.com and connect your agent.");
+      console.log("  [RH] No Robinhood token found. Set ROBINHOOD_ACCESS_TOKEN env var or connect via Cursor MCP.");
       return false;
     }
 
     try {
-      // MCP initialize handshake
       const initResult = await mcpCall("initialize", {
         protocolVersion: "2025-03-26",
         capabilities: {},
         clientInfo: {
           name: "swingtrader-bot",
-          version: "1.0.0",
+          version: "2.0.0",
         },
       });
 
@@ -212,8 +225,30 @@ const robinhood = {
       });
 
       mcpInitialized = true;
-      loadPendingOrders();
-      console.log("  [RH] Robinhood Agentic Trading connected ✓");
+
+      // Auto-discover the agentic account
+      try {
+        const accounts = await robinhood.getAccounts();
+        if (Array.isArray(accounts)) {
+          // Find the agentic-allowed account
+          const agentic = accounts.find(a => a.agentic_allowed || a.is_agentic);
+          if (agentic) {
+            discoveredAccountNumber = agentic.account_number || agentic.account_id;
+            console.log(`  [RH] Agentic account discovered: ${discoveredAccountNumber}`);
+          } else if (accounts.length > 0) {
+            // Fall back to first account
+            discoveredAccountNumber = accounts[0].account_number || accounts[0].account_id;
+            console.log(`  [RH] Using first account: ${discoveredAccountNumber} (no explicit agentic flag found)`);
+          }
+        } else if (typeof accounts === "object" && accounts.account_number) {
+          discoveredAccountNumber = accounts.account_number;
+          console.log(`  [RH] Account discovered: ${discoveredAccountNumber}`);
+        }
+      } catch (e) {
+        console.log(`  [RH] Account discovery failed: ${e.message}`);
+      }
+
+      console.log(`  [RH] Robinhood Agentic Trading connected ✓`);
       return true;
     } catch (e) {
       console.log(`  [RH] MCP init failed: ${e.message}`);
@@ -222,193 +257,108 @@ const robinhood = {
     }
   },
 
-  /**
-   * Get account info (buying power, portfolio value, etc.)
-   */
-  async getAccount() {
-    const result = await callTool("robinhood_get_account");
+  // ─── Account & Portfolio ───
+
+  async getAccounts() {
+    const result = await callTool("get_accounts");
     return extractContent(result);
   },
 
-  /**
-   * Get portfolio summary (all positions with P&L)
-   */
-  async getPortfolio() {
-    const result = await callTool("robinhood_get_portfolio");
+  async getPortfolio(accountNumber) {
+    const acctNum = accountNumber || discoveredAccountNumber;
+    if (!acctNum) throw new Error("No account number — call getAccounts() first");
+    const result = await callTool("get_portfolio", { account_number: acctNum });
     return extractContent(result);
   },
 
-  /**
-   * Get stock quote
-   */
-  async getQuote(symbol) {
-    const result = await callTool("robinhood_get_stock_quote", { symbol: symbol.toUpperCase() });
+  async getPositions(accountNumber) {
+    const acctNum = accountNumber || discoveredAccountNumber;
+    if (!acctNum) throw new Error("No account number — call getAccounts() first");
+    const result = await callTool("get_equity_positions", { account_number: acctNum });
     return extractContent(result);
   },
 
-  /**
-   * Place a stock order (equities only for now)
-   * @param {string} symbol - Ticker (e.g., "AAPL")
-   * @param {string} side - "buy" or "sell"
-   * @param {number} quantity - Number of shares
-   * @param {string} orderType - "market" or "limit"
-   * @param {number} [limitPrice] - Required for limit orders
-   * @returns {object} Order confirmation
-   */
-  async placeStockOrder(symbol, side, quantity, orderType = "market", limitPrice = null) {
+  // ─── Market Data ───
+
+  async getQuotes(symbols) {
+    const syms = Array.isArray(symbols) ? symbols : [symbols];
+    const result = await callTool("get_equity_quotes", { symbols: syms.map(s => s.toUpperCase()) });
+    return extractContent(result);
+  },
+
+  async checkTradability(symbols, accountNumber) {
+    const acctNum = accountNumber || discoveredAccountNumber;
+    if (!acctNum) throw new Error("No account number");
+    const syms = Array.isArray(symbols) ? symbols : [symbols];
+    const result = await callTool("get_equity_tradability", {
+      account_number: acctNum,
+      symbols: syms.map(s => s.toUpperCase()),
+    });
+    return extractContent(result);
+  },
+
+  async search(query) {
+    const result = await callTool("search", { query });
+    return extractContent(result);
+  },
+
+  // ─── Orders ───
+
+  async getOrders(filters = {}, accountNumber) {
+    const acctNum = accountNumber || discoveredAccountNumber;
+    if (!acctNum) throw new Error("No account number");
+    const result = await callTool("get_equity_orders", { account_number: acctNum, ...filters });
+    return extractContent(result);
+  },
+
+  async reviewEquityOrder({ symbol, side, type, quantity, dollarAmount, limitPrice, stopPrice, timeInForce, marketHours } = {}, accountNumber) {
+    const acctNum = accountNumber || discoveredAccountNumber;
+    if (!acctNum) throw new Error("No account number");
+    const args = { account_number: acctNum, symbol: symbol.toUpperCase(), side, type };
+    if (quantity) args.quantity = String(quantity);
+    if (dollarAmount) args.dollar_amount = String(dollarAmount);
+    if (limitPrice) args.limit_price = String(limitPrice);
+    if (stopPrice) args.stop_price = String(stopPrice);
+    if (timeInForce) args.time_in_force = timeInForce;
+    if (marketHours) args.market_hours = marketHours;
+    const result = await callTool("review_equity_order", args);
+    return extractContent(result);
+  },
+
+  async placeEquityOrder({ symbol, side, type, quantity, dollarAmount, limitPrice, stopPrice, timeInForce, marketHours, refId } = {}, accountNumber) {
+    const acctNum = accountNumber || discoveredAccountNumber;
+    if (!acctNum) throw new Error("No account number");
     const args = {
+      account_number: acctNum,
       symbol: symbol.toUpperCase(),
       side,
-      quantity,
-      order_type: orderType,
+      type,
+      ref_id: refId || crypto.randomUUID(),
     };
-    if (orderType === "limit" && limitPrice) {
-      args.limit_price = limitPrice;
-    }
+    if (quantity) args.quantity = String(quantity);
+    if (dollarAmount) args.dollar_amount = String(dollarAmount);
+    if (limitPrice) args.limit_price = String(limitPrice);
+    if (stopPrice) args.stop_price = String(stopPrice);
+    if (timeInForce) args.time_in_force = timeInForce || "gfd";
+    if (marketHours) args.market_hours = marketHours;
 
-    console.log(`  [RH] Placing ${side.toUpperCase()} ${quantity} ${symbol} (${orderType}${limitPrice ? ` @ $${limitPrice}` : ""})`);
+    console.log(`  [RH] Placing ${side.toUpperCase()} ${quantity || '$' + dollarAmount} ${symbol} (${type}${limitPrice ? ` @ $${limitPrice}` : ""})`);
 
-    const result = await callTool("robinhood_place_stock_order", args);
+    const result = await callTool("place_equity_order", args);
     const parsed = extractContent(result);
     console.log(`  [RH] Order result:`, typeof parsed === "string" ? parsed.slice(0, 200) : JSON.stringify(parsed).slice(0, 200));
     return parsed;
   },
 
-  /**
-   * Get all open orders
-   */
-  async getOrders() {
-    const result = await callTool("robinhood_get_orders");
+  async cancelOrder(orderId, accountNumber) {
+    const acctNum = accountNumber || discoveredAccountNumber;
+    if (!acctNum) throw new Error("No account number");
+    const result = await callTool("cancel_equity_order", { account_number: acctNum, order_id: orderId });
     return extractContent(result);
   },
 
-  /**
-   * Cancel an order by ID
-   */
-  async cancelOrder(orderId) {
-    const result = await callTool("robinhood_cancel_order", { order_id: orderId });
-    return extractContent(result);
-  },
+  // ─── Token Management ───
 
-  /**
-   * Get order status by ID
-   */
-  async getOrderStatus(orderId) {
-    const result = await callTool("robinhood_get_order_status", { order_id: orderId });
-    return extractContent(result);
-  },
-
-  /**
-   * Get options chain for a symbol
-   */
-  async getOptions(symbol) {
-    const result = await callTool("robinhood_get_options", { symbol: symbol.toUpperCase() });
-    return extractContent(result);
-  },
-
-  /**
-   * Get historical price data for a symbol
-   */
-  async getHistoricals(symbol, span = "year", interval = "day") {
-    const result = await callTool("robinhood_get_historicals", { symbol: symbol.toUpperCase(), span, interval });
-    return extractContent(result);
-  },
-
-  /**
-   * Get all accounts info
-   */
-  async getAccounts() {
-    const result = await callTool("robinhood_get_accounts");
-    return extractContent(result);
-  },
-
-  // ─── Approval Queue ───
-
-  /**
-   * Queue an order for approval instead of executing immediately.
-   * Returns the pending order object with a unique ID.
-   */
-  queueOrder(details) {
-    const order = {
-      id: crypto.randomUUID(),
-      ...details,
-      status: "pending",
-      createdAt: new Date().toISOString(),
-    };
-    pendingOrders.push(order);
-    savePendingOrders();
-    return order;
-  },
-
-  /**
-   * Approve a pending order and execute it.
-   */
-  async approveOrder(orderId) {
-    const idx = pendingOrders.findIndex(o => o.id === orderId);
-    if (idx === -1) throw new Error(`Pending order ${orderId} not found`);
-
-    const order = pendingOrders[idx];
-    order.status = "approved";
-
-    try {
-      const result = await this.placeStockOrder(
-        order.symbol,
-        order.side,
-        order.quantity,
-        order.orderType || "market",
-        order.limitPrice
-      );
-      order.status = "executed";
-      order.result = result;
-      order.executedAt = new Date().toISOString();
-    } catch (e) {
-      order.status = "failed";
-      order.error = e.message;
-    }
-
-    pendingOrders.splice(idx, 1);
-    savePendingOrders();
-    return order;
-  },
-
-  /**
-   * Reject a pending order.
-   */
-  rejectOrder(orderId) {
-    const idx = pendingOrders.findIndex(o => o.id === orderId);
-    if (idx === -1) throw new Error(`Pending order ${orderId} not found`);
-    const order = pendingOrders.splice(idx, 1)[0];
-    order.status = "rejected";
-    order.rejectedAt = new Date().toISOString();
-    savePendingOrders();
-    return order;
-  },
-
-  /**
-   * Convert a bot options signal into an equity order.
-   * Maps: CALL signal → BUY shares, PUT signal → SELL shares (or skip if no position).
-   * Returns order details suitable for queueOrder() or direct execution.
-   */
-  convertOptionsToEquity(ticker, direction, spotPrice, riskBudget) {
-    const side = direction === "BULLISH" ? "buy" : "sell";
-    // Calculate share count based on risk budget
-    const quantity = Math.max(1, Math.floor(riskBudget / spotPrice));
-
-    return {
-      symbol: ticker,
-      side,
-      quantity,
-      orderType: "market",
-      spotPrice,
-      riskBudget,
-      originalDirection: direction,
-      conversionNote: `Options ${direction} signal → ${side.toUpperCase()} ${quantity} shares @ ~$${spotPrice.toFixed(2)}`,
-    };
-  },
-
-  /**
-   * Set the access token programmatically (e.g. from dashboard auth flow)
-   */
   setToken(token) {
     accessToken = token;
     saveTokens();
