@@ -689,6 +689,10 @@ const DEFAULT_CONFIG = {
   // When true, this account runs the full trading cycle (entries + exits) even while the market
   // is closed — intended for testing live execution against a broker sandbox on weekends/after hours.
   tradeWhenClosed: false,
+  // Margin safety rails: when Tradier reports zero option BP on a margin account, allow a small
+  // explicit spend limit without ever planning beyond this max negative-cash floor.
+  marginZeroCashSpendLimit: 200,
+  marginMaxDebt: 250,
 };
 
 // ─── Multi-Account Runtime ───
@@ -3683,9 +3687,9 @@ ${spectator ? '<div style="margin:8px 0 12px;padding:8px 12px;border:1px solid #
 <div class="grid">
   <div class="card">
     <h2>Portfolio</h2>
-    <div class="stat ${pnlPct >= 0 ? "" : "neg"}" id="pv-card-wrap"><div class="val" id="pv-card">${pv.toFixed(0)}</div><div class="lbl">Total Value</div></div>
+    <div class="stat ${pnlPct >= 0 ? "" : "neg"}" id="pv-card-wrap"><div class="val" id="pv-card">$${pv.toFixed(0)}</div><div class="lbl">Total Value</div></div>
     <div class="stat ${pnlPct >= 0 ? "" : "neg"}" id="pnl-card-wrap"><div class="val" id="pnl-card">${pnlPct >= 0 ? "+" : ""}${pnlPct}%</div><div class="lbl">P&L</div></div>
-    <div class="stat"><div class="val" id="cash-card">${state.cash.toFixed(0)}</div><div class="lbl">${cfg.broker === "tradier" ? "Settled Cash" : "Cash"}</div></div>
+    <div class="stat"><div class="val" id="cash-card">$${state.cash.toFixed(0)}</div><div class="lbl">${cfg.broker === "tradier" ? ((state.accountType || "") === "cash" ? "Settled Cash" : "Spend Limit") : "Cash"}</div></div>
     <div class="stat warn"><div class="val">${dtCount}/3</div><div class="lbl">PDT Used</div></div>
     ${cfg.broker === "tradier" ? `
     <div class="stat"><div class="val" style="font-size:14px;color:${(state.accountType || "") === "cash" ? "#00a843" : "#b07400"}">${(state.accountType || "?").toUpperCase()}</div><div class="lbl">Account Type</div></div>
@@ -4884,7 +4888,11 @@ ${spectator ? "" : `<div id="acct-modal" style="display:none;position:fixed;top:
       </select>
       <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="useCashReserve" checked> Use cash reserve (50%→25% buffer)</label>
       <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="autoExecute"> Auto-execute broker orders (full autonomy)</label>
-      <label style="display:flex;align-items:center;gap:8px;margin-bottom:16px;font-size:13px;color:#3a3b42"><input type="checkbox" name="tradeWhenClosed"> Trade when market closed (testing/sandbox)</label>
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="tradeWhenClosed"> Trade when market closed (testing/sandbox)</label>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px">
+        <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">0-cash spend limit ($)</label><input name="marginZeroCashSpendLimit" type="number" value="200" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+        <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Max margin debt ($)</label><input name="marginMaxDebt" type="number" value="250" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+      </div>
       <div style="display:flex;gap:8px">
         <button type="submit" style="flex:1;padding:10px;background:#00a843;color:#000;border:none;border-radius:6px;font-weight:bold;cursor:pointer">Create Account</button>
         <button type="button" onclick="document.getElementById('acct-modal').style.display='none'" style="flex:1;padding:10px;background:#d4d8e0;color:#1c1d22;border:none;border-radius:6px;cursor:pointer">Cancel</button>
@@ -4941,7 +4949,10 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
           <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="useCashReserve" ${cfg.useCashReserve ? "checked" : ""}> Use cash reserve (50%→25% buffer)</label>
           <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="autoExecute" ${cfg.autoExecute ? "checked" : ""}> Auto-execute broker orders (full autonomy)</label>
           <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#3a3b42"><input type="checkbox" name="tradeWhenClosed" ${cfg.tradeWhenClosed ? "checked" : ""}> Trade when market closed (testing/sandbox)</label>
-          ${cfg.broker === "tradier" ? `<p style="font-size:11px;color:#b07400;margin:10px 0 0">⚠ LIVE account — orders execute with real money. Use <strong>Pause</strong> as the kill switch (blocks new entries; exits still run to protect open positions).</p>` : ""}
+          ${cfg.broker === "tradier" ? `<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px">
+            <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">0-cash spend limit ($)</label><input name="marginZeroCashSpendLimit" type="number" step="1" value="${cfg.marginZeroCashSpendLimit ?? DEFAULT_CONFIG.marginZeroCashSpendLimit}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+            <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Max margin debt ($)</label><input name="marginMaxDebt" type="number" step="1" value="${cfg.marginMaxDebt ?? DEFAULT_CONFIG.marginMaxDebt}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          </div><p style="font-size:11px;color:#b07400;margin:10px 0 0">⚠ LIVE account — orders execute with real money. Margin spend is capped by these limits. Use <strong>Pause</strong> as the kill switch (blocks new entries; exits still run to protect open positions).</p>` : ""}
         </div>
         <div style="display:flex;gap:8px">
           <button type="submit" style="flex:1;padding:10px;background:#6a4df4;color:#000;border:none;border-radius:6px;font-weight:bold;cursor:pointer">Save Settings</button>
@@ -5043,8 +5054,9 @@ async function refresh(){
       stat('Account', d.accountId || 'data-only') +
       stat('Account Type', acctTypeHtml) +
       stat('Market', d.marketState || '—') +
-      stat('Settled Cash (BP)', fmt(bi.settledCash)) +
+      stat('Usable BP', fmt(bi.buyingPower)) +
       stat('Unsettled (T+1)', fmt(bi.unsettledCash)) +
+      (bi.accountType && bi.accountType !== 'cash' ? stat('Broker Cash', fmt(bi.marginCashAvailable ?? bi.totalCash)) + stat('Margin Cap', fmt(bi.marginSpendLimit)) : '') +
       stat('Equity', fmt(bi.totalEquity)) +
       stat('Data Source', dsHtml);
     const eb = document.getElementById('errbox');
@@ -5530,6 +5542,8 @@ function startDashboard(defaultAcct, apiKey) {
           useCashReserve: params.get("useCashReserve") === "on" || params.get("useCashReserve") === "true",
           autoExecute: params.get("autoExecute") === "on" || params.get("autoExecute") === "true",
           tradeWhenClosed: params.get("tradeWhenClosed") === "on" || params.get("tradeWhenClosed") === "true",
+          marginZeroCashSpendLimit: Math.max(0, parseFloat(params.get("marginZeroCashSpendLimit")) || DEFAULT_CONFIG.marginZeroCashSpendLimit),
+          marginMaxDebt: Math.max(0, parseFloat(params.get("marginMaxDebt")) || DEFAULT_CONFIG.marginMaxDebt),
         };
         const newAcct = createAccountRuntime(id, name, config);
         newAcct.state.apiKey = apiKey;
@@ -5579,6 +5593,8 @@ function startDashboard(defaultAcct, apiKey) {
         else cfg.maxPositions = null;
         if (params.get("maxTradeSize")) cfg.maxTradeSize = parseFloat(params.get("maxTradeSize")) || null;
         else cfg.maxTradeSize = null;
+        if (params.has("marginZeroCashSpendLimit")) cfg.marginZeroCashSpendLimit = Math.max(0, parseFloat(params.get("marginZeroCashSpendLimit")) || 0);
+        if (params.has("marginMaxDebt")) cfg.marginMaxDebt = Math.max(0, parseFloat(params.get("marginMaxDebt")) || 0);
         if (params.has("minSetupQuality")) cfg.minSetupQuality = parseInt(params.get("minSetupQuality")) ?? 50;
         cfg.customPromptSuffix = params.get("customPromptSuffix") || "";
         // Broker binding + live-trading toggles. Checkboxes only POST when checked.
@@ -5680,7 +5696,7 @@ function startDashboard(defaultAcct, apiKey) {
         accountId: tradier.accountId,
         marketState: clock?.state || null,
         balances,
-        balanceInfo: brokerBalanceInfo(balances),
+        balanceInfo: brokerBalanceInfo(balances, (accounts.get("tradier") || activeAcct)?.config || DEFAULT_CONFIG),
         dataSource: { ...marketDataStats },
         lastError: tradier.lastError,
         pendingOrders: tradier.pendingOrders,
@@ -6289,33 +6305,61 @@ async function fetchSharedMarketData(apiKey, sharedCandleCache) {
 // account is: only ever deploy SETTLED cash (cash_available), never unsettled proceeds — that is
 // exactly what prevents Good-Faith Violations. We also surface account type + unsettled funds so
 // the dashboard can show them and warn if the account isn't actually a cash account.
-function brokerBalanceInfo(bal) {
+function brokerBalanceInfo(bal, cfg = {}) {
   if (!bal) return null;
-  const num = v => (typeof v === "number" && !Number.isNaN(v)) ? v : null;
+  const num = v => {
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (typeof v === "string" && v.trim() !== "") {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+    return null;
+  };
+  const firstNumber = (...vals) => vals.find(v => typeof v === "number") ?? null;
+  const firstPositive = (...vals) => vals.find(v => typeof v === "number" && v > 0) ?? firstNumber(...vals);
   const accountType = String(bal.account_type || (bal.cash ? "cash" : bal.margin ? "margin" : "")).toLowerCase() || "unknown";
-  const unsettledCash = num(bal.cash?.unsettled_funds) ?? 0;
+  const unsettledCash = num(bal.cash?.unsettled_funds) ?? num(bal.unsettled_funds) ?? 0;
+  const totalCash = num(bal.total_cash);
+  const totalEquity = num(bal.total_equity);
+  const optionBuyingPower = num(bal.margin?.option_buying_power) ?? num(bal.option_buying_power);
+  const stockBuyingPower = num(bal.margin?.stock_buying_power) ?? num(bal.stock_buying_power);
+  const marginCashAvailable = num(bal.margin?.cash_available) ?? num(bal.cash?.cash_available) ?? num(bal.cash_available);
 
   let settledCash;
+  let marginSpendLimit = null;
   if (accountType === "cash") {
     // cash_available is settled buying power; total_cash includes unsettled, so prefer the former.
-    settledCash = num(bal.cash?.cash_available) ?? num(bal.cash_available) ?? num(bal.total_cash);
+    settledCash = num(bal.cash?.cash_available) ?? num(bal.cash_available) ?? totalCash;
   } else {
-    // Margin/unknown: long options can't be bought on margin, so option_buying_power ≈ usable cash.
-    settledCash = num(bal.margin?.option_buying_power) ?? num(bal.option_buying_power) ?? num(bal.cash?.cash_available) ?? num(bal.total_cash);
+    const zeroCashSpendLimit = Math.max(0, Number(cfg.marginZeroCashSpendLimit ?? DEFAULT_CONFIG.marginZeroCashSpendLimit ?? 200) || 0);
+    const maxDebt = Math.max(0, Number(cfg.marginMaxDebt ?? DEFAULT_CONFIG.marginMaxDebt ?? 250) || 0);
+    const cashBase = firstNumber(marginCashAvailable, totalCash, 0) ?? 0;
+    marginSpendLimit = Math.max(0, Math.min(cashBase + zeroCashSpendLimit, cashBase + maxDebt));
+    const brokerBuyingPower = firstPositive(optionBuyingPower, marginCashAvailable, totalCash, stockBuyingPower);
+    // Tradier margin accounts can report option_buying_power as literal 0 even while cash is usable.
+    // Use positive cash/BP first, then fall back to the explicit capped margin spend limit.
+    settledCash = (typeof brokerBuyingPower === "number" && brokerBuyingPower > 0)
+      ? Math.min(brokerBuyingPower, marginSpendLimit || brokerBuyingPower)
+      : marginSpendLimit;
   }
 
   return {
     accountType,
-    buyingPower: settledCash,   // what the bot is allowed to deploy (settled only)
+    buyingPower: settledCash,   // what the bot is allowed to deploy
     settledCash,
     unsettledCash,
-    totalCash: num(bal.total_cash),
-    totalEquity: num(bal.total_equity),
+    totalCash,
+    totalEquity,
+    optionBuyingPower,
+    stockBuyingPower,
+    marginCashAvailable,
+    marginSpendLimit,
+    marginZeroCashSpendLimit: cfg.marginZeroCashSpendLimit ?? DEFAULT_CONFIG.marginZeroCashSpendLimit,
+    marginMaxDebt: cfg.marginMaxDebt ?? DEFAULT_CONFIG.marginMaxDebt,
   };
 }
-
-function brokerCashFromBalances(bal) {
-  const info = brokerBalanceInfo(bal);
+function brokerCashFromBalances(bal, cfg = {}) {
+  const info = brokerBalanceInfo(bal, cfg);
   return info ? info.buyingPower : null;
 }
 
@@ -6328,6 +6372,11 @@ function applyBrokerBalanceInfo(acct, info, { warn = false } = {}) {
   state.settledCash = info.settledCash;
   state.unsettledCash = info.unsettledCash;
   state.totalCash = info.totalCash;
+  state.optionBuyingPower = info.optionBuyingPower;
+  state.marginCashAvailable = info.marginCashAvailable;
+  state.marginSpendLimit = info.marginSpendLimit;
+  state.marginZeroCashSpendLimit = info.marginZeroCashSpendLimit;
+  state.marginMaxDebt = info.marginMaxDebt;
   if (warn && info.accountType !== "cash" && state._lastAcctTypeWarned !== info.accountType) {
     log(acct, "⚠️ TRADIER: account type is \"" + info.accountType.toUpperCase() + "\", not CASH — PDT rule and margin/leverage apply. You wanted a cash account.");
     state._lastAcctTypeWarned = info.accountType;
@@ -6344,7 +6393,7 @@ async function refreshBrokerBalances(acct, { maxAgeMs = 4000, logErrors = false 
   acct._brokerBalanceRefreshPromise = (async () => {
     try {
       const bal = await tradier.getAccount();
-      const info = brokerBalanceInfo(bal);
+      const info = brokerBalanceInfo(bal, acct.config);
       applyBrokerBalanceInfo(acct, info);
       acct._brokerBalanceInfo = info;
       acct._brokerBalanceRefreshedAt = Date.now();
@@ -6374,6 +6423,8 @@ async function ensureTradierAccount() {
     acct.config.broker = "tradier";
     if (acct.config.autoExecute === undefined) acct.config.autoExecute = true;
     if (acct.config.tradeWhenClosed === undefined) acct.config.tradeWhenClosed = tradier.environment === "sandbox";
+    if (acct.config.marginZeroCashSpendLimit === undefined) acct.config.marginZeroCashSpendLimit = DEFAULT_CONFIG.marginZeroCashSpendLimit;
+    if (acct.config.marginMaxDebt === undefined) acct.config.marginMaxDebt = DEFAULT_CONFIG.marginMaxDebt;
 
     // Detect environment change (sandbox ↔ production) OR a massive equity mismatch (stale sandbox state)
     const expectedName = `Tradier Live (${tradier.environment})`;
@@ -6417,6 +6468,8 @@ async function ensureTradierAccount() {
     // Sandbox accounts trade when closed by default so you can test execution outside market hours.
     tradeWhenClosed: tradier.environment === "sandbox",
     startingCash: typeof seedCash === "number" ? seedCash : DEFAULT_CONFIG.startingCash,
+    marginZeroCashSpendLimit: DEFAULT_CONFIG.marginZeroCashSpendLimit,
+    marginMaxDebt: DEFAULT_CONFIG.marginMaxDebt,
   };
   const state = {
     cash: typeof seedCash === "number" ? seedCash : DEFAULT_CONFIG.startingCash,
@@ -6621,7 +6674,7 @@ async function syncBrokerAccount(acct, quotes) {
 
   try {
     const bal = await tradier.getAccount();
-    const info = brokerBalanceInfo(bal);
+    const info = brokerBalanceInfo(bal, acct.config);
     applyBrokerBalanceInfo(acct, info, { warn: true });
     acct._brokerBalanceInfo = info;
     acct._brokerBalanceRefreshedAt = Date.now();
