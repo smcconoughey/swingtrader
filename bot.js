@@ -4581,7 +4581,7 @@ ${pos ? '<div class="card" style="margin-top:16px"><h2>Position Details</h2>' + 
 
 function robinhoodPageHTML({ spectator = false } = {}) {
   const connected = robinhood.isConnected;
-  const pending = robinhood.pendingOrders;
+  const pending = robinhood.pendingOrders || [];
 
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
