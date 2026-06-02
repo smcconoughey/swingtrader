@@ -5079,6 +5079,8 @@ async function refresh(){
       stat('Account Type', acctTypeHtml) +
       stat('Market', d.marketState || '—') +
       stat('Usable BP', fmt(bi.buyingPower)) +
+      stat('Options BP', fmt(bi.optionBuyingPower)) +
+      (bi.rawOptionBuyingPower === 0 && bi.optionBuyingPower > 0 ? stat('Raw Options BP', '<span class="muted">$0.00 normalized</span>') : '') +
       stat('Unsettled (T+1)', fmt(bi.unsettledCash)) +
       (bi.accountType && bi.accountType !== 'cash' ? stat('Broker Cash', fmt(bi.marginCashAvailable ?? bi.totalCash)) + stat('Margin Cap', fmt(bi.marginSpendLimit)) : '') +
       stat('Equity', fmt(bi.totalEquity)) +
@@ -6345,7 +6347,7 @@ function brokerBalanceInfo(bal, cfg = {}) {
   const unsettledCash = num(bal.cash?.unsettled_funds) ?? num(bal.unsettled_funds) ?? 0;
   const totalCash = num(bal.total_cash);
   const totalEquity = num(bal.total_equity);
-  const optionBuyingPower = num(bal.margin?.option_buying_power) ?? num(bal.option_buying_power);
+  const rawOptionBuyingPower = num(bal.margin?.option_buying_power) ?? num(bal.option_buying_power);
   const stockBuyingPower = num(bal.margin?.stock_buying_power) ?? num(bal.stock_buying_power);
   const marginCashAvailable = num(bal.margin?.cash_available) ?? num(bal.cash?.cash_available) ?? num(bal.cash_available);
 
@@ -6359,13 +6361,15 @@ function brokerBalanceInfo(bal, cfg = {}) {
     const maxDebt = Math.max(0, Number(cfg.marginMaxDebt ?? DEFAULT_CONFIG.marginMaxDebt ?? 250) || 0);
     const cashBase = firstNumber(marginCashAvailable, totalCash, 0) ?? 0;
     marginSpendLimit = Math.max(0, Math.min(cashBase + zeroCashSpendLimit, cashBase + maxDebt));
-    const brokerBuyingPower = firstPositive(optionBuyingPower, marginCashAvailable, totalCash, stockBuyingPower);
+    const brokerBuyingPower = firstPositive(rawOptionBuyingPower, marginCashAvailable, totalCash, stockBuyingPower);
     // Tradier margin accounts can report option_buying_power as literal 0 even while cash is usable.
     // Use positive cash/BP first, then fall back to the explicit capped margin spend limit.
     settledCash = (typeof brokerBuyingPower === "number" && brokerBuyingPower > 0)
       ? Math.min(brokerBuyingPower, marginSpendLimit || brokerBuyingPower)
       : marginSpendLimit;
   }
+
+  const optionBuyingPower = settledCash;
 
   return {
     accountType,
@@ -6375,6 +6379,7 @@ function brokerBalanceInfo(bal, cfg = {}) {
     totalCash,
     totalEquity,
     optionBuyingPower,
+    rawOptionBuyingPower,
     stockBuyingPower,
     marginCashAvailable,
     marginSpendLimit,
@@ -6397,6 +6402,7 @@ function applyBrokerBalanceInfo(acct, info, { warn = false } = {}) {
   state.unsettledCash = info.unsettledCash;
   state.totalCash = info.totalCash;
   state.optionBuyingPower = info.optionBuyingPower;
+  state.rawOptionBuyingPower = info.rawOptionBuyingPower;
   state.marginCashAvailable = info.marginCashAvailable;
   state.marginSpendLimit = info.marginSpendLimit;
   state.marginZeroCashSpendLimit = info.marginZeroCashSpendLimit;
