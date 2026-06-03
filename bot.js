@@ -2072,7 +2072,7 @@ function portfolioValue(state, quotes) {
   for (const pos of state.positions) {
     const q = quotes[pos.ticker];
     const spot = q ? q.c : pos.entrySpot;
-    const currentPremium = pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
+    const currentPremium = pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium);
     val += currentPremium * pos.qty * 100;
   }
   return val;
@@ -3244,7 +3244,7 @@ function tryExits(acct, quotes) {
       ? Math.max(0, (pos.expiryDate - now) / 86400_000)
       : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
 
-    const currentPremium = pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
+    const currentPremium = pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium);
     const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
 
     if (!pos.bestPnlPct) pos.bestPnlPct = 0;
@@ -3365,7 +3365,7 @@ function trySignalExits(acct, quotes, analyses) {
 
     const q = quotes[pos.ticker];
     const spot = q ? q.c : pos.entrySpot;
-    const currentPremium = pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
+    const currentPremium = pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium);
 
     const trade = closePosition(acct, pos, currentPremium, "signal reversed");
     if (trade) {
@@ -3398,7 +3398,7 @@ function tryTimeBasedExits(acct, quotes) {
     if (!q) { remaining.push(pos); continue; }
 
     const spot = q.c;
-    const currentPremium = pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
+    const currentPremium = pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium);
     const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
     let reason = null;
 
@@ -3458,7 +3458,7 @@ function tryEMATrailingExits(acct, quotes) {
 
     const q = quotes[pos.ticker];
     const spot = q ? q.c : pos.entrySpot;
-    const currentPremium = pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
+    const currentPremium = pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium);
     let reason = null;
 
     const below8 = pos.type === "call" ? price < ema8[L] : price > ema8[L];
@@ -3536,8 +3536,8 @@ function dashboardHTML(acct, { spectator = false } = {}) {
       const dteLeft = pos.expiryDate
         ? Math.max(0, (pos.expiryDate - now) / 86400_000)
         : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
-      const curPremium = optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type);
-      const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
+      const curPremium = pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium);
+      const pnlPct = pos.entryPremium > 0 ? (curPremium - pos.entryPremium) / pos.entryPremium : 0;
       const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * 100;
       const profitPrice = pos.entryPremium * (1 + PROFIT_TARGET);
       const stopPrice = pos.entryPremium * (1 + STOP_LOSS);
@@ -7332,7 +7332,7 @@ function buildPositionDetails(acct, quotes) {
       };
     }
 
-    const curPremium = pos.liveMark ?? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type);
+    const curPremium = pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium);
     const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
     const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * 100;
     const profitPrice = pos.entryPremium * (1 + cfg.profitTarget);
