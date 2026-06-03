@@ -7831,6 +7831,11 @@ async function main() {
     for (const [, acct] of accounts) {
       Object.assign(acct.candleCache, sharedCandleCache);
     }
+    // Force broker sync immediately so positions are never stale after a deploy
+    for (const [, acct] of accounts) {
+      if (acct.config.broker === "tradier") await syncBrokerAccount(acct, sharedQuotes);
+      if (acct.config.broker === "robinhood") await syncRobinhoodAccount(acct, sharedQuotes);
+    }
     for (const [, acct] of accounts) {
       if (!acct.paused) await runAfterHoursScan(acct, sharedQuotes, apiKey);
     }
