@@ -15,15 +15,17 @@
   Trading Mode: PAPER
   [RH] Loaded token from mcp-remote cache: mcp-remote-0.1.37/aa46f9788cb2ecfca540f6bfe1576d4e_tokens.json
   [RH] MCP session initialized. Server: robinhood-trading
+  [RH] Agentic account discovered: 417527330
   [RH] Robinhood Agentic Trading connected ✓
-  Robinhood: CONNECTED ✓ (agentic account: null)
+  Robinhood: CONNECTED ✓ (agentic account: 417527330)
   Robinhood: PAPER mode — connected but no live trading. Toggle from dashboard.
   Tradier: not configured — set TRADIER_ACCESS_TOKEN to use real-time data. Using Finnhub/Yahoo.
   [default] Original Strategy — Cash: $200 | 0 positions | 0 trades
 
   Running startup scan...
 
-[00:59:20] WATCHLIST: Refreshing from market data...
+[01:05:22] WATCHLIST: Refreshing from market data...
   Dashboard running at http://localhost:3000
+[01:05:23] WATCHLIST: 102 tickers — SPY, QQQ, CIFR, WULF, HUT, NBIS, WGMI, IREN, BTDR, CRWV, MARA, RIOT, BKSY, PL, LUNR...
 
   Received SIGTERM — saving all accounts and exiting...
