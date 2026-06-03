@@ -1983,11 +1983,22 @@ function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 12) {
 
 function chooseAffordableCandidate(candidates, selected, maxContractCost, state) {
   if (!(maxContractCost > 0)) return selected || null;
+  
+  // If AI picked a specific contract, only trade it if we can afford it.
+  if (selected) {
+    if (selected.mid > 0 && selected.mid * 100 <= maxContractCost) {
+      if (!state || countPositionsAtExpiry(state, selected.expiryDate) < MAX_PER_EXPIRY) {
+        return selected;
+      }
+    }
+    return null; // ABORT! We can't afford the AI's specific pick or it violates constraints.
+  }
+  
+  // If no specific AI pick (e.g. fallback), pick the best affordable one
   const affordable = (candidates || [])
     .filter(c => c && c.mid > 0 && c.mid * 100 <= maxContractCost)
     .filter(c => !state || countPositionsAtExpiry(state, c.expiryDate) < MAX_PER_EXPIRY)
     .sort((a, b) => b.quality - a.quality);
-  if (selected && selected.mid > 0 && selected.mid * 100 <= maxContractCost) return selected;
   return affordable[0] || null;
 }
 
