@@ -5894,6 +5894,11 @@ function startDashboard(defaultAcct, apiKey) {
 
     // ─── Robinhood: Get Positions ───
     if (pathname === "/api/rh-portfolio") {
+      if (!robinhood.isConnected) {
+        res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: "Robinhood MCP not connected" }));
+        return;
+      }
       try {
         const positionsRes = await robinhood.getPositions();
         const positions = positionsRes && positionsRes.data && Array.isArray(positionsRes.data.positions) ? positionsRes.data.positions : (Array.isArray(positionsRes) ? positionsRes : []);
@@ -6240,6 +6245,11 @@ self.addEventListener('pushsubscriptionchange', e => {
 
     // ─── Robinhood: Get Account Info ───
     if (pathname === "/api/rh-account") {
+      if (!robinhood.isConnected) {
+        res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: "Robinhood MCP not connected" }));
+        return;
+      }
       try {
         const acctRes = await robinhood.getPortfolio();
         const payload = acctRes && acctRes.data ? { ...acctRes.data } : (acctRes || {});
@@ -6268,6 +6278,11 @@ self.addEventListener('pushsubscriptionchange', e => {
 
     // ─── Robinhood: Get Orders ───
     if (pathname === "/api/rh-orders") {
+      if (!robinhood.isConnected) {
+        res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: "Robinhood MCP not connected" }));
+        return;
+      }
       try {
         const orders = await robinhood.getOrders();
         res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
