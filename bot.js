@@ -5895,7 +5895,8 @@ function startDashboard(defaultAcct, apiKey) {
     // ─── Robinhood: Get Positions ───
     if (pathname === "/api/rh-portfolio") {
       try {
-        const positions = await robinhood.getPositions();
+        const positionsRes = await robinhood.getPositions();
+        const positions = positionsRes && positionsRes.data && Array.isArray(positionsRes.data.positions) ? positionsRes.data.positions : (Array.isArray(positionsRes) ? positionsRes : []);
         res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
         res.end(JSON.stringify(positions));
       } catch (e) {
@@ -6240,12 +6241,16 @@ self.addEventListener('pushsubscriptionchange', e => {
     // ─── Robinhood: Get Account Info ───
     if (pathname === "/api/rh-account") {
       try {
-        const acctInfo = await robinhood.getPortfolio();
+        const acctRes = await robinhood.getPortfolio();
+        const payload = acctRes && acctRes.data ? { ...acctRes.data } : (acctRes || {});
+        if (payload.buying_power && typeof payload.buying_power === 'object') {
+          payload.buying_power = payload.buying_power.buying_power;
+        }
         if (robinhood.accountNumber) {
-          acctInfo.account_number = robinhood.accountNumber;
+          payload.account_number = robinhood.accountNumber;
         }
         res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-        res.end(JSON.stringify(acctInfo));
+        res.end(JSON.stringify(payload));
       } catch (e) {
         res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
         res.end(JSON.stringify({ error: e.message }));
@@ -6957,22 +6962,27 @@ async function syncRobinhoodAccount(acct, quotes) {
   if (!state.meta) state.meta = {};
 
   try {
-    const port = await robinhood.getPortfolio();
+    const res = await robinhood.getPortfolio();
+    const port = res && res.data ? res.data : res;
     if (port) {
-      if (typeof port.equity === "string") state.brokerEquity = parseFloat(port.equity);
-      if (typeof port.buying_power === "string") state.cash = parseFloat(port.buying_power);
+      const eq = port.equity_value || port.total_value;
+      if (typeof eq === "string") state.brokerEquity = parseFloat(eq);
+      const bp = port.buying_power?.buying_power || port.buying_power || port.cash;
+      if (typeof bp === "string") state.cash = parseFloat(bp);
     }
   } catch (e) { log(acct, `ROBINHOOD SYNC: balance error — ${e.message}`); }
 
   try {
-    const raw = await robinhood.getPositions();
+    const res = await robinhood.getPositions();
+    const raw = res && res.data && Array.isArray(res.data.positions) ? res.data.positions : (Array.isArray(res) ? res : []);
     const now = Date.now();
     const positions = [];
     const seen = new Set();
     
     // Also fetch confirmed orders to count working orders
-    const workingOrders = await robinhood.getOrders({ state: 'confirmed' }).catch(() => []);
-    acct._inflightTickers = new Set(Array.isArray(workingOrders) ? workingOrders.map(o => o.symbol?.toUpperCase()).filter(Boolean) : []);
+    const workingRes = await robinhood.getOrders({ state: 'confirmed' }).catch(() => []);
+    const workingOrders = workingRes && workingRes.data && Array.isArray(workingRes.data.orders) ? workingRes.data.orders : (Array.isArray(workingRes) ? workingRes : []);
+    acct._inflightTickers = new Set(workingOrders.map(o => o.symbol?.toUpperCase()).filter(Boolean));
     
     // Fetch quotes for positions if needed (we also use shared quotes, but this is a fallback)
     const positionSymbols = raw.map(p => p.symbol).filter(Boolean);

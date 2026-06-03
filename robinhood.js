@@ -228,10 +228,16 @@ const robinhood = {
 
       // Auto-discover the agentic account
       try {
-        const accounts = await robinhood.getAccounts();
+        let accounts = await robinhood.getAccounts();
+        if (accounts && accounts.data && Array.isArray(accounts.data.accounts)) {
+          accounts = accounts.data.accounts;
+        } else if (accounts && Array.isArray(accounts.accounts)) {
+          accounts = accounts.accounts;
+        }
+
         if (Array.isArray(accounts)) {
           // Find the agentic-allowed account
-          const agentic = accounts.find(a => a.agentic_allowed || a.is_agentic);
+          const agentic = accounts.find(a => a.agentic_allowed || a.is_agentic || a.nickname === "Agentic");
           if (agentic) {
             discoveredAccountNumber = agentic.account_number || agentic.account_id;
             console.log(`  [RH] Agentic account discovered: ${discoveredAccountNumber}`);
