@@ -7827,6 +7827,12 @@ async function main() {
   // Get primary account for dashboard (first account)
   const primaryAcct = accounts.values().next().value;
 
+  // Update initial market status for all accounts so dashboard is accurate on load
+  const initialMarketOpen = isMarketOpen();
+  for (const [, acct] of accounts) {
+    if (acct.dashboard) acct.dashboard.marketOpen = initialMarketOpen;
+  }
+
   // Start web dashboard  
   startDashboard(primaryAcct, apiKey);
 
