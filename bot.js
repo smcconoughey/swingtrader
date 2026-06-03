@@ -5892,12 +5892,12 @@ function startDashboard(defaultAcct, apiKey) {
       return;
     }
 
-    // ─── Robinhood: Get Portfolio (real positions) ───
+    // ─── Robinhood: Get Positions ───
     if (pathname === "/api/rh-portfolio") {
       try {
-        const portfolio = await robinhood.getPortfolio();
+        const positions = await robinhood.getPositions();
         res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-        res.end(JSON.stringify(portfolio));
+        res.end(JSON.stringify(positions));
       } catch (e) {
         res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
         res.end(JSON.stringify({ error: e.message }));
@@ -6240,7 +6240,10 @@ self.addEventListener('pushsubscriptionchange', e => {
     // ─── Robinhood: Get Account Info ───
     if (pathname === "/api/rh-account") {
       try {
-        const acctInfo = await robinhood.getAccount();
+        const acctInfo = await robinhood.getPortfolio();
+        if (robinhood.accountNumber) {
+          acctInfo.account_number = robinhood.accountNumber;
+        }
         res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
         res.end(JSON.stringify(acctInfo));
       } catch (e) {
@@ -6252,16 +6255,9 @@ self.addEventListener('pushsubscriptionchange', e => {
 
     // ─── Robinhood: Get Options Chain ───
     if (pathname === "/api/rh-options") {
-      const sym = url.searchParams.get("symbol");
-      if (!sym) { res.writeHead(400); res.end(JSON.stringify({ error: "symbol required" })); return; }
-      try {
-        const options = await robinhood.getOptions(sym);
-        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-        res.end(JSON.stringify(options));
-      } catch (e) {
-        res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-        res.end(JSON.stringify({ error: e.message }));
-      }
+      // MCP does not support options natively yet; return mock or empty.
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ error: "Options lookup not available via MCP" }));
       return;
     }
 
@@ -7797,19 +7793,21 @@ async function main() {
 
   // Initialize Robinhood Agentic Trading
   console.log(`  Trading Mode: ${TRADING_MODE.toUpperCase()}`);
-  if (TRADING_MODE === "robinhood" || process.env.ROBINHOOD_ACCESS_TOKEN) {
-    const rhOk = await robinhood.init();
-    if (rhOk) {
-      console.log(`  Robinhood: CONNECTED ✓ (approval: ${RH_REQUIRE_APPROVAL ? "MANUAL" : "AUTO"}, max: $${RH_MAX_POSITION_DOLLARS}/position)`);
+  const rhOk = await robinhood.init();
+  if (rhOk) {
+    console.log(`  Robinhood: CONNECTED ✓ (agentic account: ${robinhood.accountNumber})`);
+    if (TRADING_MODE === "robinhood") {
+      console.log(`  Robinhood: LIVE EXECUTION ENABLED (max: $${RH_MAX_POSITION_DOLLARS}/position)`);
+      await ensureRobinhoodAccount();
     } else {
-      console.log("  Robinhood: NOT CONNECTED — set ROBINHOOD_ACCESS_TOKEN or authenticate from dashboard");
-      if (TRADING_MODE === "robinhood") {
-        console.log("  WARNING: Trading mode is ROBINHOOD but no connection — orders will fail. Falling back to PAPER.");
-        TRADING_MODE = "paper";
-      }
+      console.log(`  Robinhood: PAPER mode — connected but no live trading. Toggle from dashboard.`);
     }
   } else {
-    console.log("  Robinhood: PAPER mode — no live trading. Toggle from dashboard to enable.");
+    console.log("  Robinhood: NOT CONNECTED — set ROBINHOOD_ACCESS_TOKEN or authenticate from dashboard");
+    if (TRADING_MODE === "robinhood") {
+      console.log("  WARNING: Trading mode is ROBINHOOD but no connection — orders will fail. Falling back to PAPER.");
+      TRADING_MODE = "paper";
+    }
   }
 
   // Initialize Tradier data + execution arm (primary market-data feed when connected)
