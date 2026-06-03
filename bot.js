@@ -2921,17 +2921,26 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     costPer = premium * 100;
   }
 
-  if (costPer > state.cash) return { skipped: true, reason: `No affordable ${unitName}: cheapest selected ${unitName} costs $${costPer.toFixed(0)} but spend limit is $${state.cash.toFixed(0)}` };
+  if (costPer > state.cash && cfg.broker !== "robinhood") return { skipped: true, reason: `No affordable ${unitName}: cheapest selected ${unitName} costs $${costPer.toFixed(0)} but spend limit is $${state.cash.toFixed(0)}` };
 
-  if (deployable < costPer) {
+  if (deployable < costPer && cfg.broker !== "robinhood") {
     return { skipped: true, reason: `Cash reserve: ${(reservePct * 100).toFixed(0)}% buffer required (trust ${(trust * 100).toFixed(0)}%) — only $${deployable.toFixed(0)} of $${state.cash.toFixed(0)} cash deployable, need $${costPer.toFixed(0)}/${unitName}` };
   }
 
   const budget = Math.min(maxRisk, deployable);
   let qty = Math.max(1, Math.floor(budget / costPer));
   let totalCost = qty * costPer;
-  if (totalCost > deployable) { qty = Math.floor(deployable / costPer); totalCost = qty * costPer; }
-  if (qty < 1) return { skipped: true, reason: `Insufficient deployable cash for 1 ${unitName}${cfg.useCashReserve === false ? "" : ` (buffer ${(reservePct * 100).toFixed(0)}%)`}` };
+  
+  if (cfg.broker === "robinhood") {
+    // Robinhood supports fractional shares
+    qty = parseFloat((budget / costPer).toFixed(4));
+    totalCost = qty * costPer;
+  } else {
+    if (totalCost > deployable) { qty = Math.floor(deployable / costPer); totalCost = qty * costPer; }
+  }
+  
+  if (qty <= 0) return { skipped: true, reason: `Insufficient deployable cash for ${unitName}` };
+  if (qty < 1 && cfg.broker !== "robinhood") return { skipped: true, reason: `Insufficient deployable cash for 1 ${unitName}${cfg.useCashReserve === false ? "" : ` (buffer ${(reservePct * 100).toFixed(0)}%)`}` };
 
   // Circuit Breaker: Max Trade Size
   if (totalCost > maxSize) {
