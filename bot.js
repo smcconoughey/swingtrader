@@ -4926,7 +4926,7 @@ function tabBarHTML(activeId, { spectator = false } = {}) {
   <div class="tab-row">${tabs.join("")}
     ${spectator ? "" : `<a href="#" class="acct-tab new-tab" onclick="document.getElementById('acct-modal').style.display='flex';return false">+ New Account</a>
     <a href="/?sim=new" class="acct-tab new-tab" style="border-color:#6a4df440;color:#6a4df4">&#x1F9EA; Simulator</a>`}
-    <a href="/robinhood" class="acct-tab new-tab" style="border-color:#00a84330;color:#00a843">🔒 Robinhood</a>
+    <a href="/robinhood" class="acct-tab new-tab" style="border-color:#00a84330;color:#00a843">🔒 Robinhood MCP</a>
     <a href="/tradier" class="acct-tab new-tab" style="border-color:#2f6fed40;color:#2f6fed">📈 Tradier</a>
   </div>
   <div class="global-stats">
@@ -6569,18 +6569,18 @@ async function ensureTradierAccount() {
 
 // Ensure a first-class live account bound to Robinhood MCP exists.
 async function ensureRobinhoodAccount() {
-  if (!robinhood.isConnected) return;
-  
   let seedCash = null;
-  try {
-    const portRes = await robinhood.getPortfolio();
-    const port = portRes && portRes.data ? portRes.data : portRes;
-    if (port) {
-      const bp = port.buying_power?.buying_power || port.buying_power || port.cash;
-      if (typeof bp === "string") seedCash = parseFloat(bp);
+  if (robinhood.isConnected) {
+    try {
+      const portRes = await robinhood.getPortfolio();
+      const port = portRes && portRes.data ? portRes.data : portRes;
+      if (port) {
+        const bp = port.buying_power?.buying_power || port.buying_power || port.cash;
+        if (typeof bp === "string") seedCash = parseFloat(bp);
+      }
+    } catch (e) {
+      console.log(`  Robinhood: balance fetch failed during provision — ${e.message}`);
     }
-  } catch (e) {
-    console.log(`  Robinhood: balance fetch failed during provision — ${e.message}`);
   }
 
   if (accounts.has("robinhood")) {
@@ -7773,10 +7773,13 @@ async function main() {
   const rhOk = await robinhood.init();
   if (rhOk) {
     console.log(`  Robinhood: CONNECTED ✓ (agentic account: ${robinhood.accountNumber})`);
-    await ensureRobinhoodAccount();
-    console.log(`  Robinhood: LIVE broker account provisioned (max: $${RH_MAX_POSITION_DOLLARS}/position, PDT: 0)`);
   } else {
-    console.log("  Robinhood: NOT CONNECTED — set ROBINHOOD_ACCESS_TOKEN or authenticate from dashboard");
+    console.log("  Robinhood: MCP not connected — account will run in paper mode until token is set");
+  }
+  // Always provision the account so it appears in the dashboard
+  await ensureRobinhoodAccount();
+  if (rhOk) {
+    console.log(`  Robinhood: LIVE broker account ready (max: $${RH_MAX_POSITION_DOLLARS}/position, PDT: 0)`);
   }
 
   // Initialize Tradier data + execution arm (primary market-data feed when connected)
