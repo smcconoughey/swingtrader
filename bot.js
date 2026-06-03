@@ -652,10 +652,7 @@ const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || "AIzaSyB1agSJoX1rImf5gYGm6
 // Mutable at runtime via dashboard toggle or POST /api/llm-provider
 let LLM_PROVIDER = (process.env.LLM_PROVIDER || "claude").toLowerCase();
 
-// TRADING_MODE: "paper" | "robinhood" — defaults to paper
-// When "robinhood", the bot converts options signals to equity orders via Robinhood's MCP API.
-// Mutable at runtime via dashboard toggle or POST /api/trading-mode
-let TRADING_MODE = (process.env.TRADING_MODE || "paper").toLowerCase();
+// Robinhood execution is per-account (config.broker = "robinhood"), just like Tradier.
 
 // RH_REQUIRE_APPROVAL: when true, Robinhood orders are queued for manual approval instead of auto-executing.
 // Default true for safety — you must approve every real-money trade from the dashboard.
@@ -4665,7 +4662,7 @@ function robinhoodPageHTML({ spectator = false } = {}) {
       <h2><span class="dot ${connected ? 'green' : 'red'}"></span> Connection</h2>
       <div class="rh-stat"><span class="label">Status</span><span class="value" style="color:${connected ? '#00a843' : '#e8473f'}">${connected ? 'Connected' : 'Disconnected'}</span></div>
       <div class="rh-stat"><span class="label">MCP Endpoint</span><span class="value" style="font-size:10px;color:#6b7280">agent.robinhood.com</span></div>
-      <div class="rh-stat"><span class="label">Trading Mode</span><span class="value" style="color:${TRADING_MODE === 'robinhood' ? '#00a843' : '#6b7280'}">${TRADING_MODE.toUpperCase()}</span></div>
+      <div class="rh-stat"><span class="label">Account</span><span class="value" style="color:${connected ? '#00a843' : '#6b7280'}">${robinhood.accountNumber ? '••••' + String(robinhood.accountNumber).slice(-4) : 'Not discovered'}</span></div>
       ${spectator ? `<div style="margin-top:12px;color:#8a909b;font-size:12px">Spectator mode: token entry and connection controls are hidden.</div>` : `<div style="margin-top:12px">
         <input type="password" class="rh-input" id="rh-token" placeholder="Paste access token..." style="margin-bottom:8px">
         <div style="display:flex;gap:8px">
@@ -4721,9 +4718,8 @@ function robinhoodPageHTML({ spectator = false } = {}) {
       <h2>⚙️ Controls</h2>
       ${spectator ? `<div class="rh-empty">Spectator mode: trading controls are read-only and disabled.</div>` : `
       <div class="rh-toggle">
-        <label>Trading Mode</label>
-        <div class="switch ${TRADING_MODE === 'robinhood' ? 'on' : ''}" onclick="toggleMode()" title="${TRADING_MODE === 'robinhood' ? 'Click to switch to PAPER' : 'Click to switch to ROBINHOOD'}"></div>
-        <span style="font-size:11px;color:${TRADING_MODE === 'robinhood' ? '#00a843' : '#6b7280'};min-width:80px">${TRADING_MODE.toUpperCase()}</span>
+        <label>Live Execution</label>
+        <span style="font-size:11px;color:${connected ? '#00a843' : '#6b7280'};min-width:80px">${connected ? 'ACTIVE' : 'DISCONNECTED'}</span>
       </div>
       <div class="rh-toggle">
         <label>Require Approval</label>
@@ -5735,24 +5731,7 @@ function startDashboard(defaultAcct, apiKey) {
       return;
     }
 
-    // ─── Trading Mode Toggle ───
-    if (req.method === "POST" && pathname === "/api/trading-mode") {
-      let body = "";
-      req.on("data", chunk => body += chunk);
-      req.on("end", () => {
-        const params = new URLSearchParams(body);
-        const requested = params.get("mode");
-        if (requested === "paper" || requested === "robinhood") {
-          TRADING_MODE = requested;
-        } else {
-          TRADING_MODE = TRADING_MODE === "paper" ? "robinhood" : "paper";
-        }
-        console.log(`  Trading Mode switched to: ${TRADING_MODE.toUpperCase()}`);
-        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-        res.end(JSON.stringify({ mode: TRADING_MODE, connected: robinhood.isConnected }));
-      });
-      return;
-    }
+    // (TRADING_MODE toggle removed — broker is per-account via config.broker)
 
     // ─── Robinhood: Toggle Approval Mode ───
     if (req.method === "POST" && pathname === "/api/rh-approval") {
@@ -5854,12 +5833,12 @@ function startDashboard(defaultAcct, apiKey) {
     if (pathname === "/api/rh-status") {
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       res.end(JSON.stringify({
-        mode: TRADING_MODE,
         connected: robinhood.isConnected,
         authenticated: robinhood.isAuthenticated,
+        accountNumber: robinhood.accountNumber,
         requireApproval: RH_REQUIRE_APPROVAL,
         maxPositionDollars: RH_MAX_POSITION_DOLLARS,
-        pendingOrders: robinhood.pendingOrders,
+        pendingOrders: robinhood.pendingOrders || [],
       }));
       return;
     }
@@ -7239,39 +7218,8 @@ async function runCycle(acct, sharedQuotes, apiKey) {
       const q = quotes[ticker];
       tweetTradeEntry(acct, result, entryA, st, q).catch(e => console.log(`  [X] Entry tweet error: ${e.message}`));
 
-      // ─── Robinhood Agentic Execution (entry) ───
-      // Skip for Tradier broker accounts — they already executed natively via placeBrokerEntry.
-      if (acct.config.broker !== "tradier" && TRADING_MODE === "robinhood" && robinhood.isConnected) {
-        try {
-          const equityOrder = robinhood.convertOptionsToEquity(
-            result.ticker,
-            result.direction || (result.type === "call" ? "BULLISH" : "BEARISH"),
-            result.entrySpot,
-            Math.min(result.cost, RH_MAX_POSITION_DOLLARS)
-          );
-          if (RH_REQUIRE_APPROVAL) {
-            const pending = robinhood.queueOrder(equityOrder);
-            log(acct, `RH QUEUED: ${equityOrder.conversionNote} — awaiting approval (${pending.id.slice(0, 8)})`);
-            sendPush(
-              `📋 RH PENDING: ${equityOrder.side.toUpperCase()} ${equityOrder.quantity} ${equityOrder.symbol}`,
-              `${equityOrder.conversionNote}\nApprove from dashboard`,
-              true
-            ).catch(() => {});
-          } else {
-            const orderResult = await robinhood.placeStockOrder(
-              equityOrder.symbol, equityOrder.side, equityOrder.quantity, equityOrder.orderType
-            );
-            log(acct, `RH EXECUTED: ${equityOrder.conversionNote}`);
-            sendPush(
-              `✅ RH BUY: ${equityOrder.quantity} ${equityOrder.symbol} FILLED`,
-              equityOrder.conversionNote,
-              true
-            ).catch(() => {});
-          }
-        } catch (rhErr) {
-          log(acct, `RH ERROR (entry): ${rhErr.message}`);
-        }
-      }
+      // Robinhood broker accounts already executed natively via placeBrokerEntry above.
+      // No separate execution block needed — broker is per-account, same as Tradier.
     }
   }
 
@@ -7821,23 +7769,14 @@ async function main() {
     console.log("  X/Twitter: DRY-RUN mode — set ENABLE_TWEETS=true to post live");
   }
 
-  // Initialize Robinhood Agentic Trading
-  console.log(`  Trading Mode: ${TRADING_MODE.toUpperCase()}`);
+  // Initialize Robinhood Agentic Trading (per-account broker, same as Tradier)
   const rhOk = await robinhood.init();
   if (rhOk) {
     console.log(`  Robinhood: CONNECTED ✓ (agentic account: ${robinhood.accountNumber})`);
     await ensureRobinhoodAccount();
-    if (TRADING_MODE === "robinhood") {
-      console.log(`  Robinhood: LIVE EXECUTION ENABLED (max: $${RH_MAX_POSITION_DOLLARS}/position)`);
-    } else {
-      console.log(`  Robinhood: Connected — account synced to dashboard. Set TRADING_MODE=robinhood for live execution.`);
-    }
+    console.log(`  Robinhood: LIVE broker account provisioned (max: $${RH_MAX_POSITION_DOLLARS}/position, PDT: 0)`);
   } else {
     console.log("  Robinhood: NOT CONNECTED — set ROBINHOOD_ACCESS_TOKEN or authenticate from dashboard");
-    if (TRADING_MODE === "robinhood") {
-      console.log("  WARNING: Trading mode is ROBINHOOD but no connection — orders will fail. Falling back to PAPER.");
-      TRADING_MODE = "paper";
-    }
   }
 
   // Initialize Tradier data + execution arm (primary market-data feed when connected)

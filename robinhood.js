@@ -159,6 +159,8 @@ function loadTokens() {
               accessToken = data.access_token;
               refreshToken = data.refresh_token || null;
               console.log(`  [RH] Loaded token from mcp-remote cache: ${dir}/${file}`);
+              // Auto-persist to rh_tokens.json so it survives restarts/deploys
+              saveTokens();
               return true;
             }
           } catch { }
