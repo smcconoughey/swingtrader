@@ -4913,6 +4913,8 @@ function tabBarHTML(activeId, { spectator = false } = {}) {
     const statusDot = acct.paused ? "🔴" : "🟢";
     const liveBadge = acct.config.broker === "tradier"
       ? `<span class="tab-live" style="background:#00a8431c;color:#00a843;border:1px solid #00a84340;border-radius:4px;padding:0 4px;font-size:9px;font-weight:bold;margin-left:4px">LIVE</span>`
+      : acct.config.broker === "robinhood"
+      ? `<span class="tab-live" style="background:#00a8431c;color:#00a843;border:1px solid #00a84340;border-radius:4px;padding:0 4px;font-size:9px;font-weight:bold;margin-left:4px">RH LIVE</span>`
       : "";
     tabs.push(`<a href="/?a=${id}" class="acct-tab ${isActive ? "active" : ""}" title="${acct.name}${acct.config.broker === "tradier" ? " — LIVE Tradier account" : ""}">
       <span class="tab-status">${statusDot}</span>
@@ -6284,7 +6286,8 @@ self.addEventListener('pushsubscriptionchange', e => {
         return;
       }
       try {
-        const orders = await robinhood.getOrders();
+        const ordersRes = await robinhood.getOrders();
+        const orders = ordersRes && ordersRes.data && Array.isArray(ordersRes.data.orders) ? ordersRes.data.orders : (Array.isArray(ordersRes) ? ordersRes : []);
         res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
         res.end(JSON.stringify(orders));
       } catch (e) {
@@ -6591,9 +6594,11 @@ async function ensureRobinhoodAccount() {
   
   let seedCash = null;
   try {
-    const port = await robinhood.getPortfolio();
-    if (port && typeof port.buying_power === "string") {
-      seedCash = parseFloat(port.buying_power);
+    const portRes = await robinhood.getPortfolio();
+    const port = portRes && portRes.data ? portRes.data : portRes;
+    if (port) {
+      const bp = port.buying_power?.buying_power || port.buying_power || port.cash;
+      if (typeof bp === "string") seedCash = parseFloat(bp);
     }
   } catch (e) {
     console.log(`  Robinhood: balance fetch failed during provision — ${e.message}`);
@@ -7821,11 +7826,11 @@ async function main() {
   const rhOk = await robinhood.init();
   if (rhOk) {
     console.log(`  Robinhood: CONNECTED ✓ (agentic account: ${robinhood.accountNumber})`);
+    await ensureRobinhoodAccount();
     if (TRADING_MODE === "robinhood") {
       console.log(`  Robinhood: LIVE EXECUTION ENABLED (max: $${RH_MAX_POSITION_DOLLARS}/position)`);
-      await ensureRobinhoodAccount();
     } else {
-      console.log(`  Robinhood: PAPER mode — connected but no live trading. Toggle from dashboard.`);
+      console.log(`  Robinhood: Connected — account synced to dashboard. Set TRADING_MODE=robinhood for live execution.`);
     }
   } else {
     console.log("  Robinhood: NOT CONNECTED — set ROBINHOOD_ACCESS_TOKEN or authenticate from dashboard");
