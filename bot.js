@@ -655,8 +655,8 @@ let LLM_PROVIDER = (process.env.LLM_PROVIDER || "claude").toLowerCase();
 // Robinhood execution is per-account (config.broker = "robinhood"), just like Tradier.
 
 // RH_REQUIRE_APPROVAL: when true, Robinhood orders are queued for manual approval instead of auto-executing.
-// Default true for safety — you must approve every real-money trade from the dashboard.
-let RH_REQUIRE_APPROVAL = process.env.RH_REQUIRE_APPROVAL !== "false";
+// Default false — full autonomous execution. Set RH_REQUIRE_APPROVAL=true in env to require manual approval.
+let RH_REQUIRE_APPROVAL = process.env.RH_REQUIRE_APPROVAL === "true";
 
 // RH_MAX_POSITION_DOLLARS: Maximum dollar amount per Robinhood equity position (safety limit)
 const RH_MAX_POSITION_DOLLARS = parseInt(process.env.RH_MAX_POSITION_DOLLARS) || 500;
@@ -690,9 +690,9 @@ const DEFAULT_CONFIG = {
   // explicit spend limit without ever planning beyond this max negative-cash floor.
   marginZeroCashSpendLimit: 200,
   marginMaxDebt: 250,
-  // Maximum day trades allowed in a rolling 5-day window. Default 3 (standard PDT rule).
-  // Set to 0 to completely block same-day round trips (e.g. Robinhood agentic accounts).
-  maxDayTrades: 3,
+  // Maximum day trades allowed in a rolling 5-day window. Default Infinity (no PDT restriction).
+  // PDT rules are eliminated — the bot trades freely without day-trade limits.
+  maxDayTrades: Infinity,
 };
 
 // ─── Multi-Account Runtime ───
@@ -1799,8 +1799,7 @@ function wouldBeDayTrade(position) {
 }
 
 function canClosePDT(state, position) {
-  if (!wouldBeDayTrade(position)) return true; // not a day trade, always OK
-  return countRecentDayTrades(state) < 3;
+  return true; // PDT restrictions eliminated — always allow closing
 }
 
 function recordDayTrade(state, position) {
@@ -2058,7 +2057,7 @@ function entryLimitPrice(bid, ask, mid, conviction, pdtRiskLow) {
   const m = +(+mid).toFixed(2);
   if (!(bid > 0) || !(ask > 0) || ask < bid) return m;
   let aggr = Math.max(0, Math.min(1, conviction));
-  if (!pdtRiskLow) aggr = Math.min(aggr, 0.25); // stay near mid when day-trade headroom is tight
+  // PDT restrictions eliminated — always use full conviction-based aggression
   const px = mid + aggr * (ask - mid);
   return +Math.min(ask, Math.max(bid, px)).toFixed(2);
 }
@@ -2068,8 +2067,7 @@ function entryLimitPrice(bid, ask, mid, conviction, pdtRiskLow) {
 // deploying settled cash). So PDT risk is "low" for cash accounts, or when we still have day-trade
 // headroom on a margin account.
 function pdtRiskLow(state) {
-  if (state.accountType === "cash") return true;
-  return countRecentDayTrades(state) < 2; // leave a buffer below the 3-in-5 limit
+  return true; // PDT restrictions eliminated — risk is always "low"
 }
 
 // ─── Portfolio Helpers ───
@@ -2697,11 +2695,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   if ((cfg.broker === "tradier" || cfg.broker === "robinhood") && acct._inflightTickers?.has(ticker.toUpperCase())) {
     return { skipped: true, reason: `Broker: working order already open for ${ticker}` };
   }
-  // PDT discipline: don't re-enter a name we already closed today. Same-day round-trips burn
-  // scarce day trades — wait for a fresh session before re-engaging.
-  if (state.lastClosed && state.lastClosed[ticker] === getETDateStr()) {
-    return { skipped: true, reason: `PDT preserve: closed ${ticker} earlier today — avoiding same-day re-entry` };
-  }
+  // PDT re-entry restriction eliminated — allow same-day re-entry freely.
   // Hard cap on concurrent positions — prevents over-deployment that drained cash to $25.
   // For broker accounts this counts filled positions PLUS working orders (effectivePositionCount).
   const openCount = (cfg.broker === "tradier" || cfg.broker === "robinhood") ? effectivePositionCount(acct) : state.positions.length;
@@ -3154,28 +3148,7 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
   const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
   const pnlDollar = (currentPremium - pos.entryPremium) * qty * 100;
 
-  if (!acct._simMode && wouldBeDayTrade(pos)) {
-    // This close is a same-day round-trip = a day trade. Day trades are scarce, so spend them
-    // only on big profits or loss-cuts. Marginal same-day gains are held into the next session.
-    const bigProfit = pnlPct >= DAY_TRADE_BIG_PROFIT;
-    const lossExit = pnlPct <= 0;
-    const maxDt = acct.config.maxDayTrades !== undefined ? acct.config.maxDayTrades : 3;
-    
-    if (maxDt === 0) {
-      log(acct, `PDT BLOCKED: Cannot close ${pos.ticker} — account is configured for 0 day trades`);
-      return null;
-    }
-    
-    if (!bigProfit && !lossExit) {
-      log(acct, `PDT PRESERVE: Holding ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} — same-day exit at +${(pnlPct * 100).toFixed(0)}% not worth a day trade (need +${(DAY_TRADE_BIG_PROFIT * 100).toFixed(0)}% or a loss)`);
-      return null;
-    }
-    if (countRecentDayTrades(state) >= maxDt) {
-      const used = countRecentDayTrades(state);
-      log(acct, `PDT BLOCKED: Cannot close ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} — ${used}/${maxDt} day trades used`);
-      return null;
-    }
-  }
+  // PDT close restrictions eliminated — all same-day exits are allowed freely.
 
   // Broker (live) accounts: place a real sell_to_close and let the next sync reconcile.
   // Returns null so the exit loop keeps the position until the fill is confirmed by the broker.
@@ -6607,7 +6580,7 @@ async function ensureRobinhoodAccount() {
     const acct = accounts.get("robinhood");
     acct.config.broker = "robinhood";
     if (acct.config.autoExecute === undefined) acct.config.autoExecute = true;
-    if (acct.config.maxDayTrades === undefined) acct.config.maxDayTrades = 0; // strict PDT for RH
+    if (acct.config.maxDayTrades === undefined || acct.config.maxDayTrades === 0) acct.config.maxDayTrades = Infinity; // no PDT restrictions
     
     if (typeof seedCash === "number") acct.state.cash = seedCash;
     console.log(`  Robinhood: live account present — cash $${acct.state.cash.toFixed(2)}`);
@@ -6619,7 +6592,7 @@ async function ensureRobinhoodAccount() {
     broker: "robinhood",
     useCashReserve: false,
     autoExecute: true,
-    maxDayTrades: 0, // Enforce no day trades
+    maxDayTrades: Infinity, // No PDT restrictions — unlimited day trades
     startingCash: typeof seedCash === "number" ? seedCash : DEFAULT_CONFIG.startingCash,
   };
   const state = {
@@ -6632,7 +6605,7 @@ async function ensureRobinhoodAccount() {
   const acct = createAccountRuntime("robinhood", `Robinhood Live`, config, state);
   accounts.set("robinhood", acct);
   saveAccounts();
-  console.log(`  Robinhood: provisioned LIVE account ✓ — seeded cash $${state.cash.toFixed(2)}, autoExecute ON, 0 PDT limit`);
+  console.log(`  Robinhood: provisioned LIVE account ✓ — seeded cash $${state.cash.toFixed(2)}, autoExecute ON, NO PDT limits`);
 }
 
 const ORDER_DONE_STATUSES = ["filled", "canceled", "cancelled", "rejected", "expired", "error"];
@@ -7799,7 +7772,7 @@ async function main() {
   // Always provision the account so it appears in the dashboard
   await ensureRobinhoodAccount();
   if (rhOk) {
-    console.log(`  Robinhood: LIVE broker account ready (max: $${RH_MAX_POSITION_DOLLARS}/position, PDT: 0)`);
+    console.log(`  Robinhood: LIVE broker account ready (max: $${RH_MAX_POSITION_DOLLARS}/position, PDT: UNRESTRICTED)`);
   }
 
   // Initialize Tradier data + execution arm (primary market-data feed when connected)
