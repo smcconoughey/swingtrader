@@ -626,10 +626,6 @@ const CRITICAL_DTE = 3;        // Force-close when DTE <= 3 (give exits room bef
 const CASH_RESERVE_MAX = 0.50; // default minimum cash on hand (low trust)
 const CASH_RESERVE_MIN = 0.25; // floor minimum cash on hand (max trust)
 
-// ─── Day-Trade (PDT) Discipline ───
-// Day trades are scarce (3 per rolling window). Spend them only on big profits or loss-cuts,
-// never on marginal same-day exits or same-day re-entries.
-const DAY_TRADE_BIG_PROFIT = 0.30; // a same-day exit must be >= +30% to justify burning a day trade
 
 // ─── Expiration Cadence / DTE Staggering ───
 const TARGET_DTE = 21;     // preferred swing horizon (days to expiration)
@@ -679,7 +675,7 @@ const DEFAULT_CONFIG = {
   // Broker binding: "paper" (simulated) | "tradier" (live, broker is source of truth) | "robinhood"
   broker: "paper",
   // When false, the trust-scaled 50%->25% cash reserve gate is bypassed (per-trade sizing,
-  // max positions, sector caps, PDT and DTE staggering still apply). Toggleable per account.
+  // max positions, sector caps, and DTE staggering still apply). Toggleable per account.
   useCashReserve: true,
   // When true, broker orders execute live with no manual approval step.
   autoExecute: false,
@@ -690,9 +686,7 @@ const DEFAULT_CONFIG = {
   // explicit spend limit without ever planning beyond this max negative-cash floor.
   marginZeroCashSpendLimit: 200,
   marginMaxDebt: 250,
-  // Maximum day trades allowed in a rolling 5-day window. Default Infinity (no PDT restriction).
-  // PDT rules are eliminated — the bot trades freely without day-trade limits.
-  maxDayTrades: Infinity,
+
 };
 
 // ─── Multi-Account Runtime ───
@@ -712,7 +706,7 @@ function createAccountRuntime(id, name, config, state) {
       cash: (config && config.startingCash) || DEFAULT_CONFIG.startingCash,
       positions: [],
       history: [],
-      dayTrades: [],
+
     },
     dashboard: {
       quotes: {},
@@ -866,7 +860,7 @@ function loadAccounts() {
           cash: old.cash,
           positions: old.positions || [],
           history: old.history || [],
-          dayTrades: old.dayTrades || [],
+
         };
         const acct = createAccountRuntime("default", "Original Strategy", config, state);
         accounts.set("default", acct);
@@ -1771,47 +1765,7 @@ function nextExpiry(ticker, { targetDTE = TARGET_DTE, refDate = null, state = nu
   return expiries[0];
 }
 
-// ─── PDT Enforcement ───
 
-function getBusinessDaysAgo(n) {
-  const d = getETDate();
-  let count = 0;
-  while (count < n) {
-    d.setDate(d.getDate() - 1);
-    const day = d.getDay();
-    if (day !== 0 && day !== 6) count++;
-  }
-  return d.toISOString().slice(0, 10);
-}
-
-function cleanDayTrades(state) {
-  const cutoff = getBusinessDaysAgo(3);
-  state.dayTrades = state.dayTrades.filter(dt => dt.date >= cutoff);
-}
-
-function countRecentDayTrades(state) {
-  const cutoff = getBusinessDaysAgo(3);
-  return state.dayTrades.filter(dt => dt.date >= cutoff).length;
-}
-
-function wouldBeDayTrade(position) {
-  return position.openDate === getETDateStr();
-}
-
-function canClosePDT(state, position) {
-  return true; // PDT restrictions eliminated — always allow closing
-}
-
-function recordDayTrade(state, position) {
-  if (wouldBeDayTrade(position)) {
-    state.dayTrades.push({
-      date: getETDateStr(),
-      ticker: position.ticker,
-      strike: position.strike,
-      type: position.type,
-    });
-  }
-}
 
 // ─── API Layer ───
 
@@ -2050,25 +2004,17 @@ function reliableOptionMark(oq) {
 }
 
 // Entry limit price for a live options buy, trading like a disciplined human: when conviction is
-// high AND we aren't day-trade constrained, lean toward the ask (even crossing to it) to actually
-// get filled; when conviction is low or PDT risk is high, sit patiently at the mid. Never pays
+// high, lean toward the ask (even crossing to it) to actually
+// get filled; when conviction is low, sit patiently at the mid. Never pays
 // through the offer. conviction is 0..1; falls back to mid if we lack a real two-sided market.
-function entryLimitPrice(bid, ask, mid, conviction, pdtRiskLow) {
+function entryLimitPrice(bid, ask, mid, conviction) {
   const m = +(+mid).toFixed(2);
   if (!(bid > 0) || !(ask > 0) || ask < bid) return m;
   let aggr = Math.max(0, Math.min(1, conviction));
-  // PDT restrictions eliminated — always use full conviction-based aggression
   const px = mid + aggr * (ask - mid);
   return +Math.min(ask, Math.max(bid, px)).toFixed(2);
 }
 
-// PDT (pattern-day-trader) risk is only a real constraint on MARGIN accounts under $25k. Cash
-// accounts aren't subject to PDT at all (their constraint is T+1 settlement, handled by only
-// deploying settled cash). So PDT risk is "low" for cash accounts, or when we still have day-trade
-// headroom on a margin account.
-function pdtRiskLow(state) {
-  return true; // PDT restrictions eliminated — risk is always "low"
-}
 
 // ─── Portfolio Helpers ───
 
@@ -2695,7 +2641,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   if ((cfg.broker === "tradier" || cfg.broker === "robinhood") && acct._inflightTickers?.has(ticker.toUpperCase())) {
     return { skipped: true, reason: `Broker: working order already open for ${ticker}` };
   }
-  // PDT re-entry restriction eliminated — allow same-day re-entry freely.
+
   // Hard cap on concurrent positions — prevents over-deployment that drained cash to $25.
   // For broker accounts this counts filled positions PLUS working orders (effectivePositionCount).
   const openCount = (cfg.broker === "tradier" || cfg.broker === "robinhood") ? effectivePositionCount(acct) : state.positions.length;
@@ -3148,7 +3094,7 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
   const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
   const pnlDollar = (currentPremium - pos.entryPremium) * qty * 100;
 
-  // PDT close restrictions eliminated — all same-day exits are allowed freely.
+
 
   // Broker (live) accounts: place a real sell_to_close and let the next sync reconcile.
   // Returns null so the exit loop keeps the position until the fill is confirmed by the broker.
@@ -3185,22 +3131,11 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
   const proceeds = currentPremium * qty * 100;
   state.cash += proceeds;
   state.realizedPnl = (state.realizedPnl || 0) + pnlDollar;
-  if (!acct._simMode) {
-    recordDayTrade(state, pos);
-    // Track the close date per ticker so tryEntry can block same-day re-entry (PDT preservation).
-    if (!state.lastClosed) state.lastClosed = {};
-    state.lastClosed[pos.ticker] = getETDateStr();
-  }
-
-  const dtUsed = countRecentDayTrades(state);
   const trade = { ...pos, qty: qty, closePremium: currentPremium, pnlDollar, pnlPct, reason, closeDate: getETDateStr() };
   if (!acct._simMode) logTrade(trade);
 
   const trimLabel = qty < pos.qty ? `TRIM ${qty}/${pos.qty}` : "EXIT";
   log(acct, `${trimLabel}: ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} ${pnlDollar >= 0 ? "+" : ""}$${pnlDollar.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${(pnlPct * 100).toFixed(0)}%) — ${reason}`);
-  if (!acct._simMode && wouldBeDayTrade(pos)) {
-    log(acct, `PDT CHECK: ${dtUsed}/3 day trades used (rolling 5 days)`);
-  }
 
   // Push notification — exit alert
   if (!acct._simMode) {
@@ -3514,7 +3449,7 @@ function dashboardHTML(acct, { spectator = false } = {}) {
   const pv = portfolioValue(state, dashboard.quotes);
   const pnlPct = ((pv - STARTING_CASH) / STARTING_CASH * 100).toFixed(1);
   const progress = ((pv / GOAL) * 100).toFixed(1);
-  const dtCount = countRecentDayTrades(state);
+
   const llmBadge = spectator
     ? `<span class="llm-toggle" title="Read-only in spectator mode">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>`
     : `<span class="llm-toggle" onclick="fetch('/api/llm-provider',{method:'POST'}).then(()=>location.reload())" title="Click to switch LLM provider">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>`;
@@ -3534,15 +3469,12 @@ function dashboardHTML(acct, { spectator = false } = {}) {
       const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * 100;
       const profitPrice = pos.entryPremium * (1 + PROFIT_TARGET);
       const stopPrice = pos.entryPremium * (1 + STOP_LOSS);
-      const isDayTrade = pos.openDate === getETDateStr();
-      const pdtStatus = isDayTrade ? `Day trade (${dtCount}/3 used)` : "Swing (not a day trade)";
       return {
         ...pos, spot, dteLeft, curPremium, pnlPct, pnlDollar,
         profitTarget: { pct: `+${(PROFIT_TARGET * 100).toFixed(0)}%`, premium: profitPrice.toFixed(2) },
         stopLoss: { pct: `${(STOP_LOSS * 100).toFixed(0)}%`, premium: stopPrice.toFixed(2) },
         pctToProfit: ((profitPrice - curPremium) / curPremium * 100).toFixed(1),
         pctToStop: ((stopPrice - curPremium) / curPremium * 100).toFixed(1),
-        pdtStatus,
         greeks: optGreeks(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type),
       };
     });
@@ -3587,7 +3519,7 @@ function dashboardHTML(acct, { spectator = false } = {}) {
       <td><span style="color:#00a843">TP $${p.profitTarget.premium}</span> (${p.pctToProfit}% away)</td>
       <td><span style="color:#e8473f">SL $${p.stopLoss.premium}</span> (${p.pctToStop}% away)</td>
       <td style="font-size:10px;color:#6b7280">${p.openDate || '—'}</td>
-      <td style="font-size:10px;color:#6b7280">δ${p.greeks.delta} θ${p.greeks.theta}<br>${p.pdtStatus}<br><span style="color:${p.optionsSource === 'synthetic' ? '#8a909b' : '#138f86'}" title="Source / IV used for pricing">${(p.optionsSource || 'synthetic').toUpperCase()} IV ${((p.iv || 0.30) * 100).toFixed(0)}% ${p.optionsSource === 'synthetic' ? '○' : '●'}</span>${(p.liveBid != null && p.liveAsk != null) ? `<br><span title="Live option bid/ask used for marks & fills">b $${(+p.liveBid).toFixed(2)} / a $${(+p.liveAsk).toFixed(2)}${(p.liveBid > 0 && p.liveAsk > 0) ? ` · ${(((p.liveAsk - p.liveBid) / ((p.liveAsk + p.liveBid) / 2)) * 100).toFixed(0)}% wide` : ''}</span>` : (p.optionsSource === 'tradier' && !p._pending ? `<br><span style="color:#d2691e" title="No reliable two-sided market — position is HELD, not acted on">⚠ no live mark</span>` : '')}</td>
+      <td style="font-size:10px;color:#6b7280">δ${p.greeks.delta} θ${p.greeks.theta}<br><span style="color:${p.optionsSource === 'synthetic' ? '#8a909b' : '#138f86'}" title="Source / IV used for pricing">${(p.optionsSource || 'synthetic').toUpperCase()} IV ${((p.iv || 0.30) * 100).toFixed(0)}% ${p.optionsSource === 'synthetic' ? '○' : '●'}</span>${(p.liveBid != null && p.liveAsk != null) ? `<br><span title="Live option bid/ask used for marks & fills">b $${(+p.liveBid).toFixed(2)} / a $${(+p.liveAsk).toFixed(2)}${(p.liveBid > 0 && p.liveAsk > 0) ? ` · ${(((p.liveAsk - p.liveBid) / ((p.liveAsk + p.liveBid) / 2)) * 100).toFixed(0)}% wide` : ''}</span>` : (p.optionsSource === 'tradier' && !p._pending ? `<br><span style="color:#d2691e" title="No reliable two-sided market — position is HELD, not acted on">⚠ no live mark</span>` : '')}</td>
     </tr>${aiRow}`;
   }).join("") : '<tr><td colspan="13" style="opacity:.5">No open positions</td></tr>';
 
@@ -3661,7 +3593,7 @@ function dashboardHTML(acct, { spectator = false } = {}) {
   const logLines = dashboard.cycleLog.slice(-50).reverse().map(l =>
     l.replace(/\[(\d+:\d+:\d+)\]/, '<span style="color:#6b7280">[$1]</span>')
       .replace(/(TRADE:|EXIT:|HINT RECEIVED:|CLAUDE SAYS:)/g, '<b style="color:#6a4df4">$1</b>')
-      .replace(/(PDT BLOCKED:)/g, '<b style="color:#e8473f">$1</b>')
+
       .replace(/(STRONG BUY)/g, '<span style="color:#00a843">$1</span>')
       .replace(/(AVOID)/g, '<span style="color:#e8473f">$1</span>')
   ).join("<br>");
@@ -3759,12 +3691,12 @@ ${spectator ? '<div style="margin:8px 0 12px;padding:8px 12px;border:1px solid #
     <div class="stat ${pnlPct >= 0 ? "" : "neg"}" id="pv-card-wrap"><div class="val" id="pv-card">$${pv.toFixed(0)}</div><div class="lbl">Total Value</div></div>
     <div class="stat ${pnlPct >= 0 ? "" : "neg"}" id="pnl-card-wrap"><div class="val" id="pnl-card">${pnlPct >= 0 ? "+" : ""}${pnlPct}%</div><div class="lbl">P&L</div></div>
     <div class="stat"><div class="val" id="cash-card">$${state.cash.toFixed(0)}</div><div class="lbl">${cfg.broker === "tradier" ? ((state.accountType || "") === "cash" ? "Settled Cash" : "Spend Limit") : "Cash"}</div></div>
-    <div class="stat warn"><div class="val">${dtCount}/3</div><div class="lbl">PDT Used</div></div>
+
     ${cfg.broker === "tradier" ? `
     <div class="stat"><div class="val" style="font-size:14px;color:${(state.accountType || "") === "cash" ? "#00a843" : "#b07400"}">${(state.accountType || "?").toUpperCase()}</div><div class="lbl">Account Type</div></div>
     ${state.unsettledCash > 0 ? `<div class="stat"><div class="val" id="unsettled-card" style="font-size:14px;color:#b07400">${state.unsettledCash.toFixed(0)}</div><div class="lbl">Unsettled (T+1)</div></div>` : ""}
     ${state.reservedBuyingPower > 0 ? `<div class="stat"><div class="val" style="font-size:14px;color:#d2691e">$${state.reservedBuyingPower.toFixed(0)}</div><div class="lbl">Reserved (working orders)</div></div>` : ""}
-    ${(state.accountType && state.accountType !== "cash") ? `<div style="font-size:11px;color:#b07400;margin-top:6px">⚠️ This is a ${state.accountType.toUpperCase()} account — PDT &amp; margin/leverage apply. You wanted a cash account.</div>` : ""}` : ""}
+    ${(state.accountType && state.accountType !== "cash") ? `<div style="font-size:11px;color:#b07400;margin-top:6px">⚠️ This is a ${state.accountType.toUpperCase()} account — margin/leverage apply. You wanted a cash account.</div>` : ""}` : ""}
     <div class="progress"><div class="progress-bar" style="width:${Math.min(100, progress)}%"></div></div>
     <div style="font-size:11px;color:#6b7280">${progress}% to $${GOAL.toLocaleString()} goal</div>
     <div style="font-size:10px;color:#8a909b;margin-top:6px" title="Where price/option data came from this session">
@@ -3802,7 +3734,7 @@ ${spectator ? '<div style="margin:8px 0 12px;padding:8px 12px;border:1px solid #
 
 <div class="card" style="margin-bottom:16px">
   <h2>Open Positions (${state.positions.length})</h2>
-  <table><tr><th>Ticker</th><th>Type</th><th>Strike</th><th>Stock Price</th><th>DTE</th><th>Qty</th><th>Entry</th><th>Current</th><th>P&L</th><th>Profit Target</th><th>Stop Loss</th><th>Opened</th><th>Greeks / PDT</th></tr>${posRows}</table>
+  <table><tr><th>Ticker</th><th>Type</th><th>Strike</th><th>Stock Price</th><th>DTE</th><th>Qty</th><th>Entry</th><th>Current</th><th>P&L</th><th>Profit Target</th><th>Stop Loss</th><th>Opened</th><th>Greeks</th></tr>${posRows}</table>
 </div>
 
 <div class="card" style="margin-bottom:16px" id="bot-thinking-card">
@@ -4411,7 +4343,7 @@ function tickerDetailHTML(sym, acct, { spectator = false } = {}) {
       <hr style="border-color:#e3e6ea;margin:12px 0">
       <div class="stat"><div class="val">${pos.greeks.delta}</div><div class="lbl">Delta</div></div>
       <div class="stat"><div class="val">${pos.greeks.theta}</div><div class="lbl">Theta/day</div></div>
-      <div class="stat"><div class="val">${pos.pdtStatus}</div><div class="lbl">PDT Status</div></div>`;
+      `;
   }
 
   // Decision block
@@ -5977,7 +5909,7 @@ function startDashboard(defaultAcct, apiKey) {
     if (pathname === "/api/state") {
       await refreshBrokerBalances(activeAcct, { logErrors: true });
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-      res.end(JSON.stringify({ cash: state.cash, positions: state.positions, history: state.history.slice(-50), dayTrades: state.dayTrades, quotes: dashboard.quotes, analyses: Object.fromEntries(Object.entries(dashboard.analyses).map(([k, v]) => [k, { score: v.score, signal: v.signal, price: v.price, rsi: v.rsi }])), activeHints: activeAcct.activeHints, portfolioValue: portfolioValue(state, dashboard.quotes), marketOpen: dashboard.marketOpen, log: dashboard.cycleLog.slice(-50) }));
+      res.end(JSON.stringify({ cash: state.cash, positions: state.positions, history: state.history.slice(-50), quotes: dashboard.quotes, analyses: Object.fromEntries(Object.entries(dashboard.analyses).map(([k, v]) => [k, { score: v.score, signal: v.signal, price: v.price, rsi: v.rsi }])), activeHints: activeAcct.activeHints, portfolioValue: portfolioValue(state, dashboard.quotes), marketOpen: dashboard.marketOpen, log: dashboard.cycleLog.slice(-50) }));
       return;
     }
 
@@ -6371,7 +6303,7 @@ async function fetchSharedMarketData(apiKey, sharedCandleCache) {
 
 // ─── Broker (Tradier) Live Account Helpers ───
 
-// Extract usable cash from a Tradier balances object. Account type varies (cash / margin / pdt),
+// Extract usable cash from a Tradier balances object. Account type varies (cash / margin),
 // so the buying-power field lives in different places. Prefer option buying power when present.
 // Parse a Tradier balances object into the figures the bot trades on. The guiding rule for a CASH
 // account is: only ever deploy SETTLED cash (cash_available), never unsettled proceeds — that is
@@ -6454,7 +6386,7 @@ function applyBrokerBalanceInfo(acct, info, { warn = false } = {}) {
   state.marginZeroCashSpendLimit = info.marginZeroCashSpendLimit;
   state.marginMaxDebt = info.marginMaxDebt;
   if (warn && info.accountType !== "cash" && state._lastAcctTypeWarned !== info.accountType) {
-    log(acct, "⚠️ TRADIER: account type is \"" + info.accountType.toUpperCase() + "\", not CASH — PDT rule and margin/leverage apply. You wanted a cash account.");
+    log(acct, "⚠️ TRADIER: account type is \"" + info.accountType.toUpperCase() + "\", not CASH — margin/leverage apply. You wanted a cash account.");
     state._lastAcctTypeWarned = info.accountType;
   }
 }
@@ -6516,7 +6448,7 @@ async function ensureTradierAccount() {
       acct.state.positions = [];
       acct.state.history = [];
       acct.state.meta = {};
-      acct.state.dayTrades = [];
+
       delete acct.state.brokerEquity;
       delete acct.state.settledCash;
       delete acct.state.unsettledCash;
@@ -6551,7 +6483,7 @@ async function ensureTradierAccount() {
     cash: typeof seedCash === "number" ? seedCash : DEFAULT_CONFIG.startingCash,
     positions: [],
     history: [],
-    dayTrades: [],
+
     meta: {},
   };
   const acct = createAccountRuntime("tradier", `Tradier Live (${tradier.environment})`, config, state);
@@ -6580,7 +6512,7 @@ async function ensureRobinhoodAccount() {
     const acct = accounts.get("robinhood");
     acct.config.broker = "robinhood";
     if (acct.config.autoExecute === undefined) acct.config.autoExecute = true;
-    if (acct.config.maxDayTrades === undefined || acct.config.maxDayTrades === 0) acct.config.maxDayTrades = Infinity; // no PDT restrictions
+
     
     if (typeof seedCash === "number") acct.state.cash = seedCash;
     console.log(`  Robinhood: live account present — cash $${acct.state.cash.toFixed(2)}`);
@@ -6592,20 +6524,20 @@ async function ensureRobinhoodAccount() {
     broker: "robinhood",
     useCashReserve: false,
     autoExecute: true,
-    maxDayTrades: Infinity, // No PDT restrictions — unlimited day trades
+
     startingCash: typeof seedCash === "number" ? seedCash : DEFAULT_CONFIG.startingCash,
   };
   const state = {
     cash: typeof seedCash === "number" ? seedCash : DEFAULT_CONFIG.startingCash,
     positions: [],
     history: [],
-    dayTrades: [],
+
     meta: {},
   };
   const acct = createAccountRuntime("robinhood", `Robinhood Live`, config, state);
   accounts.set("robinhood", acct);
   saveAccounts();
-  console.log(`  Robinhood: provisioned LIVE account ✓ — seeded cash $${state.cash.toFixed(2)}, autoExecute ON, NO PDT limits`);
+  console.log(`  Robinhood: provisioned LIVE account ✓ — seeded cash $${state.cash.toFixed(2)}, autoExecute ON`);
 }
 
 const ORDER_DONE_STATUSES = ["filled", "canceled", "cancelled", "rejected", "expired", "error"];
@@ -6691,18 +6623,17 @@ async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, dte, q
   };
 
   try {
-    // Conviction-/PDT-aware fill: high conviction + low PDT risk → price toward the ask to fill;
+    // Conviction-aware fill: high conviction → price toward the ask to fill;
     // otherwise sit at the mid. Falls back to mid when we don't have a real bid/ask.
     const conviction = Math.max(0, Math.min(1, (claudeConfidence || 0) / 100));
-    const lowPdt = pdtRiskLow(acct.state);
-    const limit = entryLimitPrice(bid, ask, premium, conviction, lowPdt);
+    const limit = entryLimitPrice(bid, ask, premium, conviction);
     const aggrLabel = limit >= (ask || limit) ? "at ask" : limit > premium ? "toward ask" : "at mid";
     const res = await tradier.placeOptionOrder(ticker, expStr, type, strike, "buy_to_open", qty, "limit", limit);
     // Mark this underlying in-flight so the rest of THIS cycle counts it toward maxPositions
     // (via effectivePositionCount) and won't place a duplicate. The next sync reconciles fully.
     if (!acct._inflightTickers) acct._inflightTickers = new Set();
     acct._inflightTickers.add(ticker.toUpperCase());
-    log(acct, `TRADIER ENTRY: BUY ${qty}x ${occ} @ $${limit} (${aggrLabel}; conviction ${(conviction * 100).toFixed(0)}%, PDT ${lowPdt ? "ok" : "tight"}; bid ${bid ?? "?"}/ask ${ask ?? "?"}/mid ${premium}) — order ${res?.id || JSON.stringify(res).slice(0, 80)}`);
+    log(acct, `TRADIER ENTRY: BUY ${qty}x ${occ} @ $${limit} (${aggrLabel}; conviction ${(conviction * 100).toFixed(0)}%; bid ${bid ?? "?"}/ask ${ask ?? "?"}/mid ${premium}) — order ${res?.id || JSON.stringify(res).slice(0, 80)}`);
 
     // Optimistic in-cycle cash decrement so additional entries this cycle size off remaining
     // buying power. Reconciled (overwritten) by the next syncBrokerAccount. No placeholder
@@ -6719,7 +6650,7 @@ async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, dte, q
 }
 
 // Place a real sell_to_close on Tradier. Broker is the source of truth: we record the trade to
-// history + day-trade ledger and log it, but DO NOT mutate state.cash/state.positions — the next
+// history and log it, but DO NOT mutate state.cash/state.positions — the next
 // sync reconciles. Returns null so exit-loop callers keep the position until the fill is confirmed.
 function placeBrokerExit(acct, pos, currentPremium, reason, qty, pnlPct, pnlDollar) {
   const state = acct.state;
@@ -6760,7 +6691,7 @@ function placeBrokerExit(acct, pos, currentPremium, reason, qty, pnlPct, pnlDoll
     });
 
   // Bookkeeping (no balance/position mutation — sync is authoritative).
-  recordDayTrade(state, pos);
+
   if (!state.lastClosed) state.lastClosed = {};
   state.lastClosed[ticker] = getETDateStr();
   state.realizedPnl = (state.realizedPnl || 0) + pnlDollar;
@@ -7166,7 +7097,7 @@ async function runCycle(acct, sharedQuotes, apiKey) {
   dash.decisions = decisions;
   dash.shortTermAnalyses = shortTermAnalyses;
 
-  cleanDayTrades(state);
+
 
   // Broker accounts: mirror real balance + positions before any exit/entry decisions.
   if (cfg.broker === "tradier") await syncBrokerAccount(acct, quotes);
@@ -7221,7 +7152,7 @@ async function runCycle(acct, sharedQuotes, apiKey) {
   const pv = portfolioValue(state, quotes);
   const pnlPct = ((pv - cfg.startingCash) / cfg.startingCash * 100).toFixed(1);
   const progress = ((pv / cfg.goal) * 100).toFixed(1);
-  log(acct, `Portfolio: $${pv.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%) | Goal: ${progress}% of $${cfg.goal.toLocaleString()} | Cash: $${state.cash.toFixed(0)} | ${state.positions.length} open | ${countRecentDayTrades(state)}/3 PDT | ${regime.mode.toUpperCase()}${getActiveHintsSummary(acct)}`);
+  log(acct, `Portfolio: $${pv.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%) | Goal: ${progress}% of $${cfg.goal.toLocaleString()} | Cash: $${state.cash.toFixed(0)} | ${state.positions.length} open | ${regime.mode.toUpperCase()}${getActiveHintsSummary(acct)}`);
 
   // Tweet daily watchlist summary (once per day)
   tweetWatchlistSummary(acct, decisions, regime).catch(e => console.log(`  [X] Watchlist tweet error: ${e.message}`));
@@ -7272,7 +7203,7 @@ async function runPausedCycle(acct, sharedQuotes) {
     }
   }
 
-  cleanDayTrades(state);
+
 
   // Build minimal analyses for signal-based exits
   const analyses = {};
@@ -7320,7 +7251,7 @@ function buildPositionDetails(acct, quotes) {
         profitTarget: { pct: "—", premium: "—" },
         stopLoss: { pct: "—", premium: "—" },
         pctToProfit: "0.0", pctToStop: "0.0",
-        pdtStatus: `⏳ WORKING ORDER${pos.orderStatus ? ` (${pos.orderStatus})` : ""}`,
+
         greeks: { delta: "—", theta: "—" },
       };
     }
@@ -7330,8 +7261,6 @@ function buildPositionDetails(acct, quotes) {
     const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * 100;
     const profitPrice = pos.entryPremium * (1 + cfg.profitTarget);
     const stopLossPrice = pos.entryPremium * (1 + cfg.stopLoss);
-    const isDayTrade = pos.openDate === getETDateStr();
-    const pdtStatus = isDayTrade ? `Day trade (${countRecentDayTrades(state)}/3 used)` : "Swing (not a day trade)";
 
     let effectiveStop;
     if ((pos.trimLevel || 0) >= 2) effectiveStop = pos.entryPremium * 1.15;
@@ -7344,7 +7273,6 @@ function buildPositionDetails(acct, quotes) {
       stopLoss: { pct: `${(cfg.stopLoss * 100).toFixed(0)}%`, premium: effectiveStop.toFixed(2) },
       pctToProfit: ((profitPrice - curPremium) / curPremium * 100).toFixed(1),
       pctToStop: ((effectiveStop - curPremium) / curPremium * 100).toFixed(1),
-      pdtStatus,
       greeks: pos.liveGreeks
         ? { delta: (pos.liveGreeks.delta ?? 0).toFixed(3), theta: (pos.liveGreeks.theta ?? 0).toFixed(3) }
         : optGreeks(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type),
@@ -7698,7 +7626,7 @@ async function runAfterHoursScan(acct, sharedQuotes, apiKey) {
 async function main() {
   console.log("\n  ╔═══════════════════════════════════════════════╗");
   console.log("  ║  Swing Trader — Auto-Trading Bot v1.0         ║");
-  console.log("  ║  Multi-Account · Dynamic Watchlist · PDT      ║");
+  console.log("  ║  Multi-Account · Dynamic Watchlist             ║");
   console.log("  ║  Headless · Finnhub · Aggressive Mode          ║");
   console.log("  ╚═══════════════════════════════════════════════╝\n");
 
@@ -7772,7 +7700,7 @@ async function main() {
   // Always provision the account so it appears in the dashboard
   await ensureRobinhoodAccount();
   if (rhOk) {
-    console.log(`  Robinhood: LIVE broker account ready (max: $${RH_MAX_POSITION_DOLLARS}/position, PDT: UNRESTRICTED)`);
+    console.log(`  Robinhood: LIVE broker account ready (max: $${RH_MAX_POSITION_DOLLARS}/position)`);
   }
 
   // Initialize Tradier data + execution arm (primary market-data feed when connected)

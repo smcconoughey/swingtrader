@@ -1,7 +1,7 @@
 {
   "name": "swingers-bot",
   "version": "1.0.0",
-  "description": "Headless auto-trading bot with PDT enforcement",
+  "description": "Headless auto-trading bot",
   "type": "module",
   "scripts": {
     "start": "node bot.js",

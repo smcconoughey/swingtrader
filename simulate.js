@@ -119,7 +119,7 @@ function simulateRun(candles, genome, startCash, tradingDays) {
   let cash = startCash;
   let positions = [];
   let trades = [];
-  let dayTradeCount = 0;
+
   let maxDrawdown = 0;
   let peak = startCash;
 
@@ -169,7 +169,7 @@ function simulateRun(candles, genome, startCash, tradingDays) {
 
       if (closeReason) {
         cash += curPremium * pos.qty * 100;
-        if (pos.daysHeld === 0) dayTradeCount++;
+
         trades.push({ ticker: pos.ticker, pnlPct, pnlDollar, reason: closeReason, type: pos.type });
       } else {
         remaining.push(pos);
@@ -243,7 +243,7 @@ function simulateRun(candles, genome, startCash, tradingDays) {
     winRate: trades.length > 0 ? winTrades.length / trades.length : 0,
     avgWin: winTrades.length > 0 ? winTrades.reduce((s, t) => s + t.pnlPct, 0) / winTrades.length : 0,
     avgLoss: lossTrades.length > 0 ? lossTrades.reduce((s, t) => s + t.pnlPct, 0) / lossTrades.length : 0,
-    dayTradeCount,
+
     sharpe: trades.length > 1 ? calcSharpe(trades.map(t => t.pnlPct)) : 0,
   };
 }
