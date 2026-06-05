@@ -2027,8 +2027,11 @@ function portfolioValue(state, quotes) {
   for (const pos of state.positions) {
     const q = quotes[pos.ticker];
     const spot = q ? q.c : pos.entrySpot;
-    const currentPremium = pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium);
-    val += currentPremium * pos.qty * 100;
+    const isEquity = pos.type === "equity";
+    const currentPremium = isEquity
+      ? (pos.liveMark ?? spot)
+      : (pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
+    val += currentPremium * pos.qty * (isEquity ? 1 : 100);
   }
   return val;
 }
@@ -2509,7 +2512,10 @@ Rules:
 
 async function validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, candidates) {
   const cfg = acct.config;
-  const direction = analysis.score >= cfg.bullEntry ? 'BULLISH (buying calls)' : 'BEARISH (buying puts)';
+  const isEquity = cfg.broker === "robinhood";
+  const direction = analysis.score >= cfg.bullEntry
+    ? (isEquity ? 'BULLISH (buying shares)' : 'BULLISH (buying calls)')
+    : (isEquity ? 'BEARISH' : 'BEARISH (buying puts)');
 
   // Build the candidate contract table if we have real chain data
   let contractSection = '';
@@ -2531,11 +2537,25 @@ async function validateEntryWithClaude(acct, ticker, quote, analysis, setupQuali
     }).join('\n');
     contractSection = `\nReal options chain (${candidates.length} viable contracts):\n${header}\n${rows}`;
     contractInstruction = `\nSelect the best contract index (1-${candidates.length}) for this trade. Consider: DTE vs setup timeframe, delta (higher confidence → closer to ATM), liquidity (OI + volume), and spread cost.`;
+  } else if (isEquity) {
+    contractSection = '\nThis is an EQUITY (shares) trade on Robinhood — no options contracts. Evaluate whether buying shares at the current price is a good swing entry.';
   } else {
     contractSection = '\nNo real chain data available — synthetic pricing will be used.';
   }
 
-  const promptText = `You are a trading bot's risk management system. Evaluate this potential options trade and select the best available contract.
+  const tradeType = isEquity ? 'equity (shares) trade' : 'options trade';
+  const evalQuestions = isEquity
+    ? `Evaluate:
+1. Is this a quality setup for buying shares, or chasing an extended move?
+2. Key risks for this swing trade given current conditions?
+3. What price targets and stop levels would you suggest?`
+    : `Evaluate:
+1. Is this a quality setup or chasing an extended move?
+2. Key risks for this trade given current conditions?
+3. Best contract choice and why (DTE, strike depth)?
+${contractInstruction}`;
+
+  const promptText = `You are a trading bot's risk management system. Evaluate this potential ${tradeType}.
 
 Ticker: ${ticker}
 Price: $${quote.c.toFixed(2)}
@@ -2549,15 +2569,11 @@ ${earningsInfo.hasEarnings ? `⚠ EARNINGS in ${earningsInfo.daysUntil} days (${
 ${cfg.customPromptSuffix ? `Additional context: ${cfg.customPromptSuffix}` : ''}
 ${contractSection}
 
-Evaluate:
-1. Is this a quality setup or chasing an extended move?
-2. Key risks for this trade given current conditions?
-3. Best contract choice and why (DTE, strike depth)?
-${contractInstruction}
+${evalQuestions}
 
 Respond with ONLY valid JSON (no markdown, no backticks). "reasoning" must be your FULL thought
 process: walk through the setup assessment, the technical/regime read, the specific risks, and why
-you chose (or rejected) the contract — several sentences. "suggestion" stays a one-line takeaway:
+you chose (or rejected) the ${isEquity ? 'entry' : 'contract'} — several sentences. "suggestion" stays a one-line takeaway:
 {"approve": true, "confidence": 75, "concerns": [], "reasoning": "full step-by-step thought process", "suggestion": "one-line takeaway"${candidates?.length > 0 ? ', "contractIdx": 1' : ''}}`;
 
   try {
@@ -2690,6 +2706,11 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   if (isBullish && analysis.rsi > 85 && !analysis.aligned) {
     return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} parabolic with misaligned EMAs — exhaustion risk, not a healthy strength setup` };
   }
+  // Robinhood only supports equity longs — skip all bearish/put setups
+  if (cfg.broker === "robinhood" && isBearish) {
+    return { skipped: true, reason: `Robinhood: equity longs only — skipping bearish setup` };
+  }
+
   if (isBearish && analysis.rsi > 30 && analysis.rsi < 55 && !analysis.bearish) {
     return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} neutral with non-bearish EMA stack — weak put setup` };
   }
@@ -2711,7 +2732,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     await delay(API_DELAY);
   } catch { }
   if (earningsInfo.hasEarnings) {
-    return { skipped: true, reason: `Earnings in ${earningsInfo.daysUntil} days (${earningsInfo.date}) — too risky for 7DTE options` };
+    return { skipped: true, reason: `Earnings in ${earningsInfo.daysUntil} days (${earningsInfo.date}) — too risky${cfg.broker === "robinhood" ? "" : " for 7DTE options"}` };
   }
 
   const spot = quote.c;
@@ -2732,37 +2753,43 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     if (!claudeResult.approve) {
       return { skipped: true, reason: `Claude rejected (cached): ${claudeResult.suggestion}` };
     }
-    try {
-      let chain = getCachedChain(ticker);
-      if (!chain) {
-        chain = await fetchFullOptionsChain(ticker, apiKey);
-        await delay(API_DELAY);
-        if (chain) setCachedChain(ticker, chain);
+    // Robinhood trades equities, not options — skip chain fetch
+    if (cfg.broker !== "robinhood") {
+      try {
+        let chain = getCachedChain(ticker);
+        if (!chain) {
+          chain = await fetchFullOptionsChain(ticker, apiKey);
+          await delay(API_DELAY);
+          if (chain) setCachedChain(ticker, chain);
+        }
+        if (chain) candidates = buildCandidateContracts(chain, type, spot, 60);
+      } catch (e) {
+        log(acct, `OPTIONS ${ticker}: cached affordability refresh failed — ${e.message}`);
       }
-      if (chain) candidates = buildCandidateContracts(chain, type, spot, 60);
-    } catch (e) {
-      log(acct, `OPTIONS ${ticker}: cached affordability refresh failed — ${e.message}`);
     }
   } else {
-    // ─── Step 2: Fetch full options chain (with short-lived cache) ───
-    try {
-      let chain = getCachedChain(ticker);
-      if (!chain) {
-        chain = await fetchFullOptionsChain(ticker, apiKey);
-        await delay(API_DELAY);
-        if (chain) setCachedChain(ticker, chain);
+    // Robinhood trades equities — skip options chain, use equity-focused Claude prompt
+    if (cfg.broker !== "robinhood") {
+      // ─── Step 2: Fetch full options chain (with short-lived cache) ───
+      try {
+        let chain = getCachedChain(ticker);
+        if (!chain) {
+          chain = await fetchFullOptionsChain(ticker, apiKey);
+          await delay(API_DELAY);
+          if (chain) setCachedChain(ticker, chain);
+        }
+        if (chain) {
+          candidates = buildCandidateContracts(chain, type, spot, 60);
+          log(acct, `OPTIONS ${ticker}: ${candidates.length} viable ${type} contracts (${chain.length} expiries)`);
+        }
+      } catch (e) {
+        log(acct, `OPTIONS ${ticker}: chain error — ${e.message}`);
       }
-      if (chain) {
-        candidates = buildCandidateContracts(chain, type, spot, 60);
-        log(acct, `OPTIONS ${ticker}: ${candidates.length} viable ${type} contracts (${chain.length} expiries)`);
-      }
-    } catch (e) {
-      log(acct, `OPTIONS ${ticker}: chain error — ${e.message}`);
     }
 
     // ─── Step 3: Claude validates setup AND selects best contract ───
     try {
-      claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, candidates);
+      claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, cfg.broker === "robinhood" ? null : candidates);
       selectedCandidate = candidates.length > 0 ? candidates[claudeResult.contractIdx ?? 0] : null;
       // Stagger expirations: if Claude's pick lands on an over-concentrated expiry, prefer an
       // equally-valid candidate on a less-crowded expiration date.
@@ -3091,8 +3118,10 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
 function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
   const state = acct.state;
   const qty = qtyToClose || pos.qty;
+  const isEquity = pos.type === "equity";
+  const multiplier = isEquity ? 1 : 100;
   const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
-  const pnlDollar = (currentPremium - pos.entryPremium) * qty * 100;
+  const pnlDollar = (currentPremium - pos.entryPremium) * qty * multiplier;
 
 
 
@@ -3128,7 +3157,7 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
     }
   }
 
-  const proceeds = currentPremium * qty * 100;
+  const proceeds = currentPremium * qty * multiplier;
   state.cash += proceeds;
   state.realizedPnl = (state.realizedPnl || 0) + pnlDollar;
   const trade = { ...pos, qty: qty, closePremium: currentPremium, pnlDollar, pnlPct, reason, closeDate: getETDateStr() };
@@ -3167,12 +3196,21 @@ function tryExits(acct, quotes) {
 
     const spot = q.c;
     const now = acct._simNow || Date.now();
-    // Use stored Friday expiry date if available, otherwise fall back to elapsed-day calculation
-    pos.dteRemaining = pos.expiryDate
-      ? Math.max(0, (pos.expiryDate - now) / 86400_000)
-      : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
+    const isEquity = pos.type === "equity";
 
-    const currentPremium = pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium);
+    // Equity positions don't expire; options use stored expiry date or elapsed-day fallback
+    if (!isEquity) {
+      pos.dteRemaining = pos.expiryDate
+        ? Math.max(0, (pos.expiryDate - now) / 86400_000)
+        : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
+    } else {
+      pos.dteRemaining = 0;
+    }
+
+    // Equity: current price is just the spot; Options: use live mark or Black-Scholes
+    const currentPremium = isEquity
+      ? (pos.liveMark ?? spot)
+      : (pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
     const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
 
     if (!pos.bestPnlPct) pos.bestPnlPct = 0;
@@ -3188,20 +3226,24 @@ function tryExits(acct, quotes) {
     // get a wider stop so normal intraday noise doesn't whipsaw us; calm names (UNH ~2% ATR)
     // keep the 4% floor. Formula: max(4%, 1.5 × entry-day ATR%).
     const spotMove = pos.entrySpot ? (spot - pos.entrySpot) / pos.entrySpot : 0;
-    const adverseSpotMove = pos.type === "call" ? -spotMove : spotMove; // +ve = moved against us
+    // Equity longs: adverse = stock went down. Options: call adverse = down, put adverse = up.
+    const adverseSpotMove = isEquity ? -spotMove : (pos.type === "call" ? -spotMove : spotMove);
     const atrPct = (pos.entryAtrPct || 0) / 100;
     const spotStopThreshold = Math.max(0.04, 1.5 * atrPct);
     if (adverseSpotMove >= spotStopThreshold) {
-      reason = `spot stop: underlying ${pos.type === "call" ? "down" : "up"} ${(adverseSpotMove * 100).toFixed(1)}% from entry (threshold ${(spotStopThreshold * 100).toFixed(1)}%, ATR ${(atrPct * 100).toFixed(1)}%)`;
+      reason = isEquity
+        ? `spot stop: stock down ${(adverseSpotMove * 100).toFixed(1)}% from entry (threshold ${(spotStopThreshold * 100).toFixed(1)}%, ATR ${(atrPct * 100).toFixed(1)}%)`
+        : `spot stop: underlying ${pos.type === "call" ? "down" : "up"} ${(adverseSpotMove * 100).toFixed(1)}% from entry (threshold ${(spotStopThreshold * 100).toFixed(1)}%, ATR ${(atrPct * 100).toFixed(1)}%)`;
       fullClose = true;
     }
-    else if (pos.dteRemaining <= CRITICAL_DTE) {
+    // DTE-based exits only apply to options, not equity positions
+    else if (!isEquity && pos.dteRemaining <= CRITICAL_DTE) {
       reason = `DTE critical (${pos.dteRemaining.toFixed(1)}d remaining)`;
       fullClose = true;
     }
     // DTE-aware stop tightening: as expiration approaches, accept smaller losses to avoid
     // the "force-close at -60%" trap. At <=5 DTE, use a -20% stop instead of -35%.
-    else if (pos.dteRemaining <= LOW_DTE_THRESHOLD && pnlPct <= -0.20) {
+    else if (!isEquity && pos.dteRemaining <= LOW_DTE_THRESHOLD && pnlPct <= -0.20) {
       reason = `low-DTE tight stop ${(pnlPct * 100).toFixed(0)}% (${pos.dteRemaining.toFixed(1)}d left, theta accelerating)`;
       fullClose = true;
     }
@@ -3209,7 +3251,7 @@ function tryExits(acct, quotes) {
       reason = `stop loss ${(pnlPct * 100).toFixed(0)}%`;
       fullClose = true;
     }
-    else if (pos.dteRemaining <= 1) {
+    else if (!isEquity && pos.dteRemaining <= 1) {
       reason = "DTE expiring";
       fullClose = true;
     }
@@ -3464,9 +3506,10 @@ function dashboardHTML(acct, { spectator = false } = {}) {
       const dteLeft = pos.expiryDate
         ? Math.max(0, (pos.expiryDate - now) / 86400_000)
         : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
-      const curPremium = pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium);
+      const isEq = pos.type === "equity";
+      const curPremium = isEq ? (pos.liveMark ?? spot) : (pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
       const pnlPct = pos.entryPremium > 0 ? (curPremium - pos.entryPremium) / pos.entryPremium : 0;
-      const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * 100;
+      const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * (isEq ? 1 : 100);
       const profitPrice = pos.entryPremium * (1 + PROFIT_TARGET);
       const stopPrice = pos.entryPremium * (1 + STOP_LOSS);
       return {
@@ -5937,7 +5980,7 @@ function startDashboard(defaultAcct, apiKey) {
         const a = dashboard.analyses[sym]; const st = dashboard.shortTermAnalyses[sym];
         const pos = state.positions.find(p => p.ticker === sym);
         let posPnl = null;
-        if (pos) { const spot = q ? q.c : pos.entrySpot; const _now = Date.now(); const dteLeft = pos.expiryDate ? Math.max(0, (pos.expiryDate - _now) / 86400_000) : Math.max(0, pos.dte - (_now - pos.openTime) / 86400_000); const curPremium = optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type); posPnl = { pct: ((curPremium - pos.entryPremium) / pos.entryPremium * 100).toFixed(1), dollar: ((curPremium - pos.entryPremium) * pos.qty * 100).toFixed(0) }; }
+        if (pos) { const spot = q ? q.c : pos.entrySpot; const _isEq = pos.type === "equity"; const _now = Date.now(); const dteLeft = pos.expiryDate ? Math.max(0, (pos.expiryDate - _now) / 86400_000) : Math.max(0, pos.dte - (_now - pos.openTime) / 86400_000); const curPremium = _isEq ? (pos.liveMark ?? spot) : optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type); const _mult = _isEq ? 1 : 100; posPnl = { pct: ((curPremium - pos.entryPremium) / pos.entryPremium * 100).toFixed(1), dollar: ((curPremium - pos.entryPremium) * pos.qty * _mult).toFixed(0) }; }
         tickers[sym] = { c: q.c, pc: q.pc, d: q.d, dp: q.dp, h: q.h, l: q.l, score: a?.score, signal: a?.signal, stScore: st?.score, mom1d: st?.mom1d, mom3d: st?.mom3d, mom7d: st?.mom7d, held: !!pos, type: pos?.type, posPnl };
       }
       res.end(JSON.stringify({ tickers, pv: portfolioValue(state, dashboard.quotes), cash: state.cash, balanceInfo, open: state.positions.length, marketOpen: dashboard.marketOpen, lastCycle: dashboard.lastCycle }));
@@ -7256,9 +7299,10 @@ function buildPositionDetails(acct, quotes) {
       };
     }
 
-    const curPremium = pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium);
+    const isEq = pos.type === "equity";
+    const curPremium = isEq ? (pos.liveMark ?? spot) : (pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
     const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
-    const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * 100;
+    const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * (isEq ? 1 : 100);
     const profitPrice = pos.entryPremium * (1 + cfg.profitTarget);
     const stopLossPrice = pos.entryPremium * (1 + cfg.stopLoss);
 
