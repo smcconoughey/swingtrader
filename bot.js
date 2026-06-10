@@ -5182,8 +5182,8 @@ function tabBarHTML(activeId, { spectator = false } = {}) {
 </div>
 
 <!-- Account Management Modal -->
-${spectator ? "" : `<div id="acct-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:999;align-items:center;justify-content:center">
-  <div style="background:#ffffff;border:1px solid #d4d8e0;border-radius:12px;padding:24px;max-width:420px;width:90%">
+${spectator ? "" : `<div id="acct-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:999;align-items:flex-start;justify-content:center;overflow-y:auto;padding:20px 0;box-sizing:border-box">
+  <div style="background:#ffffff;border:1px solid #d4d8e0;border-radius:12px;padding:24px;max-width:420px;width:90%;max-height:calc(100vh - 40px);overflow-y:auto;box-sizing:border-box">
     <h2 style="margin:0 0 16px;color:#1c1d22">New Account</h2>
     <form method="POST" action="/api/accounts">
       <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Account Name</label>
@@ -5244,8 +5244,8 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
       <button type="submit" class="acct-btn delete">🗑 Delete</button>
     </form>` : ""}
   </div>
-  <div id="edit-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:999;align-items:center;justify-content:center">
-    <div style="background:#ffffff;border:1px solid #d4d8e0;border-radius:12px;padding:24px;max-width:420px;width:90%">
+  <div id="edit-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:999;align-items:flex-start;justify-content:center;overflow-y:auto;padding:20px 0;box-sizing:border-box">
+    <div style="background:#ffffff;border:1px solid #d4d8e0;border-radius:12px;padding:24px;max-width:420px;width:90%;max-height:calc(100vh - 40px);overflow-y:auto;box-sizing:border-box">
       <h2 style="margin:0 0 16px;color:#1c1d22">Settings: ${acct.name}</h2>
       <form method="POST" action="/api/accounts/${acctId}/config">
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Risk per Trade (%)</label>
