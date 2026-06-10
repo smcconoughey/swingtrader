@@ -5262,6 +5262,10 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
         <input name="maxTradeSize" type="number" value="${cfg.maxTradeSize || 500}" placeholder="500" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Min Setup Quality (0=trade anything, 50=default, 100=perfect setups only)</label>
         <input name="minSetupQuality" type="number" value="${cfg.minSetupQuality ?? 50}" min="0" max="100" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Bull Entry Score (≥, buy calls)</label><input name="bullEntry" type="number" value="${cfg.bullEntry ?? 68}" min="50" max="100" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Bear Entry Score (≤, buy puts)</label><input name="bearEntry" type="number" value="${cfg.bearEntry ?? 32}" min="0" max="50" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+        </div>
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Custom Prompt Suffix</label>
         <input name="customPromptSuffix" value="${(cfg.customPromptSuffix || "").replace(/"/g, "&quot;")}" placeholder="e.g. Focus on tech sector only" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:16px;box-sizing:border-box">
         <input type="hidden" name="configForm" value="1">
@@ -5919,6 +5923,8 @@ function startDashboard(defaultAcct, apiKey) {
         if (params.has("marginZeroCashSpendLimit")) cfg.marginZeroCashSpendLimit = Math.max(0, parseFloat(params.get("marginZeroCashSpendLimit")) || 0);
         if (params.has("marginMaxDebt")) cfg.marginMaxDebt = Math.max(0, parseFloat(params.get("marginMaxDebt")) || 0);
         if (params.has("minSetupQuality")) cfg.minSetupQuality = parseInt(params.get("minSetupQuality")) ?? 50;
+        if (params.has("bullEntry")) cfg.bullEntry = Math.min(100, Math.max(50, parseInt(params.get("bullEntry")) || 68));
+        if (params.has("bearEntry")) cfg.bearEntry = Math.min(50, Math.max(0, parseInt(params.get("bearEntry")) || 32));
         cfg.customPromptSuffix = params.get("customPromptSuffix") || "";
         // Broker binding + live-trading toggles. Checkboxes only POST when checked.
         if (params.has("broker") && ["paper", "tradier", "robinhood"].includes(params.get("broker"))) cfg.broker = params.get("broker");
@@ -5929,7 +5935,7 @@ function startDashboard(defaultAcct, apiKey) {
         }
         target.riskPct = cfg.baseRiskPct * (target.currentRegime?.riskScale || 0.5);
         saveAccounts();
-        console.log(`  [${id}] Config updated: risk=${(cfg.baseRiskPct * 100).toFixed(1)}% target=${(cfg.profitTarget * 100)}% stop=${(cfg.stopLoss * 100)}% minQuality=${cfg.minSetupQuality}`);
+        console.log(`  [${id}] Config updated: risk=${(cfg.baseRiskPct * 100).toFixed(1)}% target=${(cfg.profitTarget * 100)}% stop=${(cfg.stopLoss * 100)}% minQuality=${cfg.minSetupQuality} bullEntry=${cfg.bullEntry} bearEntry=${cfg.bearEntry}`);
         res.writeHead(302, { Location: `/?a=${id}` });
         res.end();
       });
