@@ -1792,7 +1792,9 @@ async function fetchQuote(sym, key) {
   const meta = d.chart?.result?.[0]?.meta;
   if (!meta || !meta.regularMarketPrice) throw new Error(`No Yahoo quote for ${sym}`);
   noteDataSource("yahoo");
-  return { c: meta.regularMarketPrice, h: meta.regularMarketDayHigh || meta.regularMarketPrice, l: meta.regularMarketDayLow || meta.regularMarketPrice, o: meta.regularMarketOpen || meta.regularMarketPrice, pc: meta.chartPreviousClose || meta.previousClose || 0 };
+  const c = meta.regularMarketPrice;
+  const pc = meta.chartPreviousClose || meta.previousClose || 0;
+  return { c, h: meta.regularMarketDayHigh || c, l: meta.regularMarketDayLow || c, o: meta.regularMarketOpen || c, pc, d: pc ? +(c - pc).toFixed(2) : 0, dp: pc ? +((c - pc) / pc * 100).toFixed(2) : 0 };
 }
 
 async function fetchCandles(sym, key) {
@@ -2030,7 +2032,7 @@ function portfolioValue(state, quotes) {
     const isEquity = pos.type === "equity";
     const currentPremium = isEquity
       ? (pos.liveMark ?? spot)
-      : (pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
+      : (pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type));
     val += currentPremium * pos.qty * (isEquity ? 1 : 100);
   }
   return val;
@@ -3268,7 +3270,7 @@ function tryExits(acct, quotes) {
     // Equity: current price is just the spot; Options: use live mark or Black-Scholes
     const currentPremium = isEquity
       ? (pos.liveMark ?? spot)
-      : (pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
+      : (pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type));
     const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
 
     if (!pos.bestPnlPct) pos.bestPnlPct = 0;
@@ -3393,7 +3395,7 @@ function trySignalExits(acct, quotes, analyses) {
 
     const q = quotes[pos.ticker];
     const spot = q ? q.c : pos.entrySpot;
-    const currentPremium = pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium);
+    const currentPremium = pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
 
     const trade = closePosition(acct, pos, currentPremium, "signal reversed");
     if (trade) {
@@ -3426,7 +3428,7 @@ function tryTimeBasedExits(acct, quotes) {
     if (!q) { remaining.push(pos); continue; }
 
     const spot = q.c;
-    const currentPremium = pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium);
+    const currentPremium = pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
     const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
     let reason = null;
 
@@ -3486,7 +3488,7 @@ function tryEMATrailingExits(acct, quotes) {
 
     const q = quotes[pos.ticker];
     const spot = q ? q.c : pos.entrySpot;
-    const currentPremium = pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium);
+    const currentPremium = pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
     let reason = null;
 
     const below8 = pos.type === "call" ? price < ema8[L] : price > ema8[L];
@@ -3624,7 +3626,7 @@ function dashboardHTML(acct, { spectator = false } = {}) {
         ? Math.max(0, (pos.expiryDate - now) / 86400_000)
         : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
       const isEq = pos.type === "equity";
-      const curPremium = isEq ? (pos.liveMark ?? spot) : (pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
+      const curPremium = isEq ? (pos.liveMark ?? spot) : (pos.liveMark ?? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type));
       const pnlPct = pos.entryPremium > 0 ? (curPremium - pos.entryPremium) / pos.entryPremium : 0;
       const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * (isEq ? 1 : 100);
       const profitPrice = pos.entryPremium * (1 + PROFIT_TARGET);
@@ -6254,7 +6256,7 @@ function startDashboard(defaultAcct, apiKey) {
         const a = dashboard.analyses[sym]; const st = dashboard.shortTermAnalyses[sym];
         const pos = state.positions.find(p => p.ticker === sym);
         let posPnl = null;
-        if (pos) { const spot = q ? q.c : pos.entrySpot; const _isEq = pos.type === "equity"; const _now = Date.now(); const dteLeft = pos.expiryDate ? Math.max(0, (pos.expiryDate - _now) / 86400_000) : Math.max(0, pos.dte - (_now - pos.openTime) / 86400_000); const curPremium = _isEq ? (pos.liveMark ?? spot) : optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type); const _mult = _isEq ? 1 : 100; posPnl = { pct: ((curPremium - pos.entryPremium) / pos.entryPremium * 100).toFixed(1), dollar: ((curPremium - pos.entryPremium) * pos.qty * _mult).toFixed(0) }; }
+        if (pos) { const spot = q ? q.c : pos.entrySpot; const _isEq = pos.type === "equity"; const _now = Date.now(); const dteLeft = pos.expiryDate ? Math.max(0, (pos.expiryDate - _now) / 86400_000) : Math.max(0, pos.dte - (_now - pos.openTime) / 86400_000); const curPremium = _isEq ? (pos.liveMark ?? spot) : (pos.liveMark ?? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type)); const _mult = _isEq ? 1 : 100; posPnl = { pct: ((curPremium - pos.entryPremium) / pos.entryPremium * 100).toFixed(1), dollar: ((curPremium - pos.entryPremium) * pos.qty * _mult).toFixed(0) }; }
         tickers[sym] = { c: q.c, pc: q.pc, d: q.d, dp: q.dp, h: q.h, l: q.l, score: a?.score, signal: a?.signal, stScore: st?.score, mom1d: st?.mom1d, mom3d: st?.mom3d, mom7d: st?.mom7d, held: !!pos, type: pos?.type, posPnl };
       }
       res.end(JSON.stringify({ tickers, pv: portfolioValue(state, dashboard.quotes), cash: state.cash, balanceInfo, open: state.positions.length, marketOpen: dashboard.marketOpen, lastCycle: dashboard.lastCycle }));
@@ -7574,7 +7576,7 @@ function buildPositionDetails(acct, quotes) {
     }
 
     const isEq = pos.type === "equity";
-    const curPremium = isEq ? (pos.liveMark ?? spot) : (pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
+    const curPremium = isEq ? (pos.liveMark ?? spot) : (pos.liveMark ?? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type));
     const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
     const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * (isEq ? 1 : 100);
     const profitPrice = pos.entryPremium * (1 + cfg.profitTarget);

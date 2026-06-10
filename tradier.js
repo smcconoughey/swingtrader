@@ -535,12 +535,16 @@ const tradier = {
 };
 
 function normalizeQuote(q) {
+  const c = q.last ?? q.close ?? null;
+  const pc = q.prevclose ?? 0;
   return {
-    c: q.last ?? q.close ?? null,
+    c,
     h: q.high ?? q.last ?? null,
     l: q.low ?? q.last ?? null,
     o: q.open ?? q.last ?? null,
-    pc: q.prevclose ?? 0,
+    pc,
+    d: (c != null && pc) ? +(c - pc).toFixed(2) : 0,
+    dp: (c != null && pc) ? +((c - pc) / pc * 100).toFixed(2) : 0,
     bid: q.bid ?? null,
     ask: q.ask ?? null,
     volume: q.volume ?? 0,
