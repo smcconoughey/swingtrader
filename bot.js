@@ -1938,20 +1938,20 @@ function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 12) {
 
 function chooseAffordableCandidate(candidates, selected, maxContractCost, state) {
   if (!(maxContractCost > 0)) return selected || null;
-  
-  // If AI picked a specific contract, only trade it if we can afford it.
-  if (selected) {
-    if (selected.mid > 0 && selected.mid * 100 <= maxContractCost) {
-      if (!state || countPositionsAtExpiry(state, selected.expiryDate) < MAX_PER_EXPIRY) {
-        return selected;
-      }
-    }
-    return null; // ABORT! We can't afford the AI's specific pick or it violates constraints.
+
+  // If AI picked a specific contract and we can afford it (and it doesn't over-concentrate
+  // an expiry), use it.
+  if (selected && selected.mid > 0 && selected.mid * 100 <= maxContractCost
+      && (!state || countPositionsAtExpiry(state, selected.expiryDate) < MAX_PER_EXPIRY)) {
+    return selected;
   }
-  
-  // If no specific AI pick (e.g. fallback), pick the best affordable one
+
+  // AI's pick is unaffordable (or over-concentrated) — don't give up. Fall back to the best
+  // affordable real contract from the same candidate list. This matters most for small
+  // accounts: Claude tends to pick higher-quality (often pricier, near-ATM) contracts that
+  // can exceed a small budget even when a cheaper, perfectly tradeable real contract exists.
   const affordable = (candidates || [])
-    .filter(c => c && c.mid > 0 && c.mid * 100 <= maxContractCost)
+    .filter(c => c && c !== selected && c.mid > 0 && c.mid * 100 <= maxContractCost)
     .filter(c => !state || countPositionsAtExpiry(state, c.expiryDate) < MAX_PER_EXPIRY)
     .sort((a, b) => b.quality - a.quality);
   return affordable[0] || null;
@@ -2920,7 +2920,11 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     const originalCandidate = selectedCandidate;
     selectedCandidate = chooseAffordableCandidate(candidates, selectedCandidate, maxContractCost, state);
     if (selectedCandidate && originalCandidate && selectedCandidate !== originalCandidate) {
-      log(acct, `AFFORDABLE CONTRACT ${ticker}: Claude pick cost $${(originalCandidate.mid * 100).toFixed(0)} > budget $${maxContractCost.toFixed(0)} — switching to ${selectedCandidate.strike} ${type.toUpperCase()} ${selectedCandidate.expiryStr} @ $${selectedCandidate.mid}`);
+      const origCost = (originalCandidate.mid * 100).toFixed(0);
+      const why = originalCandidate.mid * 100 > maxContractCost
+        ? `cost $${origCost} > budget $${maxContractCost.toFixed(0)}`
+        : `expiry ${originalCandidate.expiryStr} over-concentrated`;
+      log(acct, `AFFORDABLE CONTRACT ${ticker}: Claude pick (${why}) — switching to ${selectedCandidate.strike} ${type.toUpperCase()} ${selectedCandidate.expiryStr} @ $${selectedCandidate.mid}`);
     }
 
     // selectedCandidate already set above (either from cache or fresh Claude response)
