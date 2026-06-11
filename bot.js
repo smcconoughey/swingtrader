@@ -1285,6 +1285,15 @@ function getMarketRegime(candleCache) {
   return { mode, riskScale, label, spyAbove: spy, qqqAbove: qqq };
 }
 
+// At max risk-per-trade (100%), the user has explicitly opted to deploy the full configured
+// budget on a trade — treat that as an override and skip the regime-based scale-down (which
+// otherwise quietly caps a "100%" setting to e.g. 35% of cash in a CHOPPY regime). Any other
+// risk level still scales with the regime as before.
+function effectiveRiskPct(baseRiskPct, regime) {
+  if (baseRiskPct >= 1.0) return baseRiskPct;
+  return baseRiskPct * (regime?.riskScale ?? 0.5);
+}
+
 // ─── Earnings Calendar Check (Finnhub) ───
 
 async function checkEarnings(ticker, apiKey) {
@@ -5937,7 +5946,7 @@ function startDashboard(defaultAcct, apiKey) {
           cfg.autoExecute = params.get("autoExecute") === "on" || params.get("autoExecute") === "true";
           cfg.tradeWhenClosed = params.get("tradeWhenClosed") === "on" || params.get("tradeWhenClosed") === "true";
         }
-        target.riskPct = cfg.baseRiskPct * (target.currentRegime?.riskScale || 0.5);
+        target.riskPct = effectiveRiskPct(cfg.baseRiskPct, target.currentRegime);
         saveAccounts();
         console.log(`  [${id}] Config updated: risk=${(cfg.baseRiskPct * 100).toFixed(1)}% target=${(cfg.profitTarget * 100)}% stop=${(cfg.stopLoss * 100)}% minQuality=${cfg.minSetupQuality} bullEntry=${cfg.bullEntry} bearEntry=${cfg.bearEntry}`);
         res.writeHead(302, { Location: `/?a=${id}` });
@@ -7433,8 +7442,8 @@ async function runCycle(acct, sharedQuotes, apiKey) {
 
   const regime = getMarketRegime(acct.candleCache);
   acct.currentRegime = regime;
-  acct.riskPct = cfg.baseRiskPct * regime.riskScale;
-  log(acct, `REGIME: ${regime.label} | Risk: ${(acct.riskPct * 100).toFixed(1)}% per trade (${regime.riskScale}x base)`);
+  acct.riskPct = effectiveRiskPct(cfg.baseRiskPct, regime);
+  log(acct, `REGIME: ${regime.label} | Risk: ${(acct.riskPct * 100).toFixed(1)}% per trade (${cfg.baseRiskPct >= 1.0 ? "max risk override, regime scale skipped" : `${regime.riskScale}x base`})`);
 
   tryTimeBasedExits(acct, quotes);
   tryExits(acct, quotes);
@@ -7747,7 +7756,7 @@ async function simTick(sim) {
   // Market regime
   const regime = getMarketRegime(acct.candleCache);
   acct.currentRegime = regime;
-  acct.riskPct = acct.config.baseRiskPct * regime.riskScale;
+  acct.riskPct = effectiveRiskPct(acct.config.baseRiskPct, regime);
 
   // Run exits
   tryExits(acct, quotes);
