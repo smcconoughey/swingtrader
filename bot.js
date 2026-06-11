@@ -1285,6 +1285,15 @@ function getMarketRegime(candleCache) {
   return { mode, riskScale, label, spyAbove: spy, qqqAbove: qqq };
 }
 
+// At max risk-per-trade (100%), the user has explicitly opted to deploy the full configured
+// budget on a trade — treat that as an override and skip the regime-based scale-down (which
+// otherwise quietly caps a "100%" setting to e.g. 35% of cash in a CHOPPY regime). Any other
+// risk level still scales with the regime as before.
+function effectiveRiskPct(baseRiskPct, regime) {
+  if (baseRiskPct >= 1.0) return baseRiskPct;
+  return baseRiskPct * (regime?.riskScale ?? 0.5);
+}
+
 // ─── Earnings Calendar Check (Finnhub) ───
 
 async function checkEarnings(ticker, apiKey) {
@@ -1938,20 +1947,20 @@ function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 12) {
 
 function chooseAffordableCandidate(candidates, selected, maxContractCost, state) {
   if (!(maxContractCost > 0)) return selected || null;
-  
-  // If AI picked a specific contract, only trade it if we can afford it.
-  if (selected) {
-    if (selected.mid > 0 && selected.mid * 100 <= maxContractCost) {
-      if (!state || countPositionsAtExpiry(state, selected.expiryDate) < MAX_PER_EXPIRY) {
-        return selected;
-      }
-    }
-    return null; // ABORT! We can't afford the AI's specific pick or it violates constraints.
+
+  // If AI picked a specific contract and we can afford it (and it doesn't over-concentrate
+  // an expiry), use it.
+  if (selected && selected.mid > 0 && selected.mid * 100 <= maxContractCost
+      && (!state || countPositionsAtExpiry(state, selected.expiryDate) < MAX_PER_EXPIRY)) {
+    return selected;
   }
-  
-  // If no specific AI pick (e.g. fallback), pick the best affordable one
+
+  // AI's pick is unaffordable (or over-concentrated) — don't give up. Fall back to the best
+  // affordable real contract from the same candidate list. This matters most for small
+  // accounts: Claude tends to pick higher-quality (often pricier, near-ATM) contracts that
+  // can exceed a small budget even when a cheaper, perfectly tradeable real contract exists.
   const affordable = (candidates || [])
-    .filter(c => c && c.mid > 0 && c.mid * 100 <= maxContractCost)
+    .filter(c => c && c !== selected && c.mid > 0 && c.mid * 100 <= maxContractCost)
     .filter(c => !state || countPositionsAtExpiry(state, c.expiryDate) < MAX_PER_EXPIRY)
     .sort((a, b) => b.quality - a.quality);
   return affordable[0] || null;
@@ -2920,7 +2929,11 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     const originalCandidate = selectedCandidate;
     selectedCandidate = chooseAffordableCandidate(candidates, selectedCandidate, maxContractCost, state);
     if (selectedCandidate && originalCandidate && selectedCandidate !== originalCandidate) {
-      log(acct, `AFFORDABLE CONTRACT ${ticker}: Claude pick cost $${(originalCandidate.mid * 100).toFixed(0)} > budget $${maxContractCost.toFixed(0)} — switching to ${selectedCandidate.strike} ${type.toUpperCase()} ${selectedCandidate.expiryStr} @ $${selectedCandidate.mid}`);
+      const origCost = (originalCandidate.mid * 100).toFixed(0);
+      const why = originalCandidate.mid * 100 > maxContractCost
+        ? `cost $${origCost} > budget $${maxContractCost.toFixed(0)}`
+        : `expiry ${originalCandidate.expiryStr} over-concentrated`;
+      log(acct, `AFFORDABLE CONTRACT ${ticker}: Claude pick (${why}) — switching to ${selectedCandidate.strike} ${type.toUpperCase()} ${selectedCandidate.expiryStr} @ $${selectedCandidate.mid}`);
     }
 
     // selectedCandidate already set above (either from cache or fresh Claude response)
@@ -5933,7 +5946,7 @@ function startDashboard(defaultAcct, apiKey) {
           cfg.autoExecute = params.get("autoExecute") === "on" || params.get("autoExecute") === "true";
           cfg.tradeWhenClosed = params.get("tradeWhenClosed") === "on" || params.get("tradeWhenClosed") === "true";
         }
-        target.riskPct = cfg.baseRiskPct * (target.currentRegime?.riskScale || 0.5);
+        target.riskPct = effectiveRiskPct(cfg.baseRiskPct, target.currentRegime);
         saveAccounts();
         console.log(`  [${id}] Config updated: risk=${(cfg.baseRiskPct * 100).toFixed(1)}% target=${(cfg.profitTarget * 100)}% stop=${(cfg.stopLoss * 100)}% minQuality=${cfg.minSetupQuality} bullEntry=${cfg.bullEntry} bearEntry=${cfg.bearEntry}`);
         res.writeHead(302, { Location: `/?a=${id}` });
@@ -7429,8 +7442,8 @@ async function runCycle(acct, sharedQuotes, apiKey) {
 
   const regime = getMarketRegime(acct.candleCache);
   acct.currentRegime = regime;
-  acct.riskPct = cfg.baseRiskPct * regime.riskScale;
-  log(acct, `REGIME: ${regime.label} | Risk: ${(acct.riskPct * 100).toFixed(1)}% per trade (${regime.riskScale}x base)`);
+  acct.riskPct = effectiveRiskPct(cfg.baseRiskPct, regime);
+  log(acct, `REGIME: ${regime.label} | Risk: ${(acct.riskPct * 100).toFixed(1)}% per trade (${cfg.baseRiskPct >= 1.0 ? "max risk override, regime scale skipped" : `${regime.riskScale}x base`})`);
 
   tryTimeBasedExits(acct, quotes);
   tryExits(acct, quotes);
@@ -7743,7 +7756,7 @@ async function simTick(sim) {
   // Market regime
   const regime = getMarketRegime(acct.candleCache);
   acct.currentRegime = regime;
-  acct.riskPct = acct.config.baseRiskPct * regime.riskScale;
+  acct.riskPct = effectiveRiskPct(acct.config.baseRiskPct, regime);
 
   // Run exits
   tryExits(acct, quotes);
