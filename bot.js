@@ -3897,6 +3897,36 @@ function svgCandleChart(candles, {
   </svg>`;
 }
 
+// Build a TradingView Lightweight-Charts data payload from a candle window. EMAs are seeded from
+// full history (when supplied) so long periods stay accurate on a short visible slice. `time` is a
+// daily business-day string so the axis spaces cleanly and never collides. Barrier `lines` become
+// price-lines whose labels live on the price axis (no overlap with the candles). The actual drawing
+// is done client-side, where the library measures the real container width and renders crisply at
+// any size — this is what fixes the "fine on mobile, distorted on desktop" stretching.
+function lwcChartData(windowCandles, fullCandles, emaConfigs = [], lines = []) {
+  if (!windowCandles || windowCandles.length < 2) return null;
+  const day = t => new Date((t || 0) * 1000).toISOString().slice(0, 10);
+  const fullCls = (fullCandles && fullCandles.length >= windowCandles.length) ? fullCandles.map(c => c.c) : windowCandles.map(c => c.c);
+  const n = windowCandles.length;
+  const emaArrs = emaConfigs.map(e => calcEMA(fullCls, e.period).slice(-n));
+  const seen = new Set();
+  const candles = [], volume = [], emaData = emaConfigs.map(() => []);
+  windowCandles.forEach((c, i) => {
+    if (c.t == null || c.c == null) return;
+    const time = day(c.t);
+    if (seen.has(time)) return; // strictly-ascending, unique daily keys (LWC requirement)
+    seen.add(time);
+    candles.push({ time, open: +c.o, high: +c.h, low: +c.l, close: +c.c });
+    volume.push({ time, value: +(c.v || 0), color: c.c >= c.o ? "#00a84355" : "#e8473f55" });
+    emaConfigs.forEach((e, k) => { const v = emaArrs[k][i]; if (v != null && isFinite(v)) emaData[k].push({ time, value: +(+v).toFixed(4) }); });
+  });
+  if (candles.length < 2) return null;
+  const emas = emaConfigs.map((e, k) => ({ color: e.color, label: e.label || `EMA ${e.period}`, data: emaData[k] }));
+  const priceLines = (lines || []).filter(l => l.value != null && isFinite(l.value))
+    .map(l => ({ price: +(+l.value).toFixed(2), color: l.color, title: l.label || "" }));
+  return { candles, volume, emas, lines: priceLines };
+}
+
 function dashboardHTML(acct, { spectator = false } = {}) {
   const state = acct.state;
   const dashboard = acct.dashboard;
@@ -4790,79 +4820,24 @@ function tickerDetailHTML(sym, acct, { spectator = false } = {}) {
     .slice(0, 8);
   const onDemandAnalysis = dashboard.onDemandAnalyses?.[sym] || null;
 
-  // Helper: build SVG candlestick chart from a set of candles with EMA overlays
-  function buildChart(cdata, emas, W, H) {
-    if (!cdata || cdata.length < 3) return { chart: '<div style="color:#8a909b">No data</div>', volume: '' };
-    const cls = cdata.map(c => c.c), hs = cdata.map(c => c.h), ls = cdata.map(c => c.l), vs = cdata.map(c => c.v);
-    const emaLines = emas.map(e => ({ data: calcEMA(cls, e.period), color: e.color, label: e.label }));
-    const allP = [...hs, ...ls];
-    const mn = Math.min(...allP) * 0.998, mx = Math.max(...allP) * 1.002, rng = mx - mn;
-    const y = v => H - ((v - mn) / rng) * (H - 20) - 10;
-    const x = i => (i / Math.max(1, cls.length - 1)) * W;
-
-    const bars = cdata.map((c, i) => {
-      const green = c.c >= c.o;
-      const color = green ? "#00a843" : "#e8473f";
-      const bw = Math.max(3, W / cdata.length - 1);
-      const top = y(Math.max(c.o, c.c)), bot = y(Math.min(c.o, c.c));
-      const bodyH = Math.max(1, bot - top);
-      return `<line x1="${x(i)}" y1="${y(c.h)}" x2="${x(i)}" y2="${y(c.l)}" stroke="${color}" stroke-width="1"/>
-        <rect x="${x(i) - bw / 2}" y="${top}" width="${bw}" height="${bodyH}" fill="${color}" rx="0.5"/>`;
-    }).join("");
-
-    const emaPaths = emaLines.map(e =>
-      `<path d="${e.data.map((v, i) => `${i ? "L" : "M"}${x(i)},${y(v)}`).join(" ")}" fill="none" stroke="${e.color}" stroke-width="1.5" opacity="0.8"/>`
-    ).join("");
-
-    const pLabels = [mn, mn + rng * 0.25, mn + rng * 0.5, mn + rng * 0.75, mx].map(p =>
-      `<text x="${W + 5}" y="${y(p)}" fill="#8a909b" font-size="9" dominant-baseline="middle">$${p.toFixed(2)}</text>`
-    ).join("");
-
-    const legend = emaLines.map(e =>
-      `<span style="color:${e.color}">\u2501 ${e.label} (${e.data[e.data.length - 1].toFixed(2)})</span>`
-    ).join(" &nbsp; ");
-
-    const chart = `<svg viewBox="0 0 ${W + 60} ${H}" style="width:100%;height:${H}px">
-      ${bars}${emaPaths}${pLabels}
-    </svg>
-    <div style="font-size:10px;margin-top:4px;color:#6b7280">${legend}</div>`;
-
-    const maxV = Math.max(...vs);
-    const avgV = vs.reduce((a, b) => a + b, 0) / vs.length;
-    const VH = 60;
-    const volBars = vs.map((v, i) => {
-      const bw = Math.max(3, W / vs.length - 1);
-      const h = (v / maxV) * VH;
-      return `<rect x="${x(i) - bw / 2}" y="${VH - h}" width="${bw}" height="${h}" fill="${v > avgV * 1.15 ? '#00a8433a' : '#00000016'}" rx="0.5"/>`;
-    }).join("");
-    const volume = `<svg viewBox="0 0 ${W + 60} ${VH}" style="width:100%;height:${VH}px">
-      <line x1="0" y1="${VH - (avgV / maxV) * VH}" x2="${W}" y2="${VH - (avgV / maxV) * VH}" stroke="#00000014" stroke-dasharray="3 2"/>
-      ${volBars}
-    </svg>`;
-
-    return { chart, volume };
-  }
-
-  // 90-day chart with EMA 8/21/50
-  const longChart = buildChart(candles, [
+  // 90-day chart with EMA 8/21/50 (rendered client-side by TradingView Lightweight Charts).
+  const longChartData = lwcChartData(candles, candles, [
     { period: 8, color: "#138f86", label: "EMA 8" },
     { period: 21, color: "#d2691e", label: "EMA 21" },
     { period: 50, color: "#6a4df4", label: "EMA 50" },
-  ], 700, 250);
+  ]);
 
-  // 7-day chart (last 14 candles) with EMA 3/5/8
+  // 7-day chart (last 14 candles) with EMA 3/5/8 — EMAs seeded from full history for accuracy.
   const shortCandles = candles ? candles.slice(-14) : null;
-  const shortChart = buildChart(shortCandles, [
+  const shortChartData = lwcChartData(shortCandles, candles, [
     { period: 3, color: "#0a8fb8", label: "EMA 3" },
     { period: 5, color: "#b07400", label: "EMA 5" },
     { period: 8, color: "#d6336c", label: "EMA 8" },
-  ], 700, 250);
-
-  const chartSVG = longChart.chart;
-  const volumeSVG = longChart.volume;
+  ]);
 
   // ─── Entry/Exit Barriers card: where price sits, where it's trending, and the
   // levels (score thresholds + price S/R + ATR targets) that gate an entry or exit ───
+  let barrierChartData = null; // populated by the IIFE below; consumed by the client chart payload
   const barriersBlock = (() => {
     const cfg = acct.config;
     const bull = cfg.bullEntry ?? 68;
@@ -4912,13 +4887,14 @@ function tickerDetailHTML(sym, acct, { spectator = false } = {}) {
     if (st?.recentHigh) lines.push({ value: st.recentHigh, color: "#00a84366", label: "7d hi", dash: "2 3" });
     if (st?.recentLow) lines.push({ value: st.recentLow, color: "#e8473f66", label: "7d lo", dash: "2 3" });
     if (pos?.entrySpot) lines.push({ value: pos.entrySpot, color: "#6a4df4", label: "entry", dash: "5 3" });
-    const barrierChart = recent ? svgCandleChart(recent, {
-      height: 180,
-      full: candles,
-      emas: [{ period: 8, color: "#138f86" }, { period: 21, color: "#d2691e" }, { period: 50, color: "#6a4df4" }],
-      lines,
-      markers: q ? [{ value: q.c, color: score == null ? "#6b7280" : score >= bull ? "#00a843" : score <= bear ? "#e8473f" : "#6b7280" }] : [],
-    }) : '<div style="color:#8a909b">No chart data</div>';
+    // Current price as a barrier line too, so it reads on the price axis alongside the levels.
+    if (q?.c != null) lines.push({ value: +q.c, color: score == null ? "#6b7280" : score >= bull ? "#00a843" : score <= bear ? "#e8473f" : "#6b7280", label: "now" });
+    barrierChartData = recent ? lwcChartData(recent, candles, [
+      { period: 8, color: "#138f86", label: "EMA 8" }, { period: 21, color: "#d2691e", label: "EMA 21" }, { period: 50, color: "#6a4df4", label: "EMA 50" },
+    ], lines) : null;
+    const barrierChart = barrierChartData
+      ? `<div id="chart-barrier" class="lwc" style="height:240px"></div>`
+      : '<div style="color:#8a909b">No chart data</div>';
 
     const trend = st ? `
       <div style="display:flex;gap:16px;margin-top:12px;flex-wrap:wrap;font-size:11px">
@@ -5030,6 +5006,7 @@ function tickerDetailHTML(sym, acct, { spectator = false } = {}) {
   .stat .lbl{font-size:10px;color:#6b7280;text-transform:uppercase}
   .stat.neg .val{color:#e8473f}
   .hint{display:inline-block;background:#6a4df420;border:1px solid #6a4df440;border-radius:4px;padding:4px 10px;font-size:11px;color:#6a4df4}
+  .lwc{width:100%;position:relative}
 </style></head><body>
 <h1><a href="/">← Back</a> &nbsp; ${sym} ${q ? '$' + q.c.toFixed(2) : ''}
 ${q ? `<span style="font-size:13px;color:${q.d >= 0 ? '#00a843' : '#e8473f'}">${q.d >= 0 ? '+' : ''}${q.d?.toFixed(2)} (${q.dp?.toFixed(2)}%)</span>` : ''}</h1>
@@ -5038,8 +5015,8 @@ ${q?.t ? ` &nbsp;|&nbsp; Last: ${new Date(q.t * 1000).toLocaleString("en-US", { 
 
 <div class="card" style="margin-bottom:16px;border-color:#0a8fb840">
   <h2 style="color:#0a8fb8">7-Day Chart (Contract Window) — Fast EMAs 3/5/8</h2>
-  ${shortChart.chart}
-  <div style="margin-top:8px">${shortChart.volume}</div>
+  ${shortChartData ? '<div id="chart-short" class="lwc" style="height:240px"></div>' : '<div style="color:#8a909b">No chart data</div>'}
+  <div style="font-size:9px;color:#8a909b;margin-top:4px"><span style="color:#0a8fb8">━ EMA 3</span> &nbsp; <span style="color:#b07400">━ EMA 5</span> &nbsp; <span style="color:#d6336c">━ EMA 8</span></div>
   ${st ? `<div style="margin-top:12px;display:flex;gap:20px;flex-wrap:wrap">
     <div class="stat"><div class="val" style="color:${st.score >= 55 ? '#00a843' : st.score >= 45 ? '#6b7280' : '#e8473f'}">${st.score}</div><div class="lbl">7d Score</div></div>
     <div class="stat"><div class="val" style="color:${st.signal.includes('BUY') ? '#00a843' : st.signal.includes('SELL') ? '#e8473f' : '#6b7280'}">${st.signal}</div><div class="lbl">7d Signal</div></div>
@@ -5062,8 +5039,8 @@ ${q?.t ? ` &nbsp;|&nbsp; Last: ${new Date(q.t * 1000).toLocaleString("en-US", { 
 
 <div class="card" style="margin-bottom:16px">
   <h2>90-Day Chart — EMAs 8/21/50</h2>
-  ${chartSVG}
-  <div style="margin-top:8px">${volumeSVG || '<div style="color:#8a909b">No volume data</div>'}</div>
+  ${longChartData ? '<div id="chart-long" class="lwc" style="height:300px"></div>' : '<div style="color:#8a909b">No chart data</div>'}
+  <div style="font-size:9px;color:#8a909b;margin-top:4px"><span style="color:#138f86">━ EMA 8</span> &nbsp; <span style="color:#d2691e">━ EMA 21</span> &nbsp; <span style="color:#6a4df4">━ EMA 50</span></div>
 </div>
 
 <div class="grid">
@@ -5125,6 +5102,52 @@ ${pos ? '<div class="card" style="margin-top:16px"><h2>Position Details</h2>' + 
   <div style="color:#aab0bb;font-size:10px;margin-top:6px">Leave blank for a full setup analysis · Uses Claude Haiku</div>`}
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+window.__CHARTS__ = ${JSON.stringify({ short: shortChartData, barrier: barrierChartData, long: longChartData }).replace(/</g, "\\u003c")};
+(function () {
+  function build(id, cfg, height) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    if (typeof LightweightCharts === "undefined" || !cfg) {
+      el.innerHTML = '<div style="color:#8a909b;font-size:11px;padding:20px 0;text-align:center">Chart unavailable</div>';
+      return;
+    }
+    var chart = LightweightCharts.createChart(el, {
+      width: el.clientWidth, height: height,
+      layout: { background: { color: "#ffffff" }, textColor: "#6b7280", fontSize: 11, fontFamily: "-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif" },
+      grid: { vertLines: { color: "#f0f1f4" }, horzLines: { color: "#f0f1f4" } },
+      rightPriceScale: { borderColor: "#e7e8ec", scaleMargins: { top: 0.08, bottom: 0.08 } },
+      timeScale: { borderColor: "#e7e8ec", fixLeftEdge: true, fixRightEdge: true },
+      crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+      handleScroll: false, handleScale: false,
+    });
+    var cs = chart.addCandlestickSeries({ upColor: "#00a843", downColor: "#e8473f", borderUpColor: "#00a843", borderDownColor: "#e8473f", wickUpColor: "#00a84399", wickDownColor: "#e8473f99" });
+    cs.setData(cfg.candles || []);
+    (cfg.emas || []).forEach(function (e) {
+      if (!e.data || !e.data.length) return;
+      var ls = chart.addLineSeries({ color: e.color, lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
+      ls.setData(e.data);
+    });
+    if (cfg.volume && cfg.volume.length) {
+      var vs = chart.addHistogramSeries({ priceFormat: { type: "volume" }, priceScaleId: "vol" });
+      chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+      vs.setData(cfg.volume);
+    }
+    (cfg.lines || []).forEach(function (l) {
+      cs.createPriceLine({ price: l.price, color: l.color, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: l.title || "" });
+    });
+    chart.timeScale().fitContent();
+    if (window.ResizeObserver) {
+      new ResizeObserver(function () { chart.applyOptions({ width: el.clientWidth }); chart.timeScale().fitContent(); }).observe(el);
+    }
+  }
+  var C = window.__CHARTS__ || {};
+  build("chart-short", C.short, 240);
+  build("chart-barrier", C.barrier, 240);
+  build("chart-long", C.long, 300);
+})();
+</script>
 </body></html>`;
 }
 
