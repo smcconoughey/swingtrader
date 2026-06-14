@@ -276,6 +276,30 @@ function optPrice(spot, strike, dte, iv, type = "call") {
   return Math.max(0.05, +(intr + spot * iv * Math.sqrt(t) * 0.4).toFixed(2));
 }
 
+// ─── Realistic fill model for PAPER / SIMULATED accounts ───
+// Live broker accounts (Tradier/Robinhood) fill at real market prices. Paper & backtest accounts are
+// priced off the theoretical mid (optPrice), and were filling with NO spread — buying at the mid and
+// selling at the mid. That let the sim "sell at the top with no real buyer," overstating gains. This
+// pegs paper fills to a realistic bid/ask around the mid: BUY at the ask (mid+half), SELL at the bid
+// (mid-half). Cheap/OTM contracts get a wider modeled spread — exactly where gains were most inflated.
+// IMPORTANT: this only changes the recorded FILL PRICE; it does NOT change which trades fire or when
+// (entry signals, stops, targets all still evaluate on the mid), so the winning strategy is untouched.
+function posMoneyness(type, spot, strike) {
+  if (!(spot > 0)) return 0;
+  return type === "put" ? (spot - strike) / spot : (strike - spot) / spot; // +ve = out-of-the-money
+}
+function modeledSpreadFrac(mid, moneyness = 0) {
+  if (!(mid > 0)) return 0.50;
+  const cheap = Math.min(0.35, 0.06 / mid);   // cheaper premium → wider %-spread (tick-size effect)
+  const otm = Math.max(0, moneyness) * 1.2;   // far OTM → thinner market, wider spread / no buyer
+  return Math.min(0.60, 0.05 + cheap + otm);  // total bid/ask spread as a fraction of mid
+}
+function simFillPrice(mid, moneyness, side) {
+  const half = modeledSpreadFrac(mid, moneyness) / 2;
+  const px = side === "buy" ? mid * (1 + half) : mid * (1 - half);
+  return Math.max(0.01, +px.toFixed(2));
+}
+
 function optGreeks(spot, strike, dte, iv, type = "call") {
   const t = Math.max(dte / 365, 0.001);
   const d = type === "call"
@@ -593,14 +617,46 @@ function getActiveTickers(acct) {
 const STATE_FILE = process.env.STATE_FILE || "state.json";
 const ACCOUNTS_FILE = process.env.ACCOUNTS_FILE || (process.env.STATE_FILE ? process.env.STATE_FILE.replace(/state\.json$/, "accounts.json") : "accounts.json");
 const HINT_FILE = "hint.txt";
-const CYCLE_MS = 60_000;       // 60s between cycles
-const API_DELAY = 150;         // 150ms between API calls (Finnhub free tier)
+const CYCLE_MS = 45_000;       // 45s between cycles when market open (was 60s)
+const CYCLE_MS_CLOSED = 90_000; // slower after-hours polling
+const API_DELAY_FINNHUB = 150;  // Finnhub free tier
+const API_DELAY_TRADIER = 25;   // Tradier batch-friendly
+function apiDelay() { return tradier.isConnected ? API_DELAY_TRADIER : API_DELAY_FINNHUB; }
 const DEFAULT_IV = 0.30;
 
 // Per-contract options commission (Tradier Lite = $0.35/contract). Used as a SMALL bias against
 // low-priced/small-cap underlyings in contract scoring — fees are a larger % of a cheap premium.
 const FEE_PER_CONTRACT = 0.35;
 
+// Swing-trade contract quality — we ONLY want real, near-the-money directional trades, never cheap
+// far-OTM lottery tickets (the ones that have been sinking the account). Delta is the discriminator:
+// a δ0.50 ATM call is a real trade; a δ0.15 far-OTM call is a lottery ticket regardless of price.
+const MIN_OPTION_DELTA = 0.40;        // hard floor — below this is a lottery ticket, skip the trade
+const PREFERRED_DELTA_MIN = 0.45;     // sweet spot: ATM → slightly ITM (high win probability)
+const PREFERRED_DELTA_MAX = 0.70;
+// Moneyness window for candidates: from this much ITM to this much OTM. Tight on the OTM side so we
+// never reach for cheap out-of-the-money strikes; ITM is fine (higher delta, higher win rate).
+const MAX_OTM_MONEYNESS = 0.06;       // ≤6% out-of-the-money
+const MAX_ITM_MONEYNESS = 0.15;       // up to 15% in-the-money
+// A contract whose live bid/ask spread exceeds this fraction of mid is effectively un-exitable
+// without donating the spread (e.g. the XLV $161 call at b$0.25/a$0.82 = 107% wide). Reject such
+// contracts on entry — they look "affordable" but you can't get out near fair value.
+const MAX_ENTRY_SPREAD_PCT = 0.30;
+// On protective exits, if the live spread is wider than this, do NOT dump at the raw bid (which
+// donates the whole spread). Instead post a limit a small step below mid and let it re-price each
+// cycle. Tight markets below this threshold still exit marketable (at the bid).
+const WIDE_SPREAD_EXIT_PCT = 0.20;
+// Most we'll concede below mid when working a protective exit through a wide spread.
+const MAX_EXIT_CONCESSION_PCT = 0.12;
+// In choppy regimes (broken EMA stack), demand stronger confirmation before new risk.
+const CHOPPY_MIN_BULL_SCORE = 72;
+const CHOPPY_MIN_BEAR_SCORE = 28; // must be <= this for puts (stricter than default bearEntry)
+// Signal exits: don't flatten on a marginal score flip while still green on spot/premium.
+const SIGNAL_EXIT_MIN_LOSS = -0.05;
+const SIGNAL_EXIT_SCORE_MARGIN = 3; // must cross threshold by this many points
+
+// Earnings calendar cache (one Finnhub call per ticker per day).
+const earningsCache = new Map();
 // Live market-data provenance counters so the UI can show whether the bot is on Tradier (live,
 // fill-accurate) data or has fallen back to Finnhub/Yahoo. Reset is not needed — these are running
 // totals since process start; the dashboard shows the current primary + fallback counts.
@@ -687,6 +743,13 @@ const DEFAULT_CONFIG = {
   marginZeroCashSpendLimit: 200,
   marginMaxDebt: 250,
 
+  // ─── Capital-preservation safety net (stops the account from bleeding) ───
+  // After this many consecutive LOSING trades the account HARD-pauses and pings you to review —
+  // a losing streak is the clearest "something is wrong, stop" signal. Set 0 to disable.
+  maxConsecutiveLosses: 3,
+  // If realized losses in a single day reach this fraction of the day's starting equity, stop opening
+  // new trades for the rest of the day (open positions are still managed). Set 0 to disable.
+  dailyLossLimitPct: 0.15,
 };
 
 // ─── Multi-Account Runtime ───
@@ -1307,6 +1370,15 @@ async function checkEarnings(ticker, apiKey) {
   }
 }
 
+async function checkEarningsCached(ticker, apiKey) {
+  const day = getETDateStr();
+  const cached = earningsCache.get(ticker);
+  if (cached && cached.day === day) return cached.result;
+  const result = await checkEarnings(ticker, apiKey);
+  earningsCache.set(ticker, { day, result });
+  return result;
+}
+
 // ─── Consolidation / Tightness Detection (SRxTrades "staircase" setup quality) ───
 
 function detectConsolidation(candles) {
@@ -1871,7 +1943,7 @@ function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 12) {
     const expiryDt = new Date(exp.expirationDate);
     expiryDt.setHours(16, 0, 0, 0);
     const dte = Math.round((expiryDt.getTime() - now) / 86400_000);
-    if (dte < 10 || dte > 45) continue; // 10-45 DTE — 7DTE bled to theta on flat thesis
+    if (dte < 14 || dte > 45) continue; // 14-45 DTE — gives the thesis room; short-dated bleeds theta
 
     const contracts = exp.options?.[typeKey] || [];
     for (const c of contracts) {
@@ -1887,8 +1959,9 @@ function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 12) {
         ? (c.strike - spotPrice) / spotPrice   // +ve = OTM call
         : (spotPrice - c.strike) / spotPrice;  // +ve = OTM put
 
-      // Allow from 10% ITM to 25% OTM — lets Claude decide depth
-      if (moneyness < -0.10 || moneyness > 0.25) continue;
+      // Only near-the-money / ITM. Reject reaching for cheap far-OTM strikes — those are the
+      // lottery tickets that bleed the account. ITM is welcome (higher delta, higher win rate).
+      if (moneyness < -MAX_ITM_MONEYNESS || moneyness > MAX_OTM_MONEYNESS) continue;
 
       const spread = +(c.ask - c.bid).toFixed(2);
       const spreadPct = mid > 0 ? (spread / mid) : 1;
@@ -1896,6 +1969,10 @@ function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 12) {
 
       const iv = c.impliedVolatility > 0 ? c.impliedVolatility : null;
       const delta = c.delta != null ? c.delta : null;
+
+      // Reject lottery tickets: require real directional exposure (δ ≥ MIN_OPTION_DELTA). When greeks
+      // are unavailable we already constrained moneyness to near-the-money above, so it can't be junk.
+      if (delta != null && Math.abs(delta) < MIN_OPTION_DELTA) continue;
 
       // Commission drag: a round-trip (buy + sell) costs ~2 contracts of commission. As a fraction
       // of premium this is far larger on cheap options (small caps), so it doubles as a SMALL bias
@@ -1906,9 +1983,16 @@ function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 12) {
 
       // Quality score: penalise wide spreads, illiquidity, very short or very long DTE, plus the
       // small fee/small-cap bias (kept small so it only breaks otherwise-close ties).
-      const dtePenalty = Math.abs(dte - 21); // prefer ~21 DTE — leaves room for thesis to play out
+      const dtePenalty = Math.abs(dte - 28); // prefer ~28 DTE — room for the thesis, less theta bleed
       const liqScore = Math.log1p((c.openInterest || 0) + (c.volume || 0));
-      const quality = liqScore - spreadPct * 3 - dtePenalty * 0.1 - feeDragPct * 4 - smallCapPenalty;
+      // Strongly prefer the high-probability band (ATM → slightly ITM). Weight delta heavily so a
+      // near-the-money contract always beats a cheaper, lower-delta one.
+      const absD = delta != null ? Math.abs(delta) : 0;
+      const deltaBonus = absD >= PREFERRED_DELTA_MIN && absD <= PREFERRED_DELTA_MAX ? 2.0
+        : absD >= MIN_OPTION_DELTA ? 0.6 : 0;
+      // Penalize OTM-ness directly so closer-to-the-money strikes rank higher (OTM = lower win rate).
+      const otmPenalty = Math.max(0, moneyness) * 6;
+      const quality = liqScore - spreadPct * 3 - dtePenalty * 0.1 - feeDragPct * 4 - smallCapPenalty + deltaBonus - otmPenalty;
 
       candidates.push({
         strike: c.strike,
@@ -2059,6 +2143,7 @@ function computeTradeTrust({ claudeConfidence = null, setupQuality = 50, technic
   let trust = 0.45 * conf + 0.35 * setup + 0.20 * tech;
   // Risk-off regime caps trust so we stay defensive on the cash buffer.
   if (regime && regime.mode === "risk-off") trust = Math.min(trust, 0.4);
+  if (regime && regime.mode === "choppy") trust = Math.min(trust, 0.55);
   return clamp01(trust);
 }
 
@@ -2129,7 +2214,7 @@ function setCachedValidation(acctId, ticker, score, direction, result, selectedC
 // ─── Options Chain Cache ───
 // Short-lived per-ticker chain cache so rapid re-attempts don't hammer Finnhub.
 const chainCache = new Map();
-const CHAIN_CACHE_TTL_MS = 5 * 60_000; // 5 minutes
+const CHAIN_CACHE_TTL_MS = 10 * 60_000; // 10 minutes — chains don't move that fast intraday
 
 function getCachedChain(ticker) {
   const cached = chainCache.get(ticker);
@@ -2382,7 +2467,7 @@ async function fetchMarketNews(apiKey, tickers) {
           headlines.push({ title: a.headline, source: a.source, ticker, summary: a.summary?.slice(0, 200) || "" });
         }
       }
-      await delay(API_DELAY);
+      await delay(apiDelay());
     } catch { }
   }
 
@@ -2535,8 +2620,8 @@ async function validateEntryWithClaude(acct, ticker, quote, analysis, setupQuali
       const spread = `$${c.spread}`;
       return `${num} | ${exp}      | ${dte} | ${strike} | ${mid} | ${iv} | ${delta} | ${oi} | ${vol} | ${spread}`;
     }).join('\n');
-    contractSection = `\nReal options chain (${candidates.length} viable contracts):\n${header}\n${rows}`;
-    contractInstruction = `\nSelect the best contract index (1-${candidates.length}) for this trade. Consider: DTE vs setup timeframe, delta (higher confidence → closer to ATM), liquidity (OI + volume), and spread cost.`;
+    contractSection = `\nReal options chain (${candidates.length} pre-vetted near-the-money / ITM contracts — all δ≥${MIN_OPTION_DELTA}, no far-OTM lottery tickets):\n${header}\n${rows}`;
+    contractInstruction = `\nSelect the best contract index (1-${candidates.length}). These are all real, near-the-money directional contracts — prefer the ATM-to-slightly-ITM strike (δ${PREFERRED_DELTA_MIN}-${PREFERRED_DELTA_MAX}) with the best liquidity and tightest spread. Only approve if this is a genuinely high-conviction setup worth real capital; we trade infrequently and only take trades likely to win — when in doubt, PASS.`;
   } else if (isEquity) {
     contractSection = '\nThis is an EQUITY (shares) trade on Robinhood — no options contracts. Evaluate whether buying shares at the current price is a good swing entry.';
   } else {
@@ -2659,10 +2744,13 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   }
 
   // Hard cap on concurrent positions — prevents over-deployment that drained cash to $25.
-  // For broker accounts this counts filled positions PLUS working orders (effectivePositionCount).
+  // In choppy regimes, cap at 3 regardless of config (correlation + whipsaw risk).
+  const maxPos = regime?.mode === "choppy"
+    ? Math.min(cfg.maxPositions || 6, 3)
+    : (cfg.maxPositions || 6);
   const openCount = (cfg.broker === "tradier" || cfg.broker === "robinhood") ? effectivePositionCount(acct) : state.positions.length;
-  if (cfg.maxPositions && openCount >= cfg.maxPositions) {
-    return { skipped: true, reason: `Max positions (${cfg.maxPositions}) already open or pending` };
+  if (maxPos && openCount >= maxPos) {
+    return { skipped: true, reason: `Max positions (${maxPos}${regime?.mode === "choppy" ? ", choppy cap" : ""}) already open or pending` };
   }
   // Sector concentration cap — prevent doubling/tripling-down on correlated names.
   // Example: holding CL+XLE+USO means one bad oil headline unwinds three positions together.
@@ -2720,6 +2808,16 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     return { skipped: true, reason: `Risk-off regime + misaligned EMAs contradicts bullish call bias` };
   }
 
+  // Choppy regime (broken EMA stack while above 50): highest whipsaw rate — demand alignment + score.
+  if (regime.mode === "choppy") {
+    if (isBullish && (!analysis.aligned || analysis.score < CHOPPY_MIN_BULL_SCORE)) {
+      return { skipped: true, reason: `Choppy regime — need aligned 8>21>50 stack AND score >= ${CHOPPY_MIN_BULL_SCORE} for calls (score ${analysis.score}, aligned ${analysis.aligned ? "yes" : "no"})` };
+    }
+    if (isBearish && (!analysis.bearish || analysis.score > CHOPPY_MIN_BEAR_SCORE)) {
+      return { skipped: true, reason: `Choppy regime — puts need bearish EMA stack AND score <= ${CHOPPY_MIN_BEAR_SCORE} (score ${analysis.score})` };
+    }
+  }
+
   // Range cap: tight consolidation setups need <15%; aligned EMA leaders (SRxTrades style) allow up to 60%
   const maxRange = (analysis.aligned && isBullish) || (analysis.bearish && isBearish) ? 60 : 15;
   if (parseFloat(setupQuality.rangePct) > maxRange) {
@@ -2728,8 +2826,8 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
 
   let earningsInfo = { hasEarnings: false, daysUntil: null };
   try {
-    earningsInfo = await checkEarnings(ticker, apiKey);
-    await delay(API_DELAY);
+    earningsInfo = await checkEarningsCached(ticker, apiKey);
+    await delay(apiDelay());
   } catch { }
   if (earningsInfo.hasEarnings) {
     return { skipped: true, reason: `Earnings in ${earningsInfo.daysUntil} days (${earningsInfo.date}) — too risky${cfg.broker === "robinhood" ? "" : " for 7DTE options"}` };
@@ -2759,7 +2857,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
         let chain = getCachedChain(ticker);
         if (!chain) {
           chain = await fetchFullOptionsChain(ticker, apiKey);
-          await delay(API_DELAY);
+          await delay(apiDelay());
           if (chain) setCachedChain(ticker, chain);
         }
         if (chain) candidates = buildCandidateContracts(chain, type, spot, 60);
@@ -2775,7 +2873,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
         let chain = getCachedChain(ticker);
         if (!chain) {
           chain = await fetchFullOptionsChain(ticker, apiKey);
-          await delay(API_DELAY);
+          await delay(apiDelay());
           if (chain) setCachedChain(ticker, chain);
         }
         if (chain) {
@@ -2850,6 +2948,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   let strike = 0, dte = 0, expiryDate = 0, premium = 0, posIv = 0, optionsSource = "robinhood";
   let costPer = 0;
   let unitName = "contract";
+  let contractDowngraded = null; // set when an affordability swap moved us off Claude's described pick
 
   if (cfg.broker === "robinhood") {
     // Robinhood currently only supports equities via MCP, buy shares of the underlying
@@ -2860,11 +2959,27 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     const originalCandidate = selectedCandidate;
     selectedCandidate = chooseAffordableCandidate(candidates, selectedCandidate, maxContractCost, state);
     if (selectedCandidate && originalCandidate && selectedCandidate !== originalCandidate) {
-      log(acct, `AFFORDABLE CONTRACT ${ticker}: Claude pick cost $${(originalCandidate.mid * 100).toFixed(0)} > budget $${maxContractCost.toFixed(0)} — switching to ${selectedCandidate.strike} ${type.toUpperCase()} ${selectedCandidate.expiryStr} @ $${selectedCandidate.mid}`);
+      contractDowngraded = {
+        from: { strike: originalCandidate.strike, expiryStr: originalCandidate.expiryStr, mid: originalCandidate.mid, delta: originalCandidate.delta ?? null },
+        to:   { strike: selectedCandidate.strike, expiryStr: selectedCandidate.expiryStr, mid: selectedCandidate.mid, delta: selectedCandidate.delta ?? null },
+        budget: maxContractCost,
+      };
+      log(acct, `AFFORDABLE CONTRACT ${ticker}: Claude pick $${originalCandidate.strike} ${type.toUpperCase()} @ $${originalCandidate.mid} cost $${(originalCandidate.mid * 100).toFixed(0)} > budget $${maxContractCost.toFixed(0)} — switching to $${selectedCandidate.strike} ${selectedCandidate.expiryStr} @ $${selectedCandidate.mid} (δ${selectedCandidate.delta != null ? Math.abs(selectedCandidate.delta).toFixed(2) : "?"})`);
     }
 
     // selectedCandidate already set above (either from cache or fresh Claude response)
     if (selectedCandidate) {
+      // Quality gates apply to the contract we will ACTUALLY order — not the one Claude described.
+      // When a tight budget forces a downgrade, the substitute is often a cheap far-OTM lottery with
+      // a huge %-spread. Reject those so we never buy a contract we can't exit near fair value.
+      const chosenDelta = selectedCandidate.delta != null ? Math.abs(selectedCandidate.delta) : null;
+      if (chosenDelta != null && chosenDelta < MIN_OPTION_DELTA) {
+        return { skipped: true, reason: `Contract delta ${chosenDelta.toFixed(2)} below min ${MIN_OPTION_DELTA} — lottery ticket, not a swing trade${contractDowngraded ? " (only sub-budget junk was affordable)" : ""}` };
+      }
+      const chosenSpreadPct = selectedCandidate.spreadPct != null ? selectedCandidate.spreadPct / 100 : null;
+      if (chosenSpreadPct != null && chosenSpreadPct > MAX_ENTRY_SPREAD_PCT) {
+        return { skipped: true, reason: `Contract spread ${(chosenSpreadPct * 100).toFixed(0)}% of mid exceeds ${(MAX_ENTRY_SPREAD_PCT * 100).toFixed(0)}% cap — un-exitable without donating the spread${contractDowngraded ? " (only wide-spread junk fit the budget)" : ""}` };
+      }
       strike = selectedCandidate.strike;
       dte = selectedCandidate.dte;
       expiryDate = selectedCandidate.expiryDate;
@@ -2872,6 +2987,11 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
       posIv = selectedCandidate.iv || DEFAULT_IV;
       optionsSource = tradier.isConnected ? "tradier" : "finnhub";
       log(acct, `CONTRACT ${ticker}: $${strike} ${type.toUpperCase()} exp ${selectedCandidate.expiryStr} (${dte}d) @ $${premium} mid | IV ${posIv ? (posIv*100).toFixed(0)+'%' : '?'} | OI ${selectedCandidate.oi} | spread $${selectedCandidate.spread}${selectedCandidate.feeDragPct != null ? ` | fee drag ${selectedCandidate.feeDragPct}% RT` : ''}`);
+    } else if ((candidates || []).length > 0) {
+      // Real near-the-money contracts exist but none fit the budget. We deliberately do NOT reach for
+      // a cheaper far-OTM strike — skip and wait for a trade we can actually afford to do right.
+      const cheapest = candidates.reduce((a, b) => (b.mid < a.mid ? b : a));
+      return { skipped: true, reason: `No quality contract within budget: cheapest near-the-money ${type} is $${(cheapest.mid * 100).toFixed(0)} (δ${cheapest.delta != null ? Math.abs(cheapest.delta).toFixed(2) : "?"}) but only $${maxContractCost.toFixed(0)} is deployable — skipping rather than buying a cheap OTM lottery ticket` };
     } else {
       // Synthetic fallback: 1 strike OTM, expiry chosen from the ticker's cadence near TARGET_DTE
       // and staggered away from over-concentrated expirations.
@@ -2925,8 +3045,18 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   // position and into trade history. If the LLM wasn't called (or returned no prose), synthesize a
   // readable thesis from the technical signals so every trade still documents WHY it was opened.
   const topSignals = (analysis.sigs || []).slice(0, 5).map(s => s.text);
-  const claudeReasoning = (claudeResult.reasoning || "").trim()
+  let claudeReasoning = (claudeResult.reasoning || "").trim()
     || `No LLM prose for this entry. Opened on technicals: ${direction} setup, score ${analysis.score}/100, setup quality ${setupQuality.quality}/100, regime ${regime.label}. Signals: ${topSignals.join("; ") || "n/a"}.`;
+  // As-ordered footer so the displayed thesis can never silently describe a different contract than
+  // the one we actually traded. If the budget forced a downgrade off Claude's pick, say so plainly.
+  const deltaStr = selectedCandidate?.delta != null ? `δ${Math.abs(selectedCandidate.delta).toFixed(2)}` : "δ?";
+  if (cfg.broker !== "robinhood" && selectedCandidate) {
+    if (contractDowngraded) {
+      claudeReasoning += `\n\n⚠ As ordered (NOT Claude's described contract): $${strike} ${type.toUpperCase()} ${selectedCandidate.expiryStr} (${dte}d, ${deltaStr}) @ ~$${premium} mid. Claude described the $${contractDowngraded.from.strike} strike @ $${contractDowngraded.from.mid}, but it cost $${(contractDowngraded.from.mid * 100).toFixed(0)} vs a $${contractDowngraded.budget.toFixed(0)} budget, so the bot substituted this cheaper contract. Treat the strike/delta reasoning above as approximate.`;
+    } else {
+      claudeReasoning += `\n\nAs ordered: $${strike} ${type.toUpperCase()} ${selectedCandidate.expiryStr} (${dte}d, ${deltaStr}) @ ~$${premium} mid.`;
+    }
+  }
   const aiThesis = {
     claudeConfidence: claudeResult.confidence,
     claudeReasoning,
@@ -2938,6 +3068,8 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     regimeAtEntry: regime.label,
     topSignals,
     entryAtrPct: analysis.atrPct ?? null,
+    contractDowngraded: contractDowngraded || null,
+    orderedContract: selectedCandidate ? { strike, type, expiryStr: selectedCandidate.expiryStr, dte, midAtEntry: premium, delta: selectedCandidate.delta ?? null } : null,
   };
 
   // ─── Broker accounts: place a REAL buy_to_open and let the next sync reconcile state ───
@@ -2991,12 +3123,21 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     }
   }
 
+  // Paper account: BUY fills at the realistic ask (mid+half-spread), not the optimistic mid. Re-clamp
+  // qty to what's affordable at that higher fill so paper cash stays honest. (Live broker accounts
+  // returned earlier and use real fills.)
+  const entryFill = simFillPrice(premium, posMoneyness(type, spot, strike), "buy");
+  const entryCostPer = entryFill * 100;
+  qty = Math.max(1, Math.min(qty, Math.floor(state.cash / entryCostPer)));
+  totalCost = qty * entryCostPer;
+
   const position = {
     ticker, type, strike, dte,
     expiryDate,
     dteRemaining: dte,
-    entryPremium: +premium.toFixed(2),
+    entryPremium: entryFill,
     entrySpot: spot,
+    _lastSpot: spot,
     qty,
     originalQty: qty,
     cost: totalCost,
@@ -3092,9 +3233,15 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
   if (totalCost > deployable) { qty = Math.floor(deployable / costPer); totalCost = qty * costPer; }
   if (qty < 1) return { skipped: true, reason: `Cash reserve — insufficient deployable cash for 1 contract` };
 
+  // Realistic BUY fill at the ask (mid+half-spread); re-clamp qty to stay within deployable cash.
+  const entryFill = simFillPrice(premium, posMoneyness(type, spot, strike), "buy");
+  const entryCostPer = entryFill * 100;
+  qty = Math.max(1, Math.min(qty, Math.floor(deployable / entryCostPer)));
+  totalCost = qty * entryCostPer;
+
   const position = {
     ticker, type, strike, dte, expiryDate, dteRemaining: dte,
-    entryPremium: premium, entrySpot: spot, qty, originalQty: qty,
+    entryPremium: entryFill, entrySpot: spot, _lastSpot: spot, qty, originalQty: qty,
     cost: totalCost, openDate: acct._simDateStr || getETDateStr(),
     openTime: acct._simNow || Date.now(),
     trimLevel: 0, bestPnlPct: 0,
@@ -3157,24 +3304,34 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
     }
   }
 
-  const proceeds = currentPremium * qty * multiplier;
+  // Paper / sim accounts: peg the fill to a realistic SELL price (the bid), not the theoretical mid —
+  // you can't sell at the top with no real buyer. Live broker accounts never reach here. The exit
+  // DECISION already happened on the mid above, so timing/strategy are unchanged; only the realized
+  // fill price is made realistic. Equities trade at the spot (negligible spread).
+  const fillPx = isEquity
+    ? currentPremium
+    : simFillPrice(currentPremium, posMoneyness(pos.type, pos._lastSpot ?? pos.entrySpot, pos.strike), "sell");
+  const realPnlPct = (fillPx - pos.entryPremium) / pos.entryPremium;
+  const realPnlDollar = (fillPx - pos.entryPremium) * qty * multiplier;
+
+  const proceeds = fillPx * qty * multiplier;
   state.cash += proceeds;
-  state.realizedPnl = (state.realizedPnl || 0) + pnlDollar;
-  const trade = { ...pos, qty: qty, closePremium: currentPremium, pnlDollar, pnlPct, reason, closeDate: getETDateStr() };
+  state.realizedPnl = (state.realizedPnl || 0) + realPnlDollar;
+  const trade = { ...pos, qty: qty, closePremium: fillPx, proceeds, pnlDollar: realPnlDollar, pnlPct: realPnlPct, reason, closeDate: getETDateStr(), closeTime: acct._simNow || Date.now() };
   if (!acct._simMode) logTrade(trade);
 
   const trimLabel = qty < pos.qty ? `TRIM ${qty}/${pos.qty}` : "EXIT";
-  log(acct, `${trimLabel}: ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} ${pnlDollar >= 0 ? "+" : ""}$${pnlDollar.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${(pnlPct * 100).toFixed(0)}%) — ${reason}`);
+  log(acct, `${trimLabel}: ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} ${realPnlDollar >= 0 ? "+" : ""}$${realPnlDollar.toFixed(0)} (${realPnlPct >= 0 ? "+" : ""}${(realPnlPct * 100).toFixed(0)}%) — ${reason}`);
 
   // Push notification — exit alert
   if (!acct._simMode) {
     const isTrim = qty < pos.qty;
-    const emoji = pnlDollar >= 0 ? "✅" : "🛑";
-    const label = isTrim ? "TRIM" : (pnlDollar >= 0 ? "EXIT TP" : "EXIT SL");
+    const emoji = realPnlDollar >= 0 ? "✅" : "🛑";
+    const label = isTrim ? "TRIM" : (realPnlDollar >= 0 ? "EXIT TP" : "EXIT SL");
     sendPush(
       `${emoji} ${label}: ${pos.ticker} ${pos.type.toUpperCase()} $${pos.strike} [${acct.name}]`,
-      `P&L: ${pnlDollar >= 0 ? "+" : ""}$${pnlDollar.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${(pnlPct * 100).toFixed(0)}%)\n${reason}`,
-      pnlDollar < 0 // urgent only for stop losses
+      `P&L: ${realPnlDollar >= 0 ? "+" : ""}$${realPnlDollar.toFixed(0)} (${realPnlPct >= 0 ? "+" : ""}${(realPnlPct * 100).toFixed(0)}%)\n${reason}`,
+      realPnlDollar < 0 // urgent only for stop losses
     ).catch(() => {});
     tweetTradeExit(acct, pos, trade).catch(e => console.log(`  [X] Exit tweet error: ${e.message}`));
   }
@@ -3195,6 +3352,7 @@ function tryExits(acct, quotes) {
     if (!q) { remaining.push(pos); continue; }
 
     const spot = q.c;
+    pos._lastSpot = spot; // used by the realistic paper-fill model to gauge moneyness on exit
     const now = acct._simNow || Date.now();
     const isEquity = pos.type === "equity";
 
@@ -3335,7 +3493,28 @@ function trySignalExits(acct, quotes, analyses) {
 
     const q = quotes[pos.ticker];
     const spot = q ? q.c : pos.entrySpot;
-    const currentPremium = pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium);
+    const isEquity = pos.type === "equity";
+    const now = acct._simNow || Date.now();
+    if (!isEquity && pos.expiryDate) {
+      pos.dteRemaining = Math.max(0, (pos.expiryDate - now) / 86400_000);
+    }
+    const currentPremium = isEquity
+      ? (pos.liveMark ?? spot)
+      : (pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
+    const pnlPct = pos.entryPremium > 0 ? (currentPremium - pos.entryPremium) / pos.entryPremium : 0;
+
+    // Hysteresis: don't flatten on a marginal score touch while still green on spot/premium.
+    const deepReversal = pos.type === "call"
+      ? a.score <= cfg.bearEntry - SIGNAL_EXIT_SCORE_MARGIN
+      : a.score >= cfg.bullEntry + SIGNAL_EXIT_SCORE_MARGIN;
+    const underwater = pnlPct <= SIGNAL_EXIT_MIN_LOSS;
+    const spotAgainst = pos.entrySpot && (
+      pos.type === "call" ? spot < pos.entrySpot * 0.98 : spot > pos.entrySpot * 1.02
+    );
+    if (!deepReversal && !underwater && !spotAgainst) {
+      remaining.push(pos);
+      continue;
+    }
 
     const trade = closePosition(acct, pos, currentPremium, "signal reversed");
     if (trade) {
@@ -3557,7 +3736,7 @@ function dashboardHTML(acct, { spectator = false } = {}) {
       <td><a href="/ticker/${p.ticker}"><b>${p.ticker}</b></a>${aiToggle}</td><td>${p.type.toUpperCase()}</td><td>$${p.strike}</td>
       <td style="white-space:nowrap">$${p.spot.toFixed(2)}<br><span style="color:${spotColor};font-size:10px">${spotChg >= 0 ? "+" : ""}${spotChg.toFixed(2)} (${spotChgPct >= 0 ? "+" : ""}${spotChgPct.toFixed(1)}%)</span><br><span style="color:${spotFromEntryColor};font-size:10px">from entry: ${spotFromEntry >= 0 ? "+" : ""}${spotFromEntry.toFixed(1)}%</span></td>
       <td>${p.dteLeft.toFixed(1)}d</td><td>${p.qty}</td>
-      <td>$${p.entryPremium.toFixed(2)}</td><td>$${p.curPremium.toFixed(2)}</td>
+      <td>$${p.entryPremium.toFixed(2)}${(p.intendedEntryPremium && Math.abs(p.intendedEntryPremium - p.entryPremium) >= 0.01) ? `<br><span style="font-size:9px;color:#9aa0aa" title="Bot's intended limit before the actual fill">intended $${(+p.intendedEntryPremium).toFixed(2)}</span>` : ''}</td><td>$${p.curPremium.toFixed(2)}</td>
       <td style="color:${color}">${p.pnlPct >= 0 ? "+" : ""}${(p.pnlPct * 100).toFixed(1)}% ($${p.pnlDollar.toFixed(0)})</td>
       <td><span style="color:#00a843">TP $${p.profitTarget.premium}</span> (${p.pctToProfit}% away)</td>
       <td><span style="color:#e8473f">SL $${p.stopLoss.premium}</span> (${p.pctToStop}% away)</td>
@@ -3621,9 +3800,13 @@ function dashboardHTML(acct, { spectator = false } = {}) {
         <div style="margin-top:4px;color:#6b7280">Setup quality <span style="color:#1c1d22">${h.setupQuality ?? '?'}/100</span> · Tech score <span style="color:#1c1d22">${h.technicalScore ?? '?'}/100</span> · Regime <span style="color:#1c1d22">${h.regimeAtEntry || '?'}</span></div>
       </td>
     </tr>` : "";
+    const exitTag = h._pendingFill ? ' <span style="color:#b07400;font-size:9px" title="awaiting actual broker fill">est</span>'
+      : (h._fillUnresolved ? ' <span style="color:#b07400;font-size:9px" title="fill could not be confirmed">?</span>'
+      : (h._reconciled ? ' <span style="color:#138f86;font-size:9px" title="reconciled to actual broker fill">✓</span>' : ''));
+    const feeNote = h.exitFees ? `<br><span style="font-size:9px;color:#9aa0aa">−$${h.exitFees.toFixed(2)} fee</span>` : '';
     return `<tr><td>${h.ticker}${aiToggle}</td><td>${h.type.toUpperCase()}</td><td>$${h.strike}</td>
       <td style="font-size:10px;color:#6b7280;white-space:nowrap">${h.openDate || '—'}<br>→ ${h.closeDate || '—'}</td>
-      <td>$${h.entryPremium.toFixed(2)}</td><td>$${(h.closePremium || 0).toFixed(2)}</td>
+      <td>$${h.entryPremium.toFixed(2)}</td><td>$${(h.closePremium || 0).toFixed(2)}${exitTag}${feeNote}</td>
       <td style="color:${color}">${h.pnlDollar >= 0 ? "+" : ""}$${h.pnlDollar.toFixed(0)} (${(h.pnlPct * 100).toFixed(0)}%)</td>
       <td>${h.reason || "—"}</td></tr>${aiRow}`;
   }).join("") || '<tr><td colspan="8" style="opacity:.5">No trades yet</td></tr>';
@@ -6314,22 +6497,41 @@ async function fetchSharedMarketData(apiKey, sharedCandleCache) {
   const tickerList = [...allTickers];
   const sharedQuotes = {};
 
-  // Fetch quotes once for all tickers
+  // Batch quotes via Tradier (25 symbols/call) — ~4s for 106 tickers vs ~16s sequential.
+  if (tradier.isConnected && tickerList.length > 0) {
+    const BATCH = 25;
+    for (let i = 0; i < tickerList.length; i += BATCH) {
+      try {
+        const batch = tickerList.slice(i, i + BATCH);
+        const qs = await tradier.getQuotes(batch);
+        Object.assign(sharedQuotes, qs);
+      } catch { }
+      if (i + BATCH < tickerList.length) await delay(apiDelay());
+    }
+  }
+  // Fallback / fill gaps one at a time
   for (const ticker of tickerList) {
+    if (sharedQuotes[ticker]?.c > 0) continue;
     try {
       sharedQuotes[ticker] = await fetchQuote(ticker, apiKey);
-      await delay(API_DELAY);
-    } catch (e) { }
+      await delay(apiDelay());
+    } catch { }
   }
 
-  // Fetch candles for tickers not already cached
-  for (const ticker of tickerList) {
-    if (!sharedCandleCache[ticker]) {
+  // Fetch candles for tickers not already cached (parallel chunks of 6)
+  const needCandles = tickerList.filter(t => !sharedCandleCache[t]);
+  const CHUNK = 6;
+  for (let i = 0; i < needCandles.length; i += CHUNK) {
+    const chunk = needCandles.slice(i, i + CHUNK);
+    await Promise.all(chunk.map(async ticker => {
       try {
         sharedCandleCache[ticker] = await fetchCandles(ticker, apiKey);
-        await delay(API_DELAY);
-      } catch (e) { }
-    } else if (sharedQuotes[ticker]) {
+      } catch { }
+    }));
+    if (i + CHUNK < needCandles.length) await delay(apiDelay());
+  }
+  for (const ticker of tickerList) {
+    if (sharedCandleCache[ticker] && sharedQuotes[ticker]) {
       // Update latest candle with current quote
       const q = sharedQuotes[ticker];
       const last = sharedCandleCache[ticker][sharedCandleCache[ticker].length - 1];
@@ -6713,15 +6915,36 @@ function placeBrokerExit(acct, pos, currentPremium, reason, qty, pnlPct, pnlDoll
 
   acct._inflightTickers.add(ticker.toUpperCase());
 
-  // Protective exits (losses, stops, DTE/critical, signal reversals) must actually FILL, so price
-  // them at the live bid (marketable) rather than mid where they could rest unfilled while the
-  // position keeps bleeding. Profit-taking exits can be patient and use the mid.
+  // Exit pricing must FILL without donating the spread. The old behavior dumped every protective
+  // exit at the raw bid — on a wide market (e.g. b$0.25/a$0.82) that gives away ~half the value.
+  // New model:
+  //   • profit-taking            → post at mid (patient; re-prices each cycle)
+  //   • urgent protective        → at the bid (must get out: critical/expiry/hard stop)
+  //   • tight-market protective  → at the bid (spread is small, marketable is fine)
+  //   • wide-market protective   → mid minus a capped concession; re-prices down over cycles
+  const bid = typeof pos.liveBid === "number" && pos.liveBid > 0 ? pos.liveBid : null;
+  const ask = typeof pos.liveAsk === "number" && pos.liveAsk > 0 ? pos.liveAsk : null;
+  const mid = (bid != null && ask != null && ask >= bid) ? (bid + ask) / 2
+            : (typeof pos.liveMark === "number" && pos.liveMark > 0 ? pos.liveMark : currentPremium);
+  const spreadPct = (bid != null && ask != null && mid > 0) ? (ask - bid) / mid : 0;
   const protective = pnlPct <= 0 || /stop|critical|expir|reversed|breakeven|low-dte|theta/i.test(reason);
-  let limit = +currentPremium.toFixed(2);
-  if (protective && typeof pos.liveBid === "number" && pos.liveBid > 0) {
-    limit = +pos.liveBid.toFixed(2);
-  } else if (protective) {
-    log(acct, `TRADIER EXIT WARN ${ticker}: no live bid for protective exit — using mid $${limit} (fill not guaranteed)`);
+  const urgent = /critical|expir|low-dte/i.test(reason);
+
+  let limit = +mid.toFixed(2);
+  if (protective) {
+    if (urgent && bid != null) {
+      limit = +bid.toFixed(2); // must exit now — take the bid
+    } else if (spreadPct <= WIDE_SPREAD_EXIT_PCT && bid != null) {
+      limit = +bid.toFixed(2); // tight market — marketable at the bid is fine
+    } else if (mid > 0) {
+      // Wide market: don't dump at the bid. Concede at most MAX_EXIT_CONCESSION_PCT below mid,
+      // but never below the bid. If unfilled, the next cycle re-prices off the new mid.
+      const floor = bid != null ? bid : 0;
+      limit = +Math.max(floor, mid * (1 - MAX_EXIT_CONCESSION_PCT)).toFixed(2);
+      log(acct, `TRADIER EXIT ${ticker}: wide market (${(spreadPct * 100).toFixed(0)}% spread) — working limit $${limit} near mid $${mid.toFixed(2)} instead of dumping at bid $${bid ?? "?"}`);
+    } else {
+      log(acct, `TRADIER EXIT WARN ${ticker}: no live market for protective exit — using $${limit} (fill not guaranteed)`);
+    }
   }
 
   // Use the EXACT held OCC symbol so we can never target the wrong contract via reconstruction.
@@ -6733,13 +6956,25 @@ function placeBrokerExit(acct, pos, currentPremium, reason, qty, pnlPct, pnlDoll
       log(acct, `TRADIER EXIT FAILED ${ticker}: ${e.message}`);
     });
 
-  // Bookkeeping (no balance/position mutation — sync is authoritative).
-
+  // Bookkeeping (no balance/position mutation — sync is authoritative). The P&L recorded here is an
+  // ESTIMATE based on the limit we sent; the actual fill is reconciled by reconcileBrokerFills() on a
+  // later cycle (which corrects closePremium/proceeds/pnl and folds in commissions). We tag the trade
+  // with the exact OCC + submit time so the reconciler can find the real fill.
   if (!state.lastClosed) state.lastClosed = {};
   state.lastClosed[ticker] = getETDateStr();
   state.realizedPnl = (state.realizedPnl || 0) + pnlDollar;
 
-  const trade = { ...pos, qty, closePremium: currentPremium, pnlDollar, pnlPct, reason, closeDate: getETDateStr() };
+  const occForTrade = pos.occSymbol || occForExit;
+  const trade = {
+    ...pos, qty,
+    closePremium: +limit.toFixed(2),   // estimate (submitted limit) until the fill is reconciled
+    proceeds: +(limit * qty * 100).toFixed(2),
+    pnlDollar, pnlPct, reason, closeDate: getETDateStr(), closeTime: Date.now(),
+    _occ: occForTrade,
+    _exitSubmittedAt: Date.now(),
+    _pendingFill: true,
+    _estPnlDollar: pnlDollar,           // remember the estimate so reconciliation can net it out
+  };
   logTrade(trade);
   state.history.push(trade);
 
@@ -6758,6 +6993,68 @@ function placeBrokerExit(acct, pos, currentPremium, reason, qty, pnlPct, pnlDoll
   return null; // keep position locally; sync reconciles after fill
 }
 
+// Reconcile recorded exits against ACTUAL broker fills. placeBrokerExit records an estimated
+// close price (the submitted limit); once Tradier reports the order as filled we overwrite the
+// trade's close price, proceeds, fees, and P&L with the real numbers so trade history and realized
+// P&L reflect what truly happened — not what we hoped for. Also nets out the estimate we had added.
+async function reconcileBrokerFills(acct) {
+  if (acct.config.broker !== "tradier" || !tradier.isConnected) return;
+  const state = acct.state;
+  const pending = (state.history || []).filter(t => t._pendingFill && t._occ);
+  if (!pending.length) return;
+
+  let orders;
+  try { orders = await tradier.getOrders(); } catch { return; }
+  const filled = orders.filter(o => (o.status || "").toLowerCase() === "filled" && (o.avg_fill_price > 0 || o.last_fill_price > 0));
+
+  for (const trade of pending) {
+    const occ = trade._occ;
+    const submittedAt = trade._exitSubmittedAt || 0;
+    // Match the filled sell order for this exact contract, dated at/after we submitted (60s slack).
+    const match = filled.find(o => {
+      const oOcc = o.option_symbol || o.symbol || "";
+      const side = (o.side || "").toLowerCase();
+      if (oOcc !== occ) return false;
+      if (side !== "sell_to_close" && side !== "sell") return false;
+      const t = o.transaction_date || o.create_date;
+      const filledAt = t ? new Date(t).getTime() : 0;
+      return filledAt >= submittedAt - 60_000;
+    });
+    if (!match) {
+      // Give up reconciling after 24h (order canceled/expired or history pruned) so it stops retrying.
+      if (Date.now() - submittedAt > 86_400_000) { trade._pendingFill = false; trade._fillUnresolved = true; }
+      continue;
+    }
+
+    const actualClose = +(match.avg_fill_price || match.last_fill_price);
+    const filledQty = Math.round(Math.abs(match.exec_quantity || match.quantity || trade.qty));
+    const exitFees = +(FEE_PER_CONTRACT * filledQty).toFixed(2);
+    const grossProceeds = +(actualClose * filledQty * 100).toFixed(2);
+    const netProceeds = +(grossProceeds - exitFees).toFixed(2);
+    // Prefer the all-in entry cost basis (already includes entry commission) for a true net number.
+    const costBasis = trade.cost && trade.cost > 0 ? trade.cost : (trade.entryPremium || 0) * filledQty * 100;
+    const realPnl = +(netProceeds - costBasis).toFixed(2);
+    const realPnlPct = costBasis > 0 ? realPnl / costBasis : 0;
+
+    // Net the estimate out of realized P&L, fold in the actual.
+    state.realizedPnl = (state.realizedPnl || 0) - (trade._estPnlDollar || 0) + realPnl;
+
+    const est = trade.closePremium;
+    trade.closePremium = +actualClose.toFixed(2);
+    trade.proceeds = netProceeds;
+    trade.exitFees = exitFees;
+    trade.costBasis = +costBasis.toFixed(2);
+    trade.pnlDollar = realPnl;
+    trade.pnlPct = realPnlPct;
+    trade.filledQty = filledQty;
+    trade._pendingFill = false;
+    trade._reconciled = true;
+
+    const slip = est ? ((actualClose - est) / est) * 100 : 0;
+    log(acct, `FILL RECONCILED ${trade.ticker} ${occ}: actual close $${actualClose.toFixed(2)} (est $${est}, ${slip >= 0 ? "+" : ""}${slip.toFixed(0)}% slip) · net proceeds $${netProceeds} − fees $${exitFees} · P&L ${realPnl >= 0 ? "+" : ""}$${realPnl.toFixed(0)} (${(realPnlPct * 100).toFixed(0)}%)`);
+  }
+}
+
 // Mirror the real Tradier account into acct.state: cash from balances, positions (option legs only)
 // from holdings with live option marks. Bot-only side-metadata is merged back by OCC each cycle.
 async function syncBrokerAccount(acct, quotes) {
@@ -6769,6 +7066,9 @@ async function syncBrokerAccount(acct, quotes) {
   // and the pending-position rows below.
   const workingOrders = await brokerWorkingOrders(acct);
   acct._inflightTickers = new Set(workingOrders.map(o => o.ticker.toUpperCase()));
+
+  // Correct any recorded exits against their real fills (close price, proceeds, fees, realized P&L).
+  await reconcileBrokerFills(acct).catch(e => log(acct, `FILL RECONCILE error — ${e.message}`));
 
   try {
     const bal = await tradier.getAccount();
@@ -6789,7 +7089,10 @@ async function syncBrokerAccount(acct, quotes) {
       if (!parsed) continue;                       // skip equity / non-option holdings
       const qtyContracts = Math.round(Math.abs(p.quantity));
       if (qtyContracts < 1) continue;
-      const entryPremium = p.cost_basis && qtyContracts ? Math.abs(p.cost_basis) / (qtyContracts * 100) : 0;
+      // Tradier's cost_basis is the REAL all-in fill (premium × qty × 100, incl. commissions). This
+      // is authoritative for what we actually paid — the bot's pre-fill limit estimate (meta.entryPremium)
+      // is only a guess and must never override the broker's reported fill.
+      const actualEntryPremium = p.cost_basis && qtyContracts ? Math.abs(p.cost_basis) / (qtyContracts * 100) : 0;
 
       let mark = null, bid = null, ask = null, greeks = null, iv = DEFAULT_IV;
       try {
@@ -6819,11 +7122,15 @@ async function syncBrokerAccount(acct, quotes) {
         expiryDate,
         dte: meta.dte ?? Math.round(dteRemaining),
         dteRemaining,
-        entryPremium: meta.entryPremium ?? +entryPremium.toFixed(2),
+        // Broker fill wins. Once Tradier reports a cost_basis we use it as the true entry premium
+        // (this is what fixes "the bot thought $0.80 but it actually filled at $0.67"). Fall back to
+        // the bot's intended limit only until the fill is reported.
+        entryPremium: actualEntryPremium > 0 ? +actualEntryPremium.toFixed(2) : (meta.entryPremium ?? 0),
+        intendedEntryPremium: meta.entryPremium ?? null, // the limit we submitted — kept for slippage transparency
         entrySpot: meta.entrySpot ?? spot,
         qty: qtyContracts,
         originalQty: meta.originalQty ?? qtyContracts,
-        cost: Math.abs(p.cost_basis || entryPremium * qtyContracts * 100),
+        cost: Math.abs(p.cost_basis || actualEntryPremium * qtyContracts * 100),
         openDate: meta.openDate ?? (p.date_acquired ? String(p.date_acquired).slice(0, 10) : getETDateStr()),
         openTime: meta.openTime ?? (p.date_acquired ? new Date(p.date_acquired).getTime() : now),
         trimLevel: meta.trimLevel ?? 0,
@@ -7029,6 +7336,42 @@ async function syncRobinhoodAccount(acct, quotes) {
 
 // ─── Main Trading Cycle ───
 
+// Capital-preservation safety net. Reads ONLY reconciled trade history (real broker P&L) and is
+// deposit-agnostic, so adding funds never masks a losing streak. Only counts trades closed after this
+// feature shipped (those carry a closeTime), so it won't trip on stale historical losses on first run.
+// Returns { halt, hard, reason } when NEW ENTRIES should be blocked (exits always keep running).
+function checkRiskHalt(acct) {
+  const cfg = acct.config;
+  const state = acct.state;
+  const hist = (state.history || []).filter(t => t.closeTime && !t._pendingFill);
+  if (!hist.length) return { halt: false };
+
+  // 1) Consecutive losses (hard stop). Walk newest→oldest until a winner breaks the streak.
+  const maxStreak = cfg.maxConsecutiveLosses ?? 3;
+  if (maxStreak > 0) {
+    let streak = 0;
+    for (let i = hist.length - 1; i >= 0; i--) {
+      if ((hist[i].pnlDollar || 0) < 0) streak++; else break;
+    }
+    if (streak >= maxStreak) {
+      return { halt: true, hard: true, reason: `${streak} consecutive losing trades (limit ${maxStreak}) — account hard-paused to stop the bleed. Review and Resume when ready.` };
+    }
+  }
+
+  // 2) Daily realized-loss limit (soft stop — auto-clears next trading day).
+  const lossLimitPct = cfg.dailyLossLimitPct ?? 0;
+  if (lossLimitPct > 0) {
+    const today = getETDateStr();
+    const todayPnl = hist.filter(t => t.closeDate === today).reduce((s, t) => s + (t.pnlDollar || 0), 0);
+    const dayStart = state.dayStartEquity || cfg.startingCash || 0;
+    if (dayStart > 0 && todayPnl < 0 && Math.abs(todayPnl) >= lossLimitPct * dayStart) {
+      return { halt: true, hard: false, reason: `Daily loss $${Math.abs(todayPnl).toFixed(0)} reached ${(lossLimitPct * 100).toFixed(0)}% of day-start equity $${dayStart.toFixed(0)} — no new entries until tomorrow (open positions still managed).` };
+    }
+  }
+
+  return { halt: false };
+}
+
 async function runCycle(acct, sharedQuotes, apiKey) {
   const state = acct.state;
   const cfg = acct.config;
@@ -7145,6 +7488,14 @@ async function runCycle(acct, sharedQuotes, apiKey) {
   // Broker accounts: mirror real balance + positions before any exit/entry decisions.
   if (cfg.broker === "tradier") await syncBrokerAccount(acct, quotes);
 
+  // Record the day's starting equity once per trading day (for the daily-loss safety limit). Done
+  // after sync so broker equity is current; deposit-agnostic because the limit sums realized P&L.
+  const todayStr = getETDateStr();
+  if (state.dayStartDate !== todayStr) {
+    state.dayStartDate = todayStr;
+    state.dayStartEquity = portfolioValue(state, quotes);
+  }
+
   const regime = getMarketRegime(acct.candleCache);
   acct.currentRegime = regime;
   acct.riskPct = cfg.baseRiskPct * regime.riskScale;
@@ -7155,7 +7506,24 @@ async function runCycle(acct, sharedQuotes, apiKey) {
   trySignalExits(acct, quotes, analyses);
   tryEMATrailingExits(acct, quotes);
 
+  // ─── Capital-preservation gate: block NEW entries on a losing streak / daily loss limit ───
+  const risk = checkRiskHalt(acct);
+  dash.riskHalt = risk.halt ? risk.reason : null;
+  if (risk.halt) {
+    if (acct._riskHaltNotified !== risk.reason) {
+      acct._riskHaltNotified = risk.reason;
+      log(acct, `🛑 RISK HALT: ${risk.reason}`);
+      sendPush(`🛑 Trading halted [${acct.name}]`, risk.reason, true).catch(() => {});
+    }
+    if (risk.hard && !acct.paused) { acct.paused = true; saveAccounts(); }
+    return; // skip all new entries this cycle; exits already ran above
+  }
+  acct._riskHaltNotified = null;
+
   for (const ticker of activeTickers) {
+    const dec = decisions.find(d => d.ticker === ticker);
+    if (!dec || (dec.action !== "BUY CALL" && dec.action !== "BUY PUT")) continue;
+
     const a = analyses[ticker];
     const q = quotes[ticker];
     if (!a || !q) continue;
@@ -7257,6 +7625,10 @@ async function runPausedCycle(acct, sharedQuotes) {
       if (a) analyses[ticker] = a;
     }
   }
+
+  // Broker accounts: keep mirroring the real account so exits price off fresh marks/bids even while
+  // paused (a hard risk-halt pauses entries but must not abandon open positions).
+  if (cfg.broker === "tradier") await syncBrokerAccount(acct, quotes);
 
   tryTimeBasedExits(acct, quotes);
   tryExits(acct, quotes);
@@ -7868,7 +8240,7 @@ async function main() {
 
       saveAccounts();
       console.log("");
-      await delay(CYCLE_MS);
+      await delay(marketOpen ? CYCLE_MS : CYCLE_MS_CLOSED);
     } else {
       // After hours
       try {
