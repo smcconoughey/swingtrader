@@ -1195,20 +1195,25 @@ async function tweetWithChart(text, pngBuffer) {
   }
 }
 
-function renderChartPNG(candles, ticker, analysis, shortTermAnalysis, quote) {
+function renderChartPNG(candles, ticker, analysis, shortTermAnalysis, quote, opts = {}) {
   if (!candles || candles.length < 3) return null;
   try {
     const W = 1100, H = 500, PAD = 50;
+    // When a projection is supplied we reserve a band on the right for the forecast path/targets,
+    // so the candles compress into the left ~78% and the projection reads as "the road ahead".
+    const proj = opts.projection || null;
+    const FUTURE = proj ? 230 : 0;
     const cls = candles.map(c => c.c), hs = candles.map(c => c.h), ls = candles.map(c => c.l), vs = candles.map(c => c.v);
     const emas = [
       { period: 8, color: "#138f86", label: "EMA 8", data: calcEMA(cls, 8) },
       { period: 21, color: "#d2691e", label: "EMA 21", data: calcEMA(cls, 21) },
       { period: 50, color: "#6a4df4", label: "EMA 50", data: calcEMA(cls, 50) },
     ];
-    const allP = [...hs, ...ls];
+    const projLevels = proj ? [proj.trigger, proj.target].filter(v => v > 0) : [];
+    const allP = [...hs, ...ls, ...projLevels];
     const mn = Math.min(...allP) * 0.998, mx = Math.max(...allP) * 1.002, rng = mx - mn;
     const y = v => H - ((v - mn) / rng) * (H - 40) - 20;
-    const x = i => PAD + (i / Math.max(1, cls.length - 1)) * (W - PAD);
+    const x = i => PAD + (i / Math.max(1, cls.length - 1)) * (W - PAD - FUTURE);
 
     // Candlestick bars
     const bars = candles.map((c, i) => {
@@ -1225,6 +1230,27 @@ function renderChartPNG(candles, ticker, analysis, shortTermAnalysis, quote) {
     const emaPaths = emas.map(e =>
       `<path d="${e.data.map((v, i) => `${i ? "L" : "M"}${x(i)},${y(v)}`).join(" ")}" fill="none" stroke="${e.color}" stroke-width="2" opacity="0.85"/>`
     ).join("");
+
+    // Projection layer: trigger/target levels + a forecast path from "now" to the target.
+    let projection = "";
+    if (proj) {
+      const lastClose = cls[cls.length - 1];
+      const xNow = x(cls.length - 1);
+      const xEnd = W - 12;
+      const tgtColor = proj.isCall ? "#00a843" : "#e8473f";
+      const level = (val, color, label) =>
+        `<line x1="${PAD}" y1="${y(val)}" x2="${xEnd}" y2="${y(val)}" stroke="${color}" stroke-width="1.5" stroke-dasharray="7 5" opacity="0.9"/>
+         <text x="${xEnd}" y="${y(val) - 6}" fill="${color}" font-size="14" font-weight="bold" font-family="monospace" text-anchor="end">${label} $${fmtNum(val)}</text>`;
+      const midY = (y(lastClose) + y(proj.target)) / 2;
+      projection = `
+        ${level(proj.trigger, "#b07400", proj.isCall ? "BREAK OVER" : "BREAK UNDER")}
+        ${level(proj.target, tgtColor, "TARGET")}
+        <line x1="${xNow}" y1="${20}" x2="${xNow}" y2="${H}" stroke="#9aa1ad" stroke-width="1" stroke-dasharray="2 4" opacity="0.5"/>
+        <path d="M${xNow},${y(lastClose)} L${xEnd - 14},${y(proj.target)}" fill="none" stroke="${tgtColor}" stroke-width="3" stroke-dasharray="3 5" opacity="0.95"/>
+        <circle cx="${xNow}" cy="${y(lastClose)}" r="5" fill="${tgtColor}"/>
+        <polygon points="${xEnd - 16},${y(proj.target) - 7} ${xEnd},${y(proj.target)} ${xEnd - 16},${y(proj.target) + 7}" fill="${tgtColor}"/>
+        <text x="${(xNow + xEnd) / 2}" y="${midY - 10}" fill="${tgtColor}" font-size="13" font-weight="bold" font-family="monospace" text-anchor="middle">${proj.contract || proj.expLabel || ""}</text>`;
+    }
 
     // Price labels on right side
     const pLabels = [mn, mn + rng * 0.25, mn + rng * 0.5, mn + rng * 0.75, mx].map(p =>
@@ -1270,7 +1296,7 @@ function renderChartPNG(candles, ticker, analysis, shortTermAnalysis, quote) {
 
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="${totalH}" viewBox="0 0 1200 ${totalH}">
       <rect width="1200" height="${totalH}" fill="#f6f7f9" rx="12"/>
-      <text x="20" y="22" fill="#fff" font-size="18" font-weight="bold" font-family="monospace">$${ticker}</text>
+      <text x="20" y="22" fill="#1c1d22" font-size="18" font-weight="bold" font-family="monospace">$${ticker}</text>
       <text x="${20 + ticker.length * 12 + 10}" y="22" fill="#6b7280" font-size="14" font-family="monospace">$${price}</text>
       <text x="${20 + ticker.length * 12 + 80}" y="22" fill="${chgColor}" font-size="14" font-family="monospace">${chg}</text>
       <text x="${W - 20}" y="22" fill="${scoreColor}" font-size="16" font-weight="bold" font-family="monospace" text-anchor="end">Score: ${score}/100 ${signal}</text>
@@ -1279,6 +1305,7 @@ function renderChartPNG(candles, ticker, analysis, shortTermAnalysis, quote) {
       <g transform="translate(0, 10)">
         ${bars}
         ${emaPaths}
+        ${projection}
         ${pLabels}
         ${volBars}
       </g>
@@ -1360,6 +1387,255 @@ async function tweetWatchlistSummary(acct, decisions, regime) {
     chart = renderChartPNG(acct.candleCache[topTicker], topTicker, topAnalysis, topST, topQuote);
   }
   await tweetWithChart(text, chart);
+}
+
+// ─── Media / Social composer (manual now, automatable later) ───
+// Turns the live technicals into SRxTrades-style trade-plan lines and standalone per-ticker
+// captions, plus the projection levels (trigger + target) used to annotate the share chart.
+
+// Strip trailing zeros so levels read like a human wrote them ("400", "28.5", "372.4", "24.17").
+function fmtNum(v) {
+  if (v == null || !isFinite(v)) return "?";
+  const s = (+v).toFixed(2);
+  return s.replace(/\.?0+$/, "");
+}
+
+function niceStrikeIncrement(price) {
+  if (price < 5) return 0.5;
+  if (price < 25) return 1;
+  if (price < 75) return 2.5;
+  if (price < 150) return 5;
+  if (price < 400) return 10;
+  if (price < 1000) return 25;
+  return 50;
+}
+function roundStrike(price, dir = "near") {
+  const inc = niceStrikeIncrement(price);
+  const n = price / inc;
+  const r = dir === "up" ? Math.ceil(n) : dir === "down" ? Math.floor(n) : Math.round(n);
+  return +(r * inc).toFixed(2);
+}
+
+// Build the trade idea (plan line + caption + projection) for one ticker. Returns null if thin data.
+function buildMediaIdea(ticker, analysis, st, quote, candles) {
+  if (!analysis || !quote || !(quote.c > 0)) return null;
+  if (!candles || candles.length < 15) return null;
+  const price = quote.c;
+  const cons = candles ? detectConsolidation(candles) : null;
+  const mom = candles ? detectMomentumQuality(candles) : null;
+
+  const bullish = analysis.score >= 55 || (analysis.aligned && (st?.aligned ?? false));
+  const bearish = analysis.score <= 35 || analysis.bearish;
+  const isCall = bullish && !bearish ? true : bearish && !bullish ? false : analysis.score >= 50;
+
+  const recentHigh = st?.recentHigh ?? Math.max(...candles.slice(-10).map(c => c.h));
+  const recentLow = st?.recentLow ?? Math.min(...candles.slice(-10).map(c => c.l));
+  const trigger = isCall ? Math.max(recentHigh, price) : Math.min(recentLow, price);
+
+  // Target: ATR-projected move in the trade direction, clamped to a sensible swing.
+  const atr = analysis.atr || price * 0.02;
+  const target = isCall ? Math.max(price + atr * 3, trigger * 1.05) : Math.min(price - atr * 3, trigger * 0.95);
+  const targetRound = roundStrike(target, isCall ? "down" : "up"); // clean round number near the target
+
+  const exp = nextFridayExpiry(30); // ~monthly Friday
+  const expLabel = exp.date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  const strike = isCall ? roundStrike(Math.max(target, trigger), "up") : roundStrike(Math.min(target, trigger), "down");
+  const cType = isCall ? "c" : "p";
+
+  const planLine = isCall
+    ? `$${ticker} break over ${fmtNum(trigger)}, ${fmtNum(strike)}c ${expLabel} → to target: $${fmtNum(targetRound)}+`
+    : `$${ticker} break under ${fmtNum(trigger)}, ${fmtNum(strike)}p ${expLabel} → to target: $${fmtNum(targetRound)}`;
+
+  const caption = buildCaptionText(ticker, { isCall, analysis, st, cons, mom, price, trigger, target: targetRound, recentHigh });
+
+  return {
+    ticker, isCall, dir: isCall ? "bullish" : "bearish", price: +price.toFixed(2),
+    trigger: +trigger.toFixed(2), target: +targetRound.toFixed(2),
+    strike, expLabel, contract: `${fmtNum(strike)}${cType} ${expLabel}`,
+    score: analysis.score, planLine, caption,
+  };
+}
+
+// Narrative caption in the chart-poster style, derived from the technical read.
+function buildCaptionText(ticker, ctx) {
+  const { isCall, analysis, st, cons, mom, price, trigger, target, recentHigh } = ctx;
+  const emas = [{ n: 8, v: analysis.ema8v }, { n: 21, v: analysis.ema21v }, { n: 50, v: analysis.ema50v }].filter(e => e.v > 0);
+  let ride = null;
+  if (isCall) ride = emas.filter(e => e.v <= price).sort((a, b) => b.v - a.v)[0] || emas[0];
+  else ride = emas.filter(e => e.v >= price).sort((a, b) => a.v - b.v)[0] || emas[0];
+  const emaWk = ride ? `${ride.n}-week EMA` : "key moving average";
+
+  const vr = st?.vr ?? analysis.vr ?? 1;
+  const volPhrase = vr < 0.85 ? "on decreasing volume" : vr > 1.25 ? "on expanding volume" : "with steady volume";
+  const tight = cons && cons.quality >= 55;
+
+  let setup;
+  if (isCall) {
+    if (tight && vr < 0.95) setup = `Picture-perfect flag off the ${emaWk} ${volPhrase}.`;
+    else if (analysis.aligned && (st?.mom7d ?? 0) > 0) setup = `Clean uptrend riding the ${emaWk} — higher highs, higher lows ${volPhrase}.`;
+    else if (st?.nearHigh) setup = `Coiling just under the ${fmtNum(recentHigh)} highs, ${emaWk} holding as support.`;
+    else setup = `Basing above the ${emaWk}, setting up for the next leg.`;
+  } else {
+    if (analysis.bearish) setup = `Breaking down through the ${emaWk}, momentum rolling over ${volPhrase}.`;
+    else setup = `Losing the ${emaWk} — lower highs building in.`;
+  }
+
+  const triggerLine = isCall
+    ? `Break over ${fmtNum(trigger)} opens the door to $${fmtNum(target)}+.`
+    : `Lose ${fmtNum(trigger)} and $${fmtNum(target)} is in play.`;
+  const closer = isCall
+    ? ((st?.mom7d ?? 0) > 3 ? "Feels like this name is not done yet." : "Watching for the breakout.")
+    : "Watching the breakdown.";
+
+  return `$${ticker}\n\n${setup}\n\n${triggerLine}\n\n${closer}`;
+}
+
+// Assemble the dated "Trade plan" post from a set of ideas.
+function buildTradePlanText(ideas) {
+  const date = new Date().toLocaleDateString("en-US", { month: "numeric", day: "numeric" });
+  return `Trade plan ${date}\n\n${ideas.map(i => i.planLine).join("\n\n")}`;
+}
+
+// Gather the tickers worth featuring this week: open positions first, then top watchlist scorers.
+function gatherMediaIdeas(acct, { featured = null, max = 12 } = {}) {
+  const dash = acct.dashboard;
+  const seen = new Set();
+  const order = [];
+  const add = t => { const u = (t || "").toUpperCase(); if (u && !seen.has(u)) { seen.add(u); order.push(u); } };
+  if (featured) add(featured);
+  for (const p of acct.state.positions) add(p.ticker);
+  // Watchlist names ranked by |score-50| (strongest directional reads), excluding SPY/QQQ.
+  const ranked = Object.entries(dash.analyses || {})
+    .filter(([t, a]) => a && t !== "SPY" && t !== "QQQ")
+    .sort((a, b) => Math.abs((b[1].score ?? 50) - 50) - Math.abs((a[1].score ?? 50) - 50))
+    .map(([t]) => t);
+  for (const t of ranked) add(t);
+
+  const ideas = [];
+  for (const t of order) {
+    if (ideas.length >= max) break;
+    const idea = buildMediaIdea(t, dash.analyses?.[t], dash.shortTermAnalyses?.[t], dash.quotes?.[t], acct.candleCache?.[t]);
+    if (idea) ideas.push(idea);
+  }
+  return ideas;
+}
+
+// Compute shareable performance stats for an account (growth, win rate, top winners, start date).
+function buildAccountStats(acct) {
+  const state = acct.state;
+  const dash = acct.dashboard;
+  const cfg = acct.config;
+  const start = cfg.startingCash || 0;
+  const pv = portfolioValue(state, dash.quotes);
+  const allTimePnl = pv - start;
+  const allTimePct = start > 0 ? (allTimePnl / start) * 100 : 0;
+
+  const createdAt = acct.createdAt || Date.now();
+  const days = Math.max(1, Math.round((Date.now() - createdAt) / 86400_000));
+
+  // Weekly growth from the portfolio-value history (last point at/just before 7 days ago).
+  const hist = (dash.portfolioHistory || []).filter(p => p && typeof p.value === "number");
+  const weekAgoTs = Date.now() - 7 * 86400_000;
+  let weekStartVal = null;
+  for (const p of hist) { if (p.ts <= weekAgoTs) weekStartVal = p.value; else break; }
+  if (weekStartVal == null && hist.length) weekStartVal = hist[0].value;
+  const weekPnl = weekStartVal != null ? pv - weekStartVal : null;
+  const weekPct = weekStartVal ? (weekPnl / weekStartVal) * 100 : null;
+
+  // Closed trades, win rate, averages.
+  const closed = (state.history || []).filter(t => !t._pendingFill && t.pnlDollar != null);
+  const wins = closed.filter(t => t.pnlDollar > 0);
+  const losses = closed.filter(t => t.pnlDollar <= 0);
+  const winRate = closed.length ? (wins.length / closed.length) * 100 : 0;
+  const avgWin = wins.length ? (wins.reduce((s, t) => s + t.pnlPct, 0) / wins.length) * 100 : 0;
+  const avgLoss = losses.length ? (losses.reduce((s, t) => s + t.pnlPct, 0) / losses.length) * 100 : 0;
+
+  // Top recent winners — dedupe by ticker (keep the best) so the post reads clean.
+  const recent = closed.slice(-50).filter(t => t.pnlPct > 0);
+  const byTicker = new Map();
+  for (const t of recent) { if (!byTicker.has(t.ticker) || t.pnlPct > byTicker.get(t.ticker).pnlPct) byTicker.set(t.ticker, t); }
+  const topWinners = [...byTicker.values()].sort((a, b) => b.pnlPct - a.pnlPct).slice(0, 5);
+
+  return {
+    name: acct.name, start, pv, goal: cfg.goal || 0,
+    allTimePnl, allTimePct, createdAt, days,
+    weekPnl, weekPct, winRate, wins: wins.length, total: closed.length, avgWin, avgLoss, topWinners,
+  };
+}
+
+// Format the bragging-rights account-growth post.
+function buildAccountPostText(acct, stats) {
+  const s = stats || buildAccountStats(acct);
+  const startDate = new Date(s.createdAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+  const money = v => `$${Math.round(v).toLocaleString("en-US")}`;
+  const lines = [];
+  const rocket = s.allTimePct >= 0 ? "🚀" : "📉";
+  lines.push(`${rocket} ${s.name} — Day ${s.days}${s.goal ? ` of the ${money(s.start)} → ${money(s.goal)} challenge` : ""}`);
+  lines.push("");
+  lines.push(`💰 ${money(s.start)} → ${money(s.pv)} (${s.allTimePct >= 0 ? "+" : ""}${s.allTimePct.toFixed(1)}%) all-time`);
+  if (s.weekPnl != null) lines.push(`📅 This week: ${s.weekPnl >= 0 ? "+" : "-"}${money(Math.abs(s.weekPnl))} (${s.weekPct >= 0 ? "+" : ""}${s.weekPct.toFixed(1)}%)`);
+  if (s.total > 0) lines.push(`🎯 Win rate: ${s.winRate.toFixed(0)}% (${s.wins}/${s.total}) · avg win +${s.avgWin.toFixed(0)}%`);
+  if (s.topWinners.length) {
+    lines.push("");
+    lines.push("🔥 Recent winners:");
+    lines.push(s.topWinners.map(t => `$${t.ticker} +${Math.round(t.pnlPct * 100)}%`).join(" · "));
+  }
+  lines.push("");
+  lines.push(`Started ${startDate}. ${s.allTimePct >= 0 ? "Compounding daily 📈" : "Grinding it back."}`);
+  lines.push("#SwingTrader #Options");
+  return lines.join("\n");
+}
+
+// Render the account equity curve as a shareable PNG (the "watch me get rich" visual).
+function renderEquityCurvePNG(acct) {
+  const dash = acct.dashboard;
+  const hist = (dash.portfolioHistory || []).filter(p => p && typeof p.value === "number");
+  if (hist.length < 2) return null;
+  try {
+    const W = 1100, H = 560, PADL = 70, PADR = 30, TOP = 150, BOT = 60;
+    const vals = hist.map(p => p.value);
+    const start = acct.config.startingCash || vals[0];
+    const pv = vals[vals.length - 1];
+    const pct = start > 0 ? ((pv - start) / start) * 100 : 0;
+    const up = pct >= 0;
+    const col = up ? "#00a843" : "#e8473f";
+    const mn = Math.min(...vals, start) * 0.99, mx = Math.max(...vals, start) * 1.01, rng = (mx - mn) || 1;
+    const n = hist.length;
+    const x = i => PADL + (i / (n - 1)) * (W - PADL - PADR);
+    const y = v => TOP + (H - TOP - BOT) * (1 - (v - mn) / rng);
+    const linePts = vals.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+    const areaPts = `${x(0).toFixed(1)},${(H - BOT).toFixed(1)} ${linePts} ${x(n - 1).toFixed(1)},${(H - BOT).toFixed(1)}`;
+    const money = v => `$${Math.round(v).toLocaleString("en-US")}`;
+    const startDate = new Date(acct.createdAt || Date.now()).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+    const days = Math.max(1, Math.round((Date.now() - (acct.createdAt || Date.now())) / 86400_000));
+    const baseY = y(start);
+    const yLabels = [mx, mn + rng * 0.5, mn].map(v =>
+      `<text x="${PADL - 8}" y="${y(v).toFixed(1)}" fill="#9aa1ad" font-size="13" font-family="monospace" text-anchor="end" dominant-baseline="middle">${money(v)}</text>`
+    ).join("");
+
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="${H}" viewBox="0 0 ${W} ${H}">
+      <rect width="${W}" height="${H}" fill="#ffffff"/>
+      <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="${col}" stop-opacity="0.28"/>
+        <stop offset="100%" stop-color="${col}" stop-opacity="0.02"/>
+      </linearGradient></defs>
+      <text x="${PADL - 8}" y="44" fill="#1c1d22" font-size="30" font-weight="bold" font-family="-apple-system,Helvetica,Arial,sans-serif">${acct.name}</text>
+      <text x="${PADL - 8}" y="92" fill="#1c1d22" font-size="40" font-weight="bold" font-family="monospace">${money(start)} → ${money(pv)}</text>
+      <text x="${PADL - 8}" y="128" fill="${col}" font-size="26" font-weight="bold" font-family="monospace">${up ? "+" : ""}${pct.toFixed(1)}%  ·  Day ${days}</text>
+      <text x="${W - PADR}" y="44" fill="#9aa1ad" font-size="15" font-family="monospace" text-anchor="end">since ${startDate}</text>
+      ${yLabels}
+      <line x1="${PADL}" y1="${baseY.toFixed(1)}" x2="${W - PADR}" y2="${baseY.toFixed(1)}" stroke="#c7ccd4" stroke-width="1" stroke-dasharray="5 5"/>
+      <text x="${W - PADR}" y="${(baseY - 6).toFixed(1)}" fill="#9aa1ad" font-size="12" font-family="monospace" text-anchor="end">start ${money(start)}</text>
+      <polygon points="${areaPts}" fill="url(#g)"/>
+      <polyline points="${linePts}" fill="none" stroke="${col}" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+      <circle cx="${x(n - 1).toFixed(1)}" cy="${y(pv).toFixed(1)}" r="6" fill="${col}"/>
+      <text x="${W - PADR}" y="${H - 18}" fill="#d4d8e0" font-size="13" font-family="monospace" text-anchor="end">SwingTrader Bot</text>
+    </svg>`;
+    return new Resvg(svg, { fitTo: { mode: "width", value: 1200 } }).render().asPng();
+  } catch (e) {
+    console.log(`  [MEDIA] Equity curve render failed: ${e.message}`);
+    return null;
+  }
 }
 
 // ─── Market Regime (SPY/QQQ EMA health) ───
@@ -4005,7 +4281,7 @@ function dashboardHTML(acct, { spectator = false } = {}) {
       </td>
     </tr>` : "";
     return `<tr>
-      <td><a href="/ticker/${p.ticker}"><b>${p.ticker}</b></a>${aiToggle}</td><td>${p.type.toUpperCase()}</td><td>$${p.strike}</td>
+      <td><a href="/ticker/${p.ticker}"><b>${p.ticker}</b></a>${aiToggle}<a href="/media?a=${acct.id}&ticker=${p.ticker}" title="Compose a shareable post for ${p.ticker}" style="margin-left:6px;text-decoration:none;font-size:11px" onclick="event.stopPropagation()">📣</a></td><td>${p.type.toUpperCase()}</td><td>$${p.strike}</td>
       <td style="white-space:nowrap">$${p.spot.toFixed(2)}<br><span style="color:${spotColor};font-size:10px">${spotChg >= 0 ? "+" : ""}${spotChg.toFixed(2)} (${spotChgPct >= 0 ? "+" : ""}${spotChgPct.toFixed(1)}%)</span><br><span style="color:${spotFromEntryColor};font-size:10px">from entry: ${spotFromEntry >= 0 ? "+" : ""}${spotFromEntry.toFixed(1)}%</span></td>
       <td>${p.dteLeft.toFixed(1)}d</td><td>${p.qty}</td>
       <td>$${p.entryPremium.toFixed(2)}${(p.intendedEntryPremium && Math.abs(p.intendedEntryPremium - p.entryPremium) >= 0.01) ? `<br><span style="font-size:9px;color:#9aa0aa" title="Bot's intended limit before the actual fill">intended $${(+p.intendedEntryPremium).toFixed(2)}</span>` : ''}</td><td>$${p.curPremium.toFixed(2)}</td>
@@ -5010,7 +5286,7 @@ function tickerDetailHTML(sym, acct, { spectator = false } = {}) {
 </style></head><body>
 <h1><a href="/">← Back</a> &nbsp; ${sym} ${q ? '$' + q.c.toFixed(2) : ''}
 ${q ? `<span style="font-size:13px;color:${q.d >= 0 ? '#00a843' : '#e8473f'}">${q.d >= 0 ? '+' : ''}${q.d?.toFixed(2)} (${q.dp?.toFixed(2)}%)</span>` : ''}</h1>
-<div class="sub">${pos ? pos.type.toUpperCase() + ' $' + pos.strike + ' | ' + pos.qty + ' contracts' : 'Not currently held'} &nbsp;|&nbsp; Auto-refreshes every 30s
+<div class="sub">${pos ? pos.type.toUpperCase() + ' $' + pos.strike + ' | ' + pos.qty + ' contracts' : 'Not currently held'} &nbsp;|&nbsp; <a href="/media?a=${acct.id}&ticker=${sym}" style="color:#6a4df4;font-weight:700;text-decoration:none">📣 Share this setup</a> &nbsp;|&nbsp; Auto-refreshes every 30s
 ${q?.t ? ` &nbsp;|&nbsp; Last: ${new Date(q.t * 1000).toLocaleString("en-US", { timeZone: "America/New_York" })} ET` : ''}</div>
 
 <div class="card" style="margin-bottom:16px;border-color:#0a8fb840">
@@ -5505,6 +5781,7 @@ function tabBarHTML(activeId, { spectator = false } = {}) {
     <a href="/?sim=new" class="acct-tab new-tab" style="border-color:#6a4df440;color:#6a4df4">&#x1F9EA; Simulator</a>`}
     <a href="/robinhood" class="acct-tab new-tab" style="border-color:#00a84330;color:#00a843">🔒 Robinhood MCP</a>
     <a href="/tradier" class="acct-tab new-tab" style="border-color:#2f6fed40;color:#2f6fed">📈 Tradier</a>
+    <a href="/media?a=${activeId}" class="acct-tab new-tab" style="border-color:#6a4df440;color:#6a4df4">📣 Media</a>
   </div>
   <div class="global-stats">
     <span>Total PV: <b>$${totalPV.toFixed(0)}</b></span>
@@ -5769,6 +6046,126 @@ async function lookupChain(){
   document.getElementById('lookup').innerHTML='<table>'+rows+'</table>';
 }
 refresh(); setInterval(refresh, 8000);
+</script>
+</body></html>`;
+}
+
+// ─── Media Studio: compose shareable trade-plan posts + per-ticker chart cards ───
+function mediaPageHTML(acct, { spectator = false, featured = null } = {}) {
+  const esc = s => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const ideas = gatherMediaIdeas(acct, { featured, max: 14 });
+  const planText = ideas.length ? buildTradePlanText(ideas) : "No tracked setups with data yet — let a scan run, then refresh.";
+  const xLive = ENABLE_TWEETS && xClient;
+  const dateStr = new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric" });
+
+  const acctStats = buildAccountStats(acct);
+  const acctPost = buildAccountPostText(acct, acctStats);
+  const hasCurve = (acct.dashboard.portfolioHistory || []).filter(p => p && typeof p.value === "number").length >= 2;
+  const acctColor = acctStats.allTimePct >= 0 ? "#00a843" : "#e8473f";
+
+  const cards = ideas.map(i => {
+    const dirColor = i.isCall ? "#00a843" : "#e8473f";
+    const chartUrl = `/media/chart/${i.ticker}?a=${acct.id}`;
+    return `<div class="mcard" id="card-${i.ticker}">
+      <div class="mhead">
+        <span><a href="/ticker/${i.ticker}?a=${acct.id}" style="font-weight:800;font-size:16px;color:#1c1d22;text-decoration:none">$${i.ticker}</a>
+          <span class="pill" style="background:${dirColor}1a;color:${dirColor};border:1px solid ${dirColor}40">${i.isCall ? "CALL" : "PUT"} · ${i.contract}</span></span>
+        <span class="muted" style="font-size:11px">trigger $${fmtNum(i.trigger)} · target $${fmtNum(i.target)} · score ${i.score}</span>
+      </div>
+      <img class="mchart" src="${chartUrl}" alt="$${i.ticker} chart" loading="lazy"/>
+      <textarea id="cap-${i.ticker}" class="mcap" rows="6">${esc(i.caption)}</textarea>
+      <div class="mbtns">
+        <button type="button" onclick="copyEl('cap-${i.ticker}')">📋 Copy text</button>
+        <a class="btn" href="${chartUrl}&dl=1" download="${i.ticker}-chart.png">⬇ Download chart</a>
+        ${spectator ? "" : `<button type="button" class="primary" onclick="postMedia('${i.ticker}')">${xLive ? "𝕏 Post to X" : "𝕏 Post (dry-run)"}</button>`}
+      </div>
+    </div>`;
+  }).join("");
+
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#f6f7f9">
+<title>Media Studio — Swing Trader</title>
+<style>
+  body{background:#f6f7f9;color:#23242a;font-family:-apple-system,system-ui,sans-serif;margin:0 auto;padding:24px;max-width:1100px}
+  a.back{color:#6a4df4;text-decoration:none;font-size:13px}
+  h1{font-size:22px;margin:6px 0 2px}
+  .muted{color:#6b7280}
+  .card{background:#fff;border:1px solid #e3e6ea;border-radius:12px;padding:16px;margin-top:16px}
+  textarea{width:100%;box-sizing:border-box;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:8px;color:#1c1d22;padding:10px;font-family:inherit;font-size:13px;line-height:1.5;resize:vertical}
+  button,.btn{padding:8px 14px;background:#eef1f4;color:#1c1d22;border:1px solid #d4d8e0;border-radius:8px;font-weight:600;cursor:pointer;font-size:12px;text-decoration:none;display:inline-block}
+  button.primary{background:#1c1d22;color:#fff;border-color:#1c1d22}
+  button:hover,.btn:hover{filter:brightness(.97)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:16px;margin-top:16px}
+  @media(max-width:600px){.grid{grid-template-columns:1fr}body{padding:14px}textarea,button,.btn{font-size:16px}}
+  .mcard{background:#fff;border:1px solid #e3e6ea;border-radius:12px;padding:14px}
+  .mhead{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  .mchart{width:100%;border:1px solid #eceef1;border-radius:8px;display:block;margin-bottom:10px}
+  .mcap{margin-bottom:10px}
+  .mbtns{display:flex;gap:8px;flex-wrap:wrap}
+  .pill{font-size:10px;font-weight:700;border-radius:999px;padding:2px 8px;margin-left:6px}
+  #toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#1c1d22;color:#fff;padding:10px 16px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:99}
+  #toast.show{opacity:1}
+</style></head><body>
+  <a class="back" href="/?a=${acct.id}">&larr; Back to dashboard</a>
+  <h1>📣 Media Studio</h1>
+  <div class="muted" style="font-size:13px">${dateStr} · ${acct.name} · ${ideas.length} setup${ideas.length === 1 ? "" : "s"} tracked.
+    Posting is <b style="color:${xLive ? "#00a843" : "#b07400"}">${xLive ? "LIVE (X connected)" : "dry-run (set X_API keys + ENABLE_TWEETS=true)"}</b>. Charts include trigger + target projections.</div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px">
+      <h2 style="margin:0;font-size:15px">📈 Account Update — flex the growth</h2>
+      <div style="display:flex;gap:8px">
+        <button type="button" onclick="copyEl('acct-post')">📋 Copy</button>
+        ${hasCurve ? `<a class="btn" href="/media/account-chart?a=${acct.id}&dl=1" download="${acct.id}-growth.png">⬇ Download chart</a>` : ""}
+        ${spectator ? "" : `<button type="button" class="primary" onclick="postAccount()">${xLive ? "𝕏 Post update" : "𝕏 Post (dry-run)"}</button>`}
+      </div>
+    </div>
+    <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px">
+      <div><div style="font-size:24px;font-weight:800;color:${acctColor}">${acctStats.allTimePct >= 0 ? "+" : ""}${acctStats.allTimePct.toFixed(1)}%</div><div class="muted" style="font-size:10px;text-transform:uppercase">All-Time</div></div>
+      <div><div style="font-size:24px;font-weight:800">$${Math.round(acctStats.pv).toLocaleString()}</div><div class="muted" style="font-size:10px;text-transform:uppercase">Value (from $${Math.round(acctStats.start).toLocaleString()})</div></div>
+      ${acctStats.weekPct != null ? `<div><div style="font-size:24px;font-weight:800;color:${acctStats.weekPct >= 0 ? "#00a843" : "#e8473f"}">${acctStats.weekPct >= 0 ? "+" : ""}${acctStats.weekPct.toFixed(1)}%</div><div class="muted" style="font-size:10px;text-transform:uppercase">This Week</div></div>` : ""}
+      ${acctStats.total > 0 ? `<div><div style="font-size:24px;font-weight:800">${acctStats.winRate.toFixed(0)}%</div><div class="muted" style="font-size:10px;text-transform:uppercase">Win Rate (${acctStats.wins}/${acctStats.total})</div></div>` : ""}
+      <div><div style="font-size:24px;font-weight:800">${acctStats.days}</div><div class="muted" style="font-size:10px;text-transform:uppercase">Days · since ${new Date(acctStats.createdAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}</div></div>
+    </div>
+    ${hasCurve ? `<img class="mchart" src="/media/account-chart?a=${acct.id}" alt="${acct.name} growth"/>` : '<div class="muted" style="font-size:12px;margin-bottom:10px">Equity curve appears once a few portfolio-value points are recorded.</div>'}
+    <textarea id="acct-post" rows="9">${esc(acctPost)}</textarea>
+    <div class="muted" style="font-size:11px;margin-top:6px">Growth, win rate, top winners & start date — auto-drafted. Edit before posting.</div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px">
+      <h2 style="margin:0;font-size:15px">Weekly / Daily Trade Plan</h2>
+      <div style="display:flex;gap:8px">
+        <button type="button" onclick="copyEl('plan')">📋 Copy plan</button>
+        ${spectator ? "" : `<button type="button" class="primary" onclick="postPlan()">${xLive ? "𝕏 Post plan" : "𝕏 Post plan (dry-run)"}</button>`}
+      </div>
+    </div>
+    <textarea id="plan" rows="${Math.min(20, 4 + ideas.length * 2)}">${esc(planText)}</textarea>
+    <div class="muted" style="font-size:11px;margin-top:6px">Auto-drafted from live technicals. Edit freely before posting — this never auto-posts.</div>
+  </div>
+
+  <div class="grid">${cards || '<div class="muted">No setups to share yet.</div>'}</div>
+
+  <div id="toast"></div>
+<script>
+  function toast(m){var t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(function(){t.classList.remove('show')},2200);}
+  function copyEl(id){var el=document.getElementById(id);el.select();navigator.clipboard.writeText(el.value).then(function(){toast('Copied to clipboard');},function(){document.execCommand('copy');toast('Copied');});}
+  function postMedia(ticker){
+    var text=document.getElementById('cap-'+ticker).value;
+    fetch('/api/media/post',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({a:'${acct.id}',ticker:ticker,text:text,chart:true})})
+      .then(r=>r.json()).then(d=>toast(d.message||(d.ok?'Posted':'Failed'))).catch(e=>toast('Error: '+e.message));
+  }
+  function postPlan(){
+    var text=document.getElementById('plan').value;
+    fetch('/api/media/post',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({a:'${acct.id}',text:text,chart:false})})
+      .then(r=>r.json()).then(d=>toast(d.message||(d.ok?'Posted':'Failed'))).catch(e=>toast('Error: '+e.message));
+  }
+  function postAccount(){
+    var text=document.getElementById('acct-post').value;
+    fetch('/api/media/post',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({a:'${acct.id}',text:text,account:true})})
+      .then(r=>r.json()).then(d=>toast(d.message||(d.ok?'Posted':'Failed'))).catch(e=>toast('Error: '+e.message));
+  }
+  ${featured ? `var f=document.getElementById('card-${featured}');if(f)f.scrollIntoView({behavior:'smooth',block:'center'});` : ""}
 </script>
 </body></html>`;
 }
@@ -6913,6 +7310,106 @@ self.addEventListener('pushsubscriptionchange', e => {
     if (pathname === "/tradier") {
       res.writeHead(200, { "Content-Type": "text/html" });
       res.end(tradierPageHTML({ spectator }));
+      return;
+    }
+
+    // ─── Media Studio page ───
+    if (pathname === "/media") {
+      const featured = (url.searchParams.get("ticker") || "").toUpperCase() || null;
+      // Make sure the featured ticker has data so its card/chart render even if it wasn't scanned.
+      if (featured) {
+        try {
+          if (!dashboard.candles[featured] && apiKey) dashboard.candles[featured] = await fetchCandles(featured, apiKey);
+          if (!dashboard.quotes[featured] && apiKey) dashboard.quotes[featured] = await fetchQuote(featured, apiKey);
+          if (dashboard.candles[featured] && !dashboard.analyses[featured]) {
+            const a = runAnalysis(dashboard.candles[featured]); if (a) dashboard.analyses[featured] = a;
+            const st = runShortTermAnalysis(dashboard.candles[featured]); if (st) dashboard.shortTermAnalyses[featured] = st;
+          }
+          if (dashboard.candles[featured] && !activeAcct.candleCache[featured]) activeAcct.candleCache[featured] = dashboard.candles[featured];
+        } catch (e) { log(activeAcct, `WARN: media featured fetch ${featured} — ${e.message}`); }
+      }
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(mediaPageHTML(activeAcct, { spectator, featured }));
+      return;
+    }
+
+    // ─── Media: account equity-curve PNG (growth flex chart) ───
+    if (pathname === "/media/account-chart") {
+      try {
+        const png = renderEquityCurvePNG(activeAcct);
+        if (!png) { res.writeHead(404, { "Content-Type": "text/plain" }); res.end("Not enough history yet"); return; }
+        const headers = { "Content-Type": "image/png", "Cache-Control": "no-store" };
+        if (url.searchParams.get("dl")) headers["Content-Disposition"] = `attachment; filename="${activeAcct.id}-growth.png"`;
+        res.writeHead(200, headers);
+        res.end(png);
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        res.end(`Chart error: ${e.message}`);
+      }
+      return;
+    }
+
+    // ─── Media: share-chart PNG (candles + EMAs + trigger/target projection) ───
+    const mediaChartMatch = pathname.match(/^\/media\/chart\/([A-Z.]+)$/);
+    if (mediaChartMatch) {
+      const sym = mediaChartMatch[1];
+      try {
+        if (!dashboard.candles[sym] && apiKey) dashboard.candles[sym] = await fetchCandles(sym, apiKey);
+        if (!dashboard.quotes[sym] && apiKey) dashboard.quotes[sym] = await fetchQuote(sym, apiKey);
+        if (dashboard.candles[sym] && !dashboard.analyses[sym]) {
+          const a = runAnalysis(dashboard.candles[sym]); if (a) dashboard.analyses[sym] = a;
+          const st = runShortTermAnalysis(dashboard.candles[sym]); if (st) dashboard.shortTermAnalyses[sym] = st;
+        }
+        const candles = activeAcct.candleCache[sym] || dashboard.candles[sym];
+        const analysis = dashboard.analyses[sym];
+        const st = dashboard.shortTermAnalyses[sym];
+        const quote = dashboard.quotes[sym];
+        const idea = buildMediaIdea(sym, analysis, st, quote, candles);
+        const png = renderChartPNG((candles || []).slice(-60), sym, analysis, st, quote, idea ? {
+          projection: { trigger: idea.trigger, target: idea.target, isCall: idea.isCall, expLabel: idea.expLabel, contract: idea.contract },
+        } : {});
+        if (!png) { res.writeHead(404, { "Content-Type": "text/plain" }); res.end("No chart"); return; }
+        const headers = { "Content-Type": "image/png", "Cache-Control": "no-store" };
+        if (url.searchParams.get("dl")) headers["Content-Disposition"] = `attachment; filename="${sym}-chart.png"`;
+        res.writeHead(200, headers);
+        res.end(png);
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        res.end(`Chart error: ${e.message}`);
+      }
+      return;
+    }
+
+    // ─── Media: post to X (caption + optional projection chart) ───
+    if (req.method === "POST" && pathname === "/api/media/post") {
+      if (spectator) { res.writeHead(403, { "Content-Type": "application/json" }); res.end(JSON.stringify({ ok: false, message: "Spectator mode: posting disabled" })); return; }
+      let body = "";
+      req.on("data", c => body += c);
+      req.on("end", async () => {
+        try {
+          const { ticker, text, chart, account } = JSON.parse(body || "{}");
+          if (!text || !text.trim()) { res.writeHead(400, { "Content-Type": "application/json" }); res.end(JSON.stringify({ ok: false, message: "No text to post" })); return; }
+          let png = null;
+          if (account) {
+            png = renderEquityCurvePNG(activeAcct);
+          } else if (chart && ticker) {
+            const candles = activeAcct.candleCache[ticker] || dashboard.candles[ticker];
+            const idea = buildMediaIdea(ticker, dashboard.analyses[ticker], dashboard.shortTermAnalyses[ticker], dashboard.quotes[ticker], candles);
+            png = renderChartPNG((candles || []).slice(-60), ticker, dashboard.analyses[ticker], dashboard.shortTermAnalyses[ticker], dashboard.quotes[ticker], idea ? {
+              projection: { trigger: idea.trigger, target: idea.target, isCall: idea.isCall, expLabel: idea.expLabel, contract: idea.contract },
+            } : {});
+          }
+          const live = ENABLE_TWEETS && xClient;
+          if (live && !canTweet()) { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ ok: false, message: `Daily X cap reached (${X_DAILY_CAP})` })); return; }
+          await tweetWithChart(text.trim(), png);
+          log(activeAcct, `MEDIA POST${ticker ? ` ${ticker}` : ""}: ${live ? "posted to X" : "dry-run (X not configured)"}`);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, message: live ? `Posted to X${png ? " with chart" : ""}` : "Dry-run: logged (X not configured)" }));
+        } catch (e) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, message: `Error: ${e.message}` }));
+        }
+      });
       return;
     }
 
