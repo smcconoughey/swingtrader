@@ -1348,6 +1348,15 @@ function getMarketRegime(candleCache) {
   return { mode, riskScale, label, spyAbove: spy, qqqAbove: qqq };
 }
 
+// At max risk-per-trade (100%), the user has explicitly opted to deploy the full configured
+// budget on a trade — treat that as an override and skip the regime-based scale-down (which
+// otherwise quietly caps a "100%" setting to e.g. 35% of cash in a CHOPPY regime). Any other
+// risk level still scales with the regime as before.
+function effectiveRiskPct(baseRiskPct, regime) {
+  if (baseRiskPct >= 1.0) return baseRiskPct;
+  return baseRiskPct * (regime?.riskScale ?? 0.5);
+}
+
 // ─── Earnings Calendar Check (Finnhub) ───
 
 async function checkEarnings(ticker, apiKey) {
@@ -1864,7 +1873,9 @@ async function fetchQuote(sym, key) {
   const meta = d.chart?.result?.[0]?.meta;
   if (!meta || !meta.regularMarketPrice) throw new Error(`No Yahoo quote for ${sym}`);
   noteDataSource("yahoo");
-  return { c: meta.regularMarketPrice, h: meta.regularMarketDayHigh || meta.regularMarketPrice, l: meta.regularMarketDayLow || meta.regularMarketPrice, o: meta.regularMarketOpen || meta.regularMarketPrice, pc: meta.chartPreviousClose || meta.previousClose || 0 };
+  const c = meta.regularMarketPrice;
+  const pc = meta.chartPreviousClose || meta.previousClose || 0;
+  return { c, h: meta.regularMarketDayHigh || c, l: meta.regularMarketDayLow || c, o: meta.regularMarketOpen || c, pc, d: pc ? +(c - pc).toFixed(2) : 0, dp: pc ? +((c - pc) / pc * 100).toFixed(2) : 0 };
 }
 
 async function fetchCandles(sym, key) {
@@ -2020,20 +2031,20 @@ function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 12) {
 
 function chooseAffordableCandidate(candidates, selected, maxContractCost, state) {
   if (!(maxContractCost > 0)) return selected || null;
-  
-  // If AI picked a specific contract, only trade it if we can afford it.
-  if (selected) {
-    if (selected.mid > 0 && selected.mid * 100 <= maxContractCost) {
-      if (!state || countPositionsAtExpiry(state, selected.expiryDate) < MAX_PER_EXPIRY) {
-        return selected;
-      }
-    }
-    return null; // ABORT! We can't afford the AI's specific pick or it violates constraints.
+
+  // If AI picked a specific contract and we can afford it (and it doesn't over-concentrate
+  // an expiry), use it.
+  if (selected && selected.mid > 0 && selected.mid * 100 <= maxContractCost
+      && (!state || countPositionsAtExpiry(state, selected.expiryDate) < MAX_PER_EXPIRY)) {
+    return selected;
   }
-  
-  // If no specific AI pick (e.g. fallback), pick the best affordable one
+
+  // AI's pick is unaffordable (or over-concentrated) — don't give up. Fall back to the best
+  // affordable real contract from the same candidate list. This matters most for small
+  // accounts: Claude tends to pick higher-quality (often pricier, near-ATM) contracts that
+  // can exceed a small budget even when a cheaper, perfectly tradeable real contract exists.
   const affordable = (candidates || [])
-    .filter(c => c && c.mid > 0 && c.mid * 100 <= maxContractCost)
+    .filter(c => c && c !== selected && c.mid > 0 && c.mid * 100 <= maxContractCost)
     .filter(c => !state || countPositionsAtExpiry(state, c.expiryDate) < MAX_PER_EXPIRY)
     .sort((a, b) => b.quality - a.quality);
   return affordable[0] || null;
@@ -2114,7 +2125,7 @@ function portfolioValue(state, quotes) {
     const isEquity = pos.type === "equity";
     const currentPremium = isEquity
       ? (pos.liveMark ?? spot)
-      : (pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
+      : (pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type));
     val += currentPremium * pos.qty * (isEquity ? 1 : 100);
   }
   return val;
@@ -2193,8 +2204,8 @@ function getLLMLabel() {
 // the Finnhub chain fetch and the Claude call entirely.
 // Key: "<acctId>:<ticker>" → { ts, score, direction, result, selectedCandidate }
 const claudeValidationCache = new Map();
-const CLAUDE_VALIDATION_COOLDOWN_MS = 10 * 60_000; // 10 minutes
-const CLAUDE_VALIDATION_SCORE_DELTA = 5;            // re-validate if score shifts ≥5 pts
+const CLAUDE_VALIDATION_COOLDOWN_MS = 15 * 60_000; // 15 minutes (longer = fewer redundant calls)
+const CLAUDE_VALIDATION_SCORE_DELTA = 6;            // re-validate only on a real shift (≥6 pts)
 
 function getCachedValidation(acctId, ticker, currentScore, direction) {
   const key = `${acctId}:${ticker}`;
@@ -2226,7 +2237,7 @@ function setCachedChain(ticker, chain) {
   chainCache.set(ticker, { ts: Date.now(), chain });
 }
 
-async function callClaudeRaw(prompt, retries = 3) {
+async function callClaudeRaw(prompt, retries = 3, maxTokens = 1024) {
   if (!CLAUDE_API_KEY) throw new Error("CLAUDE_API_KEY not set");
   for (let attempt = 0; attempt <= retries; attempt++) {
     const r = await fetch("https://api.anthropic.com/v1/messages", {
@@ -2238,7 +2249,7 @@ async function callClaudeRaw(prompt, retries = 3) {
       },
       body: JSON.stringify({
         model: "claude-haiku-4-5-20251001",
-        max_tokens: 1024,
+        max_tokens: maxTokens,
         messages: [{ role: "user", content: prompt }],
       }),
     });
@@ -2262,7 +2273,7 @@ async function callClaudeRaw(prompt, retries = 3) {
   }
 }
 
-async function callGemini(prompt, retries = 3) {
+async function callGemini(prompt, retries = 3, maxTokens = 1024) {
   if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY not set");
   for (let attempt = 0; attempt <= retries; attempt++) {
     const r = await fetch(
@@ -2272,7 +2283,7 @@ async function callGemini(prompt, retries = 3) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { maxOutputTokens: 1024 },
+          generationConfig: { maxOutputTokens: maxTokens },
         }),
       }
     );
@@ -2301,11 +2312,67 @@ async function callGemini(prompt, retries = 3) {
 }
 
 // Unified LLM dispatcher — routes to active provider
-async function callClaude(prompt, retries = 3) {
+async function callClaude(prompt, retries = 3, maxTokens = 1024) {
   if (LLM_PROVIDER === "gemini") {
-    return callGemini(prompt, retries);
+    return callGemini(prompt, retries, maxTokens);
   }
-  return callClaudeRaw(prompt, retries);
+  return callClaudeRaw(prompt, retries, maxTokens);
+}
+
+// Robust JSON extractor for LLM responses. Strips markdown fences, isolates the
+// first balanced {...} object, and repairs the common truncation case (response
+// cut off mid-string by max_tokens) by closing dangling strings/braces so we get
+// a usable object instead of silently failing the parse.
+function extractLLMJSON(raw) {
+  let s = String(raw || "").replace(/```json\n?/gi, "").replace(/```\n?/g, "").trim();
+  const start = s.indexOf("{");
+  if (start === -1) throw new Error("no JSON object found");
+  s = s.slice(start);
+
+  // Fast path: already valid.
+  try { return JSON.parse(s); } catch { }
+
+  // Helper: brace depth of a fragment, ignoring braces inside strings. Returns
+  // -1 if the fragment ends mid-string (an unsafe cut point).
+  const depthOf = frag => {
+    let d = 0, inStr = false, esc = false;
+    for (let i = 0; i < frag.length; i++) {
+      const ch = frag[i];
+      if (inStr) { if (esc) esc = false; else if (ch === "\\") esc = true; else if (ch === '"') inStr = false; continue; }
+      if (ch === '"') inStr = true;
+      else if (ch === "{") d++;
+      else if (ch === "}") d--;
+    }
+    return inStr ? -1 : d;
+  };
+
+  // First-complete-object path: the model often appends prose after valid JSON.
+  // Slice out the first balanced top-level {...} and parse just that.
+  {
+    let d = 0, inStr = false, esc = false;
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (inStr) { if (esc) esc = false; else if (ch === "\\") esc = true; else if (ch === '"') inStr = false; continue; }
+      if (ch === '"') inStr = true;
+      else if (ch === "{") d++;
+      else if (ch === "}") { d--; if (d === 0) { try { return JSON.parse(s.slice(0, i + 1)); } catch { } break; } }
+    }
+  }
+
+  // Repair path: the model truncated mid-object. Try closing the response as-is,
+  // then progressively trim back to each earlier comma (dropping the incomplete
+  // trailing pair) until a balanced object parses.
+  let base = s;
+  if (depthOf(s) === -1) base += '"'; // close a dangling string
+  const cuts = [base.length];
+  for (let i = base.length - 1; i >= 0; i--) if (base[i] === ",") cuts.push(i);
+  for (const cut of cuts) {
+    const frag = base.slice(0, cut).replace(/[\s,:]+$/, "");
+    const d = depthOf(frag);
+    if (d <= 0) continue; // unbalanced or mid-string at this cut
+    try { return JSON.parse(frag + "}".repeat(d)); } catch { }
+  }
+  throw new Error("unrepairable JSON");
 }
 
 async function processHint(hintText, acct) {
@@ -2347,8 +2414,7 @@ Rules:
 
   try {
     const raw = await callClaude(promptText);
-    const cleaned = raw.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-    return JSON.parse(cleaned);
+    return extractLLMJSON(raw);
   } catch (e) {
     log(acct, `CLAUDE WARN: Failed to parse hint response — ${e.message}`);
     return null;
@@ -2534,9 +2600,9 @@ Rules:
 - Be concise. Only flag what actually matters for short-term options trading.`;
 
   try {
-    const raw = await callClaude(promptText);
-    const cleaned = raw.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-    const result = JSON.parse(cleaned);
+    // News briefs carry several ticker impacts — give headroom so the JSON closes.
+    const raw = await callClaude(promptText, 3, 1536);
+    const result = extractLLMJSON(raw);
 
     const sevColor = result.severity === "critical" ? "!!!" : result.severity === "elevated" ? "!!" : "";
     log(acct, `NEWS ${sevColor}${result.severity.toUpperCase()}: ${result.summary}`);
@@ -2656,15 +2722,17 @@ ${contractSection}
 
 ${evalQuestions}
 
-Respond with ONLY valid JSON (no markdown, no backticks). "reasoning" must be your FULL thought
-process: walk through the setup assessment, the technical/regime read, the specific risks, and why
-you chose (or rejected) the ${isEquity ? 'entry' : 'contract'} — several sentences. "suggestion" stays a one-line takeaway:
-{"approve": true, "confidence": 75, "concerns": [], "reasoning": "full step-by-step thought process", "suggestion": "one-line takeaway"${candidates?.length > 0 ? ', "contractIdx": 1' : ''}}`;
+Respond with ONLY valid JSON (no markdown, no backticks). Keep "reasoning" tight — 2-3 sentences
+covering the setup read, the main risk, and why you approve/reject the ${isEquity ? 'entry' : 'contract'}.
+"suggestion" is a one-line takeaway. Do not pad; brevity is graded:
+{"approve": true, "confidence": 75, "concerns": [], "reasoning": "2-3 sentence rationale", "suggestion": "one-line takeaway"${candidates?.length > 0 ? ', "contractIdx": 1' : ''}}`;
 
   try {
-    const raw = await callClaude(promptText);
-    const cleaned = raw.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-    const result = JSON.parse(cleaned);
+    // Concise reasoning fits comfortably under 768 tokens; the ceiling is a safety
+    // margin so the JSON always closes (the old 1024 hard cap truncated responses
+    // mid-object and forced a silent default-approve on every call).
+    const raw = await callClaude(promptText, 3, 768);
+    const result = extractLLMJSON(raw);
     // Validate contractIdx is in range
     if (candidates?.length > 0) {
       const idx = parseInt(result.contractIdx);
@@ -2727,7 +2795,8 @@ Respond in plain text (not JSON). Be direct and specific — mention the actual 
 3. Recommendation (clear: enter call / enter put / wait / avoid — explain why)
 4. If currently held: position management advice`;
 
-  const raw = await callClaude(promptText);
+  // On-demand analysis is user-facing prose — allow room for the full answer.
+  const raw = await callClaude(promptText, 3, 1536);
   return raw.trim();
 }
 
@@ -2964,7 +3033,10 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
         to:   { strike: selectedCandidate.strike, expiryStr: selectedCandidate.expiryStr, mid: selectedCandidate.mid, delta: selectedCandidate.delta ?? null },
         budget: maxContractCost,
       };
-      log(acct, `AFFORDABLE CONTRACT ${ticker}: Claude pick $${originalCandidate.strike} ${type.toUpperCase()} @ $${originalCandidate.mid} cost $${(originalCandidate.mid * 100).toFixed(0)} > budget $${maxContractCost.toFixed(0)} — switching to $${selectedCandidate.strike} ${selectedCandidate.expiryStr} @ $${selectedCandidate.mid} (δ${selectedCandidate.delta != null ? Math.abs(selectedCandidate.delta).toFixed(2) : "?"})`);
+      const why = originalCandidate.mid * 100 > maxContractCost
+        ? `cost $${(originalCandidate.mid * 100).toFixed(0)} > budget $${maxContractCost.toFixed(0)}`
+        : `expiry ${originalCandidate.expiryStr} over-concentrated`;
+      log(acct, `AFFORDABLE CONTRACT ${ticker}: Claude pick $${originalCandidate.strike} ${type.toUpperCase()} (${why}) — switching to $${selectedCandidate.strike} ${selectedCandidate.expiryStr} @ $${selectedCandidate.mid} (δ${selectedCandidate.delta != null ? Math.abs(selectedCandidate.delta).toFixed(2) : "?"})`);
     }
 
     // selectedCandidate already set above (either from cache or fresh Claude response)
@@ -3368,7 +3440,7 @@ function tryExits(acct, quotes) {
     // Equity: current price is just the spot; Options: use live mark or Black-Scholes
     const currentPremium = isEquity
       ? (pos.liveMark ?? spot)
-      : (pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
+      : (pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type));
     const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
 
     if (!pos.bestPnlPct) pos.bestPnlPct = 0;
@@ -3498,9 +3570,10 @@ function trySignalExits(acct, quotes, analyses) {
     if (!isEquity && pos.expiryDate) {
       pos.dteRemaining = Math.max(0, (pos.expiryDate - now) / 86400_000);
     }
+    // Always reprice off the live spot when there's no live mark (don't freeze at entryPremium).
     const currentPremium = isEquity
       ? (pos.liveMark ?? spot)
-      : (pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
+      : (pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type));
     const pnlPct = pos.entryPremium > 0 ? (currentPremium - pos.entryPremium) / pos.entryPremium : 0;
 
     // Hysteresis: don't flatten on a marginal score touch while still green on spot/premium.
@@ -3547,7 +3620,7 @@ function tryTimeBasedExits(acct, quotes) {
     if (!q) { remaining.push(pos); continue; }
 
     const spot = q.c;
-    const currentPremium = pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium);
+    const currentPremium = pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
     const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
     let reason = null;
 
@@ -3607,7 +3680,7 @@ function tryEMATrailingExits(acct, quotes) {
 
     const q = quotes[pos.ticker];
     const spot = q ? q.c : pos.entrySpot;
-    const currentPremium = pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium);
+    const currentPremium = pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
     let reason = null;
 
     const below8 = pos.type === "call" ? price < ema8[L] : price > ema8[L];
@@ -3655,6 +3728,65 @@ function tryEMATrailingExits(acct, quotes) {
 
 const DASH_PORT = parseInt(process.env.PORT) || 3000;
 
+// Reusable inline-SVG candlestick chart used across the dashboard and detail pages.
+// Draws candles + EMA overlays + optional horizontal "barrier" lines (support /
+// resistance / entry / TP-SL-equivalent) and an entry marker. Returns an SVG
+// string sized to fill its container width. `lines` entries: {value,color,label,dash}.
+function svgCandleChart(candles, {
+  width = 320, height = 120, emas = [], lines = [], markers = [], padTop = 0.004, padBot = 0.004, full = null,
+} = {}) {
+  if (!candles || candles.length < 3) {
+    return `<div style="color:#8a909b;font-size:11px;padding:20px 0;text-align:center">No chart data yet</div>`;
+  }
+  const cls = candles.map(c => c.c);
+  // EMAs are seeded from full history (when supplied) then sliced to the visible
+  // window so long periods (e.g. 50) are accurate even on a short display slice.
+  const fullCls = (full && full.length >= candles.length) ? full.map(c => c.c) : cls;
+  const emaTail = period => calcEMA(fullCls, period).slice(-cls.length);
+  const hs = candles.map(c => c.h), ls = candles.map(c => c.l);
+  const W = width, H = height, AXIS = 44;
+  const lineVals = lines.map(l => l.value).filter(v => v != null && isFinite(v));
+  const mn = Math.min(...ls, ...lineVals) * (1 - padBot);
+  const mx = Math.max(...hs, ...lineVals) * (1 + padTop);
+  const rng = (mx - mn) || 1;
+  const y = v => H - ((v - mn) / rng) * (H - 14) - 7;
+  const x = i => (i / Math.max(1, cls.length - 1)) * W;
+
+  const bars = candles.map((c, i) => {
+    const green = c.c >= c.o;
+    const color = green ? "#00a843" : "#e8473f";
+    const bw = Math.max(1.5, W / candles.length - 1.2);
+    const top = y(Math.max(c.o, c.c)), bot = y(Math.min(c.o, c.c));
+    const bodyH = Math.max(0.8, bot - top);
+    return `<line x1="${x(i).toFixed(1)}" y1="${y(c.h).toFixed(1)}" x2="${x(i).toFixed(1)}" y2="${y(c.l).toFixed(1)}" stroke="${color}" stroke-width="0.8" opacity="0.7"/>`
+      + `<rect x="${(x(i) - bw / 2).toFixed(1)}" y="${top.toFixed(1)}" width="${bw.toFixed(1)}" height="${bodyH.toFixed(1)}" fill="${color}"/>`;
+  }).join("");
+
+  const emaPaths = emas.map(e => {
+    const data = emaTail(e.period);
+    return `<path d="${data.map((v, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ")}" fill="none" stroke="${e.color}" stroke-width="1.2" opacity="0.85"/>`;
+  }).join("");
+
+  const barrierLines = lines.filter(l => l.value != null && isFinite(l.value)).map(l => {
+    const yy = y(l.value).toFixed(1);
+    return `<line x1="0" y1="${yy}" x2="${W}" y2="${yy}" stroke="${l.color}" stroke-width="1" stroke-dasharray="${l.dash || "4 3"}" opacity="0.8"/>`
+      + `<text x="2" y="${(+yy - 2).toFixed(1)}" fill="${l.color}" font-size="8" font-weight="700">${l.label} ${l.value.toFixed(2)}</text>`;
+  }).join("");
+
+  const markerDots = markers.filter(m => m.value != null).map(m => {
+    const idx = m.index != null ? m.index : cls.length - 1;
+    return `<circle cx="${x(idx).toFixed(1)}" cy="${y(m.value).toFixed(1)}" r="2.6" fill="${m.color}" stroke="#fff" stroke-width="1"/>`;
+  }).join("");
+
+  const axis = [mx, mn + rng * 0.5, mn].map(p =>
+    `<text x="${W + 3}" y="${y(p).toFixed(1)}" fill="#8a909b" font-size="8" dominant-baseline="middle">${p.toFixed(2)}</text>`
+  ).join("");
+
+  return `<svg viewBox="0 0 ${W + AXIS} ${H}" preserveAspectRatio="none" style="width:100%;height:${H}px;display:block">
+    ${bars}${emaPaths}${barrierLines}${markerDots}${axis}
+  </svg>`;
+}
+
 function dashboardHTML(acct, { spectator = false } = {}) {
   const state = acct.state;
   const dashboard = acct.dashboard;
@@ -3686,7 +3818,7 @@ function dashboardHTML(acct, { spectator = false } = {}) {
         ? Math.max(0, (pos.expiryDate - now) / 86400_000)
         : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
       const isEq = pos.type === "equity";
-      const curPremium = isEq ? (pos.liveMark ?? spot) : (pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
+      const curPremium = isEq ? (pos.liveMark ?? spot) : (pos.liveMark ?? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type));
       const pnlPct = pos.entryPremium > 0 ? (curPremium - pos.entryPremium) / pos.entryPremium : 0;
       const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * (isEq ? 1 : 100);
       const profitPrice = pos.entryPremium * (1 + PROFIT_TARGET);
@@ -3744,6 +3876,80 @@ function dashboardHTML(acct, { spectator = false } = {}) {
       <td style="font-size:10px;color:#6b7280">δ${p.greeks.delta} θ${p.greeks.theta}<br><span style="color:${p.optionsSource === 'synthetic' ? '#8a909b' : '#138f86'}" title="Source / IV used for pricing">${(p.optionsSource || 'synthetic').toUpperCase()} IV ${((p.iv || 0.30) * 100).toFixed(0)}% ${p.optionsSource === 'synthetic' ? '○' : '●'}</span>${(p.liveBid != null && p.liveAsk != null) ? `<br><span title="Live option bid/ask used for marks & fills">b $${(+p.liveBid).toFixed(2)} / a $${(+p.liveAsk).toFixed(2)}${(p.liveBid > 0 && p.liveAsk > 0) ? ` · ${(((p.liveAsk - p.liveBid) / ((p.liveAsk + p.liveBid) / 2)) * 100).toFixed(0)}% wide` : ''}</span>` : (p.optionsSource === 'tradier' && !p._pending ? `<br><span style="color:#d2691e" title="No reliable two-sided market — position is HELD, not acted on">⚠ no live mark</span>` : '')}</td>
     </tr>${aiRow}`;
   }).join("") : '<tr><td colspan="13" style="opacity:.5">No open positions</td></tr>';
+
+  // ─── Market overview charts (SPY / QQQ) — front and center for at-a-glance regime read ───
+  const marketCard = (() => {
+    const tiles = ["SPY", "QQQ"].map(sym => {
+      const cd = dashboard.candles[sym];
+      const q = dashboard.quotes[sym];
+      const a = dashboard.analyses[sym];
+      if (!cd || cd.length < 5) return `<div style="flex:1;min-width:220px"><div style="font-weight:700">${sym}</div><div style="color:#8a909b;font-size:11px;padding:20px 0;text-align:center">No data yet</div></div>`;
+      const recent = cd.slice(-45);
+      const dColor = q && q.d >= 0 ? "#00a843" : "#e8473f";
+      const chart = svgCandleChart(recent, {
+        height: 120,
+        full: cd,
+        emas: [
+          { period: 8, color: "#138f86" },
+          { period: 21, color: "#d2691e" },
+          { period: 50, color: "#6a4df4" },
+        ],
+      });
+      return `<div style="flex:1;min-width:220px">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px">
+          <a href="/ticker/${sym}?a=${acct.id}" style="font-weight:700;font-size:14px">${sym}</a>
+          <span style="font-size:12px">${q ? "$" + q.c.toFixed(2) : ""} <span style="color:${dColor};font-size:10px">${q && q.d >= 0 ? "+" : ""}${q?.dp?.toFixed(2) ?? ""}%</span></span>
+        </div>
+        ${chart}
+        <div style="font-size:9px;color:#6b7280;margin-top:2px">${a ? `Score ${a.score} · ${a.aligned ? "8>21>50 ✓" : "stack broken"}` : ""} <span style="color:#138f86">━8</span> <span style="color:#d2691e">━21</span> <span style="color:#6a4df4">━50</span></div>
+      </div>`;
+    }).join("");
+    const rColor = currentRegime.mode === "risk-on" ? "#00a843" : currentRegime.mode === "cautious" ? "#b07400" : currentRegime.mode === "choppy" ? "#d2691e" : "#e8473f";
+    return `<div class="card" style="margin-bottom:16px;border-color:${rColor}30">
+      <h2 style="display:flex;justify-content:space-between;align-items:center">
+        <span>Market — 45-Day Trend</span>
+        <span style="color:${rColor};font-size:11px;font-weight:700">${(currentRegime.label || currentRegime.mode || "").toUpperCase()}</span>
+      </h2>
+      <div style="display:flex;gap:20px;flex-wrap:wrap">${tiles}</div>
+    </div>`;
+  })();
+
+  // ─── Per-position underlying charts — where price sits vs entry, trend, and key levels ───
+  const positionCharts = posSource.length > 0 ? `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px;margin-top:14px">` + posSource.map(p => {
+    const cd = dashboard.candles[p.ticker];
+    if (!cd || cd.length < 5) return "";
+    const recent = cd.slice(-45);
+    const isCall = p.type === "call" || p.type === "equity";
+    const rh = Math.max(...recent.slice(-10).map(c => c.h));
+    const rl = Math.min(...recent.slice(-10).map(c => c.l));
+    const pnlColor = p.pnlPct >= 0 ? "#00a843" : "#e8473f";
+    // Barriers: entry stock price + recent swing high/low (the levels price must clear/hold).
+    const lines = [
+      { value: p.entrySpot, color: "#6b7280", label: "entry", dash: "5 3" },
+      { value: rh, color: "#00a84366", label: "R", dash: "2 3" },
+      { value: rl, color: "#e8473f66", label: "S", dash: "2 3" },
+    ];
+    const chart = svgCandleChart(recent, {
+      height: 110,
+      full: cd,
+      emas: [{ period: 8, color: "#138f86" }, { period: 21, color: "#d2691e" }],
+      lines,
+      markers: [{ value: p.spot, color: pnlColor }],
+    });
+    const fromEntry = p.entrySpot ? ((p.spot - p.entrySpot) / p.entrySpot * 100) : 0;
+    return `<div style="border:1px solid #e7e8ec;border-radius:10px;padding:10px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px">
+        <a href="/ticker/${p.ticker}?a=${acct.id}" style="font-weight:700">${p.ticker}</a>
+        <span style="font-size:11px;color:#6b7280">${p.type.toUpperCase()} $${p.strike} · ${p.dteLeft.toFixed(0)}d</span>
+      </div>
+      ${chart}
+      <div style="display:flex;justify-content:space-between;font-size:10px;margin-top:4px">
+        <span style="color:#6b7280">Stock <b style="color:#1c1d22">$${p.spot.toFixed(2)}</b> <span style="color:${fromEntry >= 0 ? '#00a843' : '#e8473f'}">${fromEntry >= 0 ? '+' : ''}${fromEntry.toFixed(1)}%</span></span>
+        <span style="color:${pnlColor};font-weight:700">${p.pnlPct >= 0 ? '+' : ''}${(p.pnlPct * 100).toFixed(1)}%</span>
+      </div>
+      <div style="font-size:9px;color:#8a909b;margin-top:2px">TP $${p.profitTarget.premium} (${p.pctToProfit}%) · SL $${p.stopLoss.premium} (${p.pctToStop}%) · ${isCall ? 'needs price ↑' : 'needs price ↓'}</div>
+    </div>`;
+  }).join("") + `</div>` : "";
 
   // Decision reasoning panel
   const decisionRows = dashboard.decisions.map(d => {
@@ -3958,9 +4164,12 @@ ${spectator ? '<div style="margin:8px 0 12px;padding:8px 12px;border:1px solid #
   </div>
 </div>
 
+${marketCard}
+
 <div class="card" style="margin-bottom:16px">
   <h2>Open Positions (${state.positions.length})</h2>
   <table><tr><th>Ticker</th><th>Type</th><th>Strike</th><th>Stock Price</th><th>DTE</th><th>Qty</th><th>Entry</th><th>Current</th><th>P&L</th><th>Profit Target</th><th>Stop Loss</th><th>Opened</th><th>Greeks</th></tr>${posRows}</table>
+  ${positionCharts}
 </div>
 
 <div class="card" style="margin-bottom:16px" id="bot-thinking-card">
@@ -4538,6 +4747,81 @@ function tickerDetailHTML(sym, acct, { spectator = false } = {}) {
   const chartSVG = longChart.chart;
   const volumeSVG = longChart.volume;
 
+  // ─── Entry/Exit Barriers card: where price sits, where it's trending, and the
+  // levels (score thresholds + price S/R + ATR targets) that gate an entry or exit ───
+  const barriersBlock = (() => {
+    const cfg = acct.config;
+    const bull = cfg.bullEntry ?? 68;
+    const bear = cfg.bearEntry ?? 32;
+    const minQ = cfg.minSetupQuality ?? 50;
+    const score = a ? a.score : null;
+    const stScore = st ? st.score : null;
+
+    // Score gauge: current blended score against the bull/bear entry barriers.
+    let gauge = "";
+    if (score != null) {
+      const pct = v => Math.max(0, Math.min(100, v));
+      const markerColor = score >= bull ? "#00a843" : score <= bear ? "#e8473f" : "#6b7280";
+      const zone = score >= bull ? "CALL ZONE (entry armed)" : score <= bear ? "PUT ZONE (entry armed)" : `WAIT — need ≥${bull} for calls or ≤${bear} for puts`;
+      const gap = score >= bull || score <= bear ? 0 : Math.min(bull - score, score - bear);
+      gauge = `
+        <div style="margin-bottom:6px;font-size:11px;color:#6b7280">Blended score <b style="color:${markerColor};font-size:14px">${score}</b> ${stScore != null ? `<span style="color:#aab0bb">(7d ${stScore})</span>` : ""} — <span style="color:${markerColor}">${zone}</span>${gap ? ` <span style="color:#aab0bb">· ${gap} pts away</span>` : ""}</div>
+        <div style="position:relative;height:22px;background:linear-gradient(90deg,#e8473f22 0%,#e8473f22 ${bear}%,#6b728018 ${bear}%,#6b728018 ${bull}%,#00a84322 ${bull}%,#00a84322 100%);border-radius:5px;border:1px solid #e3e6ea">
+          <div style="position:absolute;left:${bear}%;top:0;bottom:0;border-left:2px dashed #e8473f"></div>
+          <div style="position:absolute;left:${bull}%;top:0;bottom:0;border-left:2px dashed #00a843"></div>
+          <div style="position:absolute;left:calc(${pct(score)}% - 6px);top:-3px;width:0;height:0;border-left:6px solid transparent;border-right:6px solid transparent;border-top:9px solid ${markerColor}"></div>
+          <div style="position:absolute;left:calc(${pct(score)}% - 1px);top:0;bottom:0;border-left:2px solid ${markerColor}"></div>
+        </div>
+        <div style="position:relative;font-size:8px;color:#8a909b;height:12px;margin-top:1px">
+          <span style="position:absolute;left:0">0</span>
+          <span style="position:absolute;left:calc(${bear}% - 14px);color:#e8473f">put ≤${bear}</span>
+          <span style="position:absolute;left:calc(${bull}% - 8px);color:#00a843">call ≥${bull}</span>
+          <span style="position:absolute;right:0">100</span>
+        </div>`;
+    }
+
+    // Setup-quality barrier (the second gate after score).
+    const cons = candles ? detectConsolidation(candles) : null;
+    const mom = candles ? detectMomentumQuality(candles) : null;
+    const effQ = cons && mom ? Math.max(cons.quality, mom.quality) : (a?.setupQuality ?? null);
+    const qBar = effQ != null ? `
+      <div style="margin-top:12px;font-size:11px;color:#6b7280">Setup quality <b style="color:${effQ >= minQ ? '#00a843' : '#b07400'}">${effQ}/100</b> (need ≥${minQ} to pass) — base ${cons?.quality ?? '?'} / momentum ${mom?.quality ?? '?'}</div>
+      <div style="height:8px;background:#eef0f3;border-radius:4px;margin-top:4px;overflow:hidden"><div style="height:100%;width:${Math.min(100, effQ)}%;background:${effQ >= minQ ? '#00a843' : '#b07400'}"></div><div style="position:relative;left:${minQ}%;top:-8px;height:8px;border-left:2px dashed #6b7280"></div></div>` : "";
+
+    // Price-level barriers on a candlestick: 7d high (R), 7d low (S), 50 EMA,
+    // ATR stop/targets, and — if held — entry + DTE marker.
+    const recent = candles ? candles.slice(-45) : null;
+    const lines = [];
+    if (a?.t1) lines.push({ value: +a.t1, color: "#00a843", label: "T1", dash: "4 3" });
+    if (a?.t2) lines.push({ value: +a.t2, color: "#00a84399", label: "T2", dash: "4 3" });
+    if (a?.stop) lines.push({ value: +a.stop, color: "#e8473f", label: "ATR stop", dash: "4 3" });
+    if (st?.recentHigh) lines.push({ value: st.recentHigh, color: "#00a84366", label: "7d hi", dash: "2 3" });
+    if (st?.recentLow) lines.push({ value: st.recentLow, color: "#e8473f66", label: "7d lo", dash: "2 3" });
+    if (pos?.entrySpot) lines.push({ value: pos.entrySpot, color: "#6a4df4", label: "entry", dash: "5 3" });
+    const barrierChart = recent ? svgCandleChart(recent, {
+      height: 180,
+      full: candles,
+      emas: [{ period: 8, color: "#138f86" }, { period: 21, color: "#d2691e" }, { period: 50, color: "#6a4df4" }],
+      lines,
+      markers: q ? [{ value: q.c, color: score == null ? "#6b7280" : score >= bull ? "#00a843" : score <= bear ? "#e8473f" : "#6b7280" }] : [],
+    }) : '<div style="color:#8a909b">No chart data</div>';
+
+    const trend = st ? `
+      <div style="display:flex;gap:16px;margin-top:12px;flex-wrap:wrap;font-size:11px">
+        <span>Trend: <b style="color:${st.mom1d >= 0 ? '#00a843' : '#e8473f'}">1d ${st.mom1d >= 0 ? '+' : ''}${st.mom1d.toFixed(1)}%</b></span>
+        <span><b style="color:${st.mom3d >= 0 ? '#00a843' : '#e8473f'}">3d ${st.mom3d >= 0 ? '+' : ''}${st.mom3d.toFixed(1)}%</b></span>
+        <span><b style="color:${st.mom7d >= 0 ? '#00a843' : '#e8473f'}">7d ${st.mom7d >= 0 ? '+' : ''}${st.mom7d.toFixed(1)}%</b></span>
+        <span style="color:#6b7280">EMA stack: <b style="color:${a?.aligned ? '#00a843' : a?.bearish ? '#e8473f' : '#b07400'}">${a?.aligned ? 'bullish 8>21>50' : a?.bearish ? 'bearish 50>21>8' : 'mixed/transitioning'}</b></span>
+      </div>` : "";
+
+    return `${gauge}${qBar}${trend}
+      <div style="margin-top:12px">${barrierChart}</div>
+      <div style="font-size:9px;color:#8a909b;margin-top:4px">
+        <span style="color:#138f86">━8</span> <span style="color:#d2691e">━21</span> <span style="color:#6a4df4">━50 EMA</span> ·
+        <span style="color:#00a843">T1/T2 targets</span> · <span style="color:#e8473f">ATR stop</span> · 7d hi/lo S/R${pos ? ' · <span style="color:#6a4df4">entry</span>' : ''}
+      </div>`;
+  })();
+
   // Position info block
   let posBlock = '<div style="color:#8a909b">No position in this ticker</div>';
   if (pos) {
@@ -4655,6 +4939,11 @@ ${q?.t ? ` &nbsp;|&nbsp; Last: ${new Date(q.t * 1000).toLocaleString("en-US", { 
     <div class="stat"><div class="val">${st.vr.toFixed(2)}</div><div class="lbl">Vol Ratio</div></div>
   </div>
   <div style="margin-top:8px">${st.sigs.map(s => '<span style="color:' + (s.t === 'bull' ? '#00a843' : '#e8473f') + ';font-size:11px;margin-right:12px">• ' + s.text + '</span>').join('')}</div>` : ''}
+</div>
+
+<div class="card" style="margin-bottom:16px;border-color:#6a4df440">
+  <h2 style="color:#6a4df4">Entry / Exit Barriers — where it is, where it's trending, what gates a trade</h2>
+  ${barriersBlock}
 </div>
 
 <div class="card" style="margin-bottom:16px">
@@ -5089,8 +5378,8 @@ function tabBarHTML(activeId, { spectator = false } = {}) {
 </div>
 
 <!-- Account Management Modal -->
-${spectator ? "" : `<div id="acct-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:999;align-items:center;justify-content:center">
-  <div style="background:#ffffff;border:1px solid #d4d8e0;border-radius:12px;padding:24px;max-width:420px;width:90%">
+${spectator ? "" : `<div id="acct-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:999;align-items:flex-start;justify-content:center;overflow-y:auto;padding:20px 0;box-sizing:border-box">
+  <div style="background:#ffffff;border:1px solid #d4d8e0;border-radius:12px;padding:24px;max-width:420px;width:90%;max-height:calc(100vh - 40px);overflow-y:auto;box-sizing:border-box">
     <h2 style="margin:0 0 16px;color:#1c1d22">New Account</h2>
     <form method="POST" action="/api/accounts">
       <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Account Name</label>
@@ -5151,8 +5440,8 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
       <button type="submit" class="acct-btn delete">🗑 Delete</button>
     </form>` : ""}
   </div>
-  <div id="edit-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:999;align-items:center;justify-content:center">
-    <div style="background:#ffffff;border:1px solid #d4d8e0;border-radius:12px;padding:24px;max-width:420px;width:90%">
+  <div id="edit-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:999;align-items:flex-start;justify-content:center;overflow-y:auto;padding:20px 0;box-sizing:border-box">
+    <div style="background:#ffffff;border:1px solid #d4d8e0;border-radius:12px;padding:24px;max-width:420px;width:90%;max-height:calc(100vh - 40px);overflow-y:auto;box-sizing:border-box">
       <h2 style="margin:0 0 16px;color:#1c1d22">Settings: ${acct.name}</h2>
       <form method="POST" action="/api/accounts/${acctId}/config">
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Risk per Trade (%)</label>
@@ -5169,6 +5458,10 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
         <input name="maxTradeSize" type="number" value="${cfg.maxTradeSize || 500}" placeholder="500" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Min Setup Quality (0=trade anything, 50=default, 100=perfect setups only)</label>
         <input name="minSetupQuality" type="number" value="${cfg.minSetupQuality ?? 50}" min="0" max="100" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Bull Entry Score (≥, buy calls)</label><input name="bullEntry" type="number" value="${cfg.bullEntry ?? 68}" min="50" max="100" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Bear Entry Score (≤, buy puts)</label><input name="bearEntry" type="number" value="${cfg.bearEntry ?? 32}" min="0" max="50" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+        </div>
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Custom Prompt Suffix</label>
         <input name="customPromptSuffix" value="${(cfg.customPromptSuffix || "").replace(/"/g, "&quot;")}" placeholder="e.g. Focus on tech sector only" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:16px;box-sizing:border-box">
         <input type="hidden" name="configForm" value="1">
@@ -5826,6 +6119,8 @@ function startDashboard(defaultAcct, apiKey) {
         if (params.has("marginZeroCashSpendLimit")) cfg.marginZeroCashSpendLimit = Math.max(0, parseFloat(params.get("marginZeroCashSpendLimit")) || 0);
         if (params.has("marginMaxDebt")) cfg.marginMaxDebt = Math.max(0, parseFloat(params.get("marginMaxDebt")) || 0);
         if (params.has("minSetupQuality")) cfg.minSetupQuality = parseInt(params.get("minSetupQuality")) ?? 50;
+        if (params.has("bullEntry")) cfg.bullEntry = Math.min(100, Math.max(50, parseInt(params.get("bullEntry")) || 68));
+        if (params.has("bearEntry")) cfg.bearEntry = Math.min(50, Math.max(0, parseInt(params.get("bearEntry")) || 32));
         cfg.customPromptSuffix = params.get("customPromptSuffix") || "";
         // Broker binding + live-trading toggles. Checkboxes only POST when checked.
         if (params.has("broker") && ["paper", "tradier", "robinhood"].includes(params.get("broker"))) cfg.broker = params.get("broker");
@@ -5834,9 +6129,9 @@ function startDashboard(defaultAcct, apiKey) {
           cfg.autoExecute = params.get("autoExecute") === "on" || params.get("autoExecute") === "true";
           cfg.tradeWhenClosed = params.get("tradeWhenClosed") === "on" || params.get("tradeWhenClosed") === "true";
         }
-        target.riskPct = cfg.baseRiskPct * (target.currentRegime?.riskScale || 0.5);
+        target.riskPct = effectiveRiskPct(cfg.baseRiskPct, target.currentRegime);
         saveAccounts();
-        console.log(`  [${id}] Config updated: risk=${(cfg.baseRiskPct * 100).toFixed(1)}% target=${(cfg.profitTarget * 100)}% stop=${(cfg.stopLoss * 100)}% minQuality=${cfg.minSetupQuality}`);
+        console.log(`  [${id}] Config updated: risk=${(cfg.baseRiskPct * 100).toFixed(1)}% target=${(cfg.profitTarget * 100)}% stop=${(cfg.stopLoss * 100)}% minQuality=${cfg.minSetupQuality} bullEntry=${cfg.bullEntry} bearEntry=${cfg.bearEntry}`);
         res.writeHead(302, { Location: `/?a=${id}` });
         res.end();
       });
@@ -6163,7 +6458,7 @@ function startDashboard(defaultAcct, apiKey) {
         const a = dashboard.analyses[sym]; const st = dashboard.shortTermAnalyses[sym];
         const pos = state.positions.find(p => p.ticker === sym);
         let posPnl = null;
-        if (pos) { const spot = q ? q.c : pos.entrySpot; const _isEq = pos.type === "equity"; const _now = Date.now(); const dteLeft = pos.expiryDate ? Math.max(0, (pos.expiryDate - _now) / 86400_000) : Math.max(0, pos.dte - (_now - pos.openTime) / 86400_000); const curPremium = _isEq ? (pos.liveMark ?? spot) : optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type); const _mult = _isEq ? 1 : 100; posPnl = { pct: ((curPremium - pos.entryPremium) / pos.entryPremium * 100).toFixed(1), dollar: ((curPremium - pos.entryPremium) * pos.qty * _mult).toFixed(0) }; }
+        if (pos) { const spot = q ? q.c : pos.entrySpot; const _isEq = pos.type === "equity"; const _now = Date.now(); const dteLeft = pos.expiryDate ? Math.max(0, (pos.expiryDate - _now) / 86400_000) : Math.max(0, pos.dte - (_now - pos.openTime) / 86400_000); const curPremium = _isEq ? (pos.liveMark ?? spot) : (pos.liveMark ?? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type)); const _mult = _isEq ? 1 : 100; posPnl = { pct: ((curPremium - pos.entryPremium) / pos.entryPremium * 100).toFixed(1), dollar: ((curPremium - pos.entryPremium) * pos.qty * _mult).toFixed(0) }; }
         tickers[sym] = { c: q.c, pc: q.pc, d: q.d, dp: q.dp, h: q.h, l: q.l, score: a?.score, signal: a?.signal, stScore: st?.score, mom1d: st?.mom1d, mom3d: st?.mom3d, mom7d: st?.mom7d, held: !!pos, type: pos?.type, posPnl };
       }
       res.end(JSON.stringify({ tickers, pv: portfolioValue(state, dashboard.quotes), cash: state.cash, balanceInfo, open: state.positions.length, marketOpen: dashboard.marketOpen, lastCycle: dashboard.lastCycle }));
@@ -7498,8 +7793,8 @@ async function runCycle(acct, sharedQuotes, apiKey) {
 
   const regime = getMarketRegime(acct.candleCache);
   acct.currentRegime = regime;
-  acct.riskPct = cfg.baseRiskPct * regime.riskScale;
-  log(acct, `REGIME: ${regime.label} | Risk: ${(acct.riskPct * 100).toFixed(1)}% per trade (${regime.riskScale}x base)`);
+  acct.riskPct = effectiveRiskPct(cfg.baseRiskPct, regime);
+  log(acct, `REGIME: ${regime.label} | Risk: ${(acct.riskPct * 100).toFixed(1)}% per trade (${cfg.baseRiskPct >= 1.0 ? "max risk override, regime scale skipped" : `${regime.riskScale}x base`})`);
 
   tryTimeBasedExits(acct, quotes);
   tryExits(acct, quotes);
@@ -7672,7 +7967,7 @@ function buildPositionDetails(acct, quotes) {
     }
 
     const isEq = pos.type === "equity";
-    const curPremium = isEq ? (pos.liveMark ?? spot) : (pos.liveMark ?? (pos.optionsSource === "synthetic" ? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
+    const curPremium = isEq ? (pos.liveMark ?? spot) : (pos.liveMark ?? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type));
     const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
     const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * (isEq ? 1 : 100);
     const profitPrice = pos.entryPremium * (1 + cfg.profitTarget);
@@ -7833,7 +8128,7 @@ async function simTick(sim) {
   // Market regime
   const regime = getMarketRegime(acct.candleCache);
   acct.currentRegime = regime;
-  acct.riskPct = acct.config.baseRiskPct * regime.riskScale;
+  acct.riskPct = effectiveRiskPct(acct.config.baseRiskPct, regime);
 
   // Run exits
   tryExits(acct, quotes);
