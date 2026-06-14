@@ -369,9 +369,28 @@ const tradier = {
     const data = await apiGet("/markets/quotes", { symbols: occSymbol, greeks: "true" });
     const q = asArray(data?.quotes?.quote)[0];
     if (!q) return null;
-    const g = q.greeks || {};
-    const mid = q.bid != null && q.ask != null ? +(((q.bid + q.ask) / 2)).toFixed(2) : q.last;
-    return { bid: q.bid, ask: q.ask, last: q.last, mid, iv: g.mid_iv ?? null, delta: g.delta ?? null, theta: g.theta ?? null };
+    return normalizeOptionQuote(q);
+  },
+
+  /**
+   * Batch option quotes (with Greeks/IV) in as few API calls as possible. The /markets/quotes
+   * endpoint accepts many comma-separated symbols, so fetching every open contract in one request
+   * is far more reliable than N serial calls (less rate-limit exposure, a single point-in-time
+   * snapshot). Returns a map of { OCC_SYMBOL: normalizedOptionQuote }.
+   */
+  async getOptionQuotes(occSymbols) {
+    const out = {};
+    const syms = (occSymbols || []).filter(Boolean);
+    if (!syms.length) return out;
+    const CHUNK = 25; // keep URLs short and well within quote limits
+    for (let i = 0; i < syms.length; i += CHUNK) {
+      const list = syms.slice(i, i + CHUNK).join(",");
+      const data = await apiGet("/markets/quotes", { symbols: list, greeks: "true" });
+      for (const q of asArray(data?.quotes?.quote)) {
+        if (q && q.symbol) out[q.symbol] = normalizeOptionQuote(q);
+      }
+    }
+    return out;
   },
 
   // ─── Account ───
@@ -548,6 +567,30 @@ function normalizeQuote(q) {
     bid: q.bid ?? null,
     ask: q.ask ?? null,
     volume: q.volume ?? 0,
+  };
+}
+
+// Normalize a Tradier option quote. Exposes bid/ask (live two-sided market), last & prevclose
+// (for display fallbacks when closed/illiquid), greeks/IV, and the exchange session state so callers
+// can tell WHY a two-sided market may be missing (e.g. market closed vs genuinely illiquid).
+function normalizeOptionQuote(q) {
+  const g = q.greeks || {};
+  const bid = typeof q.bid === "number" ? q.bid : null;
+  const ask = typeof q.ask === "number" ? q.ask : null;
+  const twoSided = bid != null && ask != null && bid > 0 && ask > 0 && ask >= bid;
+  const mid = twoSided ? +(((bid + ask) / 2)).toFixed(2) : (typeof q.last === "number" ? q.last : null);
+  return {
+    symbol: q.symbol,
+    bid, ask, twoSided, mid,
+    last: q.last ?? null,
+    prevclose: q.prevclose ?? null,
+    volume: q.volume ?? 0,
+    iv: g.mid_iv ?? g.smv_vol ?? null,
+    delta: g.delta ?? null,
+    theta: g.theta ?? null,
+    gamma: g.gamma ?? null,
+    // Tradier exposes exchange status on the quote; helps distinguish "market closed" from "illiquid".
+    tradeable: q.tradeable !== false,
   };
 }
 

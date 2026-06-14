@@ -995,6 +995,68 @@ function logTrade(entry) {
   } catch { }
 }
 
+// ─── Structured diagnostics (agent-readable) ───
+// One JSON object per line in diagnostics.jsonl. This is deliberately LOW-VOLUME: only
+// decision-level (entry/exit) and anomaly-level (clock flip, risk halt, data-quality, error)
+// events are recorded — never per-ticker scan spam — so an agent can diagnose logic/data errors
+// days later by reading the file end-to-end without drowning in noise.
+//
+// Event shape: { ts, iso, et, type, acct, marketOpen, clock, ...payload }
+// Types:
+//   entry       — a position was opened (intended limit, mid, bid/ask, delta, downgrade info)
+//   exit_submit — a sell order was sent (reason, intended limit, mark source, spread)
+//   exit_fill   — a sell reconciled to the REAL fill (est vs actual close, slippage, net P&L)
+//   clock       — market state transitioned (old→new, source, detection latency)
+//   risk_halt   — capital-preservation halt engaged/cleared
+//   data        — data-quality anomaly during sync (model marks, stale feed, pending orders)
+//   error       — a caught exception with context
+const DIAG_LOG_FILE = "diagnostics.jsonl";
+const DIAG_MAX_LINES = 3000;
+let _diagAppendsSinceTrim = 0;
+
+function diag(type, acct, payload = {}) {
+  try {
+    const evt = {
+      ts: Date.now(),
+      iso: new Date().toISOString(),
+      et: new Date().toLocaleString("en-US", { timeZone: "America/New_York", hour12: false }),
+      type,
+      acct: typeof acct === "string" ? acct : (acct?.id ?? null),
+      marketOpen: isMarketOpen(),
+      clock: _marketClock.source === "tradier" ? (_marketClock.state || "?") : "local",
+      ...payload,
+    };
+    fs.appendFileSync(DIAG_LOG_FILE, JSON.stringify(evt) + "\n");
+    // Trim lazily — every 250 appends rewrite the tail so the file stays bounded.
+    if (++_diagAppendsSinceTrim >= 250) {
+      _diagAppendsSinceTrim = 0;
+      try {
+        const lines = fs.readFileSync(DIAG_LOG_FILE, "utf8").split("\n").filter(Boolean);
+        if (lines.length > DIAG_MAX_LINES) {
+          fs.writeFileSync(DIAG_LOG_FILE, lines.slice(-DIAG_MAX_LINES).join("\n") + "\n");
+        }
+      } catch { }
+    }
+  } catch { }
+}
+
+// Read recent diagnostics back (newest-first) for the API/agent. Optional type filter.
+function readDiagnostics(limit = 200, typeFilter = null) {
+  try {
+    const lines = fs.readFileSync(DIAG_LOG_FILE, "utf8").split("\n").filter(Boolean);
+    const out = [];
+    for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
+      try {
+        const e = JSON.parse(lines[i]);
+        if (!typeFilter || e.type === typeFilter) out.push(e);
+      } catch { }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 // ─── Claude Call History (persisted 3-day rolling log) ───
 const CLAUDE_LOG_FILE = "claude-log.json";
 const CLAUDE_LOG_TTL_MS = 3 * 24 * 60 * 60 * 1000;
@@ -1739,12 +1801,60 @@ function getETParts() {
   };
 }
 
-function isMarketOpen() {
+// US market holidays (NYSE/Nasdaq) — FALLBACK only, used when the Tradier exchange clock isn't
+// available. Tradier's /markets/clock is authoritative when connected (it also handles ad-hoc
+// closures and is always correct on early-close days).
+const MARKET_HOLIDAYS = new Set([
+  // 2025
+  "2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26", "2025-06-19", "2025-07-04", "2025-09-01", "2025-11-27", "2025-12-25",
+  // 2026
+  "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+  // 2027
+  "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31", "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+]);
+// Half-days — the market closes early at 1:00 PM ET (780 minutes).
+const MARKET_HALF_DAYS = new Set([
+  "2025-07-03", "2025-11-28", "2025-12-24",
+  "2026-11-27", "2026-12-24",
+  "2027-11-26",
+]);
+
+// Authoritative market state pulled from the Tradier exchange clock and cached briefly. This is the
+// source of truth when Tradier is connected — it flips to "open" the instant the exchange does and
+// is always right about holidays/early closes. Refreshed by the main loop (and forced near the open).
+let _marketClock = { state: null, nextChange: null, fetchedAt: 0, source: "local" };
+async function refreshMarketClock(force = false) {
+  if (!tradier.isConnected) return;
+  if (!force && Date.now() - _marketClock.fetchedAt < 30_000) return;
   try {
-    const { day, h, m } = getETParts();
+    const clk = await tradier.getClock();
+    if (clk && clk.state) {
+      const prevState = _marketClock.state;
+      _marketClock = { state: clk.state, nextChange: clk.next_change || null, fetchedAt: Date.now(), source: "tradier" };
+      // Record only the transition, not every poll — a few rows per day.
+      if (prevState && prevState !== clk.state) {
+        diag("clock", "system", {
+          from: prevState, to: clk.state, nextChange: clk.next_change || null,
+          desc: clk.description || null,
+        });
+      }
+    }
+  } catch { /* keep last good reading; fall back to local calc below */ }
+}
+
+// True only when the regular session is open. Prefers the broker clock; falls back to a local ET
+// calculation with the US holiday/half-day calendar so we're still correct when Tradier is down.
+function isMarketOpen() {
+  if (_marketClock.source === "tradier" && _marketClock.state && Date.now() - _marketClock.fetchedAt < 5 * 60_000) {
+    return _marketClock.state === "open"; // "premarket"/"postmarket"/"closed" are all NOT regular-session open
+  }
+  try {
+    const { day, h, m, dateStr } = getETParts();
     if (day === "Sat" || day === "Sun") return false;
+    if (MARKET_HOLIDAYS.has(dateStr)) return false;
     const mins = h * 60 + m;
-    return mins >= 570 && mins < 960; // 9:30 AM (570) to 4:00 PM (960)
+    const close = MARKET_HALF_DAYS.has(dateStr) ? 780 : 960; // 1:00 PM half-day, else 4:00 PM
+    return mins >= 570 && mins < close; // 9:30 AM (570) open
   } catch (e) {
     // Fallback if Intl is broken
     const d = new Date();
@@ -3873,7 +3983,11 @@ function dashboardHTML(acct, { spectator = false } = {}) {
       <td><span style="color:#00a843">TP $${p.profitTarget.premium}</span> (${p.pctToProfit}% away)</td>
       <td><span style="color:#e8473f">SL $${p.stopLoss.premium}</span> (${p.pctToStop}% away)</td>
       <td style="font-size:10px;color:#6b7280">${p.openDate || '—'}</td>
-      <td style="font-size:10px;color:#6b7280">δ${p.greeks.delta} θ${p.greeks.theta}<br><span style="color:${p.optionsSource === 'synthetic' ? '#8a909b' : '#138f86'}" title="Source / IV used for pricing">${(p.optionsSource || 'synthetic').toUpperCase()} IV ${((p.iv || 0.30) * 100).toFixed(0)}% ${p.optionsSource === 'synthetic' ? '○' : '●'}</span>${(p.liveBid != null && p.liveAsk != null) ? `<br><span title="Live option bid/ask used for marks & fills">b $${(+p.liveBid).toFixed(2)} / a $${(+p.liveAsk).toFixed(2)}${(p.liveBid > 0 && p.liveAsk > 0) ? ` · ${(((p.liveAsk - p.liveBid) / ((p.liveAsk + p.liveBid) / 2)) * 100).toFixed(0)}% wide` : ''}</span>` : (p.optionsSource === 'tradier' && !p._pending ? `<br><span style="color:#d2691e" title="No reliable two-sided market — position is HELD, not acted on">⚠ no live mark</span>` : '')}</td>
+      <td style="font-size:10px;color:#6b7280">δ${p.greeks.delta} θ${p.greeks.theta}<br><span style="color:${p.optionsSource === 'synthetic' ? '#8a909b' : '#138f86'}" title="Source / IV used for pricing">${(p.optionsSource || 'synthetic').toUpperCase()} IV ${((p.iv || 0.30) * 100).toFixed(0)}% ${p.optionsSource === 'synthetic' ? '○' : '●'}</span>${(p.liveMark != null && p.liveBid > 0 && p.liveAsk > 0)
+  ? `<br><span title="Live two-sided market — used for marks & fills">b $${(+p.liveBid).toFixed(2)} / a $${(+p.liveAsk).toFixed(2)} · ${(((p.liveAsk - p.liveBid) / ((p.liveAsk + p.liveBid) / 2)) * 100).toFixed(0)}% wide</span>`
+  : (p.optionsSource === 'tradier' && !p._pending
+    ? `<br><span style="color:#d2691e" title="No live two-sided market, so the bot won't fire exits on a fabricated price. P&L shown uses a Black-Scholes model mark from the live contract IV. A real market returns when the option is open & liquid.">⚠ ${p.markReason || 'no live mark'} · model $${p.displayMark != null ? (+p.displayMark).toFixed(2) : '?'}</span>`
+    : '')}</td>
     </tr>${aiRow}`;
   }).join("") : '<tr><td colspan="13" style="opacity:.5">No open positions</td></tr>';
 
@@ -6427,6 +6541,32 @@ function startDashboard(defaultAcct, apiKey) {
       return;
     }
 
+    // Agent-readable diagnostics feed. JSON, newest-first, low-volume (decisions + anomalies only).
+    // Usage:  /api/diagnostics            → last 200 events + rollup summary
+    //         /api/diagnostics?limit=500  → more history
+    //         /api/diagnostics?type=exit_fill | entry | clock | data | risk_halt | error
+    if (pathname === "/api/diagnostics") {
+      const limit = Math.min(2000, Math.max(1, parseInt(url.searchParams.get("limit")) || 200));
+      const typeFilter = url.searchParams.get("type") || null;
+      const events = readDiagnostics(limit, typeFilter);
+      const all = readDiagnostics(2000, null);
+      const byType = {};
+      for (const e of all) byType[e.type] = (byType[e.type] || 0) + 1;
+      const fills = all.filter(e => e.type === "exit_fill" && typeof e.slipPct === "number");
+      const avgSlip = fills.length ? +(fills.reduce((s, e) => s + e.slipPct, 0) / fills.length).toFixed(1) : null;
+      const summary = {
+        totalEvents: all.length,
+        byType,
+        avgExitSlipPct: avgSlip,
+        worstExitSlip: fills.length ? fills.reduce((a, b) => (Math.abs(b.slipPct) > Math.abs(a.slipPct) ? b : a)) : null,
+        marketClock: { state: _marketClock.state, source: _marketClock.source, nextChange: _marketClock.nextChange, ageSec: Math.round((Date.now() - _marketClock.fetchedAt) / 1000) },
+        lastError: all.find(e => e.type === "error") || null,
+      };
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ schema: "ts,iso,et,type,acct,marketOpen,clock,...payload", summary, events }, null, 2));
+      return;
+    }
+
     if (pathname === "/api/state") {
       await refreshBrokerBalances(activeAcct, { logErrors: true });
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -7181,6 +7321,16 @@ async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, dte, q
     const totalCost = qty * limit * 100; // worst-case fill (limit) so further sizing this cycle is conservative
     acct.state.cash = Math.max(0, acct.state.cash - totalCost);
 
+    const dg = aiThesis?.contractDowngraded || null;
+    diag("entry", acct, {
+      ticker, type, strike, dte, qty, occ,
+      intendedLimit: +limit.toFixed(2), mid: +(+premium).toFixed(2), bid, ask,
+      spreadPct: (bid > 0 && ask > 0) ? +(((ask - bid) / ((ask + bid) / 2)) * 100).toFixed(0) : null,
+      delta: aiThesis?.orderedContract?.delta ?? null,
+      conviction: Math.round((conviction || 0) * 100), setupQuality,
+      downgraded: dg ? { fromStrike: dg.from?.strike, fromMid: dg.from?.mid, toStrike: dg.to?.strike, toMid: dg.to?.mid, budget: dg.budget } : null,
+    });
+
     return { ticker, type, strike, dte, qty, entryPremium: +limit.toFixed(2), cost: totalCost, direction, optionsSource: "tradier", setupQuality, claudeConfidence, brokerOrder: true };
   } catch (e) {
     delete acct.state.meta[occ];
@@ -7272,6 +7422,14 @@ function placeBrokerExit(acct, pos, currentPremium, reason, qty, pnlPct, pnlDoll
   };
   logTrade(trade);
   state.history.push(trade);
+  diag("exit_submit", acct, {
+    ticker, occ: occForTrade, reason,
+    intendedLimit: +limit.toFixed(2), mid: +mid.toFixed(2), bid, ask,
+    spreadPct: +(spreadPct * 100).toFixed(0),
+    markSource: pos.markSource || (pos.liveMark != null ? "live" : "model"),
+    protective, urgent, qty,
+    entryPremium: pos.entryPremium ?? null, estPnl: +pnlDollar.toFixed(0), estPnlPct: +(pnlPct).toFixed(1),
+  });
 
   const trimLabel = qty < pos.qty ? `TRIM ${qty}/${pos.qty}` : "EXIT";
   log(acct, `${trimLabel} (LIVE): ${ticker} $${pos.strike} ${pos.type.toUpperCase()} ${pnlDollar >= 0 ? "+" : ""}$${pnlDollar.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${(pnlPct * 100).toFixed(0)}%) — ${reason}`);
@@ -7347,6 +7505,14 @@ async function reconcileBrokerFills(acct) {
 
     const slip = est ? ((actualClose - est) / est) * 100 : 0;
     log(acct, `FILL RECONCILED ${trade.ticker} ${occ}: actual close $${actualClose.toFixed(2)} (est $${est}, ${slip >= 0 ? "+" : ""}${slip.toFixed(0)}% slip) · net proceeds $${netProceeds} − fees $${exitFees} · P&L ${realPnl >= 0 ? "+" : ""}$${realPnl.toFixed(0)} (${(realPnlPct * 100).toFixed(0)}%)`);
+    diag("exit_fill", acct, {
+      ticker: trade.ticker, occ,
+      reason: trade.exitReason || trade.reason || null,
+      estClose: est ?? null, actualClose: +actualClose.toFixed(2), slipPct: +slip.toFixed(1),
+      entryPremium: trade.entryPremium ?? null, intendedEntryPremium: trade.intendedEntryPremium ?? null,
+      qty: filledQty, costBasis: +costBasis.toFixed(2), proceeds: netProceeds, fees: exitFees,
+      pnl: realPnl, pnlPct: +(realPnlPct * 100).toFixed(1),
+    });
   }
 }
 
@@ -7378,6 +7544,21 @@ async function syncBrokerAccount(acct, quotes) {
     const now = Date.now();
     const positions = [];
     const seen = new Set();
+
+    // Batch ALL option quotes in one (chunked) request rather than one serial call per position.
+    // This is faster, far less rate-limit prone, and gives a single point-in-time snapshot — the
+    // most reliable way to get consistent live marks while the market is open.
+    const optionOccs = raw
+      .filter(p => tradier.parseOCC(p.symbol) && Math.round(Math.abs(p.quantity)) >= 1)
+      .map(p => p.symbol);
+    let optionQuotes = {};
+    try {
+      optionQuotes = await tradier.getOptionQuotes(optionOccs);
+    } catch (e) {
+      log(acct, `TRADIER SYNC: batch option-quote fetch failed (${e.message}) — falling back to per-contract`);
+    }
+    const mktOpenNow = isMarketOpen();
+
     for (const p of raw) {
       const occ = p.symbol;
       const parsed = tradier.parseOCC(occ);
@@ -7390,21 +7571,40 @@ async function syncBrokerAccount(acct, quotes) {
       const actualEntryPremium = p.cost_basis && qtyContracts ? Math.abs(p.cost_basis) / (qtyContracts * 100) : 0;
 
       let mark = null, bid = null, ask = null, greeks = null, iv = DEFAULT_IV;
-      try {
-        const oq = await tradier.getOptionQuote(occ);
-        if (oq) {
-          bid = typeof oq.bid === "number" ? oq.bid : null;
-          ask = typeof oq.ask === "number" ? oq.ask : null;
-          mark = reliableOptionMark(oq);   // null if no real two-sided market
-          iv = oq.iv ?? DEFAULT_IV;
-          greeks = { delta: oq.delta ?? 0, theta: oq.theta ?? 0 };
-        }
-      } catch { }
+      let oq = optionQuotes[occ] || null;
+      if (!oq) {
+        // Gap-fill: the batch may have missed this symbol (rare) — try a single fetch.
+        try { oq = await tradier.getOptionQuote(occ); } catch { }
+      }
+      if (oq) {
+        bid = typeof oq.bid === "number" ? oq.bid : null;
+        ask = typeof oq.ask === "number" ? oq.ask : null;
+        mark = reliableOptionMark(oq);   // null if no real two-sided market (we never act on `last`)
+        iv = oq.iv ?? DEFAULT_IV;
+        greeks = { delta: oq.delta ?? 0, theta: oq.theta ?? 0 };
+      }
 
       const expiryDate = new Date(`${parsed.expiration}T16:00:00`).getTime();
       const dteRemaining = Math.max(0, (expiryDate - now) / 86400_000);
       const meta = state.meta[occ] || {};
       const spot = quotes[parsed.ticker]?.c ?? meta.entrySpot ?? null;
+
+      // Display mark + provenance. We keep `liveMark` strictly as the tradeable two-sided mid (so
+      // exits never fire on a fabricated price), but compute a continuous DISPLAY mark so the
+      // dashboard/P&L don't look frozen when there's no live market. Distinguish WHY:
+      //   live  → real two-sided market (tradeable)
+      //   model → no two-sided market; repriced via Black-Scholes using the live contract IV
+      //           (reason = market closed, or illiquid/one-sided during RTH)
+      let markSource = "live", markReason = null, displayMark = mark;
+      if (mark == null) {
+        markSource = "model";
+        markReason = !mktOpenNow ? "market closed"
+          : (bid != null || ask != null) ? "one-sided market (illiquid)"
+          : "no quote (illiquid)";
+        displayMark = (spot != null)
+          ? optPrice(spot, parsed.strike, dteRemaining, iv || DEFAULT_IV, parsed.type)
+          : (oq && typeof oq.last === "number" ? oq.last : (oq && oq.prevclose) || null);
+      }
 
       const pos = {
         // Full AI thought process captured at entry (reasoning, concerns, signals, scores). Spread
@@ -7432,7 +7632,10 @@ async function syncBrokerAccount(acct, quotes) {
         bestPnlPct: meta.bestPnlPct ?? 0,
         entryAtrPct: meta.entryAtrPct ?? null,
         iv,
-        liveMark: mark != null ? +mark.toFixed(2) : null,
+        liveMark: mark != null ? +mark.toFixed(2) : null,   // tradeable two-sided mid only (exits gate on this)
+        displayMark: displayMark != null ? +displayMark.toFixed(2) : null, // continuous mark for UI/P&L
+        markSource,                                          // "live" | "model"
+        markReason,                                          // why we fell back (closed / illiquid)
         liveBid: bid,
         liveAsk: ask,
         liveGreeks: greeks,
@@ -7521,7 +7724,35 @@ async function syncBrokerAccount(acct, quotes) {
     const pending = positions.length - filled;
     const unsettledStr = state.unsettledCash > 0 ? ` | unsettled $${state.unsettledCash.toFixed(0)}` : "";
     log(acct, `TRADIER SYNC [${(state.accountType || "?").toUpperCase()}]: equity $${(state.brokerEquity ?? portfolioValue(state, quotes)).toFixed(2)} | settled BP $${state.cash.toFixed(2)}${unsettledStr} | ${filled} filled, ${pending} pending order(s)${reserved > 0 ? ` reserving $${reserved.toFixed(0)}` : ""}`);
-  } catch (e) { log(acct, `TRADIER SYNC: positions error — ${e.message}`); }
+
+    // Data-quality snapshot — only emit on an ANOMALY or a meaningful change so this stays low-volume
+    // even though sync runs every cycle. Anomalies are exactly what we want to catch over the coming days:
+    // option positions priced off a model instead of a live two-sided market (illiquid / feed delayed),
+    // or material equity moves while the market is closed (suggests stale/late data).
+    const optPositions = positions.filter(p => !p._pending && p.optionsSource === "tradier");
+    const modelMarked = optPositions.filter(p => p.markSource === "model");
+    const equity = +(state.brokerEquity ?? portfolioValue(state, quotes)).toFixed(2);
+    const prev = acct._lastSyncSnapshot || {};
+    const equityDelta = prev.equity != null ? +(equity - prev.equity).toFixed(2) : 0;
+    const mktNow = isMarketOpen();
+    const anomaly =
+      modelMarked.length > 0 ||
+      pending > 0 ||
+      (!mktNow && prev.equity != null && Math.abs(equityDelta) > Math.max(1, equity * 0.02)); // >2% move while closed
+    if (anomaly) {
+      diag("data", acct, {
+        equity, cashBP: +state.cash.toFixed(2),
+        filled, pending,
+        optionsTotal: optPositions.length, modelMarked: modelMarked.length, liveMarked: optPositions.length - modelMarked.length,
+        modelTickers: modelMarked.slice(0, 8).map(p => `${p.ticker}:${p.markReason || "model"}`),
+        equityDeltaSinceLast: equityDelta, marketOpen: mktNow,
+      });
+    }
+    acct._lastSyncSnapshot = { equity, ts: Date.now() };
+  } catch (e) {
+    log(acct, `TRADIER SYNC: positions error — ${e.message}`);
+    diag("error", acct, { where: "syncBrokerAccount", message: e.message });
+  }
 }
 
 async function syncRobinhoodAccount(acct, quotes) {
@@ -7808,6 +8039,7 @@ async function runCycle(acct, sharedQuotes, apiKey) {
     if (acct._riskHaltNotified !== risk.reason) {
       acct._riskHaltNotified = risk.reason;
       log(acct, `🛑 RISK HALT: ${risk.reason}`);
+      diag("risk_halt", acct, { hard: !!risk.hard, reason: risk.reason });
       sendPush(`🛑 Trading halted [${acct.name}]`, risk.reason, true).catch(() => {});
     }
     if (risk.hard && !acct.paused) { acct.paused = true; saveAccounts(); }
@@ -8440,6 +8672,7 @@ async function main() {
   const primaryAcct = accounts.values().next().value;
 
   // Update initial market status for all accounts so dashboard is accurate on load
+  await refreshMarketClock(true);
   const initialMarketOpen = isMarketOpen();
   for (const [, acct] of accounts) {
     if (acct.dashboard) acct.dashboard.marketOpen = initialMarketOpen;
@@ -8491,6 +8724,8 @@ async function main() {
     }
     lastCycleTime = Date.now();
 
+    // Pull the authoritative exchange state from Tradier (cached 30s) before deciding what to run.
+    await refreshMarketClock();
     const marketOpen = isMarketOpen();
     // Accounts may opt into trading while closed (e.g. broker sandbox testing). If any non-paused
     // account does, we run the fast cycle so its full runCycle (entries+exits) executes now.
@@ -8527,6 +8762,7 @@ async function main() {
             }
           } catch (e) {
             log(acct, `ERROR in cycle: ${e.message}`);
+            diag("error", acct, { where: "runCycle", message: e.message, stack: (e.stack || "").split("\n").slice(0, 3).join(" | ") });
           }
         }
       } catch (e) {
@@ -8555,13 +8791,23 @@ async function main() {
       }
 
       saveAccounts();
-      // Sleep for 15 minutes after hours, but wake up immediately if the market opens
-      for (let i = 0; i < 15; i++) {
-        await delay(60_000);
+      // Poll for the open rather than blindly sleeping 15 minutes. Normally check every 30s, but in
+      // the final approach to 9:30 ET poll every 5s (and force-refresh the broker clock) so we flip
+      // to trading within seconds of the bell — not 5-15 minutes late. Hard cap the wait at 15 min.
+      const sleepStart = Date.now();
+      while (Date.now() - sleepStart < 15 * 60_000) {
+        await refreshMarketClock(true);
         if (isMarketOpen()) {
-          console.log("  [WAKE] Market opened during after-hours sleep cycle!");
+          console.log("  [WAKE] Market open detected — starting trading cycle now");
           break;
         }
+        let nearOpen = false;
+        try {
+          const { day, h, m } = getETParts();
+          const mins = h * 60 + m;
+          nearOpen = day !== "Sat" && day !== "Sun" && mins >= 568 && mins < 571; // 9:28–9:31 ET
+        } catch { }
+        await delay(nearOpen ? 5_000 : 30_000);
       }
     }
   }
