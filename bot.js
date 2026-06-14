@@ -1252,6 +1252,23 @@ function renderChartPNG(candles, ticker, analysis, shortTermAnalysis, quote, opt
         <text x="${(xNow + xEnd) / 2}" y="${midY - 10}" fill="${tgtColor}" font-size="13" font-weight="bold" font-family="monospace" text-anchor="middle">${proj.contract || proj.expLabel || ""}</text>`;
     }
 
+    // Event markers: vertical lines at specific dates (e.g. entry IN / exit OUT on a trade recap).
+    let events = "";
+    if (opts.events && opts.events.length) {
+      const dayKey = ts => new Date((ts || 0) * 1000).toISOString().slice(0, 10);
+      events = opts.events.map(ev => {
+        if (!ev || !ev.date) return "";
+        let idx = -1, best = Infinity;
+        candles.forEach((c, i) => { const d = Math.abs(new Date(dayKey(c.t)) - new Date(ev.date)); if (d < best) { best = d; idx = i; } });
+        if (idx < 0) return "";
+        const xx = x(idx);
+        const anchor = idx > candles.length * 0.7 ? "end" : "start";
+        const tx = anchor === "end" ? xx - 5 : xx + 5;
+        return `<line x1="${xx.toFixed(1)}" y1="18" x2="${xx.toFixed(1)}" y2="${H}" stroke="${ev.color}" stroke-width="2" stroke-dasharray="4 3" opacity="0.9"/>
+          <text x="${tx.toFixed(1)}" y="36" fill="${ev.color}" font-size="15" font-weight="bold" font-family="monospace" text-anchor="${anchor}">${ev.label}</text>`;
+      }).join("");
+    }
+
     // Price labels on right side
     const pLabels = [mn, mn + rng * 0.25, mn + rng * 0.5, mn + rng * 0.75, mx].map(p =>
       `<text x="${W + 8}" y="${y(p)}" fill="#6b7280" font-size="11" font-family="monospace" dominant-baseline="middle">$${p.toFixed(2)}</text>`
@@ -1306,13 +1323,13 @@ function renderChartPNG(candles, ticker, analysis, shortTermAnalysis, quote, opt
         ${bars}
         ${emaPaths}
         ${projection}
+        ${events}
         ${pLabels}
         ${volBars}
       </g>
       <line x1="20" y1="${H + VH + 40}" x2="${W + 60}" y2="${H + VH + 40}" stroke="#e3e6ea" stroke-width="1"/>
       <text x="20" y="${H + VH + 58}" fill="#6b7280" font-size="11" font-family="monospace">Key Signals:</text>
       ${signalsText}
-      <text x="1180" y="${totalH - 10}" fill="#d4d8e0" font-size="10" font-family="monospace" text-anchor="end">SwingTrader Bot</text>
     </svg>`;
 
     const resvg = new Resvg(svg, { fitTo: { mode: "width", value: 1200 } });
@@ -1520,6 +1537,58 @@ function gatherMediaIdeas(acct, { featured = null, max = 12 } = {}) {
   return ideas;
 }
 
+// ─── Closed-trade recaps (the "here's what I saw, here's what it did" post) ───
+function closedTradeKey(t) {
+  return [t.ticker, t.strike, t.type, t.openDate || "", t.closeDate || "", Math.round(t.pnlDollar || 0)].join("|");
+}
+function gatherClosedTrades(acct, max = 12) {
+  const hist = (acct.state.history || []).filter(t => !t._pendingFill && t.pnlDollar != null && t.closePremium != null && t.entryPremium != null);
+  return hist.slice(-max).reverse(); // newest first
+}
+function findClosedTrade(acct, key) {
+  return (acct.state.history || []).find(t => closedTradeKey(t) === key) || null;
+}
+function tradeHoldLabel(t) {
+  let ms = null;
+  if (t.openTime && t.closeTime) ms = t.closeTime - t.openTime;
+  else if (t.openDate && t.closeDate) ms = new Date(t.closeDate) - new Date(t.openDate);
+  if (ms == null || isNaN(ms)) return "";
+  const d = ms / 86400_000;
+  if (d < 1) return "the same day";
+  const r = Math.round(d);
+  return `${r} day${r === 1 ? "" : "s"}`;
+}
+function buildTradeRecapText(t) {
+  const win = (t.pnlDollar || 0) >= 0;
+  const pct = Math.round((t.pnlPct || 0) * 100);
+  const emoji = win ? (pct >= 100 ? "🚀" : "🟢") : "🔴";
+  const hold = tradeHoldLabel(t);
+  const thesis = (t.claudeSuggestion || (t.topSignals || []).slice(0, 2).join(", ") || t.claudeReasoning || "").replace(/\s+/g, " ").trim();
+  const lines = [];
+  lines.push(`$${t.ticker} — ${win ? "+" : ""}${pct}% ${emoji}`);
+  lines.push("");
+  if (thesis) lines.push(`The read going in: ${thesis.slice(0, 170)}`);
+  lines.push(`${t.type.toUpperCase()} $${t.strike}: $${(+t.entryPremium).toFixed(2)} → $${(+t.closePremium).toFixed(2)}${hold ? ` over ${hold}` : ""}.`);
+  lines.push(win ? "Plan worked." : "Took the loss and moved on.");
+  return lines.join("\n");
+}
+function tradeRecapFacts(t) {
+  const win = (t.pnlDollar || 0) >= 0, pct = Math.round((t.pnlPct || 0) * 100);
+  const f = [];
+  f.push(`Closed trade: $${t.ticker} ${t.type.toUpperCase()} $${t.strike}`);
+  f.push(`Result: ${win ? "WIN" : "LOSS"} ${win ? "+" : ""}${pct}% (${win ? "+" : "-"}$${Math.abs(Math.round(t.pnlDollar))})`);
+  f.push(`Entry $${(+t.entryPremium).toFixed(2)} on ${t.openDate || "?"}, exit $${(+t.closePremium).toFixed(2)} on ${t.closeDate || "?"}${tradeHoldLabel(t) ? `, held ${tradeHoldLabel(t)}` : ""}`);
+  if (t.reason) f.push(`Why I exited: ${t.reason}`);
+  const sigs = (t.topSignals || []).join("; ");
+  if (sigs) f.push(`Signals at entry: ${sigs}`);
+  if (t.setupQuality != null || t.technicalScore != null) f.push(`Setup quality ${t.setupQuality ?? "?"}/100, technical read ${t.technicalScore ?? "?"}/100${t.regimeAtEntry ? `, regime ${t.regimeAtEntry}` : ""}`);
+  const reason = (t.claudeReasoning || t.claudeSuggestion || "").replace(/\s+/g, " ").trim();
+  if (reason) f.push(`My thesis going in: ${reason.slice(0, 400)}`);
+  const concerns = (t.claudeConcerns || []).join("; ");
+  if (concerns) f.push(`Concerns I flagged: ${concerns}`);
+  return f.join("\n");
+}
+
 // Compute shareable performance stats for an account (growth, win rate, top winners, start date).
 function buildAccountStats(acct) {
   const state = acct.state;
@@ -1568,22 +1637,96 @@ function buildAccountPostText(acct, stats) {
   const s = stats || buildAccountStats(acct);
   const startDate = new Date(s.createdAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
   const money = v => `$${Math.round(v).toLocaleString("en-US")}`;
+  const short = v => { const a = Math.abs(v); if (a >= 1e6) return `$${(v / 1e6).toFixed(v % 1e6 === 0 ? 0 : 1)}M`; if (a >= 1e3) return `$${(v / 1e3).toFixed(v % 1e3 === 0 ? 0 : 1)}K`; return `$${Math.round(v)}`; };
   const lines = [];
-  const rocket = s.allTimePct >= 0 ? "🚀" : "📉";
-  lines.push(`${rocket} ${s.name} — Day ${s.days}${s.goal ? ` of the ${money(s.start)} → ${money(s.goal)} challenge` : ""}`);
+  lines.push(s.goal ? `Day ${s.days} of the ${short(s.start)} → ${short(s.goal)} challenge` : `Day ${s.days}`);
   lines.push("");
-  lines.push(`💰 ${money(s.start)} → ${money(s.pv)} (${s.allTimePct >= 0 ? "+" : ""}${s.allTimePct.toFixed(1)}%) all-time`);
-  if (s.weekPnl != null) lines.push(`📅 This week: ${s.weekPnl >= 0 ? "+" : "-"}${money(Math.abs(s.weekPnl))} (${s.weekPct >= 0 ? "+" : ""}${s.weekPct.toFixed(1)}%)`);
-  if (s.total > 0) lines.push(`🎯 Win rate: ${s.winRate.toFixed(0)}% (${s.wins}/${s.total}) · avg win +${s.avgWin.toFixed(0)}%`);
+  lines.push(`${money(s.start)} → ${money(s.pv)} (${s.allTimePct >= 0 ? "+" : ""}${s.allTimePct.toFixed(1)}%)`);
+  if (s.weekPnl != null) lines.push(`This week: ${s.weekPnl >= 0 ? "+" : "-"}${money(Math.abs(s.weekPnl))} (${s.weekPct >= 0 ? "+" : ""}${s.weekPct.toFixed(1)}%)`);
+  if (s.total > 0) lines.push(`Win rate: ${s.winRate.toFixed(0)}% (${s.wins}/${s.total}) · avg win +${s.avgWin.toFixed(0)}%`);
   if (s.topWinners.length) {
     lines.push("");
-    lines.push("🔥 Recent winners:");
+    lines.push("Recent winners:");
     lines.push(s.topWinners.map(t => `$${t.ticker} +${Math.round(t.pnlPct * 100)}%`).join(" · "));
   }
   lines.push("");
-  lines.push(`Started ${startDate}. ${s.allTimePct >= 0 ? "Compounding daily 📈" : "Grinding it back."}`);
-  lines.push("#SwingTrader #Options");
+  lines.push(`Started ${startDate}. ${s.allTimePct >= 0 ? "Compounding 📈" : "Grinding it back."}`);
   return lines.join("\n");
+}
+
+// Compact, human-readable fact sheet for one ticker — fed to the LLM so it can write with real
+// insight (the EMA it's holding, volume behavior, momentum, key levels, my entry thesis if held).
+function mediaTickerFacts(acct, idea) {
+  const d = acct.dashboard;
+  const t = idea.ticker;
+  const a = d.analyses?.[t], st = d.shortTermAnalyses?.[t], q = d.quotes?.[t];
+  const candles = acct.candleCache?.[t] || d.candles?.[t];
+  const cons = candles ? detectConsolidation(candles) : null;
+  const mom = candles ? detectMomentumQuality(candles) : null;
+  const pos = acct.state.positions.find(p => p.ticker === t);
+  const f = [];
+  f.push(`Ticker: $${t}, price $${idea.price}${q?.dp != null ? ` (today ${q.dp >= 0 ? "+" : ""}${q.dp.toFixed(1)}%)` : ""}`);
+  f.push(`Lean: ${idea.isCall ? "bullish / calls" : "bearish / puts"}`);
+  if (a) {
+    const stack = a.aligned ? "8>21>50 (bullish stack)" : a.bearish ? "50>21>8 (bearish stack)" : "mixed/transitioning";
+    f.push(`EMAs: ${stack}; 8=${a.ema8v?.toFixed(2)}, 21=${a.ema21v?.toFixed(2)}, 50=${a.ema50v?.toFixed(2)} (price ${a.aligned ? "riding above" : a.bearish ? "below" : "around"} them)`);
+    f.push(`RSI(14) ${a.rsi?.toFixed(0)}, ATR ${a.atrPct?.toFixed(1)}%, volume ${a.vr?.toFixed(2)}x vs average, reward:risk ${a.rr}`);
+  }
+  if (st) f.push(`Momentum: 1d ${st.mom1d?.toFixed(1)}%, 3d ${st.mom3d?.toFixed(1)}%, 7d ${st.mom7d?.toFixed(1)}%; 7d high ${fmtNum(st.recentHigh)}, low ${fmtNum(st.recentLow)}${st.nearHigh ? " (pressing the highs)" : st.nearLow ? " (near the lows)" : ""}; recent volume ${st.vr?.toFixed(2)}x`);
+  if (cons) f.push(`Base/consolidation quality ${cons.quality}/100${mom ? `, momentum quality ${mom.quality}/100` : ""}`);
+  const sigs = [...(a?.sigs || []).map(s => s.text), ...(st?.sigs || []).map(s => `7d: ${s.text}`)].slice(0, 6);
+  if (sigs.length) f.push(`Confirming signals: ${sigs.join("; ")}`);
+  f.push(`Trade idea: break ${idea.isCall ? "over" : "under"} ${fmtNum(idea.trigger)}, target $${fmtNum(idea.target)}, contract ${idea.contract}`);
+  if (acct.currentRegime) f.push(`Market regime: ${acct.currentRegime.label || acct.currentRegime.mode}`);
+  if (pos) {
+    f.push(`I am already holding this (${pos.type?.toUpperCase()} $${pos.strike}, entry ~$${(+pos.entryPremium).toFixed?.(2) ?? pos.entryPremium}).`);
+    const reason = (pos.claudeReasoning || pos.claudeSuggestion || "").replace(/\s+/g, " ").trim();
+    if (reason) f.push(`My entry thesis was: ${reason.slice(0, 360)}`);
+  }
+  return f.join("\n");
+}
+
+// Build the LLM prompt for the requested post type. Returns null if there's nothing to write.
+function buildMediaRewritePrompt(acct, kind, ticker, tradeKey) {
+  const noBrand = `Hard rules: NO hashtags; never mention "bot", "AI", "Claude", "model", "algorithm", a numeric "score", or any account name (like "v2"); no financial-advice disclaimers; sound like a real person, not a template.`;
+  if (kind === "recap") {
+    const t = findClosedTrade(acct, tradeKey);
+    if (!t) return null;
+    const facts = tradeRecapFacts(t);
+    return `You are a swing trader posting a trade recap to X — show what you saw going in, then what actually happened. Using ONLY the facts below, write a SHORT post (2-5 short lines): start with the cashtag and the result, give the original read in a sentence or two, then the outcome (entry → exit, how long you held, why you closed). Be honest and human — own the losses too, don't only flex. Start with "$${t.ticker}" on the first line. At most one emoji. ${noBrand}\nOutput ONLY the post text.\n\nFACTS:\n${facts}`;
+  }
+  if (kind === "ticker") {
+    const idea = buildMediaIdea(ticker, acct.dashboard.analyses?.[ticker], acct.dashboard.shortTermAnalyses?.[ticker], acct.dashboard.quotes?.[ticker], acct.candleCache?.[ticker] || acct.dashboard.candles?.[ticker]);
+    if (!idea) return null;
+    const facts = mediaTickerFacts(acct, idea);
+    return `You are an experienced swing trader posting to X/StockTwits about your own setup. Using ONLY the facts below, write a SHORT post: 2-4 short sentences/lines. Show a real read of the chart — name the actual moving average it's holding or losing, the volume behavior, the momentum, and the level that matters. Be confident with a little personality, and vary your sentence structure so it never sounds formulaic. Start with the cashtag on its own line ("$${idea.ticker}"). At most one emoji. ${noBrand}\nOutput ONLY the post text.\n\nFACTS:\n${facts}`;
+  }
+  if (kind === "account") {
+    const s = buildAccountStats(acct);
+    const money = v => `$${Math.round(v).toLocaleString("en-US")}`;
+    const startDate = new Date(s.createdAt).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
+    const facts = [
+      `Started ${money(s.start)} on ${startDate}.`,
+      `Now ${money(s.pv)} — ${s.allTimePct >= 0 ? "+" : ""}${s.allTimePct.toFixed(1)}% over ${s.days} days.`,
+      s.weekPct != null ? `This week ${s.weekPct >= 0 ? "+" : ""}${s.weekPct.toFixed(1)}% (${s.weekPnl >= 0 ? "+" : "-"}${money(Math.abs(s.weekPnl))}).` : "",
+      s.total ? `Win rate ${s.winRate.toFixed(0)}% (${s.wins} of ${s.total}), average win +${s.avgWin.toFixed(0)}%.` : "",
+      s.goal ? `Goal is ${money(s.goal)}.` : "",
+      s.topWinners.length ? `Recent winners: ${s.topWinners.map(t => `$${t.ticker} +${Math.round(t.pnlPct * 100)}%`).join(", ")}.` : "",
+    ].filter(Boolean).join("\n");
+    return `You are a retail options trader sharing a confident but genuine account-growth update on X — the kind of post that makes people want to follow along. Using the facts, write a SHORT post (3-6 short lines). Lead with the growth, weave in a couple supporting stats and the recent winners naturally, and close with a line of personality. At most two emojis. ${noBrand}\nOutput ONLY the post text.\n\nFACTS:\n${facts}`;
+  }
+  if (kind === "plan") {
+    const ideas = gatherMediaIdeas(acct, { max: 10 });
+    if (!ideas.length) return null;
+    const date = new Date().toLocaleDateString("en-US", { month: "numeric", day: "numeric" });
+    const rows = ideas.map(i => {
+      const a = acct.dashboard.analyses?.[i.ticker];
+      const sig = a?.sigs?.[0]?.text || (i.isCall ? "trend setup" : "breakdown setup");
+      return `$${i.ticker}: ${i.isCall ? "long" : "short"}, break ${i.isCall ? "over" : "under"} ${fmtNum(i.trigger)}, target $${fmtNum(i.target)}, ${i.contract} — ${sig}`;
+    }).join("\n");
+    return `You are a swing trader posting your watchlist for the week to X. Write a post that starts with "Trade plan ${date}" then ONE punchy, specific line per name. Each line should name the trigger level and the contract and a few words on why it's on watch — and vary the phrasing line to line so it doesn't read like a generated list. ${noBrand}\nOutput ONLY the post text.\n\nNAMES:\n${rows}`;
+  }
+  return null;
 }
 
 // Render the account equity curve as a shareable PNG (the "watch me get rich" visual).
@@ -1619,23 +1762,35 @@ function renderEquityCurvePNG(acct) {
         <stop offset="0%" stop-color="${col}" stop-opacity="0.28"/>
         <stop offset="100%" stop-color="${col}" stop-opacity="0.02"/>
       </linearGradient></defs>
-      <text x="${PADL - 8}" y="44" fill="#1c1d22" font-size="30" font-weight="bold" font-family="-apple-system,Helvetica,Arial,sans-serif">${acct.name}</text>
-      <text x="${PADL - 8}" y="92" fill="#1c1d22" font-size="40" font-weight="bold" font-family="monospace">${money(start)} → ${money(pv)}</text>
-      <text x="${PADL - 8}" y="128" fill="${col}" font-size="26" font-weight="bold" font-family="monospace">${up ? "+" : ""}${pct.toFixed(1)}%  ·  Day ${days}</text>
-      <text x="${W - PADR}" y="44" fill="#9aa1ad" font-size="15" font-family="monospace" text-anchor="end">since ${startDate}</text>
+      <text x="${PADL - 8}" y="66" fill="#1c1d22" font-size="44" font-weight="bold" font-family="monospace">${money(start)} → ${money(pv)}</text>
+      <text x="${PADL - 8}" y="108" fill="${col}" font-size="28" font-weight="bold" font-family="monospace">${up ? "+" : ""}${pct.toFixed(1)}%  ·  Day ${days}</text>
+      <text x="${W - PADR}" y="66" fill="#9aa1ad" font-size="16" font-family="monospace" text-anchor="end">since ${startDate}</text>
       ${yLabels}
       <line x1="${PADL}" y1="${baseY.toFixed(1)}" x2="${W - PADR}" y2="${baseY.toFixed(1)}" stroke="#c7ccd4" stroke-width="1" stroke-dasharray="5 5"/>
       <text x="${W - PADR}" y="${(baseY - 6).toFixed(1)}" fill="#9aa1ad" font-size="12" font-family="monospace" text-anchor="end">start ${money(start)}</text>
       <polygon points="${areaPts}" fill="url(#g)"/>
       <polyline points="${linePts}" fill="none" stroke="${col}" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
       <circle cx="${x(n - 1).toFixed(1)}" cy="${y(pv).toFixed(1)}" r="6" fill="${col}"/>
-      <text x="${W - PADR}" y="${H - 18}" fill="#d4d8e0" font-size="13" font-family="monospace" text-anchor="end">SwingTrader Bot</text>
     </svg>`;
     return new Resvg(svg, { fitTo: { mode: "width", value: 1200 } }).render().asPng();
   } catch (e) {
     console.log(`  [MEDIA] Equity curve render failed: ${e.message}`);
     return null;
   }
+}
+
+// Render a closed-trade recap chart: the underlying candles with IN (entry) and OUT (exit) markers.
+function renderRecapChartPNG(acct, trade, candles, dashboard) {
+  if (!candles || candles.length < 5) return null;
+  const win = (trade.pnlDollar || 0) >= 0;
+  const pct = Math.round((trade.pnlPct || 0) * 100);
+  const outColor = win ? "#00a843" : "#e8473f";
+  return renderChartPNG(candles.slice(-70), trade.ticker, dashboard.analyses?.[trade.ticker], dashboard.shortTermAnalyses?.[trade.ticker], dashboard.quotes?.[trade.ticker], {
+    events: [
+      { date: trade.openDate, color: "#6a4df4", label: "IN" },
+      { date: trade.closeDate, color: outColor, label: `OUT ${pct >= 0 ? "+" : ""}${pct}%` },
+    ],
+  });
 }
 
 // ─── Market Regime (SPY/QQQ EMA health) ───
@@ -6063,6 +6218,38 @@ function mediaPageHTML(acct, { spectator = false, featured = null } = {}) {
   const hasCurve = (acct.dashboard.portfolioHistory || []).filter(p => p && typeof p.value === "number").length >= 2;
   const acctColor = acctStats.allTimePct >= 0 ? "#00a843" : "#e8473f";
 
+  const recaps = gatherClosedTrades(acct, 12);
+  const recapCards = recaps.map((t, idx) => {
+    const win = (t.pnlDollar || 0) >= 0;
+    const pct = Math.round((t.pnlPct || 0) * 100);
+    const c = win ? "#00a843" : "#e8473f";
+    const key = closedTradeKey(t);
+    const keyAttr = encodeURIComponent(key);
+    const thesis = (t.claudeReasoning || t.claudeSuggestion || "").replace(/\s+/g, " ").trim();
+    const sigs = (t.topSignals || []).join(" · ");
+    return `<div class="mcard" id="recap-${idx}">
+      <div class="mhead">
+        <span><a href="/ticker/${t.ticker}?a=${acct.id}" style="font-weight:800;font-size:16px;color:#1c1d22;text-decoration:none">$${t.ticker}</a>
+          <span class="pill" style="background:${c}1a;color:${c};border:1px solid ${c}40">${win ? "+" : ""}${pct}% · ${t.type.toUpperCase()} $${t.strike}</span></span>
+        <span class="muted" style="font-size:11px">${t.openDate || "?"} → ${t.closeDate || "?"} · $${(+t.entryPremium).toFixed(2)} → $${(+t.closePremium).toFixed(2)}</span>
+      </div>
+      <img class="mchart" src="/media/recap-chart?a=${acct.id}&key=${keyAttr}" alt="$${t.ticker} recap" loading="lazy"/>
+      ${(thesis || sigs) ? `<details style="margin-bottom:8px"><summary class="muted" style="cursor:pointer;font-size:11px">What I saw at entry</summary>
+        <div style="font-size:11px;color:#4a4b52;line-height:1.5;margin-top:6px">
+          ${thesis ? `<div>${esc(thesis)}</div>` : ""}
+          ${sigs ? `<div style="margin-top:4px;color:#138f86">Signals: ${esc(sigs)}</div>` : ""}
+          <div style="margin-top:4px;color:#6b7280">Exit: ${esc(t.reason || "—")}</div>
+        </div></details>` : ""}
+      <textarea id="cap-recap-${idx}" class="mcap" rows="6">${esc(buildTradeRecapText(t))}</textarea>
+      <div class="mbtns">
+        ${spectator ? "" : `<button type="button" class="ai" onclick="aiRewrite('recap','${idx}','${keyAttr}')">✨ AI rewrite</button>`}
+        <button type="button" onclick="copyEl('cap-recap-${idx}')">📋 Copy text</button>
+        <a class="btn" href="/media/recap-chart?a=${acct.id}&key=${keyAttr}&dl=1" download="${t.ticker}-recap.png">⬇ Download chart</a>
+        ${spectator ? "" : `<button type="button" class="primary" onclick="postRecap('${idx}','${keyAttr}')">${xLive ? "𝕏 Post recap" : "𝕏 Post (dry-run)"}</button>`}
+      </div>
+    </div>`;
+  }).join("");
+
   const cards = ideas.map(i => {
     const dirColor = i.isCall ? "#00a843" : "#e8473f";
     const chartUrl = `/media/chart/${i.ticker}?a=${acct.id}`;
@@ -6075,6 +6262,7 @@ function mediaPageHTML(acct, { spectator = false, featured = null } = {}) {
       <img class="mchart" src="${chartUrl}" alt="$${i.ticker} chart" loading="lazy"/>
       <textarea id="cap-${i.ticker}" class="mcap" rows="6">${esc(i.caption)}</textarea>
       <div class="mbtns">
+        ${spectator ? "" : `<button type="button" class="ai" onclick="aiRewrite('ticker','${i.ticker}')">✨ AI rewrite</button>`}
         <button type="button" onclick="copyEl('cap-${i.ticker}')">📋 Copy text</button>
         <a class="btn" href="${chartUrl}&dl=1" download="${i.ticker}-chart.png">⬇ Download chart</a>
         ${spectator ? "" : `<button type="button" class="primary" onclick="postMedia('${i.ticker}')">${xLive ? "𝕏 Post to X" : "𝕏 Post (dry-run)"}</button>`}
@@ -6094,7 +6282,9 @@ function mediaPageHTML(acct, { spectator = false, featured = null } = {}) {
   textarea{width:100%;box-sizing:border-box;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:8px;color:#1c1d22;padding:10px;font-family:inherit;font-size:13px;line-height:1.5;resize:vertical}
   button,.btn{padding:8px 14px;background:#eef1f4;color:#1c1d22;border:1px solid #d4d8e0;border-radius:8px;font-weight:600;cursor:pointer;font-size:12px;text-decoration:none;display:inline-block}
   button.primary{background:#1c1d22;color:#fff;border-color:#1c1d22}
+  button.ai{background:#6a4df4;color:#fff;border-color:#6a4df4}
   button:hover,.btn:hover{filter:brightness(.97)}
+  button:disabled{opacity:.6;cursor:wait}
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:16px;margin-top:16px}
   @media(max-width:600px){.grid{grid-template-columns:1fr}body{padding:14px}textarea,button,.btn{font-size:16px}}
   .mcard{background:#fff;border:1px solid #e3e6ea;border-radius:12px;padding:14px}
@@ -6115,6 +6305,7 @@ function mediaPageHTML(acct, { spectator = false, featured = null } = {}) {
     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px">
       <h2 style="margin:0;font-size:15px">📈 Account Update — flex the growth</h2>
       <div style="display:flex;gap:8px">
+        ${spectator ? "" : `<button type="button" class="ai" onclick="aiRewrite('account')">✨ AI rewrite</button>`}
         <button type="button" onclick="copyEl('acct-post')">📋 Copy</button>
         ${hasCurve ? `<a class="btn" href="/media/account-chart?a=${acct.id}&dl=1" download="${acct.id}-growth.png">⬇ Download chart</a>` : ""}
         ${spectator ? "" : `<button type="button" class="primary" onclick="postAccount()">${xLive ? "𝕏 Post update" : "𝕏 Post (dry-run)"}</button>`}
@@ -6136,6 +6327,7 @@ function mediaPageHTML(acct, { spectator = false, featured = null } = {}) {
     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px">
       <h2 style="margin:0;font-size:15px">Weekly / Daily Trade Plan</h2>
       <div style="display:flex;gap:8px">
+        ${spectator ? "" : `<button type="button" class="ai" onclick="aiRewrite('plan')">✨ AI rewrite</button>`}
         <button type="button" onclick="copyEl('plan')">📋 Copy plan</button>
         ${spectator ? "" : `<button type="button" class="primary" onclick="postPlan()">${xLive ? "𝕏 Post plan" : "𝕏 Post plan (dry-run)"}</button>`}
       </div>
@@ -6145,6 +6337,10 @@ function mediaPageHTML(acct, { spectator = false, featured = null } = {}) {
   </div>
 
   <div class="grid">${cards || '<div class="muted">No setups to share yet.</div>'}</div>
+
+  <h2 style="margin:28px 0 0;font-size:15px">🧾 Trade Recaps — what I saw vs. what it did</h2>
+  <div class="muted" style="font-size:12px">Closed trades with the entry read and the actual result. Chart marks entry (IN) and exit (OUT).</div>
+  <div class="grid">${recapCards || '<div class="muted">No closed trades to recap yet.</div>'}</div>
 
   <div id="toast"></div>
 <script>
@@ -6164,6 +6360,21 @@ function mediaPageHTML(acct, { spectator = false, featured = null } = {}) {
     var text=document.getElementById('acct-post').value;
     fetch('/api/media/post',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({a:'${acct.id}',text:text,account:true})})
       .then(r=>r.json()).then(d=>toast(d.message||(d.ok?'Posted':'Failed'))).catch(e=>toast('Error: '+e.message));
+  }
+  function postRecap(idx,key){
+    var text=document.getElementById('cap-recap-'+idx).value;
+    fetch('/api/media/post',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({a:'${acct.id}',text:text,recapKey:decodeURIComponent(key)})})
+      .then(r=>r.json()).then(d=>toast(d.message||(d.ok?'Posted':'Failed'))).catch(e=>toast('Error: '+e.message));
+  }
+  function aiRewrite(kind,ticker,key){
+    var id=kind==='account'?'acct-post':kind==='plan'?'plan':kind==='recap'?'cap-recap-'+ticker:'cap-'+ticker;
+    var el=document.getElementById(id);if(!el)return;
+    var prev=el.value;el.value='✨ writing…';el.disabled=true;
+    var payload={a:'${acct.id}',kind:kind,ticker:(kind==='recap'?'':ticker)||''};
+    if(kind==='recap')payload.key=decodeURIComponent(key);
+    fetch('/api/media/rewrite',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
+      .then(r=>r.json()).then(function(d){el.disabled=false;if(d.ok&&d.text){el.value=d.text;toast('Rewritten ✨');}else{el.value=prev;toast(d.message||'Rewrite failed');}})
+      .catch(function(e){el.disabled=false;el.value=prev;toast('Error: '+e.message);});
   }
   ${featured ? `var f=document.getElementById('card-${featured}');if(f)f.scrollIntoView({behavior:'smooth',block:'center'});` : ""}
 </script>
@@ -7349,6 +7560,32 @@ self.addEventListener('pushsubscriptionchange', e => {
       return;
     }
 
+    // ─── Media: trade-recap chart PNG (candles + IN/OUT markers) ───
+    if (pathname === "/media/recap-chart") {
+      try {
+        const t = findClosedTrade(activeAcct, url.searchParams.get("key") || "");
+        if (!t) { res.writeHead(404, { "Content-Type": "text/plain" }); res.end("Trade not found"); return; }
+        const sym = t.ticker;
+        if (!dashboard.candles[sym] && apiKey) { try { dashboard.candles[sym] = await fetchCandles(sym, apiKey); } catch { } }
+        if (!dashboard.quotes[sym] && apiKey) { try { dashboard.quotes[sym] = await fetchQuote(sym, apiKey); } catch { } }
+        if (dashboard.candles[sym] && !dashboard.analyses[sym]) {
+          const a = runAnalysis(dashboard.candles[sym]); if (a) dashboard.analyses[sym] = a;
+          const stz = runShortTermAnalysis(dashboard.candles[sym]); if (stz) dashboard.shortTermAnalyses[sym] = stz;
+        }
+        const candles = activeAcct.candleCache[sym] || dashboard.candles[sym];
+        const png = renderRecapChartPNG(activeAcct, t, candles, dashboard);
+        if (!png) { res.writeHead(404, { "Content-Type": "text/plain" }); res.end("No chart"); return; }
+        const headers = { "Content-Type": "image/png", "Cache-Control": "no-store" };
+        if (url.searchParams.get("dl")) headers["Content-Disposition"] = `attachment; filename="${t.ticker}-recap.png"`;
+        res.writeHead(200, headers);
+        res.end(png);
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        res.end(`Chart error: ${e.message}`);
+      }
+      return;
+    }
+
     // ─── Media: share-chart PNG (candles + EMAs + trigger/target projection) ───
     const mediaChartMatch = pathname.match(/^\/media\/chart\/([A-Z.]+)$/);
     if (mediaChartMatch) {
@@ -7387,11 +7624,17 @@ self.addEventListener('pushsubscriptionchange', e => {
       req.on("data", c => body += c);
       req.on("end", async () => {
         try {
-          const { ticker, text, chart, account } = JSON.parse(body || "{}");
+          const { ticker, text, chart, account, recapKey } = JSON.parse(body || "{}");
           if (!text || !text.trim()) { res.writeHead(400, { "Content-Type": "application/json" }); res.end(JSON.stringify({ ok: false, message: "No text to post" })); return; }
           let png = null;
           if (account) {
             png = renderEquityCurvePNG(activeAcct);
+          } else if (recapKey) {
+            const t = findClosedTrade(activeAcct, recapKey);
+            if (t) {
+              const candles = activeAcct.candleCache[t.ticker] || dashboard.candles[t.ticker];
+              png = renderRecapChartPNG(activeAcct, t, candles, dashboard);
+            }
           } else if (chart && ticker) {
             const candles = activeAcct.candleCache[ticker] || dashboard.candles[ticker];
             const idea = buildMediaIdea(ticker, dashboard.analyses[ticker], dashboard.shortTermAnalyses[ticker], dashboard.quotes[ticker], candles);
@@ -7408,6 +7651,32 @@ self.addEventListener('pushsubscriptionchange', e => {
         } catch (e) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: false, message: `Error: ${e.message}` }));
+        }
+      });
+      return;
+    }
+
+    // ─── Media: LLM rewrite (Haiku) — turns the templated draft into a varied, insightful post ───
+    if (req.method === "POST" && pathname === "/api/media/rewrite") {
+      if (spectator) { res.writeHead(403, { "Content-Type": "application/json" }); res.end(JSON.stringify({ ok: false, message: "Spectator mode: rewrite disabled" })); return; }
+      let body = "";
+      req.on("data", c => body += c);
+      req.on("end", async () => {
+        try {
+          const { kind, ticker, key } = JSON.parse(body || "{}");
+          const prompt = buildMediaRewritePrompt(activeAcct, kind, (ticker || "").toUpperCase(), key || null);
+          if (!prompt) { res.writeHead(400, { "Content-Type": "application/json" }); res.end(JSON.stringify({ ok: false, message: "Nothing to rewrite (no data for that item)" })); return; }
+          const max = kind === "account" ? 500 : kind === "plan" ? 600 : 360;
+          let text = await callClaude(prompt, 2, max);
+          text = String(text || "").trim().replace(/^["']|["']$/g, "").replace(/#\w+/g, "").replace(/[ \t]+\n/g, "\n").trim();
+          if (!text) { res.writeHead(502, { "Content-Type": "application/json" }); res.end(JSON.stringify({ ok: false, message: "Empty response — try again" })); return; }
+          log(activeAcct, `MEDIA REWRITE ${kind}${ticker ? ` ${ticker}` : ""} via ${getLLMLabel()}`);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, text }));
+        } catch (e) {
+          const msg = /API key|not set/i.test(e.message) ? "LLM not configured (set CLAUDE_API_KEY)" : `Error: ${e.message}`;
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, message: msg }));
         }
       });
       return;
