@@ -742,14 +742,6 @@ const DEFAULT_CONFIG = {
   // explicit spend limit without ever planning beyond this max negative-cash floor.
   marginZeroCashSpendLimit: 200,
   marginMaxDebt: 250,
-
-  // ─── Capital-preservation safety net (stops the account from bleeding) ───
-  // After this many consecutive LOSING trades the account HARD-pauses and pings you to review —
-  // a losing streak is the clearest "something is wrong, stop" signal. Set 0 to disable.
-  maxConsecutiveLosses: 3,
-  // If realized losses in a single day reach this fraction of the day's starting equity, stop opening
-  // new trades for the rest of the day (open positions are still managed). Set 0 to disable.
-  dailyLossLimitPct: 0.15,
 };
 
 // ─── Multi-Account Runtime ───
@@ -8651,42 +8643,6 @@ async function syncRobinhoodAccount(acct, quotes) {
 
 // ─── Main Trading Cycle ───
 
-// Capital-preservation safety net. Reads ONLY reconciled trade history (real broker P&L) and is
-// deposit-agnostic, so adding funds never masks a losing streak. Only counts trades closed after this
-// feature shipped (those carry a closeTime), so it won't trip on stale historical losses on first run.
-// Returns { halt, hard, reason } when NEW ENTRIES should be blocked (exits always keep running).
-function checkRiskHalt(acct) {
-  const cfg = acct.config;
-  const state = acct.state;
-  const hist = (state.history || []).filter(t => t.closeTime && !t._pendingFill);
-  if (!hist.length) return { halt: false };
-
-  // 1) Consecutive losses (hard stop). Walk newest→oldest until a winner breaks the streak.
-  const maxStreak = cfg.maxConsecutiveLosses ?? 3;
-  if (maxStreak > 0) {
-    let streak = 0;
-    for (let i = hist.length - 1; i >= 0; i--) {
-      if ((hist[i].pnlDollar || 0) < 0) streak++; else break;
-    }
-    if (streak >= maxStreak) {
-      return { halt: true, hard: true, reason: `${streak} consecutive losing trades (limit ${maxStreak}) — account hard-paused to stop the bleed. Review and Resume when ready.` };
-    }
-  }
-
-  // 2) Daily realized-loss limit (soft stop — auto-clears next trading day).
-  const lossLimitPct = cfg.dailyLossLimitPct ?? 0;
-  if (lossLimitPct > 0) {
-    const today = getETDateStr();
-    const todayPnl = hist.filter(t => t.closeDate === today).reduce((s, t) => s + (t.pnlDollar || 0), 0);
-    const dayStart = state.dayStartEquity || cfg.startingCash || 0;
-    if (dayStart > 0 && todayPnl < 0 && Math.abs(todayPnl) >= lossLimitPct * dayStart) {
-      return { halt: true, hard: false, reason: `Daily loss $${Math.abs(todayPnl).toFixed(0)} reached ${(lossLimitPct * 100).toFixed(0)}% of day-start equity $${dayStart.toFixed(0)} — no new entries until tomorrow (open positions still managed).` };
-    }
-  }
-
-  return { halt: false };
-}
-
 async function runCycle(acct, sharedQuotes, apiKey) {
   const state = acct.state;
   const cfg = acct.config;
@@ -8803,14 +8759,6 @@ async function runCycle(acct, sharedQuotes, apiKey) {
   // Broker accounts: mirror real balance + positions before any exit/entry decisions.
   if (cfg.broker === "tradier") await syncBrokerAccount(acct, quotes);
 
-  // Record the day's starting equity once per trading day (for the daily-loss safety limit). Done
-  // after sync so broker equity is current; deposit-agnostic because the limit sums realized P&L.
-  const todayStr = getETDateStr();
-  if (state.dayStartDate !== todayStr) {
-    state.dayStartDate = todayStr;
-    state.dayStartEquity = portfolioValue(state, quotes);
-  }
-
   const regime = getMarketRegime(acct.candleCache);
   acct.currentRegime = regime;
   acct.riskPct = effectiveRiskPct(cfg.baseRiskPct, regime);
@@ -8820,21 +8768,6 @@ async function runCycle(acct, sharedQuotes, apiKey) {
   tryExits(acct, quotes);
   trySignalExits(acct, quotes, analyses);
   tryEMATrailingExits(acct, quotes);
-
-  // ─── Capital-preservation gate: block NEW entries on a losing streak / daily loss limit ───
-  const risk = checkRiskHalt(acct);
-  dash.riskHalt = risk.halt ? risk.reason : null;
-  if (risk.halt) {
-    if (acct._riskHaltNotified !== risk.reason) {
-      acct._riskHaltNotified = risk.reason;
-      log(acct, `🛑 RISK HALT: ${risk.reason}`);
-      diag("risk_halt", acct, { hard: !!risk.hard, reason: risk.reason });
-      sendPush(`🛑 Trading halted [${acct.name}]`, risk.reason, true).catch(() => {});
-    }
-    if (risk.hard && !acct.paused) { acct.paused = true; saveAccounts(); }
-    return; // skip all new entries this cycle; exits already ran above
-  }
-  acct._riskHaltNotified = null;
 
   for (const ticker of activeTickers) {
     const dec = decisions.find(d => d.ticker === ticker);
