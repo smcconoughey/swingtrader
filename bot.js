@@ -8838,7 +8838,7 @@ async function runPausedCycle(acct, sharedQuotes) {
   dash.marketOpen = isMarketOpen();
 
   // Keep dashboard quotes alive so PV and UI don't freeze while paused
-  for (const ticker of globalTickers) {
+  for (const ticker of Object.keys(sharedQuotes)) {
     if (sharedQuotes[ticker]) dash.quotes[ticker] = sharedQuotes[ticker];
   }
 
@@ -9189,7 +9189,7 @@ async function runAfterHoursScan(acct, sharedQuotes, apiKey) {
   dash.marketOpen = false; // By definition, after-hours scan means the market is closed.
   log(acct, "AFTER-HOURS SCAN — Fetching data for analysis (no trades)");
 
-  for (const ticker of globalTickers) {
+  for (const ticker of Object.keys(sharedQuotes)) {
     if (sharedQuotes[ticker]) dash.quotes[ticker] = sharedQuotes[ticker];
   }
 
