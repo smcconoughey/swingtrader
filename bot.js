@@ -617,7 +617,7 @@ function getActiveTickers(acct) {
 const STATE_FILE = process.env.STATE_FILE || "state.json";
 const ACCOUNTS_FILE = process.env.ACCOUNTS_FILE || (process.env.STATE_FILE ? process.env.STATE_FILE.replace(/state\.json$/, "accounts.json") : "accounts.json");
 const HINT_FILE = "hint.txt";
-const CYCLE_MS = 45_000;       // 45s between cycles when market open (was 60s)
+const CYCLE_MS = 60_000;       // 60s between cycles when market open
 const CYCLE_MS_CLOSED = 90_000; // slower after-hours polling
 const API_DELAY_FINNHUB = 150;  // Finnhub free tier
 const API_DELAY_TRADIER = 25;   // Tradier batch-friendly
@@ -2735,24 +2735,23 @@ function getLLMLabel() {
 // ─── Validation Cache ───
 // Caches Claude's decision AND the selected contract so cache hits skip both
 // the Finnhub chain fetch and the Claude call entirely.
-// Key: "<acctId>:<ticker>" → { ts, score, direction, result, selectedCandidate }
+// Global cache — keyed by ticker (not per-account) since the validation prompt is based on
+// market data, not account state. All accounts share results for the same ticker/direction/score.
 const claudeValidationCache = new Map();
-const CLAUDE_VALIDATION_COOLDOWN_MS = 15 * 60_000; // 15 minutes (longer = fewer redundant calls)
-const CLAUDE_VALIDATION_SCORE_DELTA = 6;            // re-validate only on a real shift (≥6 pts)
+const CLAUDE_VALIDATION_COOLDOWN_MS = 30 * 60_000; // 30 minutes — markets don't shift radically every 15 min
+const CLAUDE_VALIDATION_SCORE_DELTA = 8;            // re-validate only on a real shift (≥8 pts)
 
 function getCachedValidation(acctId, ticker, currentScore, direction) {
-  const key = `${acctId}:${ticker}`;
-  const cached = claudeValidationCache.get(key);
+  const cached = claudeValidationCache.get(ticker);
   if (!cached) return null;
   if (Date.now() - cached.ts > CLAUDE_VALIDATION_COOLDOWN_MS) return null;
   if (Math.abs(currentScore - cached.score) >= CLAUDE_VALIDATION_SCORE_DELTA) return null;
   if (cached.direction !== direction) return null;
-  return cached; // returns { result, selectedCandidate }
+  return cached;
 }
 
 function setCachedValidation(acctId, ticker, score, direction, result, selectedCandidate = null) {
-  const key = `${acctId}:${ticker}`;
-  claudeValidationCache.set(key, { ts: Date.now(), score, direction, result, selectedCandidate });
+  claudeValidationCache.set(ticker, { ts: Date.now(), score, direction, result, selectedCandidate });
 }
 
 // ─── Options Chain Cache ───
@@ -3261,10 +3260,7 @@ covering the setup read, the main risk, and why you approve/reject the ${isEquit
 {"approve": true, "confidence": 75, "concerns": [], "reasoning": "2-3 sentence rationale", "suggestion": "one-line takeaway"${candidates?.length > 0 ? ', "contractIdx": 1' : ''}}`;
 
   try {
-    // Concise reasoning fits comfortably under 768 tokens; the ceiling is a safety
-    // margin so the JSON always closes (the old 1024 hard cap truncated responses
-    // mid-object and forced a silent default-approve on every call).
-    const raw = await callClaude(promptText, 3, 768);
+    const raw = await callClaude(promptText, 3, 512);
     const result = extractLLMJSON(raw);
     // Validate contractIdx is in range
     if (candidates?.length > 0) {
@@ -3462,7 +3458,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
           await delay(apiDelay());
           if (chain) setCachedChain(ticker, chain);
         }
-        if (chain) candidates = buildCandidateContracts(chain, type, spot, 60);
+        if (chain) candidates = buildCandidateContracts(chain, type, spot, 15);
       } catch (e) {
         log(acct, `OPTIONS ${ticker}: cached affordability refresh failed — ${e.message}`);
       }
@@ -3479,7 +3475,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
           if (chain) setCachedChain(ticker, chain);
         }
         if (chain) {
-          candidates = buildCandidateContracts(chain, type, spot, 60);
+          candidates = buildCandidateContracts(chain, type, spot, 15);
           log(acct, `OPTIONS ${ticker}: ${candidates.length} viable ${type} contracts (${chain.length} expiries)`);
         }
       } catch (e) {
