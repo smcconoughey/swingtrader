@@ -31,6 +31,7 @@ let mcpInitialized = false;
 let discoveredAccountNumber = null;
 let discoveredTools = new Set();
 let optionsSupported = false;
+let lastInitError = null;
 
 // ─── Token Refresh ───
 
@@ -271,15 +272,21 @@ const robinhood = {
   get accountNumber() { return discoveredAccountNumber; },
   get optionsEnabled() { return optionsSupported; },
   get availableTools() { return [...discoveredTools]; },
+  get lastInitError() { return lastInitError; },
 
   buildOCC,
   parseOCC,
 
-  async init() {
-    if (!loadTokens()) {
-      console.log("  [RH] No Robinhood token found. Set ROBINHOOD_ACCESS_TOKEN env var or connect via Cursor MCP.");
-      return false;
+  async init({ reload = true } = {}) {
+    if (reload || !accessToken) {
+      if (!loadTokens()) {
+        lastInitError = "No Robinhood token found";
+        console.log("  [RH] No Robinhood token found. Set ROBINHOOD_ACCESS_TOKEN env var or connect via Cursor MCP.");
+        return false;
+      }
     }
+
+    lastInitError = null;
 
     try {
       const initResult = await mcpCall("initialize", {
@@ -352,6 +359,7 @@ const robinhood = {
       console.log(`  [RH] Robinhood Agentic Trading connected ✓${optionsSupported ? " (equity + options)" : " (equity only)"}`);
       return true;
     } catch (e) {
+      lastInitError = e.message;
       console.log(`  [RH] MCP init failed: ${e.message}`);
       mcpInitialized = false;
       return false;
@@ -579,8 +587,15 @@ const robinhood = {
   // ─── Token Management ───
 
   setToken(token, refresh = null) {
-    accessToken = token;
-    if (refresh) refreshToken = refresh;
+    accessToken = (token || "").trim() || null;
+    refreshToken = refresh != null ? String(refresh).trim() || null : refreshToken;
+    if (!accessToken) {
+      refreshToken = null;
+      mcpInitialized = false;
+      sessionId = null;
+      try { fs.unlinkSync(TOKEN_FILE); } catch { }
+      return;
+    }
     saveTokens();
   },
 

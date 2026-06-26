@@ -5799,7 +5799,8 @@ function robinhoodPageHTML({ spectator = false } = {}) {
         <details style="margin-top:4px">
           <summary style="color:#6b7280;font-size:11px;cursor:pointer">Or paste a token manually</summary>
           <div style="margin-top:8px">
-            <input type="password" class="rh-input" id="rh-token" placeholder="Paste access token..." style="margin-bottom:8px">
+            <input type="password" class="rh-input" id="rh-token" placeholder="Paste accessToken (long eyJ... string)" style="margin-bottom:8px">
+            <input type="password" class="rh-input" id="rh-refresh" placeholder="Optional: refreshToken" style="margin-bottom:8px">
             <div style="display:flex;gap:8px">
               <button class="rh-btn primary" onclick="connectRH()">Connect</button>
               <button class="rh-btn danger" onclick="disconnectRH()">Disconnect</button>
@@ -5984,9 +5985,13 @@ async function lookupOptions() {
 
 async function connectRH() {
   const token = document.getElementById('rh-token').value.trim();
-  if (!token) { alert('Enter a token first'); return; }
+  const refresh = document.getElementById('rh-refresh').value.trim();
+  if (!token) { alert('Paste the accessToken value from rh_tokens.json (starts with eyJ)'); return; }
+  if (!token.startsWith('eyJ')) { alert('That does not look like an access token. Copy accessToken from rh_tokens.json — not refreshToken.'); return; }
   try {
-    const r = await fetch('/api/rh-token', { method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'}, body: 'token='+encodeURIComponent(token) });
+    let body = 'token='+encodeURIComponent(token);
+    if (refresh) body += '&refresh_token='+encodeURIComponent(refresh);
+    const r = await fetch('/api/rh-token', { method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'}, body });
     const d = await r.json();
     alert(d.message || d.error || 'Done');
     location.reload();
@@ -7287,7 +7292,7 @@ function startDashboard(defaultAcct, apiKey) {
 
           rhOAuthPending = null;
           robinhood.setToken(tokens.access_token, tokens.refresh_token || null);
-          const connected = await robinhood.init();
+          const connected = await robinhood.init({ reload: false });
           const optLabel = robinhood.optionsEnabled ? "Options + Equity" : "Equity only";
 
           console.log(`  [RH-AUTH] OAuth complete via manual code — ${connected ? "CONNECTED" : "token saved but init failed"} (${optLabel})`);
@@ -7361,7 +7366,7 @@ function startDashboard(defaultAcct, apiKey) {
         rhOAuthPending = null;
 
         robinhood.setToken(tokens.access_token, tokens.refresh_token || null);
-        const connected = await robinhood.init();
+        const connected = await robinhood.init({ reload: false });
         const optLabel = robinhood.optionsEnabled ? "Options + Equity" : "Equity only";
 
         console.log(`  [RH-AUTH] OAuth complete — ${connected ? "CONNECTED" : "token saved but init failed"} (${optLabel})`);
@@ -7454,14 +7459,26 @@ function startDashboard(defaultAcct, apiKey) {
       req.on("data", chunk => body += chunk);
       req.on("end", async () => {
         const params = new URLSearchParams(body);
-        const token = params.get("token");
-        const refresh = params.get("refresh_token") || null;
+        const token = (params.get("token") || "").trim();
+        const refresh = (params.get("refresh_token") || "").trim() || null;
         if (token) {
           robinhood.setToken(token, refresh);
-          const connected = await robinhood.init();
+          const connected = await robinhood.init({ reload: false });
           const optLabel = robinhood.optionsEnabled ? " (options enabled)" : " (equity only)";
+          const errDetail = robinhood.lastInitError ? ` — ${robinhood.lastInitError}` : "";
           res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-          res.end(JSON.stringify({ connected, optionsEnabled: robinhood.optionsEnabled, message: connected ? `Robinhood connected!${optLabel}` : "Token saved but MCP init failed — check token validity" }));
+          res.end(JSON.stringify({
+            connected,
+            optionsEnabled: robinhood.optionsEnabled,
+            error: connected ? null : robinhood.lastInitError,
+            message: connected
+              ? `Robinhood connected!${optLabel}`
+              : `Token saved but MCP init failed${errDetail}. Use the long accessToken (starts with eyJ), not refreshToken. If Render has ROBINHOOD_ACCESS_TOKEN set, update or remove it.`,
+          }));
+        } else if (params.has("token")) {
+          robinhood.setToken("");
+          res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+          res.end(JSON.stringify({ connected: false, message: "Robinhood disconnected" }));
         } else {
           res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
           res.end(JSON.stringify({ error: "No token provided" }));
