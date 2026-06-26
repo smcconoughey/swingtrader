@@ -7196,6 +7196,7 @@ function startDashboard(defaultAcct, apiKey) {
         authUrl.searchParams.set("code_challenge_method", "S256");
         authUrl.searchParams.set("state", state);
         authUrl.searchParams.set("scope", "internal");
+        authUrl.searchParams.set("resource", "https://agent.robinhood.com/mcp/trading");
 
         const authUrlStr = authUrl.toString();
         console.log(`  [RH-AUTH] OAuth flow started (client: ${client.client_id})`);
