@@ -7197,132 +7197,31 @@ function startDashboard(defaultAcct, apiKey) {
         authUrl.searchParams.set("state", state);
         authUrl.searchParams.set("scope", "internal");
 
-        const authUrlStr = authUrl.toString();
-        console.log(`  [RH-AUTH] OAuth flow started (client: ${client.client_id})`);
-        console.log(`  [RH-AUTH] Callback: ${redirectUri}`);
-
-        res.writeHead(200, { "Content-Type": "text/html" });
-        res.end(`<html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-        <body style="font-family:system-ui;max-width:600px;margin:0 auto;padding:24px;background:#111;color:#e5e7eb">
-          <h2 style="color:#00a843;margin-bottom:4px">Robinhood OAuth Sign-In</h2>
-          <p style="color:#8a909b;font-size:13px;margin-top:0">Open this link in a <strong>desktop browser</strong> where you're logged into Robinhood.</p>
-
-          <div style="background:#1a1a2e;border:1px solid #333;border-radius:8px;padding:16px;margin:16px 0;word-break:break-all">
-            <a href="${authUrlStr}" target="_blank" style="color:#4da6ff;font-size:13px;text-decoration:none">${authUrlStr}</a>
-          </div>
-
-          <p style="font-size:13px;color:#8a909b">
-            <strong>If the page loads correctly:</strong> Sign in and authorize — you'll be redirected back here automatically.<br><br>
-            <strong>If Robinhood shows a 404:</strong> The agentic OAuth web page may not work on mobile yet.
-            Try a desktop browser, or use the Robinhood app if prompted. After authorizing, if you land on a page
-            that won't load, copy the <strong>full URL</strong> from your browser's address bar and paste it below.
-          </p>
-
-          <form method="POST" action="/api/rh-code" style="margin-top:20px">
-            <label style="color:#9ca3af;font-size:12px;display:block;margin-bottom:6px">Paste the callback URL or just the <code>code</code> parameter:</label>
-            <input type="text" name="callback_url" placeholder="https://...?code=abc123&state=... or just the code" style="width:100%;box-sizing:border-box;padding:10px;border-radius:6px;border:1px solid #444;background:#1a1a2e;color:#e5e7eb;font-size:14px;margin-bottom:10px">
-            <button type="submit" style="background:#00a843;color:white;border:none;padding:10px 24px;border-radius:6px;font-size:14px;cursor:pointer;width:100%">Exchange Code for Token</button>
-          </form>
-
-          <p style="margin-top:20px;text-align:center"><a href="/robinhood" style="color:#6b7280;font-size:13px">Cancel</a></p>
-        </body></html>`);
+        console.log(`  [RH-AUTH] OAuth flow started — redirecting to Robinhood login (client: ${client.client_id})`);
+        res.writeHead(302, { Location: authUrl.toString() });
+        res.end();
       } catch (e) {
         console.error(`  [RH-AUTH] Error starting OAuth flow: ${e.message}`);
         res.writeHead(500, { "Content-Type": "text/html" });
-        res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px;background:#111;color:#e5e7eb"><h2 style="color:#e8473f">OAuth Error</h2><p>${e.message}</p><a href="/robinhood" style="color:#00a843">Back to Dashboard</a></body></html>`);
+        res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px"><h2 style="color:#e8473f">OAuth Error</h2><p>${e.message}</p><a href="/robinhood">Back to Dashboard</a></body></html>`);
       }
       return;
     }
 
-    // ─── Robinhood: OAuth2 PKCE — Manual Code Submission ───
-    if (req.method === "POST" && pathname === "/api/rh-code") {
-      if (spectator) { res.writeHead(403); res.end("Spectators cannot authenticate."); return; }
-      let body = "";
-      req.on("data", chunk => body += chunk);
-      req.on("end", async () => {
-        if (!rhOAuthPending) {
-          res.writeHead(400, { "Content-Type": "text/html" });
-          res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px;background:#111;color:#e5e7eb"><h2 style="color:#e8473f">No pending auth flow</h2><p>Start again from the <a href="/robinhood" style="color:#00a843">dashboard</a>.</p></body></html>`);
-          return;
-        }
-
-        const params = new URLSearchParams(body);
-        let callbackInput = (params.get("callback_url") || "").trim();
-        let code = null;
-
-        try {
-          const parsed = new URL(callbackInput);
-          code = parsed.searchParams.get("code");
-        } catch {
-          code = callbackInput;
-        }
-
-        if (!code) {
-          res.writeHead(400, { "Content-Type": "text/html" });
-          res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px;background:#111;color:#e5e7eb"><h2 style="color:#e8473f">No code found</h2><p>Paste the full callback URL or the code parameter.</p><a href="/api/rh-auth" style="color:#00a843">Try Again</a></body></html>`);
-          return;
-        }
-
-        try {
-          const tokenRes = await fetch(rhOAuthPending.tokenEndpoint, {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body: new URLSearchParams({
-              grant_type: "authorization_code",
-              code,
-              redirect_uri: rhOAuthPending.redirectUri,
-              client_id: rhOAuthPending.clientId,
-              code_verifier: rhOAuthPending.codeVerifier,
-            }).toString(),
-          });
-
-          if (!tokenRes.ok) {
-            const errText = await tokenRes.text();
-            throw new Error(`Token exchange failed: HTTP ${tokenRes.status} — ${errText}`);
-          }
-
-          const tokens = await tokenRes.json();
-          if (!tokens.access_token) throw new Error("No access_token in response");
-
-          rhOAuthPending = null;
-          robinhood.setToken(tokens.access_token, tokens.refresh_token || null);
-          const connected = await robinhood.init();
-          const optLabel = robinhood.optionsEnabled ? "Options + Equity" : "Equity only";
-
-          console.log(`  [RH-AUTH] OAuth complete via manual code — ${connected ? "CONNECTED" : "token saved but init failed"} (${optLabel})`);
-
-          res.writeHead(200, { "Content-Type": "text/html" });
-          res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px;background:#111;color:#e5e7eb">
-            <h2 style="color:#00a843">✓ Robinhood Connected!</h2>
-            <p style="font-size:18px">${connected ? `MCP initialized — <strong>${optLabel}</strong>` : "Token saved but MCP init failed."}</p>
-            <p style="color:#6b7280;font-size:13px">Account: ${robinhood.accountNumber || "discovering..."}</p>
-            <p style="color:#6b7280;font-size:13px">Expires in: ${tokens.expires_in ? Math.round(tokens.expires_in / 3600) + " hours" : "unknown"}</p>
-            <p style="margin-top:24px"><a href="/robinhood" style="color:#00a843;font-size:16px">← Back to Dashboard</a></p>
-          </body></html>`);
-        } catch (e) {
-          console.error(`  [RH-AUTH] Manual code exchange error: ${e.message}`);
-          rhOAuthPending = null;
-          res.writeHead(500, { "Content-Type": "text/html" });
-          res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px;background:#111;color:#e5e7eb"><h2 style="color:#e8473f">Token Exchange Failed</h2><p>${e.message}</p><a href="/robinhood" style="color:#00a843">Back to Dashboard</a></body></html>`);
-        }
-      });
-      return;
-    }
-
-    // ─── Robinhood: OAuth2 PKCE — Automatic Callback ───
+    // ─── Robinhood: OAuth2 PKCE — Callback ───
     if (pathname === "/api/rh-callback") {
       const error = url.searchParams.get("error");
       if (error) {
         const desc = url.searchParams.get("error_description") || "";
         console.error(`  [RH-AUTH] OAuth error: ${error} — ${desc}`);
         res.writeHead(400, { "Content-Type": "text/html" });
-        res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px;background:#111;color:#e5e7eb"><h2 style="color:#e8473f">Authorization Failed</h2><p>${error}: ${desc}</p><a href="/robinhood" style="color:#00a843">Back to Dashboard</a></body></html>`);
+        res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px"><h2 style="color:#e8473f">Authorization Failed</h2><p>${error}: ${desc}</p><a href="/robinhood">Back to Dashboard</a></body></html>`);
         return;
       }
 
       if (!rhOAuthPending) {
         res.writeHead(400, { "Content-Type": "text/html" });
-        res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px;background:#111;color:#e5e7eb"><h2 style="color:#e8473f">No pending auth flow</h2><p>Start the flow again from the <a href="/robinhood" style="color:#00a843">dashboard</a>.</p></body></html>`);
+        res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px"><h2 style="color:#e8473f">No pending auth flow</h2><p>Start the flow again from the dashboard.</p><a href="/robinhood">Back to Dashboard</a></body></html>`);
         return;
       }
 
@@ -7331,7 +7230,7 @@ function startDashboard(defaultAcct, apiKey) {
 
       if (returnedState !== rhOAuthPending.state) {
         res.writeHead(400, { "Content-Type": "text/html" });
-        res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px;background:#111;color:#e5e7eb"><h2 style="color:#e8473f">State Mismatch</h2><p>Try again.</p><a href="/robinhood" style="color:#00a843">Back to Dashboard</a></body></html>`);
+        res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px"><h2 style="color:#e8473f">State Mismatch</h2><p>Possible CSRF attack. Try again.</p><a href="/robinhood">Back to Dashboard</a></body></html>`);
         rhOAuthPending = null;
         return;
       }
@@ -7364,6 +7263,7 @@ function startDashboard(defaultAcct, apiKey) {
         const optLabel = robinhood.optionsEnabled ? "Options + Equity" : "Equity only";
 
         console.log(`  [RH-AUTH] OAuth complete — ${connected ? "CONNECTED" : "token saved but init failed"} (${optLabel})`);
+        console.log(`  [RH-AUTH] Access token: ${tokens.access_token.slice(0, 12)}...${tokens.access_token.slice(-6)}`);
 
         res.writeHead(200, { "Content-Type": "text/html" });
         res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px;background:#111;color:#e5e7eb">
@@ -7377,7 +7277,7 @@ function startDashboard(defaultAcct, apiKey) {
         console.error(`  [RH-AUTH] Token exchange error: ${e.message}`);
         rhOAuthPending = null;
         res.writeHead(500, { "Content-Type": "text/html" });
-        res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px;background:#111;color:#e5e7eb"><h2 style="color:#e8473f">Token Exchange Failed</h2><p>${e.message}</p><a href="/robinhood" style="color:#00a843">Back to Dashboard</a></body></html>`);
+        res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px"><h2 style="color:#e8473f">Token Exchange Failed</h2><p>${e.message}</p><a href="/robinhood">Back to Dashboard</a></body></html>`);
       }
       return;
     }
