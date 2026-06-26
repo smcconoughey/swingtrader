@@ -32,11 +32,59 @@ let discoveredAccountNumber = null;
 let discoveredTools = new Set();
 let optionsSupported = false;
 
+// ─── Token Refresh ───
+
+let refreshInProgress = null;
+
+async function tryRefreshToken() {
+  if (!refreshToken) return false;
+  if (refreshInProgress) return refreshInProgress;
+
+  refreshInProgress = (async () => {
+    try {
+      console.log("  [RH] Access token expired — attempting refresh...");
+      const res = await fetch("https://api.robinhood.com/oauth2/token/", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: refreshToken,
+          client_id: "c82SH0WZOsabOXGP2sxqcj34FxkvfnWRZBKlBbFS",
+        }).toString(),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        console.log(`  [RH] Token refresh failed: HTTP ${res.status} — ${errText.slice(0, 200)}`);
+        return false;
+      }
+
+      const data = await res.json();
+      if (data.access_token) {
+        accessToken = data.access_token;
+        if (data.refresh_token) refreshToken = data.refresh_token;
+        saveTokens();
+        sessionId = null;
+        mcpInitialized = false;
+        console.log("  [RH] Token refreshed successfully");
+        return true;
+      }
+      return false;
+    } catch (e) {
+      console.log(`  [RH] Token refresh error: ${e.message}`);
+      return false;
+    } finally {
+      refreshInProgress = null;
+    }
+  })();
+  return refreshInProgress;
+}
+
 // ─── MCP Transport Layer ───
 
 let rpcId = 1;
 
-async function mcpCall(method, params = {}) {
+async function mcpCall(method, params = {}, _retried = false) {
   if (!accessToken) throw new Error("Robinhood not authenticated. Set ROBINHOOD_ACCESS_TOKEN or connect via mcp-remote.");
 
   const body = {
@@ -67,6 +115,19 @@ async function mcpCall(method, params = {}) {
 
   if (!res.ok) {
     const errText = await res.text().catch(() => "");
+
+    // Auto-refresh on 401/403 and retry once
+    if ((res.status === 401 || res.status === 403) && !_retried && refreshToken) {
+      const refreshed = await tryRefreshToken();
+      if (refreshed) {
+        // Re-init the MCP session with the new token
+        if (method !== "initialize") {
+          try { await robinhood.init(); } catch { }
+        }
+        return mcpCall(method, params, true);
+      }
+    }
+
     throw new Error(`MCP HTTP ${res.status}: ${errText}`);
   }
 
@@ -517,9 +578,14 @@ const robinhood = {
 
   // ─── Token Management ───
 
-  setToken(token) {
+  setToken(token, refresh = null) {
     accessToken = token;
+    if (refresh) refreshToken = refresh;
     saveTokens();
+  },
+
+  async refreshAuth() {
+    return tryRefreshToken();
   },
 };
 

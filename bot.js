@@ -648,6 +648,10 @@ const MAX_ENTRY_SPREAD_PCT = 0.30;
 const WIDE_SPREAD_EXIT_PCT = 0.20;
 // Most we'll concede below mid when working a protective exit through a wide spread.
 const MAX_EXIT_CONCESSION_PCT = 0.12;
+// Hard cap on overpay: never submit a limit more than this fraction above the mid.
+const MAX_ENTRY_OVERPAY_PCT = 0.15;
+// Reject contracts whose IV exceeds this — premium is inflated by event risk, not directional value.
+const MAX_ENTRY_IV = 1.50;
 // In choppy regimes (broken EMA stack), demand stronger confirmation before new risk.
 const CHOPPY_MIN_BULL_SCORE = 72;
 const CHOPPY_MIN_BEAR_SCORE = 28; // must be <= this for puts (stricter than default bearEntry)
@@ -2514,6 +2518,9 @@ function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 12) {
       const iv = c.impliedVolatility > 0 ? c.impliedVolatility : null;
       const delta = c.delta != null ? c.delta : null;
 
+      // Reject IV-spiked contracts — premium is inflated by event risk, not the directional thesis.
+      if (iv != null && iv > MAX_ENTRY_IV) continue;
+
       // Reject lottery tickets: require real directional exposure (δ ≥ MIN_OPTION_DELTA). When greeks
       // are unavailable we already constrained moneyness to near-the-money above, so it can't be junk.
       if (delta != null && Math.abs(delta) < MIN_OPTION_DELTA) continue;
@@ -2633,14 +2640,15 @@ function reliableOptionMark(oq) {
 
 // Entry limit price for a live options buy, trading like a disciplined human: when conviction is
 // high, lean toward the ask (even crossing to it) to actually
-// get filled; when conviction is low, sit patiently at the mid. Never pays
-// through the offer. conviction is 0..1; falls back to mid if we lack a real two-sided market.
+// get filled; when conviction is low, sit patiently at the mid. Hard-capped
+// at MAX_ENTRY_OVERPAY_PCT above mid so a wide market never drags us into an absurd fill.
 function entryLimitPrice(bid, ask, mid, conviction) {
   const m = +(+mid).toFixed(2);
   if (!(bid > 0) || !(ask > 0) || ask < bid) return m;
   let aggr = Math.max(0, Math.min(1, conviction));
   const px = mid + aggr * (ask - mid);
-  return +Math.min(ask, Math.max(bid, px)).toFixed(2);
+  const ceiling = +(mid * (1 + MAX_ENTRY_OVERPAY_PCT)).toFixed(2);
+  return +Math.min(ceiling, Math.min(ask, Math.max(bid, px))).toFixed(2);
 }
 
 
@@ -3434,7 +3442,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   const spot = quote.c;
   const maxRisk = state.cash * acct.riskPct;
   const direction = isBullish ? "BULLISH" : "BEARISH";
-  const type = isBullish ? "call" : "put";
+  let type = isBullish ? "call" : "put";
 
   // ─── Step 1: Check validation cache (skips both chain fetch AND Claude call) ───
   let claudeResult = { approve: true, confidence: 70, concerns: [], reasoning: "", suggestion: "", contractIdx: 0 };
@@ -3720,6 +3728,16 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
       try {
         const conviction = Math.max(0, Math.min(1, (claudeResult.confidence || 0) / 100));
         const bid = selectedCandidate.bid, ask = selectedCandidate.ask;
+
+        // Hard stop: reject if spread at order time is too wide
+        if (bid > 0 && ask > 0 && premium > 0) {
+          const liveSpreadPct = (ask - bid) / premium;
+          if (liveSpreadPct > MAX_ENTRY_SPREAD_PCT) {
+            delete acct.state.meta[occ];
+            return { skipped: true, reason: `Robinhood: spread ${(liveSpreadPct * 100).toFixed(0)}% at order time exceeds ${(MAX_ENTRY_SPREAD_PCT * 100).toFixed(0)}% cap — refusing entry on ${ticker}` };
+          }
+        }
+
         const limit = entryLimitPrice(bid, ask, premium, conviction);
         const aggrLabel = limit >= (ask || limit) ? "at ask" : limit > premium ? "toward ask" : "at mid";
 
@@ -3754,9 +3772,15 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
       }
     } else {
       // ─── Robinhood EQUITY fallback (no options support) ───
+      // Use bid/ask from quote if available; cap limit at MAX_ENTRY_OVERPAY_PCT above mid
+      const eqBid = quote.bid ?? null;
+      const eqAsk = quote.ask ?? null;
+      const eqMid = (eqBid > 0 && eqAsk > 0) ? (eqBid + eqAsk) / 2 : spot;
+      const eqLimit = +(Math.min(eqAsk || spot, eqMid * (1 + MAX_ENTRY_OVERPAY_PCT))).toFixed(2);
+
       if (!acct.state.meta) acct.state.meta = {};
       acct.state.meta[ticker] = {
-        entryPremium: spot,
+        entryPremium: eqLimit,
         entrySpot: spot,
         originalQty: qty,
         openDate: getETDateStr(),
@@ -3769,15 +3793,15 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
 
       try {
         const res = await robinhood.placeEquityOrder({
-          symbol: ticker, side: "buy", type: "limit", quantity: qty, limitPrice: spot, refId: crypto.randomUUID()
+          symbol: ticker, side: "buy", type: "limit", quantity: qty, limitPrice: eqLimit, refId: crypto.randomUUID()
         });
 
         if (!acct._inflightTickers) acct._inflightTickers = new Set();
         acct._inflightTickers.add(ticker.toUpperCase());
-        log(acct, `ROBINHOOD ENTRY: BUY ${qty}x ${ticker} @ $${spot.toFixed(2)} limit — order ${res?.id || "?"}`);
+        log(acct, `ROBINHOOD ENTRY: BUY ${qty}x ${ticker} @ $${eqLimit.toFixed(2)} limit — order ${res?.id || "?"}`);
 
         acct.state.cash = Math.max(0, acct.state.cash - totalCost);
-        return { ticker, type: "equity", strike: 0, dte: 0, qty, entryPremium: spot, cost: totalCost, direction, optionsSource: "robinhood", setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence, brokerOrder: true };
+        return { ticker, type: "equity", strike: 0, dte: 0, qty, entryPremium: eqLimit, cost: totalCost, direction, optionsSource: "robinhood", setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence, brokerOrder: true };
       } catch (e) {
         delete acct.state.meta[ticker];
         log(acct, `ROBINHOOD ENTRY FAILED ${ticker}: ${e.message}`);
@@ -5771,11 +5795,17 @@ function robinhoodPageHTML({ spectator = false } = {}) {
       <div class="rh-stat"><span class="label">MCP Endpoint</span><span class="value" style="font-size:10px;color:#6b7280">agent.robinhood.com</span></div>
       <div class="rh-stat"><span class="label">Account</span><span class="value" style="color:${connected ? '#00a843' : '#6b7280'}">${robinhood.accountNumber ? '••••' + String(robinhood.accountNumber).slice(-4) : 'Not discovered'}</span></div>
       ${spectator ? `<div style="margin-top:12px;color:#8a909b;font-size:12px">Spectator mode: token entry and connection controls are hidden.</div>` : `<div style="margin-top:12px">
-        <input type="password" class="rh-input" id="rh-token" placeholder="Paste access token..." style="margin-bottom:8px">
-        <div style="display:flex;gap:8px">
-          <button class="rh-btn primary" onclick="connectRH()">Connect</button>
-          <button class="rh-btn danger" onclick="disconnectRH()">Disconnect</button>
-        </div>
+        <a href="/api/rh-auth" class="rh-btn primary" style="display:inline-block;text-decoration:none;text-align:center;margin-bottom:12px;font-size:14px;padding:10px 24px">Sign in with Robinhood</a>
+        <details style="margin-top:4px">
+          <summary style="color:#6b7280;font-size:11px;cursor:pointer">Or paste a token manually</summary>
+          <div style="margin-top:8px">
+            <input type="password" class="rh-input" id="rh-token" placeholder="Paste access token..." style="margin-bottom:8px">
+            <div style="display:flex;gap:8px">
+              <button class="rh-btn primary" onclick="connectRH()">Connect</button>
+              <button class="rh-btn danger" onclick="disconnectRH()">Disconnect</button>
+            </div>
+          </div>
+        </details>
       </div>`}
     </div>
 
@@ -6816,6 +6846,12 @@ function updateChart() {
 </body></html>`;
 }
 
+// ─── Robinhood OAuth2 PKCE In-App Auth ───
+
+const RH_OAUTH_META_URL = "https://agent.robinhood.com/.well-known/oauth-authorization-server";
+const RH_REGISTER_URL = "https://agent.robinhood.com/oauth/trading/register";
+let rhOAuthPending = null; // stores { codeVerifier, state, clientId, redirectUri, tokenEndpoint } during auth flow
+
 function startDashboard(defaultAcct, apiKey) {
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
@@ -7120,6 +7156,132 @@ function startDashboard(defaultAcct, apiKey) {
       return;
     }
 
+    // ─── Robinhood: OAuth2 PKCE — Start Auth Flow ───
+    if (pathname === "/api/rh-auth") {
+      if (spectator) { res.writeHead(403, { "Content-Type": "text/html" }); res.end("Spectators cannot authenticate."); return; }
+      try {
+        const host = req.headers.host || `localhost:${DASH_PORT}`;
+        const proto = req.headers["x-forwarded-proto"] || (host.includes("onrender.com") ? "https" : "http");
+        const redirectUri = `${proto}://${host}/api/rh-callback`;
+
+        const metaRes = await fetch(RH_OAUTH_META_URL);
+        if (!metaRes.ok) throw new Error("Failed to fetch OAuth metadata");
+        const meta = await metaRes.json();
+
+        const regRes = await fetch(RH_REGISTER_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            client_name: "swingtrader-bot",
+            redirect_uris: [redirectUri],
+            grant_types: ["authorization_code", "refresh_token"],
+            response_types: ["code"],
+            token_endpoint_auth_method: "none",
+          }),
+        });
+        if (!regRes.ok) throw new Error("Client registration failed: " + await regRes.text());
+        const client = await regRes.json();
+
+        const codeVerifier = crypto.randomBytes(32).toString("base64url");
+        const codeChallenge = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
+        const state = crypto.randomBytes(16).toString("base64url");
+
+        rhOAuthPending = { codeVerifier, state, clientId: client.client_id, redirectUri, tokenEndpoint: meta.token_endpoint };
+
+        const authUrl = new URL(meta.authorization_endpoint);
+        authUrl.searchParams.set("response_type", "code");
+        authUrl.searchParams.set("client_id", client.client_id);
+        authUrl.searchParams.set("redirect_uri", redirectUri);
+        authUrl.searchParams.set("code_challenge", codeChallenge);
+        authUrl.searchParams.set("code_challenge_method", "S256");
+        authUrl.searchParams.set("state", state);
+        authUrl.searchParams.set("scope", "internal");
+
+        console.log(`  [RH-AUTH] OAuth flow started — redirecting to Robinhood login (client: ${client.client_id})`);
+        res.writeHead(302, { Location: authUrl.toString() });
+        res.end();
+      } catch (e) {
+        console.error(`  [RH-AUTH] Error starting OAuth flow: ${e.message}`);
+        res.writeHead(500, { "Content-Type": "text/html" });
+        res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px"><h2 style="color:#e8473f">OAuth Error</h2><p>${e.message}</p><a href="/robinhood">Back to Dashboard</a></body></html>`);
+      }
+      return;
+    }
+
+    // ─── Robinhood: OAuth2 PKCE — Callback ───
+    if (pathname === "/api/rh-callback") {
+      const error = url.searchParams.get("error");
+      if (error) {
+        const desc = url.searchParams.get("error_description") || "";
+        console.error(`  [RH-AUTH] OAuth error: ${error} — ${desc}`);
+        res.writeHead(400, { "Content-Type": "text/html" });
+        res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px"><h2 style="color:#e8473f">Authorization Failed</h2><p>${error}: ${desc}</p><a href="/robinhood">Back to Dashboard</a></body></html>`);
+        return;
+      }
+
+      if (!rhOAuthPending) {
+        res.writeHead(400, { "Content-Type": "text/html" });
+        res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px"><h2 style="color:#e8473f">No pending auth flow</h2><p>Start the flow again from the dashboard.</p><a href="/robinhood">Back to Dashboard</a></body></html>`);
+        return;
+      }
+
+      const returnedState = url.searchParams.get("state");
+      const code = url.searchParams.get("code");
+
+      if (returnedState !== rhOAuthPending.state) {
+        res.writeHead(400, { "Content-Type": "text/html" });
+        res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px"><h2 style="color:#e8473f">State Mismatch</h2><p>Possible CSRF attack. Try again.</p><a href="/robinhood">Back to Dashboard</a></body></html>`);
+        rhOAuthPending = null;
+        return;
+      }
+
+      try {
+        const tokenRes = await fetch(rhOAuthPending.tokenEndpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            grant_type: "authorization_code",
+            code,
+            redirect_uri: rhOAuthPending.redirectUri,
+            client_id: rhOAuthPending.clientId,
+            code_verifier: rhOAuthPending.codeVerifier,
+          }).toString(),
+        });
+
+        if (!tokenRes.ok) {
+          const errText = await tokenRes.text();
+          throw new Error(`Token exchange failed: HTTP ${tokenRes.status} — ${errText}`);
+        }
+
+        const tokens = await tokenRes.json();
+        if (!tokens.access_token) throw new Error("No access_token in response");
+
+        rhOAuthPending = null;
+
+        robinhood.setToken(tokens.access_token, tokens.refresh_token || null);
+        const connected = await robinhood.init();
+        const optLabel = robinhood.optionsEnabled ? "Options + Equity" : "Equity only";
+
+        console.log(`  [RH-AUTH] OAuth complete — ${connected ? "CONNECTED" : "token saved but init failed"} (${optLabel})`);
+        console.log(`  [RH-AUTH] Access token: ${tokens.access_token.slice(0, 12)}...${tokens.access_token.slice(-6)}`);
+
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px;background:#111;color:#e5e7eb">
+          <h2 style="color:#00a843">✓ Robinhood Connected!</h2>
+          <p style="font-size:18px">${connected ? `MCP initialized — <strong>${optLabel}</strong>` : "Token saved but MCP init failed. Check logs."}</p>
+          <p style="color:#6b7280;font-size:13px">Account: ${robinhood.accountNumber || "discovering..."}</p>
+          <p style="color:#6b7280;font-size:13px">Expires in: ${tokens.expires_in ? Math.round(tokens.expires_in / 3600) + " hours" : "unknown"}</p>
+          <p style="margin-top:24px"><a href="/robinhood" style="color:#00a843;font-size:16px">← Back to Dashboard</a></p>
+        </body></html>`);
+      } catch (e) {
+        console.error(`  [RH-AUTH] Token exchange error: ${e.message}`);
+        rhOAuthPending = null;
+        res.writeHead(500, { "Content-Type": "text/html" });
+        res.end(`<html><body style="font-family:system-ui;text-align:center;padding:60px"><h2 style="color:#e8473f">Token Exchange Failed</h2><p>${e.message}</p><a href="/robinhood">Back to Dashboard</a></body></html>`);
+      }
+      return;
+    }
+
     // ─── Robinhood: Get Status & Pending Orders ───
     if (pathname === "/api/rh-status") {
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -7192,11 +7354,13 @@ function startDashboard(defaultAcct, apiKey) {
       req.on("end", async () => {
         const params = new URLSearchParams(body);
         const token = params.get("token");
+        const refresh = params.get("refresh_token") || null;
         if (token) {
-          robinhood.setToken(token);
+          robinhood.setToken(token, refresh);
           const connected = await robinhood.init();
+          const optLabel = robinhood.optionsEnabled ? " (options enabled)" : " (equity only)";
           res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-          res.end(JSON.stringify({ connected, message: connected ? "Robinhood connected!" : "Token saved but MCP init failed" }));
+          res.end(JSON.stringify({ connected, optionsEnabled: robinhood.optionsEnabled, message: connected ? `Robinhood connected!${optLabel}` : "Token saved but MCP init failed — check token validity" }));
         } else {
           res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
           res.end(JSON.stringify({ error: "No token provided" }));
@@ -8206,8 +8370,17 @@ async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, dte, q
   };
 
   try {
+    // Hard stop: reject if the spread at order time is too wide to get a fair fill
+    if (bid > 0 && ask > 0 && premium > 0) {
+      const liveSpreadPct = (ask - bid) / premium;
+      if (liveSpreadPct > MAX_ENTRY_SPREAD_PCT) {
+        delete acct.state.meta[occ];
+        return { skipped: true, reason: `Tradier: spread ${(liveSpreadPct * 100).toFixed(0)}% at order time exceeds ${(MAX_ENTRY_SPREAD_PCT * 100).toFixed(0)}% cap — refusing entry on ${ticker}` };
+      }
+    }
+
     // Conviction-aware fill: high conviction → price toward the ask to fill;
-    // otherwise sit at the mid. Falls back to mid when we don't have a real bid/ask.
+    // otherwise sit at the mid. Hard-capped at MAX_ENTRY_OVERPAY_PCT above mid.
     const conviction = Math.max(0, Math.min(1, (claudeConfidence || 0) / 100));
     const limit = entryLimitPrice(bid, ask, premium, conviction);
     const aggrLabel = limit >= (ask || limit) ? "at ask" : limit > premium ? "toward ask" : "at mid";
@@ -9651,6 +9824,15 @@ async function main() {
     // Copy shared candles into each account's cache
     for (const [, acct] of accounts) {
       Object.assign(acct.candleCache, sharedCandleCache);
+    }
+    // Auto-reconnect Robinhood if token exists but session dropped
+    if (robinhood.isAuthenticated && !robinhood.isConnected) {
+      console.log("  [RH] Token present but MCP disconnected — attempting reconnect...");
+      try { await robinhood.init(); } catch (e) { console.log(`  [RH] Reconnect failed: ${e.message}`); }
+      if (robinhood.isConnected) {
+        console.log(`  [RH] Reconnected ✓${robinhood.optionsEnabled ? " (options enabled)" : ""}`);
+        await ensureRobinhoodAccount();
+      }
     }
     // Force broker sync immediately so positions are never stale after a deploy
     for (const [, acct] of accounts) {
