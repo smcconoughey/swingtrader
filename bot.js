@@ -3195,7 +3195,7 @@ Rules:
 
 async function validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, candidates) {
   const cfg = acct.config;
-  const isEquity = cfg.broker === "robinhood";
+  const isEquity = cfg.broker === "robinhood" && !robinhood.optionsEnabled;
   const direction = analysis.score >= cfg.bullEntry
     ? (isEquity ? 'BULLISH (buying shares)' : 'BULLISH (buying calls)')
     : (isEquity ? 'BEARISH' : 'BEARISH (buying puts)');
@@ -3221,7 +3221,7 @@ async function validateEntryWithClaude(acct, ticker, quote, analysis, setupQuali
     contractSection = `\nReal options chain (${candidates.length} pre-vetted near-the-money / ITM contracts — all δ≥${MIN_OPTION_DELTA}, no far-OTM lottery tickets):\n${header}\n${rows}`;
     contractInstruction = `\nSelect the best contract index (1-${candidates.length}). These are all real, near-the-money directional contracts — prefer the ATM-to-slightly-ITM strike (δ${PREFERRED_DELTA_MIN}-${PREFERRED_DELTA_MAX}) with the best liquidity and tightest spread. Only approve if this is a genuinely high-conviction setup worth real capital; we trade infrequently and only take trades likely to win — when in doubt, PASS.`;
   } else if (isEquity) {
-    contractSection = '\nThis is an EQUITY (shares) trade on Robinhood — no options contracts. Evaluate whether buying shares at the current price is a good swing entry.';
+    contractSection = '\nThis is an EQUITY (shares) trade — no options contracts. Evaluate whether buying shares at the current price is a good swing entry.';
   } else {
     contractSection = '\nNo real chain data available — synthetic pricing will be used.';
   }
@@ -3392,9 +3392,9 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   if (isBullish && analysis.rsi > 85 && !analysis.aligned) {
     return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} parabolic with misaligned EMAs — exhaustion risk, not a healthy strength setup` };
   }
-  // Robinhood only supports equity longs — skip all bearish/put setups
-  if (cfg.broker === "robinhood" && isBearish) {
-    return { skipped: true, reason: `Robinhood: equity longs only — skipping bearish setup` };
+  // Robinhood without options: equity longs only — skip all bearish/put setups
+  if (cfg.broker === "robinhood" && !robinhood.optionsEnabled && isBearish) {
+    return { skipped: true, reason: `Robinhood: equity longs only (no options) — skipping bearish setup` };
   }
 
   if (isBearish && analysis.rsi > 30 && analysis.rsi < 55 && !analysis.bearish) {
@@ -3428,7 +3428,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     await delay(apiDelay());
   } catch { }
   if (earningsInfo.hasEarnings) {
-    return { skipped: true, reason: `Earnings in ${earningsInfo.daysUntil} days (${earningsInfo.date}) — too risky${cfg.broker === "robinhood" ? "" : " for 7DTE options"}` };
+    return { skipped: true, reason: `Earnings in ${earningsInfo.daysUntil} days (${earningsInfo.date}) — too risky${(cfg.broker === "robinhood" && !robinhood.optionsEnabled) ? "" : " for 7DTE options"}` };
   }
 
   const spot = quote.c;
@@ -3449,8 +3449,8 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     if (!claudeResult.approve) {
       return { skipped: true, reason: `Claude rejected (cached): ${claudeResult.suggestion}` };
     }
-    // Robinhood trades equities, not options — skip chain fetch
-    if (cfg.broker !== "robinhood") {
+    // Robinhood without options trades equities only — skip chain fetch
+    if (cfg.broker !== "robinhood" || robinhood.optionsEnabled) {
       try {
         let chain = getCachedChain(ticker);
         if (!chain) {
@@ -3464,8 +3464,8 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
       }
     }
   } else {
-    // Robinhood trades equities — skip options chain, use equity-focused Claude prompt
-    if (cfg.broker !== "robinhood") {
+    // Robinhood without options — skip options chain, use equity-focused Claude prompt
+    if (cfg.broker !== "robinhood" || robinhood.optionsEnabled) {
       // ─── Step 2: Fetch full options chain (with short-lived cache) ───
       try {
         let chain = getCachedChain(ticker);
@@ -3485,7 +3485,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
 
     // ─── Step 3: Claude validates setup AND selects best contract ───
     try {
-      claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, cfg.broker === "robinhood" ? null : candidates);
+      claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, (cfg.broker === "robinhood" && !robinhood.optionsEnabled) ? null : candidates);
       selectedCandidate = candidates.length > 0 ? candidates[claudeResult.contractIdx ?? 0] : null;
       // Stagger expirations: if Claude's pick lands on an over-concentrated expiry, prefer an
       // equally-valid candidate on a less-crowded expiration date.
@@ -3548,8 +3548,8 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   let unitName = "contract";
   let contractDowngraded = null; // set when an affordability swap moved us off Claude's described pick
 
-  if (cfg.broker === "robinhood") {
-    // Robinhood currently only supports equities via MCP, buy shares of the underlying
+  if (cfg.broker === "robinhood" && !robinhood.optionsEnabled) {
+    // Robinhood without options: buy shares of the underlying
     costPer = spot;
     type = "equity";
     unitName = "share";
@@ -3609,9 +3609,10 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     costPer = premium * 100;
   }
 
-  if (costPer > state.cash && cfg.broker !== "robinhood") return { skipped: true, reason: `No affordable ${unitName}: cheapest selected ${unitName} costs $${costPer.toFixed(0)} but spend limit is $${state.cash.toFixed(0)}` };
+  const isRhEquityOnly = cfg.broker === "robinhood" && !robinhood.optionsEnabled;
+  if (costPer > state.cash && !isRhEquityOnly) return { skipped: true, reason: `No affordable ${unitName}: cheapest selected ${unitName} costs $${costPer.toFixed(0)} but spend limit is $${state.cash.toFixed(0)}` };
 
-  if (deployable < costPer && cfg.broker !== "robinhood") {
+  if (deployable < costPer && !isRhEquityOnly) {
     return { skipped: true, reason: `Cash reserve: ${(reservePct * 100).toFixed(0)}% buffer required (trust ${(trust * 100).toFixed(0)}%) — only $${deployable.toFixed(0)} of $${state.cash.toFixed(0)} cash deployable, need $${costPer.toFixed(0)}/${unitName}` };
   }
 
@@ -3619,8 +3620,8 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   let qty = Math.max(1, Math.floor(budget / costPer));
   let totalCost = qty * costPer;
   
-  if (cfg.broker === "robinhood") {
-    // Robinhood supports fractional shares
+  if (isRhEquityOnly) {
+    // Robinhood supports fractional shares (equity-only mode)
     qty = parseFloat((budget / costPer).toFixed(4));
     totalCost = qty * costPer;
   } else {
@@ -3628,7 +3629,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   }
   
   if (qty <= 0) return { skipped: true, reason: `Insufficient deployable cash for ${unitName}` };
-  if (qty < 1 && cfg.broker !== "robinhood") return { skipped: true, reason: `Insufficient deployable cash for 1 ${unitName}${cfg.useCashReserve === false ? "" : ` (buffer ${(reservePct * 100).toFixed(0)}%)`}` };
+  if (qty < 1 && !isRhEquityOnly) return { skipped: true, reason: `Insufficient deployable cash for 1 ${unitName}${cfg.useCashReserve === false ? "" : ` (buffer ${(reservePct * 100).toFixed(0)}%)`}` };
 
   // Circuit Breaker: Max Trade Size
   if (totalCost > maxSize) {
@@ -3651,7 +3652,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   // As-ordered footer so the displayed thesis can never silently describe a different contract than
   // the one we actually traded. If the budget forced a downgrade off Claude's pick, say so plainly.
   const deltaStr = selectedCandidate?.delta != null ? `δ${Math.abs(selectedCandidate.delta).toFixed(2)}` : "δ?";
-  if (cfg.broker !== "robinhood" && selectedCandidate) {
+  if (!(isRhEquityOnly) && selectedCandidate) {
     if (contractDowngraded) {
       claudeReasoning += `\n\n⚠ As ordered (NOT Claude's described contract): $${strike} ${type.toUpperCase()} ${selectedCandidate.expiryStr} (${dte}d, ${deltaStr}) @ ~$${premium} mid. Claude described the $${contractDowngraded.from.strike} strike @ $${contractDowngraded.from.mid}, but it cost $${(contractDowngraded.from.mid * 100).toFixed(0)} vs a $${contractDowngraded.budget.toFixed(0)} budget, so the bot substituted this cheaper contract. Treat the strike/delta reasoning above as approximate.`;
     } else {
@@ -3691,36 +3692,97 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     if (!acct.config.autoExecute) {
       return { skipped: true, reason: `Robinhood: autoExecute off — entry for ${ticker} not sent (enable on the account)` };
     }
-    
-    // Seed metadata so the post-fill sync keeps entry context
-    if (!acct.state.meta) acct.state.meta = {};
-    acct.state.meta[ticker] = {
-      entryPremium: spot,
-      entrySpot: spot,
-      originalQty: qty,
-      openDate: getETDateStr(),
-      openTime: Date.now(),
-      trimLevel: 0,
-      bestPnlPct: 0,
-      entryAtrPct: analysis.atrPct ?? null,
-      ai: aiThesis || null,
-    };
-    
-    try {
-      const res = await robinhood.placeEquityOrder({ 
-        symbol: ticker, side: "buy", type: "limit", quantity: qty, limitPrice: spot, refId: require('crypto').randomUUID() 
-      });
-      
-      if (!acct._inflightTickers) acct._inflightTickers = new Set();
-      acct._inflightTickers.add(ticker.toUpperCase());
-      log(acct, `ROBINHOOD ENTRY: BUY ${qty}x ${ticker} @ $${spot.toFixed(2)} limit — order ${res?.id || "?"}`);
-      
-      acct.state.cash = Math.max(0, acct.state.cash - totalCost);
-      return { ticker, type: "equity", strike: 0, dte: 0, qty, entryPremium: spot, cost: totalCost, direction, optionsSource: "robinhood", setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence, brokerOrder: true };
-    } catch (e) {
-      delete acct.state.meta[ticker];
-      log(acct, `ROBINHOOD ENTRY FAILED ${ticker}: ${e.message}`);
-      return { skipped: true, reason: `Robinhood entry rejected: ${e.message}` };
+
+    if (robinhood.optionsEnabled && selectedCandidate) {
+      // ─── Robinhood OPTIONS entry ───
+      if (optionsSource === "synthetic" || !(premium > 0)) {
+        return { skipped: true, reason: `Robinhood: no real option market for ${ticker} (source ${optionsSource}) — refusing to trade on synthetic pricing` };
+      }
+
+      const expStr = selectedCandidate.expiryStr || new Date(expiryDate).toISOString().slice(0, 10);
+      const occ = robinhood.buildOCC(ticker, expStr, type, strike);
+
+      if (!acct.state.meta) acct.state.meta = {};
+      acct.state.meta[occ] = {
+        entryPremium: +premium.toFixed(2),
+        entrySpot: spot,
+        dte,
+        originalQty: qty,
+        openDate: getETDateStr(),
+        openTime: Date.now(),
+        trimLevel: 0,
+        bestPnlPct: 0,
+        entryAtrPct: analysis.atrPct ?? null,
+        setupQuality: effectiveQuality,
+        ai: aiThesis || null,
+      };
+
+      try {
+        const conviction = Math.max(0, Math.min(1, (claudeResult.confidence || 0) / 100));
+        const bid = selectedCandidate.bid, ask = selectedCandidate.ask;
+        const limit = entryLimitPrice(bid, ask, premium, conviction);
+        const aggrLabel = limit >= (ask || limit) ? "at ask" : limit > premium ? "toward ask" : "at mid";
+
+        const res = await robinhood.placeOptionOrder({
+          symbol: ticker,
+          expirationDate: expStr,
+          strikePrice: strike,
+          optionType: type,
+          side: "buy_to_open",
+          quantity: qty,
+          type: "limit",
+          limitPrice: limit.toFixed(2),
+        });
+
+        if (!acct._inflightTickers) acct._inflightTickers = new Set();
+        acct._inflightTickers.add(ticker.toUpperCase());
+        log(acct, `ROBINHOOD OPTION ENTRY: BUY ${qty}x ${occ} @ $${limit.toFixed(2)} (${aggrLabel}; conviction ${(conviction * 100).toFixed(0)}%; bid ${bid ?? "?"}/ask ${ask ?? "?"}/mid ${premium}) — order ${res?.id || JSON.stringify(res).slice(0, 80)}`);
+
+        acct.state.cash = Math.max(0, acct.state.cash - qty * limit * 100);
+
+        diag("entry", acct, {
+          ticker, type, strike, dte, qty, occ,
+          intendedLimit: +limit.toFixed(2), mid: +(+premium).toFixed(2), bid, ask,
+          conviction: Math.round((conviction || 0) * 100), setupQuality: effectiveQuality,
+        });
+
+        return { ticker, type, strike, dte, qty, entryPremium: +limit.toFixed(2), cost: qty * limit * 100, direction, optionsSource: "robinhood", setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence, brokerOrder: true };
+      } catch (e) {
+        delete acct.state.meta[occ];
+        log(acct, `ROBINHOOD OPTION ENTRY FAILED ${ticker}: ${e.message}`);
+        return { skipped: true, reason: `Robinhood option entry rejected: ${e.message}` };
+      }
+    } else {
+      // ─── Robinhood EQUITY fallback (no options support) ───
+      if (!acct.state.meta) acct.state.meta = {};
+      acct.state.meta[ticker] = {
+        entryPremium: spot,
+        entrySpot: spot,
+        originalQty: qty,
+        openDate: getETDateStr(),
+        openTime: Date.now(),
+        trimLevel: 0,
+        bestPnlPct: 0,
+        entryAtrPct: analysis.atrPct ?? null,
+        ai: aiThesis || null,
+      };
+
+      try {
+        const res = await robinhood.placeEquityOrder({
+          symbol: ticker, side: "buy", type: "limit", quantity: qty, limitPrice: spot, refId: crypto.randomUUID()
+        });
+
+        if (!acct._inflightTickers) acct._inflightTickers = new Set();
+        acct._inflightTickers.add(ticker.toUpperCase());
+        log(acct, `ROBINHOOD ENTRY: BUY ${qty}x ${ticker} @ $${spot.toFixed(2)} limit — order ${res?.id || "?"}`);
+
+        acct.state.cash = Math.max(0, acct.state.cash - totalCost);
+        return { ticker, type: "equity", strike: 0, dte: 0, qty, entryPremium: spot, cost: totalCost, direction, optionsSource: "robinhood", setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence, brokerOrder: true };
+      } catch (e) {
+        delete acct.state.meta[ticker];
+        log(acct, `ROBINHOOD ENTRY FAILED ${ticker}: ${e.message}`);
+        return { skipped: true, reason: `Robinhood entry rejected: ${e.message}` };
+      }
     }
   }
 
@@ -3889,18 +3951,67 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
         return null;
       }
       acct._inflightTickers.add(pos.ticker.toUpperCase());
-      
+
       const isTrimLocal = qty < pos.qty;
-      const refId = require('crypto').randomUUID();
-      const limitPrice = currentPremium; // spot price for equities
-      
-      robinhood.placeEquityOrder({ 
-        symbol: pos.ticker, side: "sell", type: "limit", quantity: qty, limitPrice, refId 
-      }).then(res => {
-        log(acct, `ROBINHOOD EXIT: SELL ${qty}x ${pos.ticker} @ $${limitPrice.toFixed(2)} limit (${isTrimLocal ? "TRIM" : "EXIT"} — ${reason}) — order ${res?.id || "?"}`);
-      }).catch(e => {
-        log(acct, `ROBINHOOD EXIT FAILED ${pos.ticker}: ${e.message}`);
-      });
+      const refId = crypto.randomUUID();
+
+      if (isEquity) {
+        // Equity exit
+        const limitPrice = currentPremium;
+        robinhood.placeEquityOrder({
+          symbol: pos.ticker, side: "sell", type: "limit", quantity: qty, limitPrice, refId
+        }).then(res => {
+          log(acct, `ROBINHOOD EXIT: SELL ${qty}x ${pos.ticker} @ $${limitPrice.toFixed(2)} limit (${isTrimLocal ? "TRIM" : "EXIT"} — ${reason}) — order ${res?.id || "?"}`);
+        }).catch(e => {
+          acct._inflightTickers.delete(pos.ticker.toUpperCase());
+          log(acct, `ROBINHOOD EXIT FAILED ${pos.ticker}: ${e.message}`);
+        });
+      } else if (robinhood.optionsEnabled) {
+        // Options exit — sell_to_close
+        const bid = typeof pos.liveBid === "number" && pos.liveBid > 0 ? pos.liveBid : null;
+        const ask = typeof pos.liveAsk === "number" && pos.liveAsk > 0 ? pos.liveAsk : null;
+        const mid = (bid != null && ask != null && ask >= bid) ? (bid + ask) / 2
+                  : (typeof pos.liveMark === "number" && pos.liveMark > 0 ? pos.liveMark : currentPremium);
+        const spreadPct = (bid != null && ask != null && mid > 0) ? (ask - bid) / mid : 0;
+        const protective = pnlPct <= 0 || /stop|critical|expir|reversed|breakeven|low-dte|theta/i.test(reason);
+        const urgent = /critical|expir|low-dte/i.test(reason);
+
+        let limit = +mid.toFixed(2);
+        if (protective) {
+          if (urgent && bid != null) {
+            limit = +bid.toFixed(2);
+          } else if (spreadPct <= WIDE_SPREAD_EXIT_PCT && bid != null) {
+            limit = +bid.toFixed(2);
+          } else if (mid > 0) {
+            const floor = bid != null ? bid : 0;
+            limit = +Math.max(floor, mid * (1 - MAX_EXIT_CONCESSION_PCT)).toFixed(2);
+          }
+        }
+
+        const expStr = pos.expiryDate ? new Date(pos.expiryDate).toISOString().slice(0, 10) : null;
+        if (expStr) {
+          robinhood.placeOptionOrder({
+            symbol: pos.ticker,
+            expirationDate: expStr,
+            strikePrice: pos.strike,
+            optionType: pos.type,
+            side: "sell_to_close",
+            quantity: qty,
+            type: "limit",
+            limitPrice: limit.toFixed(2),
+            refId,
+          }).then(res => {
+            const occ = robinhood.buildOCC(pos.ticker, expStr, pos.type, pos.strike);
+            log(acct, `ROBINHOOD OPTION EXIT: SELL ${qty}x ${occ} @ $${limit} (${isTrimLocal ? "TRIM" : "EXIT"} — ${reason}) — order ${res?.id || "?"}`);
+          }).catch(e => {
+            acct._inflightTickers.delete(pos.ticker.toUpperCase());
+            log(acct, `ROBINHOOD OPTION EXIT FAILED ${pos.ticker}: ${e.message}`);
+          });
+        } else {
+          acct._inflightTickers.delete(pos.ticker.toUpperCase());
+          log(acct, `ROBINHOOD OPTION EXIT SKIPPED ${pos.ticker}: no expiry date on position`);
+        }
+      }
       return null; // keep position until next sync
     }
   }
@@ -3948,7 +4059,7 @@ function tryExits(acct, quotes) {
 
   for (const pos of state.positions) {
     if (pos._pending) { remaining.push(pos); continue; } // unfilled broker order, not a holding
-    if (acct.config.broker === "tradier" && pos.liveMark == null) { remaining.push(pos); continue; } // no reliable mark — hold, don't act on synthetic price
+    if ((acct.config.broker === "tradier" || (acct.config.broker === "robinhood" && pos.type !== "equity")) && pos.liveMark == null) { remaining.push(pos); continue; } // no reliable mark — hold, don't act on synthetic price
     const q = quotes[pos.ticker];
     if (!q) { remaining.push(pos); continue; }
 
@@ -5723,6 +5834,7 @@ function robinhoodPageHTML({ spectator = false } = {}) {
         <span style="font-size:11px;color:${RH_REQUIRE_APPROVAL ? '#00a843' : '#b07400'};min-width:80px">${RH_REQUIRE_APPROVAL ? 'MANUAL' : 'AUTO'}</span>
       </div>
       <div class="rh-stat"><span class="label">Max Position</span><span class="value">$${RH_MAX_POSITION_DOLLARS}</span></div>
+      <div class="rh-stat"><span class="label">Options</span><span class="value" style="color:${robinhood.optionsEnabled ? '#00a843' : '#6b7280'}">${robinhood.optionsEnabled ? 'ENABLED' : 'Not Available'}</span></div>
       <div style="margin-top:12px">
         <button class="rh-btn danger" onclick="killSwitch()" style="width:100%">🛑 Cancel All Pending</button>
       </div>
@@ -7015,6 +7127,8 @@ function startDashboard(defaultAcct, apiKey) {
         connected: robinhood.isConnected,
         authenticated: robinhood.isAuthenticated,
         accountNumber: robinhood.accountNumber,
+        optionsEnabled: robinhood.optionsEnabled,
+        availableTools: robinhood.availableTools,
         requireApproval: RH_REQUIRE_APPROVAL,
         maxPositionDollars: RH_MAX_POSITION_DOLLARS,
         pendingOrders: robinhood.pendingOrders || [],
@@ -7456,9 +7570,21 @@ self.addEventListener('pushsubscriptionchange', e => {
 
     // ─── Robinhood: Get Options Chain ───
     if (pathname === "/api/rh-options") {
-      // MCP does not support options natively yet; return mock or empty.
-      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-      res.end(JSON.stringify({ error: "Options lookup not available via MCP" }));
+      if (!robinhood.optionsEnabled) {
+        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: "Options not enabled on Robinhood MCP" }));
+        return;
+      }
+      try {
+        const sym = url.searchParams.get("symbol");
+        if (!sym) { res.writeHead(400); res.end(JSON.stringify({ error: "symbol required" })); return; }
+        const optPositions = await robinhood.getOptionsPositions();
+        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ positions: optPositions, optionsEnabled: true }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
       return;
     }
 
@@ -8549,18 +8675,32 @@ async function syncRobinhoodAccount(acct, quotes) {
   } catch (e) { log(acct, `ROBINHOOD SYNC: balance error — ${e.message}`); }
 
   try {
-    const res = await robinhood.getPositions();
-    const raw = res && res.data && Array.isArray(res.data.positions) ? res.data.positions : (Array.isArray(res) ? res : []);
     const now = Date.now();
     const positions = [];
     const seen = new Set();
-    
-    // Also fetch confirmed orders to count working orders
+
+    // Fetch equity positions
+    const res = await robinhood.getPositions();
+    const raw = res && res.data && Array.isArray(res.data.positions) ? res.data.positions : (Array.isArray(res) ? res : []);
+
+    // Also fetch confirmed orders to count working orders (equity + options)
     const workingRes = await robinhood.getOrders({ state: 'confirmed' }).catch(() => []);
     const workingOrders = workingRes && workingRes.data && Array.isArray(workingRes.data.orders) ? workingRes.data.orders : (Array.isArray(workingRes) ? workingRes : []);
     acct._inflightTickers = new Set(workingOrders.map(o => o.symbol?.toUpperCase()).filter(Boolean));
-    
-    // Fetch quotes for positions if needed (we also use shared quotes, but this is a fallback)
+
+    // If options are enabled, also fetch options orders for inflight tracking
+    if (robinhood.optionsEnabled) {
+      try {
+        const optWorkingRes = await robinhood.getOptionsOrders({ state: 'confirmed' }).catch(() => []);
+        const optWorkingOrders = optWorkingRes && optWorkingRes.data && Array.isArray(optWorkingRes.data.orders) ? optWorkingRes.data.orders : (Array.isArray(optWorkingRes) ? optWorkingRes : []);
+        for (const o of optWorkingOrders) {
+          const sym = (o.chain_symbol || o.symbol || "").toUpperCase();
+          if (sym) acct._inflightTickers.add(sym);
+        }
+      } catch { }
+    }
+
+    // Fetch quotes for equity positions
     const positionSymbols = raw.map(p => p.symbol).filter(Boolean);
     const rhQuotes = positionSymbols.length > 0 ? await robinhood.getQuotes(positionSymbols).catch(() => ({})) : {};
 
@@ -8569,7 +8709,7 @@ async function syncRobinhoodAccount(acct, quotes) {
       if (!ticker) continue;
       const qty = parseFloat(p.quantity);
       if (qty <= 0) continue;
-      
+
       const costBasis = parseFloat(p.average_buy_price) || 0;
       const meta = state.meta[ticker] || {};
       const spot = quotes[ticker]?.c ?? rhQuotes[ticker]?.last_trade_price ?? meta.entrySpot ?? null;
@@ -8627,7 +8767,98 @@ async function syncRobinhoodAccount(acct, quotes) {
       positions.push(pos);
       seen.add(ticker);
     }
-    
+
+    // Sync options positions when enabled
+    if (robinhood.optionsEnabled) {
+      try {
+        const optRes = await robinhood.getOptionsPositions();
+        const optRaw = optRes && optRes.data && Array.isArray(optRes.data.positions) ? optRes.data.positions
+          : optRes && Array.isArray(optRes.positions) ? optRes.positions
+          : Array.isArray(optRes) ? optRes : [];
+
+        for (const op of optRaw) {
+          const qty = parseFloat(op.quantity || op.pending_buy_quantity || 0);
+          if (qty <= 0) continue;
+
+          const ticker = (op.chain_symbol || op.symbol || "").toUpperCase();
+          if (!ticker) continue;
+
+          const optType = (op.type || op.option_type || "call").toLowerCase();
+          const strike = parseFloat(op.strike_price || op.strike || 0);
+          const expDate = op.expiration_date || op.expiration || null;
+          const avgPrice = parseFloat(op.average_price || op.average_buy_price || 0);
+          const entryPremium = avgPrice > 1 ? avgPrice / 100 : avgPrice; // RH may return per-contract cost
+
+          const occ = expDate && strike ? robinhood.buildOCC(ticker, expDate, optType, strike) : `${ticker}_opt`;
+          const meta = state.meta[occ] || state.meta[ticker] || {};
+
+          const expMs = expDate ? new Date(expDate).getTime() : 0;
+          const dteRemaining = expMs > 0 ? Math.max(0, Math.ceil((expMs - now) / 86400000)) : 0;
+
+          const mark = parseFloat(op.mark_price || op.adjusted_mark_price || 0) || null;
+          const bid = parseFloat(op.bid_price || 0) || null;
+          const ask = parseFloat(op.ask_price || 0) || null;
+
+          const pos = {
+            ...(meta.ai || {}),
+            ticker,
+            type: optType,
+            strike,
+            dte: meta.dte ?? dteRemaining,
+            dteRemaining,
+            expiryDate: expMs || meta.expiryDate || 0,
+            occSymbol: occ,
+            entryPremium: meta.entryPremium ?? entryPremium,
+            entrySpot: meta.entrySpot ?? (quotes[ticker]?.c ?? null),
+            qty,
+            originalQty: meta.originalQty ?? qty,
+            cost: Math.abs(entryPremium * qty * 100),
+            openDate: meta.openDate ?? getETDateStr(),
+            openTime: meta.openTime ?? now,
+            trimLevel: meta.trimLevel ?? 0,
+            bestPnlPct: meta.bestPnlPct ?? 0,
+            entryAtrPct: meta.entryAtrPct ?? null,
+            iv: parseFloat(op.implied_volatility || 0) || null,
+            liveMark: mark,
+            liveBid: bid,
+            liveAsk: ask,
+            liveGreeks: op.greeks || null,
+            optionsSource: "robinhood",
+            direction: optType === "call" ? "BULLISH" : "BEARISH",
+          };
+
+          if (pos.liveMark != null && pos.entryPremium > 0) {
+            const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
+            if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
+          }
+
+          let aiData = meta.ai || null;
+          if (!aiData) {
+            const curAnalysis = acct.dashboard?.analyses?.[ticker];
+            if (curAnalysis) {
+              aiData = {
+                claudeReasoning: `Options position synced from Robinhood. ${optType.toUpperCase()} $${strike} exp ${expDate || "?"}.`,
+                claudeSuggestion: "",
+                claudeConcerns: [],
+                setupQuality: meta.setupQuality ?? curAnalysis.score ?? null,
+                technicalScore: curAnalysis.score ?? null,
+                direction: pos.direction,
+                regimeAtEntry: acct.currentRegime?.label ?? "unknown",
+                topSignals: (curAnalysis.sigs || []).slice(0, 5).map(s => s.text),
+              };
+            }
+          }
+          if (aiData) Object.assign(pos, aiData);
+
+          positions.push(pos);
+          seen.add(ticker);
+          seen.add(occ);
+        }
+      } catch (e) {
+        log(acct, `ROBINHOOD SYNC: options positions error — ${e.message}`);
+      }
+    }
+
     // Prune stale meta
     for (const k of Object.keys(state.meta)) {
       if (!seen.has(k)) delete state.meta[k];
@@ -9354,14 +9585,15 @@ async function main() {
   // Initialize Robinhood Agentic Trading (per-account broker, same as Tradier)
   const rhOk = await robinhood.init();
   if (rhOk) {
-    console.log(`  Robinhood: CONNECTED ✓ (agentic account: ${robinhood.accountNumber})`);
+    const optLabel = robinhood.optionsEnabled ? "equity + options" : "equity only";
+    console.log(`  Robinhood: CONNECTED ✓ (agentic account: ${robinhood.accountNumber}, ${optLabel})`);
   } else {
     console.log("  Robinhood: MCP not connected — account will run in paper mode until token is set");
   }
   // Always provision the account so it appears in the dashboard
   await ensureRobinhoodAccount();
   if (rhOk) {
-    console.log(`  Robinhood: LIVE broker account ready (max: $${RH_MAX_POSITION_DOLLARS}/position)`);
+    console.log(`  Robinhood: LIVE broker account ready (max: $${RH_MAX_POSITION_DOLLARS}/position)${robinhood.optionsEnabled ? " — OPTIONS TRADING ENABLED" : ""}`);
   }
 
   // Initialize Tradier data + execution arm (primary market-data feed when connected)
