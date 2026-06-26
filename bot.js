@@ -648,6 +648,10 @@ const MAX_ENTRY_SPREAD_PCT = 0.30;
 const WIDE_SPREAD_EXIT_PCT = 0.20;
 // Most we'll concede below mid when working a protective exit through a wide spread.
 const MAX_EXIT_CONCESSION_PCT = 0.12;
+// Hard cap on overpay: never submit a limit more than this fraction above the mid.
+const MAX_ENTRY_OVERPAY_PCT = 0.15;
+// Reject contracts whose IV exceeds this — premium is inflated by event risk, not directional value.
+const MAX_ENTRY_IV = 1.50;
 // In choppy regimes (broken EMA stack), demand stronger confirmation before new risk.
 const CHOPPY_MIN_BULL_SCORE = 72;
 const CHOPPY_MIN_BEAR_SCORE = 28; // must be <= this for puts (stricter than default bearEntry)
@@ -2514,6 +2518,9 @@ function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 12) {
       const iv = c.impliedVolatility > 0 ? c.impliedVolatility : null;
       const delta = c.delta != null ? c.delta : null;
 
+      // Reject IV-spiked contracts — premium is inflated by event risk, not the directional thesis.
+      if (iv != null && iv > MAX_ENTRY_IV) continue;
+
       // Reject lottery tickets: require real directional exposure (δ ≥ MIN_OPTION_DELTA). When greeks
       // are unavailable we already constrained moneyness to near-the-money above, so it can't be junk.
       if (delta != null && Math.abs(delta) < MIN_OPTION_DELTA) continue;
@@ -2633,14 +2640,15 @@ function reliableOptionMark(oq) {
 
 // Entry limit price for a live options buy, trading like a disciplined human: when conviction is
 // high, lean toward the ask (even crossing to it) to actually
-// get filled; when conviction is low, sit patiently at the mid. Never pays
-// through the offer. conviction is 0..1; falls back to mid if we lack a real two-sided market.
+// get filled; when conviction is low, sit patiently at the mid. Hard-capped
+// at MAX_ENTRY_OVERPAY_PCT above mid so a wide market never drags us into an absurd fill.
 function entryLimitPrice(bid, ask, mid, conviction) {
   const m = +(+mid).toFixed(2);
   if (!(bid > 0) || !(ask > 0) || ask < bid) return m;
   let aggr = Math.max(0, Math.min(1, conviction));
   const px = mid + aggr * (ask - mid);
-  return +Math.min(ask, Math.max(bid, px)).toFixed(2);
+  const ceiling = +(mid * (1 + MAX_ENTRY_OVERPAY_PCT)).toFixed(2);
+  return +Math.min(ceiling, Math.min(ask, Math.max(bid, px))).toFixed(2);
 }
 
 
@@ -3434,7 +3442,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   const spot = quote.c;
   const maxRisk = state.cash * acct.riskPct;
   const direction = isBullish ? "BULLISH" : "BEARISH";
-  const type = isBullish ? "call" : "put";
+  let type = isBullish ? "call" : "put";
 
   // ─── Step 1: Check validation cache (skips both chain fetch AND Claude call) ───
   let claudeResult = { approve: true, confidence: 70, concerns: [], reasoning: "", suggestion: "", contractIdx: 0 };
@@ -3720,6 +3728,16 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
       try {
         const conviction = Math.max(0, Math.min(1, (claudeResult.confidence || 0) / 100));
         const bid = selectedCandidate.bid, ask = selectedCandidate.ask;
+
+        // Hard stop: reject if spread at order time is too wide
+        if (bid > 0 && ask > 0 && premium > 0) {
+          const liveSpreadPct = (ask - bid) / premium;
+          if (liveSpreadPct > MAX_ENTRY_SPREAD_PCT) {
+            delete acct.state.meta[occ];
+            return { skipped: true, reason: `Robinhood: spread ${(liveSpreadPct * 100).toFixed(0)}% at order time exceeds ${(MAX_ENTRY_SPREAD_PCT * 100).toFixed(0)}% cap — refusing entry on ${ticker}` };
+          }
+        }
+
         const limit = entryLimitPrice(bid, ask, premium, conviction);
         const aggrLabel = limit >= (ask || limit) ? "at ask" : limit > premium ? "toward ask" : "at mid";
 
@@ -3754,9 +3772,15 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
       }
     } else {
       // ─── Robinhood EQUITY fallback (no options support) ───
+      // Use bid/ask from quote if available; cap limit at MAX_ENTRY_OVERPAY_PCT above mid
+      const eqBid = quote.bid ?? null;
+      const eqAsk = quote.ask ?? null;
+      const eqMid = (eqBid > 0 && eqAsk > 0) ? (eqBid + eqAsk) / 2 : spot;
+      const eqLimit = +(Math.min(eqAsk || spot, eqMid * (1 + MAX_ENTRY_OVERPAY_PCT))).toFixed(2);
+
       if (!acct.state.meta) acct.state.meta = {};
       acct.state.meta[ticker] = {
-        entryPremium: spot,
+        entryPremium: eqLimit,
         entrySpot: spot,
         originalQty: qty,
         openDate: getETDateStr(),
@@ -3769,15 +3793,15 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
 
       try {
         const res = await robinhood.placeEquityOrder({
-          symbol: ticker, side: "buy", type: "limit", quantity: qty, limitPrice: spot, refId: crypto.randomUUID()
+          symbol: ticker, side: "buy", type: "limit", quantity: qty, limitPrice: eqLimit, refId: crypto.randomUUID()
         });
 
         if (!acct._inflightTickers) acct._inflightTickers = new Set();
         acct._inflightTickers.add(ticker.toUpperCase());
-        log(acct, `ROBINHOOD ENTRY: BUY ${qty}x ${ticker} @ $${spot.toFixed(2)} limit — order ${res?.id || "?"}`);
+        log(acct, `ROBINHOOD ENTRY: BUY ${qty}x ${ticker} @ $${eqLimit.toFixed(2)} limit — order ${res?.id || "?"}`);
 
         acct.state.cash = Math.max(0, acct.state.cash - totalCost);
-        return { ticker, type: "equity", strike: 0, dte: 0, qty, entryPremium: spot, cost: totalCost, direction, optionsSource: "robinhood", setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence, brokerOrder: true };
+        return { ticker, type: "equity", strike: 0, dte: 0, qty, entryPremium: eqLimit, cost: totalCost, direction, optionsSource: "robinhood", setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence, brokerOrder: true };
       } catch (e) {
         delete acct.state.meta[ticker];
         log(acct, `ROBINHOOD ENTRY FAILED ${ticker}: ${e.message}`);
@@ -7192,11 +7216,13 @@ function startDashboard(defaultAcct, apiKey) {
       req.on("end", async () => {
         const params = new URLSearchParams(body);
         const token = params.get("token");
+        const refresh = params.get("refresh_token") || null;
         if (token) {
-          robinhood.setToken(token);
+          robinhood.setToken(token, refresh);
           const connected = await robinhood.init();
+          const optLabel = robinhood.optionsEnabled ? " (options enabled)" : " (equity only)";
           res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-          res.end(JSON.stringify({ connected, message: connected ? "Robinhood connected!" : "Token saved but MCP init failed" }));
+          res.end(JSON.stringify({ connected, optionsEnabled: robinhood.optionsEnabled, message: connected ? `Robinhood connected!${optLabel}` : "Token saved but MCP init failed — check token validity" }));
         } else {
           res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
           res.end(JSON.stringify({ error: "No token provided" }));
@@ -8206,8 +8232,17 @@ async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, dte, q
   };
 
   try {
+    // Hard stop: reject if the spread at order time is too wide to get a fair fill
+    if (bid > 0 && ask > 0 && premium > 0) {
+      const liveSpreadPct = (ask - bid) / premium;
+      if (liveSpreadPct > MAX_ENTRY_SPREAD_PCT) {
+        delete acct.state.meta[occ];
+        return { skipped: true, reason: `Tradier: spread ${(liveSpreadPct * 100).toFixed(0)}% at order time exceeds ${(MAX_ENTRY_SPREAD_PCT * 100).toFixed(0)}% cap — refusing entry on ${ticker}` };
+      }
+    }
+
     // Conviction-aware fill: high conviction → price toward the ask to fill;
-    // otherwise sit at the mid. Falls back to mid when we don't have a real bid/ask.
+    // otherwise sit at the mid. Hard-capped at MAX_ENTRY_OVERPAY_PCT above mid.
     const conviction = Math.max(0, Math.min(1, (claudeConfidence || 0) / 100));
     const limit = entryLimitPrice(bid, ask, premium, conviction);
     const aggrLabel = limit >= (ask || limit) ? "at ask" : limit > premium ? "toward ask" : "at mid";
@@ -9651,6 +9686,15 @@ async function main() {
     // Copy shared candles into each account's cache
     for (const [, acct] of accounts) {
       Object.assign(acct.candleCache, sharedCandleCache);
+    }
+    // Auto-reconnect Robinhood if token exists but session dropped
+    if (robinhood.isAuthenticated && !robinhood.isConnected) {
+      console.log("  [RH] Token present but MCP disconnected — attempting reconnect...");
+      try { await robinhood.init(); } catch (e) { console.log(`  [RH] Reconnect failed: ${e.message}`); }
+      if (robinhood.isConnected) {
+        console.log(`  [RH] Reconnected ✓${robinhood.optionsEnabled ? " (options enabled)" : ""}`);
+        await ensureRobinhoodAccount();
+      }
     }
     // Force broker sync immediately so positions are never stale after a deploy
     for (const [, acct] of accounts) {
