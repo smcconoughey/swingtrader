@@ -8366,7 +8366,11 @@ async function ensureRobinhoodAccount() {
       const port = portRes && portRes.data ? portRes.data : portRes;
       if (port) {
         const bp = port.buying_power?.buying_power || port.buying_power || port.cash;
-        if (typeof bp === "string") seedCash = parseFloat(bp);
+        const bpNum = typeof bp === "string" ? parseFloat(bp) : (typeof bp === "number" ? bp : NaN);
+        if (!isNaN(bpNum) && bpNum >= 0) seedCash = bpNum;
+        const eq = port.equity_value || port.total_value;
+        const eqNum = typeof eq === "string" ? parseFloat(eq) : (typeof eq === "number" ? eq : NaN);
+        if (!isNaN(eqNum) && eqNum >= 0) seedCash = eqNum;
       }
     } catch (e) {
       console.log(`  Robinhood: balance fetch failed during provision — ${e.message}`);
@@ -8378,9 +8382,12 @@ async function ensureRobinhoodAccount() {
     acct.config.broker = "robinhood";
     if (acct.config.autoExecute === undefined) acct.config.autoExecute = true;
 
-    
-    if (typeof seedCash === "number") acct.state.cash = seedCash;
-    console.log(`  Robinhood: live account present — cash $${acct.state.cash.toFixed(2)}`);
+    if (typeof seedCash === "number") {
+      acct.state.cash = seedCash;
+      if (typeof acct.state.brokerEquity !== "number" || acct.state.brokerEquity <= 0) acct.state.brokerEquity = seedCash;
+      if (acct.state.positions.length === 0 && acct.state.history.length === 0) acct.config.startingCash = seedCash;
+    }
+    console.log(`  Robinhood: live account present — cash $${acct.state.cash.toFixed(2)} (starting $${acct.config.startingCash})`);
     return;
   }
 
