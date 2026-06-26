@@ -8959,9 +8959,11 @@ async function syncRobinhoodAccount(acct, quotes) {
     const port = res && res.data ? res.data : res;
     if (port) {
       const eq = port.equity_value || port.total_value;
-      if (typeof eq === "string") state.brokerEquity = parseFloat(eq);
+      const eqNum = typeof eq === "string" ? parseFloat(eq) : (typeof eq === "number" ? eq : NaN);
+      if (!isNaN(eqNum) && eqNum >= 0) state.brokerEquity = eqNum;
       const bp = port.buying_power?.buying_power || port.buying_power || port.cash;
-      if (typeof bp === "string") state.cash = parseFloat(bp);
+      const bpNum = typeof bp === "string" ? parseFloat(bp) : (typeof bp === "number" ? bp : NaN);
+      if (!isNaN(bpNum) && bpNum >= 0) state.cash = bpNum;
     }
   } catch (e) { log(acct, `ROBINHOOD SYNC: balance error — ${e.message}`); }
 
