@@ -714,6 +714,81 @@ let LLM_PROVIDER = (process.env.LLM_PROVIDER || "claude").toLowerCase();
 // Default false — full autonomous execution. Set RH_REQUIRE_APPROVAL=true in env to require manual approval.
 let RH_REQUIRE_APPROVAL = process.env.RH_REQUIRE_APPROVAL === "true";
 
+// RH_OPTIONS_ONLY: when true (default), Robinhood trades options only — no equity share fallback.
+// Set RH_OPTIONS_ONLY=false to allow equity fallback when options chain is unavailable.
+let RH_OPTIONS_ONLY = process.env.RH_OPTIONS_ONLY !== "false";
+
+// RH_AUTO_WATCHLIST: auto-add serious entry candidates to the Robinhood MCP watchlist.
+let RH_AUTO_WATCHLIST = process.env.RH_AUTO_WATCHLIST !== "false";
+let RH_WATCHLIST_NAME = process.env.RH_WATCHLIST_NAME || "Swing Trader";
+const rhWatchlistAdded = new Set();
+
+/** Robinhood broker trade mode: "none" | "equity" | "options" | "both" */
+function rhTradeMode(cfg) {
+  if (cfg.broker !== "robinhood") return "none";
+  if (robinhood.optionsEnabled && RH_OPTIONS_ONLY) return "options";
+  if (robinhood.optionsEnabled) return "both";
+  return "equity";
+}
+
+function rhUsesOptionsForEntry(cfg) {
+  const mode = rhTradeMode(cfg);
+  return mode === "options" || mode === "both";
+}
+
+function rhUsesEquityForEntry(cfg) {
+  const mode = rhTradeMode(cfg);
+  return mode === "equity" || mode === "both";
+}
+
+async function ensureRhWatchlist() {
+  if (!robinhood.isConnected || !robinhood.availableTools.includes("create_watchlist")) return;
+  try {
+    await robinhood.createWatchlist(RH_WATCHLIST_NAME, "Swing trader serious candidates");
+    console.log(`  [RH-WL] Created watchlist "${RH_WATCHLIST_NAME}"`);
+  } catch {
+    // Already exists or tool unavailable — fine
+  }
+}
+
+async function addRhWatchlistCandidate({ ticker, optionType, candidate, source = "consideration" }) {
+  if (!robinhood.isConnected || !RH_AUTO_WATCHLIST) return;
+  const sym = (ticker || "").toUpperCase();
+  if (!sym) return;
+
+  const equityKey = `E:${sym}`;
+  if (!rhWatchlistAdded.has(equityKey)) {
+    try {
+      await robinhood.addToWatchlist(sym, RH_WATCHLIST_NAME);
+      rhWatchlistAdded.add(equityKey);
+      console.log(`  [RH-WL] Added ${sym} to "${RH_WATCHLIST_NAME}" (${source})`);
+    } catch (e) {
+      console.log(`  [RH-WL] Equity watchlist add failed ${sym}: ${e.message}`);
+    }
+  }
+
+  if (candidate && robinhood.optionsEnabled) {
+    const exp = candidate.expiryStr || (candidate.expiryDate ? new Date(candidate.expiryDate).toISOString().slice(0, 10) : null);
+    if (!exp) return;
+    const occKey = `O:${sym}:${exp}:${candidate.strike}:${optionType}`;
+    if (rhWatchlistAdded.has(occKey)) return;
+    try {
+      await robinhood.addOptionToWatchlist({
+        symbol: sym,
+        expirationDate: exp,
+        strikePrice: candidate.strike,
+        optionType,
+        watchlist: RH_WATCHLIST_NAME,
+      });
+      rhWatchlistAdded.add(occKey);
+      console.log(`  [RH-WL] Added ${sym} $${candidate.strike} ${optionType} ${exp} to "${RH_WATCHLIST_NAME}" (${source})`);
+    } catch (e) {
+      console.log(`  [RH-WL] Option watchlist add failed ${sym}: ${e.message}`);
+    }
+  }
+}
+
+
 // RH_MAX_POSITION_DOLLARS: Maximum dollar amount per Robinhood equity position (safety limit)
 const RH_MAX_POSITION_DOLLARS = parseInt(process.env.RH_MAX_POSITION_DOLLARS) || 500;
 
@@ -3203,7 +3278,7 @@ Rules:
 
 async function validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, candidates) {
   const cfg = acct.config;
-  const isEquity = cfg.broker === "robinhood" && !robinhood.optionsEnabled;
+  const isEquity = cfg.broker === "robinhood" && rhTradeMode(cfg) === "equity";
   const direction = analysis.score >= cfg.bullEntry
     ? (isEquity ? 'BULLISH (buying shares)' : 'BULLISH (buying calls)')
     : (isEquity ? 'BEARISH' : 'BEARISH (buying puts)');
@@ -3401,8 +3476,8 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} parabolic with misaligned EMAs — exhaustion risk, not a healthy strength setup` };
   }
   // Robinhood without options: equity longs only — skip all bearish/put setups
-  if (cfg.broker === "robinhood" && !robinhood.optionsEnabled && isBearish) {
-    return { skipped: true, reason: `Robinhood: equity longs only (no options) — skipping bearish setup` };
+  if (cfg.broker === "robinhood" && rhTradeMode(cfg) === "equity" && isBearish) {
+    return { skipped: true, reason: `Robinhood: equity longs only — skipping bearish setup` };
   }
 
   if (isBearish && analysis.rsi > 30 && analysis.rsi < 55 && !analysis.bearish) {
@@ -3436,7 +3511,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     await delay(apiDelay());
   } catch { }
   if (earningsInfo.hasEarnings) {
-    return { skipped: true, reason: `Earnings in ${earningsInfo.daysUntil} days (${earningsInfo.date}) — too risky${(cfg.broker === "robinhood" && !robinhood.optionsEnabled) ? "" : " for 7DTE options"}` };
+    return { skipped: true, reason: `Earnings in ${earningsInfo.daysUntil} days (${earningsInfo.date}) — too risky${rhTradeMode(cfg) === "equity" ? "" : " for 7DTE options"}` };
   }
 
   const spot = quote.c;
@@ -3458,7 +3533,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
       return { skipped: true, reason: `Claude rejected (cached): ${claudeResult.suggestion}` };
     }
     // Robinhood without options trades equities only — skip chain fetch
-    if (cfg.broker !== "robinhood" || robinhood.optionsEnabled) {
+    if (cfg.broker !== "robinhood" || rhUsesOptionsForEntry(cfg)) {
       try {
         let chain = getCachedChain(ticker);
         if (!chain) {
@@ -3473,7 +3548,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     }
   } else {
     // Robinhood without options — skip options chain, use equity-focused Claude prompt
-    if (cfg.broker !== "robinhood" || robinhood.optionsEnabled) {
+    if (cfg.broker !== "robinhood" || rhUsesOptionsForEntry(cfg)) {
       // ─── Step 2: Fetch full options chain (with short-lived cache) ───
       try {
         let chain = getCachedChain(ticker);
@@ -3493,7 +3568,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
 
     // ─── Step 3: Claude validates setup AND selects best contract ───
     try {
-      claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, (cfg.broker === "robinhood" && !robinhood.optionsEnabled) ? null : candidates);
+      claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, rhUsesOptionsForEntry(cfg) ? candidates : null);
       selectedCandidate = candidates.length > 0 ? candidates[claudeResult.contractIdx ?? 0] : null;
       // Stagger expirations: if Claude's pick lands on an over-concentrated expiry, prefer an
       // equally-valid candidate on a less-crowded expiration date.
@@ -3556,7 +3631,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   let unitName = "contract";
   let contractDowngraded = null; // set when an affordability swap moved us off Claude's described pick
 
-  if (cfg.broker === "robinhood" && !robinhood.optionsEnabled) {
+  if (cfg.broker === "robinhood" && rhTradeMode(cfg) === "equity") {
     // Robinhood without options: buy shares of the underlying
     costPer = spot;
     type = "equity";
@@ -3617,7 +3692,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     costPer = premium * 100;
   }
 
-  const isRhEquityOnly = cfg.broker === "robinhood" && !robinhood.optionsEnabled;
+  const isRhEquityOnly = cfg.broker === "robinhood" && rhTradeMode(cfg) === "equity";
   if (costPer > state.cash && !isRhEquityOnly) return { skipped: true, reason: `No affordable ${unitName}: cheapest selected ${unitName} costs $${costPer.toFixed(0)} but spend limit is $${state.cash.toFixed(0)}` };
 
   if (deployable < costPer && !isRhEquityOnly) {
@@ -3682,6 +3757,11 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     orderedContract: selectedCandidate ? { strike, type, expiryStr: selectedCandidate.expiryStr, dte, midAtEntry: premium, delta: selectedCandidate.delta ?? null } : null,
   };
 
+  // Serious consideration: Claude approved — mirror to Robinhood watchlist without blocking orders.
+  if (cfg.broker === "robinhood" && claudeResult.approve) {
+    addRhWatchlistCandidate({ ticker, optionType: type, candidate: selectedCandidate, source: "consideration" }).catch(() => {});
+  }
+
   // ─── Broker accounts: place a REAL buy_to_open and let the next sync reconcile state ───
   // Broker is the source of truth, so we do NOT push a synthetic position or mutate cash here.
   if (cfg.broker === "tradier") {
@@ -3701,7 +3781,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
       return { skipped: true, reason: `Robinhood: autoExecute off — entry for ${ticker} not sent (enable on the account)` };
     }
 
-    if (robinhood.optionsEnabled && selectedCandidate) {
+    if (rhUsesOptionsForEntry(cfg) && selectedCandidate) {
       // ─── Robinhood OPTIONS entry ───
       if (optionsSource === "synthetic" || !(premium > 0)) {
         return { skipped: true, reason: `Robinhood: no real option market for ${ticker} (source ${optionsSource}) — refusing to trade on synthetic pricing` };
@@ -3764,14 +3844,14 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
           conviction: Math.round((conviction || 0) * 100), setupQuality: effectiveQuality,
         });
 
-        return { ticker, type, strike, dte, qty, entryPremium: +limit.toFixed(2), cost: qty * limit * 100, direction, optionsSource: "robinhood", setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence, brokerOrder: true };
+        return { ticker, type, strike, dte, qty, entryPremium: +limit.toFixed(2), cost: qty * limit * 100, direction, optionsSource: "robinhood", setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence, brokerOrder: true, watchlistCandidate: selectedCandidate };
       } catch (e) {
         delete acct.state.meta[occ];
         log(acct, `ROBINHOOD OPTION ENTRY FAILED ${ticker}: ${e.message}`);
-        return { skipped: true, reason: `Robinhood option entry rejected: ${e.message}` };
+        return { skipped: true, reason: `Robinhood option entry rejected: ${e.message}`, watchlistCandidate: selectedCandidate, watchlistType: type };
       }
-    } else {
-      // ─── Robinhood EQUITY fallback (no options support) ───
+    } else if (rhUsesEquityForEntry(cfg)) {
+      // ─── Robinhood EQUITY entry (legacy / dual mode only) ───
       // Use bid/ask from quote if available; cap limit at MAX_ENTRY_OVERPAY_PCT above mid
       const eqBid = quote.bid ?? null;
       const eqAsk = quote.ask ?? null;
@@ -3805,8 +3885,10 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
       } catch (e) {
         delete acct.state.meta[ticker];
         log(acct, `ROBINHOOD ENTRY FAILED ${ticker}: ${e.message}`);
-        return { skipped: true, reason: `Robinhood entry rejected: ${e.message}` };
+        return { skipped: true, reason: `Robinhood entry rejected: ${e.message}`, watchlistCandidate: selectedCandidate, watchlistType: type };
       }
+    } else {
+      return { skipped: true, reason: `Robinhood options-only: no viable ${type} contract for ${ticker}`, watchlistCandidate: selectedCandidate, watchlistType: type };
     }
   }
 
@@ -5832,6 +5914,27 @@ function robinhoodPageHTML({ spectator = false } = {}) {
       <div id="options-results" class="rh-empty">Enter a ticker above to fetch the options chain from Robinhood</div>
     </div>
 
+    <!-- Robinhood Watchlist -->
+    <div class="rh-card">
+      <h2>👁 Watchlist <span style="color:#6b7280;font-weight:400;font-size:11px">(${RH_WATCHLIST_NAME})</span></h2>
+      ${spectator ? `<div class="rh-empty" style="margin-bottom:8px">Spectator mode: read-only</div>` : `
+      <div style="display:flex;gap:8px;margin-bottom:10px">
+        <input type="text" class="rh-input" id="wl-symbol" placeholder="Ticker (e.g. NVDA)" style="text-transform:uppercase">
+        <button class="rh-btn primary" onclick="addWatchlistSymbol()">Add</button>
+      </div>
+      <details style="margin-bottom:10px">
+        <summary style="color:#6b7280;font-size:11px;cursor:pointer">Add specific option contract</summary>
+        <div style="margin-top:8px;display:grid;grid-template-columns:1fr 1fr;gap:8px">
+          <input type="text" class="rh-input" id="wl-opt-symbol" placeholder="Underlying" style="text-transform:uppercase">
+          <input type="text" class="rh-input" id="wl-opt-exp" placeholder="YYYY-MM-DD">
+          <input type="number" class="rh-input" id="wl-opt-strike" placeholder="Strike" step="0.5">
+          <select class="rh-input" id="wl-opt-type"><option value="call">Call</option><option value="put">Put</option></select>
+        </div>
+        <button class="rh-btn primary" style="margin-top:8px;width:100%" onclick="addWatchlistOption()">Add Option</button>
+      </details>`}
+      <div id="watchlist-data" class="rh-loading">Loading watchlist...</div>
+    </div>
+
     <!-- Pending Orders -->
     <div class="rh-card">
       <h2>⏳ Pending Orders <span style="color:#6b7280;font-weight:400;font-size:11px">(${pending.length})</span></h2>
@@ -5864,8 +5967,19 @@ function robinhoodPageHTML({ spectator = false } = {}) {
         <div class="switch ${RH_REQUIRE_APPROVAL ? 'on' : ''}" onclick="toggleApproval()" title="${RH_REQUIRE_APPROVAL ? 'Manual approval ON' : 'Auto-execution ON'}"></div>
         <span style="font-size:11px;color:${RH_REQUIRE_APPROVAL ? '#00a843' : '#b07400'};min-width:80px">${RH_REQUIRE_APPROVAL ? 'MANUAL' : 'AUTO'}</span>
       </div>
+      <div class="rh-toggle">
+        <label>Options Only</label>
+        <div class="switch ${RH_OPTIONS_ONLY ? 'on' : ''}" onclick="toggleOptionsOnly()" title="${RH_OPTIONS_ONLY ? 'Options only — no equity fallback' : 'Allow equity fallback'}"></div>
+        <span style="font-size:11px;color:${RH_OPTIONS_ONLY ? '#00a843' : '#6b7280'};min-width:80px">${RH_OPTIONS_ONLY ? 'OPTIONS' : 'DUAL'}</span>
+      </div>
+      <div class="rh-toggle">
+        <label>Auto Watchlist</label>
+        <div class="switch ${RH_AUTO_WATCHLIST ? 'on' : ''}" onclick="toggleAutoWatchlist()" title="${RH_AUTO_WATCHLIST ? 'Serious candidates auto-added' : 'Manual watchlist only'}"></div>
+        <span style="font-size:11px;color:${RH_AUTO_WATCHLIST ? '#00a843' : '#6b7280'};min-width:80px">${RH_AUTO_WATCHLIST ? 'AUTO' : 'OFF'}</span>
+      </div>
+      <div class="rh-stat"><span class="label">Trade Mode</span><span class="value" style="color:${robinhood.optionsEnabled ? '#00a843' : '#6b7280'}">${robinhood.optionsEnabled ? (RH_OPTIONS_ONLY ? 'Options only' : 'Options + equity fallback') : 'Equity only (no MCP options)'}</span></div>
+      <div class="rh-stat"><span class="label">Watchlist</span><span class="value" style="font-size:11px">${RH_WATCHLIST_NAME}</span></div>
       <div class="rh-stat"><span class="label">Max Position</span><span class="value">$${RH_MAX_POSITION_DOLLARS}</span></div>
-      <div class="rh-stat"><span class="label">Options</span><span class="value" style="color:${robinhood.optionsEnabled ? '#00a843' : '#6b7280'}">${robinhood.optionsEnabled ? 'ENABLED' : 'Not Available'}</span></div>
       <div style="margin-top:12px">
         <button class="rh-btn danger" onclick="killSwitch()" style="width:100%">🛑 Cancel All Pending</button>
       </div>
@@ -5888,6 +6002,7 @@ function initApp() {
   loadAccount();
   loadPositions();
   loadOrders();
+  loadWatchlist();
 }
 
 async function loadAccount() {
@@ -6013,6 +6128,60 @@ async function toggleApproval() {
   location.reload();
 }
 
+async function toggleOptionsOnly() {
+  await fetch('/api/rh-options-only', { method: 'POST' });
+  location.reload();
+}
+
+async function toggleAutoWatchlist() {
+  await fetch('/api/rh-auto-watchlist', { method: 'POST' });
+  location.reload();
+}
+
+async function loadWatchlist() {
+  const el = document.getElementById('watchlist-data');
+  if (!el) return;
+  try {
+    const r = await fetch('/api/rh-watchlist');
+    const d = await r.json();
+    if (d.error) { el.innerHTML = '<div class="rh-empty">'+d.error+'</div>'; return; }
+    const items = d.items || [];
+    if (!items.length) { el.innerHTML = '<div class="rh-empty">No items in "'+(d.watchlist||'?')+'"</div>'; return; }
+    let html = '<table class="rh-table"><tr><th>Symbol</th><th>Type</th><th>Detail</th></tr>';
+    for (const it of items.slice(0, 30)) {
+      html += '<tr><td style="font-weight:600">'+(it.symbol||it.chain_symbol||'?')+'</td><td>'+(it.type||it.instrument_type||'equity')+'</td><td style="font-size:11px;color:#6b7280">'+(it.detail||it.name||'')+'</td></tr>';
+    }
+    html += '</table>';
+    el.innerHTML = html;
+  } catch(e) { el.innerHTML = '<div class="rh-empty">'+e.message+'</div>'; }
+}
+
+async function addWatchlistSymbol() {
+  const sym = document.getElementById('wl-symbol').value.trim().toUpperCase();
+  if (!sym) { alert('Enter a ticker'); return; }
+  try {
+    const r = await fetch('/api/rh-watchlist-add', { method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'}, body: 'symbol='+encodeURIComponent(sym) });
+    const d = await r.json();
+    alert(d.message || d.error || 'Done');
+    loadWatchlist();
+  } catch(e) { alert('Error: '+e.message); }
+}
+
+async function addWatchlistOption() {
+  const symbol = document.getElementById('wl-opt-symbol').value.trim().toUpperCase();
+  const expiration = document.getElementById('wl-opt-exp').value.trim();
+  const strike = document.getElementById('wl-opt-strike').value.trim();
+  const optionType = document.getElementById('wl-opt-type').value;
+  if (!symbol || !expiration || !strike) { alert('Fill underlying, expiry, and strike'); return; }
+  try {
+    const body = 'symbol='+encodeURIComponent(symbol)+'&expiration='+encodeURIComponent(expiration)+'&strike='+encodeURIComponent(strike)+'&option_type='+encodeURIComponent(optionType);
+    const r = await fetch('/api/rh-watchlist-add', { method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'}, body });
+    const d = await r.json();
+    alert(d.message || d.error || 'Done');
+    loadWatchlist();
+  } catch(e) { alert('Error: '+e.message); }
+}
+
 async function approveOrder(id) {
   await fetch('/api/rh-approve/'+id, { method: 'POST' });
   location.reload();
@@ -6033,7 +6202,7 @@ async function killSwitch() {
 }
 
 // Auto-refresh every 30s
-setInterval(() => { loadAccount(); loadPositions(); loadOrders(); }, 30000);
+setInterval(() => { loadAccount(); loadPositions(); loadOrders(); loadWatchlist(); }, 30000);
 </script>
 </body></html>`;
 }
@@ -7074,6 +7243,104 @@ function startDashboard(defaultAcct, apiKey) {
       return;
     }
 
+    // ─── Robinhood: Toggle Options-Only Mode ───
+    if (req.method === "POST" && pathname === "/api/rh-options-only") {
+      RH_OPTIONS_ONLY = !RH_OPTIONS_ONLY;
+      console.log(`  RH Options Only: ${RH_OPTIONS_ONLY ? "ON (no equity fallback)" : "OFF (dual mode)"}`);
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ optionsOnly: RH_OPTIONS_ONLY, tradeMode: rhTradeMode({ broker: "robinhood" }) }));
+      return;
+    }
+
+    // ─── Robinhood: Toggle Auto-Watchlist ───
+    if (req.method === "POST" && pathname === "/api/rh-auto-watchlist") {
+      RH_AUTO_WATCHLIST = !RH_AUTO_WATCHLIST;
+      console.log(`  RH Auto Watchlist: ${RH_AUTO_WATCHLIST ? "ON" : "OFF"} → "${RH_WATCHLIST_NAME}"`);
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ autoWatchlist: RH_AUTO_WATCHLIST, watchlistName: RH_WATCHLIST_NAME }));
+      return;
+    }
+
+    // ─── Robinhood: Get Watchlist ───
+    if (pathname === "/api/rh-watchlist") {
+      if (!robinhood.isConnected) {
+        res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: "Robinhood MCP not connected" }));
+        return;
+      }
+      try {
+        let items = [];
+        try {
+          const wl = await robinhood.getWatchlistItems(RH_WATCHLIST_NAME);
+          const raw = wl?.data?.items || wl?.items || wl?.results || wl;
+          if (Array.isArray(raw)) items = items.concat(raw.map(i => ({ ...i, type: "equity", detail: i.name || "" })));
+        } catch { }
+        if (robinhood.optionsEnabled) {
+          try {
+            const optWl = await robinhood.getOptionWatchlist(RH_WATCHLIST_NAME);
+            const rawOpt = optWl?.data?.items || optWl?.items || optWl?.results || optWl;
+            if (Array.isArray(rawOpt)) {
+              items = items.concat(rawOpt.map(i => ({
+                symbol: i.chain_symbol || i.symbol,
+                type: "option",
+                detail: i.strike_price ? `$${i.strike_price} ${i.option_type || i.type || ""} ${i.expiration_date || ""}`.trim() : (i.instrument_id || ""),
+              })));
+            }
+          } catch { }
+        }
+        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ watchlist: RH_WATCHLIST_NAME, items }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+      return;
+    }
+
+    // ─── Robinhood: Add to Watchlist (manual) ───
+    if (req.method === "POST" && pathname === "/api/rh-watchlist-add") {
+      if (!robinhood.isConnected) {
+        res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: "Robinhood MCP not connected" }));
+        return;
+      }
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", async () => {
+        const params = new URLSearchParams(body);
+        const symbol = (params.get("symbol") || "").trim().toUpperCase();
+        const expiration = (params.get("expiration") || "").trim();
+        const strike = (params.get("strike") || "").trim();
+        const optionType = (params.get("option_type") || "call").trim().toLowerCase();
+        try {
+          if (expiration && strike) {
+            await robinhood.addOptionToWatchlist({
+              symbol,
+              expirationDate: expiration,
+              strikePrice: strike,
+              optionType,
+              watchlist: RH_WATCHLIST_NAME,
+            });
+            rhWatchlistAdded.add(`O:${symbol}:${expiration}:${strike}:${optionType}`);
+            res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+            res.end(JSON.stringify({ ok: true, message: `Added ${symbol} $${strike} ${optionType} ${expiration} to "${RH_WATCHLIST_NAME}"` }));
+          } else if (symbol) {
+            await robinhood.addToWatchlist(symbol, RH_WATCHLIST_NAME);
+            rhWatchlistAdded.add(`E:${symbol}`);
+            res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+            res.end(JSON.stringify({ ok: true, message: `Added ${symbol} to "${RH_WATCHLIST_NAME}"` }));
+          } else {
+            res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+            res.end(JSON.stringify({ error: "symbol required" }));
+          }
+        } catch (e) {
+          res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      });
+      return;
+    }
+
     // ─── Tradier: Data/Execution Arm Status ───
     if (pathname === "/api/tradier-status") {
       let clock = null, balances = null;
@@ -7396,6 +7663,10 @@ function startDashboard(defaultAcct, apiKey) {
         authenticated: robinhood.isAuthenticated,
         accountNumber: robinhood.accountNumber,
         optionsEnabled: robinhood.optionsEnabled,
+        optionsOnly: RH_OPTIONS_ONLY,
+        autoWatchlist: RH_AUTO_WATCHLIST,
+        watchlistName: RH_WATCHLIST_NAME,
+        tradeMode: rhTradeMode({ broker: "robinhood" }),
         availableTools: robinhood.availableTools,
         requireApproval: RH_REQUIRE_APPROVAL,
         maxPositionDollars: RH_MAX_POSITION_DOLLARS,
@@ -9893,7 +10164,9 @@ async function main() {
   // Always provision the account so it appears in the dashboard
   await ensureRobinhoodAccount();
   if (rhOk) {
-    console.log(`  Robinhood: LIVE broker account ready (max: $${RH_MAX_POSITION_DOLLARS}/position)${robinhood.optionsEnabled ? " — OPTIONS TRADING ENABLED" : ""}`);
+    await ensureRhWatchlist();
+    const modeLabel = rhTradeMode({ broker: "robinhood" });
+    console.log(`  Robinhood: LIVE broker account ready (max: $${RH_MAX_POSITION_DOLLARS}/position, mode: ${modeLabel}${RH_AUTO_WATCHLIST ? `, auto-watchlist → "${RH_WATCHLIST_NAME}"` : ""})`);
   }
 
   // Initialize Tradier data + execution arm (primary market-data feed when connected)

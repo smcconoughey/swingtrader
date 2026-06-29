@@ -5,8 +5,8 @@
  * MCP = Model Context Protocol (JSON-RPC 2.0 over HTTP).
  *
  * Supports equity AND options trading via MCP tools. Tool availability is
- * auto-detected at init via tools/list — if the server exposes options tools,
- * robinhood.optionsEnabled is true and all option methods are live.
+ * auto-detected at init via tools/list. Use RH_OPTIONS_ONLY (bot.js) to disable
+ * equity fallback when options tools are available.
  *
  * Auth: OAuth tokens cached by mcp-remote in ~/.mcp-auth/, or ROBINHOOD_ACCESS_TOKEN env var.
  */
@@ -582,6 +582,58 @@ const robinhood = {
     const syms = Array.isArray(symbols) ? symbols : [symbols];
     const result = await callTool(toolName, { account_number: acctNum, symbols: syms.map(s => s.toUpperCase()) });
     return extractContent(result);
+  },
+
+  // ─── Watchlists ───
+
+  async getWatchlists() {
+    if (!discoveredTools.has("get_watchlists")) throw new Error("get_watchlists not available");
+    return extractContent(await callTool("get_watchlists", {}));
+  },
+
+  async getWatchlistItems(watchlist) {
+    const toolName = discoveredTools.has("get_watchlist_items") ? "get_watchlist_items" : null;
+    if (!toolName) throw new Error("get_watchlist_items not available");
+    return extractContent(await callTool(toolName, { watchlist }));
+  },
+
+  async getOptionWatchlist(watchlist) {
+    if (!discoveredTools.has("get_option_watchlist")) throw new Error("get_option_watchlist not available");
+    const args = watchlist ? { watchlist } : {};
+    return extractContent(await callTool("get_option_watchlist", args));
+  },
+
+  async createWatchlist(name, description = "") {
+    if (!discoveredTools.has("create_watchlist")) throw new Error("create_watchlist not available");
+    const args = { name };
+    if (description) args.description = description;
+    return extractContent(await callTool("create_watchlist", args));
+  },
+
+  async addToWatchlist(symbol, watchlist) {
+    if (!discoveredTools.has("add_to_watchlist")) throw new Error("add_to_watchlist not available");
+    const args = { symbol: symbol.toUpperCase() };
+    if (watchlist) args.watchlist = watchlist;
+    return extractContent(await callTool("add_to_watchlist", args));
+  },
+
+  async addOptionToWatchlist({ symbol, expirationDate, strikePrice, optionType, watchlist } = {}) {
+    if (!discoveredTools.has("add_option_to_watchlist")) throw new Error("add_option_to_watchlist not available");
+    const args = {
+      symbol: symbol.toUpperCase(),
+      expiration_date: expirationDate,
+      strike_price: String(strikePrice),
+      option_type: optionType,
+    };
+    if (watchlist) args.watchlist = watchlist;
+    return extractContent(await callTool("add_option_to_watchlist", args));
+  },
+
+  async removeFromWatchlist(symbol, watchlist) {
+    if (!discoveredTools.has("remove_from_watchlist")) throw new Error("remove_from_watchlist not available");
+    const args = { symbol: symbol.toUpperCase() };
+    if (watchlist) args.watchlist = watchlist;
+    return extractContent(await callTool("remove_from_watchlist", args));
   },
 
   // ─── Token Management ───
