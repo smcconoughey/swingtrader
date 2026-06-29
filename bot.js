@@ -7262,6 +7262,17 @@ function startDashboard(defaultAcct, apiKey) {
     }
 
     // ─── Robinhood: Get Watchlist ───
+    if (pathname === "/api/rh-tools") {
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({
+        connected: robinhood.isConnected,
+        optionsEnabled: robinhood.optionsEnabled,
+        tools: robinhood.availableTools,
+        schemas: robinhood.toolSchemas,
+      }, null, 2));
+      return;
+    }
+
     if (pathname === "/api/rh-watchlist") {
       if (!robinhood.isConnected) {
         res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -7334,8 +7345,11 @@ function startDashboard(defaultAcct, apiKey) {
             res.end(JSON.stringify({ error: "symbol required" }));
           }
         } catch (e) {
+          const msg = e.message.includes("not available")
+            ? `Watchlist tool not available on this Robinhood MCP session. Available tools: ${robinhood.availableTools.filter(t => /watch/i.test(t)).join(", ") || "none"}`
+            : e.message;
           res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-          res.end(JSON.stringify({ error: e.message }));
+          res.end(JSON.stringify({ error: msg }));
         }
       });
       return;
@@ -8131,9 +8145,13 @@ self.addEventListener('pushsubscriptionchange', e => {
       try {
         const sym = url.searchParams.get("symbol");
         if (!sym) { res.writeHead(400); res.end(JSON.stringify({ error: "symbol required" })); return; }
-        const optPositions = await robinhood.getOptionsPositions();
+        const result = {};
+        try { result.positions = await robinhood.getOptionsPositions(); } catch { result.positions = { data: { positions: [] } }; }
+        try { result.instruments = await robinhood.getOptionInstruments(sym); } catch { }
+        try { result.marketData = await robinhood.getOptionMarketData([sym]); } catch { }
+        result.optionsEnabled = true;
         res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-        res.end(JSON.stringify({ positions: optPositions, optionsEnabled: true }));
+        res.end(JSON.stringify(result));
       } catch (e) {
         res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
         res.end(JSON.stringify({ error: e.message }));

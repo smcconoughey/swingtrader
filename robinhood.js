@@ -30,6 +30,7 @@ let sessionId = null;
 let mcpInitialized = false;
 let discoveredAccountNumber = null;
 let discoveredTools = new Set();
+let discoveredToolSchemas = new Map();
 let optionsSupported = false;
 let lastInitError = null;
 
@@ -168,6 +169,22 @@ async function callTool(toolName, args = {}) {
   });
 }
 
+function schemaAccepts(toolName, prop) {
+  const schema = discoveredToolSchemas.get(toolName);
+  if (!schema || !schema.properties) return true;
+  return prop in schema.properties;
+}
+
+function buildSchemaArgs(toolName, candidateArgs) {
+  const schema = discoveredToolSchemas.get(toolName);
+  if (!schema || !schema.properties) return candidateArgs;
+  const filtered = {};
+  for (const [k, v] of Object.entries(candidateArgs)) {
+    if (k in schema.properties && v !== undefined && v !== null) filtered[k] = v;
+  }
+  return filtered;
+}
+
 function extractContent(result) {
   // MCP tool results come as { content: [{ type: "text", text: "..." }] }
   if (!result?.content) return result;
@@ -272,6 +289,7 @@ const robinhood = {
   get accountNumber() { return discoveredAccountNumber; },
   get optionsEnabled() { return optionsSupported; },
   get availableTools() { return [...discoveredTools]; },
+  get toolSchemas() { return Object.fromEntries(discoveredToolSchemas); },
   get lastInitError() { return lastInitError; },
 
   buildOCC,
@@ -322,9 +340,23 @@ const robinhood = {
         const toolsList = toolsResult?.tools || toolsResult || [];
         if (Array.isArray(toolsList)) {
           discoveredTools = new Set(toolsList.map(t => t.name || t));
+          discoveredToolSchemas = new Map();
+          for (const t of toolsList) {
+            if (t.name && t.inputSchema) discoveredToolSchemas.set(t.name, t.inputSchema);
+          }
           const optionTools = [...discoveredTools].filter(t => /option/i.test(t));
-          optionsSupported = optionTools.length >= 2; // need at least positions + order placement
+          optionsSupported = optionTools.length >= 2;
           console.log(`  [RH] Discovered ${discoveredTools.size} MCP tools.${optionsSupported ? ` OPTIONS ENABLED (${optionTools.join(", ")})` : " Options tools not found — equity only."}`);
+          if (discoveredToolSchemas.size > 0) {
+            const watchlistTools = [...discoveredToolSchemas.keys()].filter(n => /watchlist/i.test(n));
+            if (watchlistTools.length > 0) {
+              for (const wt of watchlistTools) {
+                const schema = discoveredToolSchemas.get(wt);
+                const props = schema?.properties ? Object.keys(schema.properties) : [];
+                console.log(`  [RH]   ${wt} params: [${props.join(", ")}]`);
+              }
+            }
+          }
         }
       } catch (e) {
         console.log(`  [RH] tools/list unavailable (${e.message}) — assuming equity only`);
@@ -504,6 +536,33 @@ const robinhood = {
     return extractContent(result);
   },
 
+  async getOptionInstruments(symbol) {
+    const toolName = discoveredTools.has("get_option_instruments") ? "get_option_instruments"
+      : discoveredTools.has("get_options_instruments") ? "get_options_instruments"
+      : null;
+    if (!toolName) throw new Error("get_option_instruments not available");
+    const args = buildSchemaArgs(toolName, {
+      symbol: symbol.toUpperCase(),
+      symbols: [symbol.toUpperCase()],
+    });
+    return extractContent(await callTool(toolName, args));
+  },
+
+  async getHistoricals(symbol, span = "year", interval = "day") {
+    const toolName = discoveredTools.has("get_historicals") ? "get_historicals"
+      : discoveredTools.has("get_stock_historicals") ? "get_stock_historicals"
+      : discoveredTools.has("get_equity_historicals") ? "get_equity_historicals"
+      : null;
+    if (!toolName) throw new Error("historicals tool not available");
+    const args = buildSchemaArgs(toolName, {
+      symbol: symbol.toUpperCase(),
+      symbols: [symbol.toUpperCase()],
+      span,
+      interval,
+    });
+    return extractContent(await callTool(toolName, args));
+  },
+
   async reviewOptionOrder({ symbol, expirationDate, strikePrice, optionType, side, quantity, type, limitPrice, stopPrice, timeInForce, refId } = {}, accountNumber) {
     if (!optionsSupported) throw new Error("Options not supported on this MCP session");
     const acctNum = accountNumber || discoveredAccountNumber;
@@ -594,45 +653,68 @@ const robinhood = {
   async getWatchlistItems(watchlist) {
     const toolName = discoveredTools.has("get_watchlist_items") ? "get_watchlist_items" : null;
     if (!toolName) throw new Error("get_watchlist_items not available");
-    return extractContent(await callTool(toolName, { watchlist }));
+    const args = buildSchemaArgs(toolName, {
+      watchlist,
+      name: watchlist,
+      account_number: discoveredAccountNumber,
+    });
+    return extractContent(await callTool(toolName, args));
   },
 
   async getOptionWatchlist(watchlist) {
     if (!discoveredTools.has("get_option_watchlist")) throw new Error("get_option_watchlist not available");
-    const args = watchlist ? { watchlist } : {};
+    const args = buildSchemaArgs("get_option_watchlist", {
+      watchlist,
+      name: watchlist,
+      account_number: discoveredAccountNumber,
+    });
     return extractContent(await callTool("get_option_watchlist", args));
   },
 
   async createWatchlist(name, description = "") {
     if (!discoveredTools.has("create_watchlist")) throw new Error("create_watchlist not available");
-    const args = { name };
-    if (description) args.description = description;
+    const candidateArgs = { name, account_number: discoveredAccountNumber };
+    if (description) candidateArgs.description = description;
+    const args = buildSchemaArgs("create_watchlist", candidateArgs);
     return extractContent(await callTool("create_watchlist", args));
   },
 
   async addToWatchlist(symbol, watchlist) {
     if (!discoveredTools.has("add_to_watchlist")) throw new Error("add_to_watchlist not available");
-    const args = { symbol: symbol.toUpperCase() };
-    if (watchlist) args.watchlist = watchlist;
+    const args = buildSchemaArgs("add_to_watchlist", {
+      symbol: symbol.toUpperCase(),
+      symbols: [symbol.toUpperCase()],
+      watchlist,
+      name: watchlist,
+      account_number: discoveredAccountNumber,
+    });
     return extractContent(await callTool("add_to_watchlist", args));
   },
 
   async addOptionToWatchlist({ symbol, expirationDate, strikePrice, optionType, watchlist } = {}) {
     if (!discoveredTools.has("add_option_to_watchlist")) throw new Error("add_option_to_watchlist not available");
-    const args = {
+    const args = buildSchemaArgs("add_option_to_watchlist", {
       symbol: symbol.toUpperCase(),
+      symbols: [symbol.toUpperCase()],
       expiration_date: expirationDate,
       strike_price: String(strikePrice),
       option_type: optionType,
-    };
-    if (watchlist) args.watchlist = watchlist;
+      watchlist,
+      name: watchlist,
+      account_number: discoveredAccountNumber,
+    });
     return extractContent(await callTool("add_option_to_watchlist", args));
   },
 
   async removeFromWatchlist(symbol, watchlist) {
     if (!discoveredTools.has("remove_from_watchlist")) throw new Error("remove_from_watchlist not available");
-    const args = { symbol: symbol.toUpperCase() };
-    if (watchlist) args.watchlist = watchlist;
+    const args = buildSchemaArgs("remove_from_watchlist", {
+      symbol: symbol.toUpperCase(),
+      symbols: [symbol.toUpperCase()],
+      watchlist,
+      name: watchlist,
+      account_number: discoveredAccountNumber,
+    });
     return extractContent(await callTool("remove_from_watchlist", args));
   },
 
