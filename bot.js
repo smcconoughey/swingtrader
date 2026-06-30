@@ -9396,8 +9396,13 @@ async function syncRobinhoodAccount(acct, quotes) {
           const ticker = (op.chain_symbol || op.symbol || "").toUpperCase();
           if (!ticker) continue;
 
-          const optType = (op.type || op.option_type || "call").toLowerCase();
-          const strike = parseFloat(op.strike_price || op.strike || 0);
+          // Robinhood returns `type: "long"/"short"` (position side), not the option type.
+          // The actual call/put type lives in `option_type`. Normalize before using.
+          const rawSide = (op.type || "").toLowerCase();
+          const optType = (rawSide === "long" || rawSide === "short")
+            ? (op.option_type || op.legs?.[0]?.option_type || "call").toLowerCase()
+            : (rawSide || op.option_type || "call").toLowerCase();
+          const strike = parseFloat(op.strike_price || op.strike || op.legs?.[0]?.strike_price || 0);
           const expDate = op.expiration_date || op.expiration || null;
           const avgPrice = parseFloat(op.average_price || op.average_buy_price || 0);
           const entryPremium = avgPrice > 1 ? avgPrice / 100 : avgPrice; // RH may return per-contract cost
