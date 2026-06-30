@@ -4091,14 +4091,18 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
         const mid = (bid != null && ask != null && ask >= bid) ? (bid + ask) / 2
                   : (typeof pos.liveMark === "number" && pos.liveMark > 0 ? pos.liveMark : currentPremium);
         const spreadPct = (bid != null && ask != null && mid > 0) ? (ask - bid) / mid : 0;
-        const protective = pnlPct <= 0 || /stop|critical|expir|reversed|breakeven|low-dte|theta/i.test(reason);
-        const urgent = /critical|expir|low-dte/i.test(reason);
+        // Any exit that is cutting a loss (or genuinely time-critical) MUST guarantee a fill —
+        // price at the bid, which is what a real buyer is actually willing to pay right now.
+        // Negotiating off mid in a wide market (the old behavior) could park the limit ABOVE the
+        // achievable bid, so the order sits open forever while the position keeps bleeding.
+        const guaranteedFill = pnlPct <= 0 || /critical|expir|low-dte/i.test(reason);
+        const protective = guaranteedFill || /stop|reversed|breakeven|theta/i.test(reason);
 
         let limit = +mid.toFixed(2);
-        if (protective) {
-          if (urgent && bid != null) {
-            limit = +bid.toFixed(2);
-          } else if (spreadPct <= WIDE_SPREAD_EXIT_PCT && bid != null) {
+        if (guaranteedFill && bid != null) {
+          limit = +bid.toFixed(2);
+        } else if (protective) {
+          if (spreadPct <= WIDE_SPREAD_EXIT_PCT && bid != null) {
             limit = +bid.toFixed(2);
           } else if (mid > 0) {
             const floor = bid != null ? bid : 0;
@@ -4108,6 +4112,9 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
 
         const expStr = pos.expiryDate ? new Date(pos.expiryDate).toISOString().slice(0, 10) : null;
         if (expStr) {
+          // Log synchronously, before the async call, so the cycle log always shows what was
+          // attempted (and at what price) even if the network call hangs or the process restarts.
+          log(acct, `ROBINHOOD OPTION EXIT: attempting SELL ${qty}x ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} @ $${limit} limit (bid=${bid ?? "?"} ask=${ask ?? "?"} mid=${mid != null ? mid.toFixed(2) : "?"} spread=${(spreadPct * 100).toFixed(0)}% guaranteedFill=${guaranteedFill}) — ${isTrimLocal ? "TRIM" : "EXIT"}: ${reason}`);
           robinhood.placeOptionOrder({
             symbol: pos.ticker,
             expirationDate: expStr,
@@ -4121,6 +4128,10 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
           }).then(res => {
             const occ = robinhood.buildOCC(pos.ticker, expStr, pos.type, pos.strike);
             log(acct, `ROBINHOOD OPTION EXIT: SELL ${qty}x ${occ} @ $${limit} (${isTrimLocal ? "TRIM" : "EXIT"} — ${reason}) — order ${res?.id || "?"}`);
+            if (!acct.state.meta[occ]) acct.state.meta[occ] = {};
+            acct.state.meta[occ].exitOrderId = res?.id || res?.order_id || null;
+            acct.state.meta[occ].exitOrderPlacedAt = Date.now();
+            acct.state.meta[occ].exitOrderLimit = limit;
           }).catch(e => {
             acct._inflightTickers.delete(pos.ticker.toUpperCase());
             log(acct, `ROBINHOOD OPTION EXIT FAILED ${pos.ticker}: ${e.message}`);
@@ -9551,6 +9562,40 @@ async function syncRobinhoodAccount(acct, quotes) {
           }
         } catch (e) {
           log(acct, `ROBINHOOD SYNC: strike resolve error — ${e.message}`);
+        }
+      }
+    }
+
+    // Step 1.5: Stale exit-order watchdog. A sell_to_close limit order can sit unfilled forever
+    // if the market moves away from it (or it was mispriced) — there's no broker-side trailing/
+    // re-pricing. If an exit order we placed hasn't filled within a few minutes, cancel it so the
+    // next cycle's tryExits re-attempts at a fresh price (guaranteed-fill logic prices at the
+    // current bid for losing positions, so a retry should clear immediately).
+    if (robinhood.optionsEnabled) {
+      const STALE_EXIT_ORDER_MS = 3 * 60_000;
+      for (const pos of positions) {
+        if (pos.type === "equity" || pos.optionsSource !== "robinhood") continue;
+        const posMeta = state.meta[pos.occSymbol];
+        if (!posMeta || !posMeta.exitOrderPlacedAt) continue;
+        const age = now - posMeta.exitOrderPlacedAt;
+        const stillInflight = acct._inflightTickers && acct._inflightTickers.has(pos.ticker.toUpperCase());
+        if (!stillInflight) {
+          // No longer a working order on the broker — either it filled or was canceled
+          // externally. Either way, stop tracking it; the position list reflects current truth.
+          delete posMeta.exitOrderId;
+          delete posMeta.exitOrderPlacedAt;
+          delete posMeta.exitOrderLimit;
+        } else if (age >= STALE_EXIT_ORDER_MS && posMeta.exitOrderId) {
+          try {
+            await robinhood.cancelOptionOrder(posMeta.exitOrderId);
+            log(acct, `ROBINHOOD SYNC: canceled stale exit order for ${pos.ticker} (unfilled ${(age / 60000).toFixed(1)}m @ $${posMeta.exitOrderLimit}) — will re-price next cycle`);
+          } catch (e) {
+            log(acct, `ROBINHOOD SYNC: cancel stale exit order failed for ${pos.ticker} — ${e.message}`);
+          }
+          delete posMeta.exitOrderId;
+          delete posMeta.exitOrderPlacedAt;
+          delete posMeta.exitOrderLimit;
+          acct._inflightTickers.delete(pos.ticker.toUpperCase());
         }
       }
     }
