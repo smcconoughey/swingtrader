@@ -448,7 +448,8 @@ const robinhood = {
   async getOrders(filters = {}, accountNumber) {
     const acctNum = accountNumber || discoveredAccountNumber;
     if (!acctNum) throw new Error("No account number");
-    const result = await callTool("get_equity_orders", { account_number: acctNum, ...filters });
+    const args = buildSchemaArgs("get_equity_orders", { account_number: acctNum, ...filters });
+    const result = await callTool("get_equity_orders", args);
     return extractContent(result);
   },
 
@@ -494,7 +495,8 @@ const robinhood = {
   async cancelOrder(orderId, accountNumber) {
     const acctNum = accountNumber || discoveredAccountNumber;
     if (!acctNum) throw new Error("No account number");
-    const result = await callTool("cancel_equity_order", { account_number: acctNum, order_id: orderId });
+    const args = buildSchemaArgs("cancel_equity_order", { account_number: acctNum, order_id: orderId });
+    const result = await callTool("cancel_equity_order", args);
     return extractContent(result);
   },
 
@@ -618,7 +620,7 @@ const robinhood = {
     const occ = buildOCC(symbol, expirationDate, optionType, parseFloat(strikePrice));
     console.log(`  [RH] Placing OPTION ${side.toUpperCase()} ${quantity}x ${occ} (${type || "limit"}${limitPrice ? ` @ $${limitPrice}` : ""})`);
 
-    const result = await callTool(toolName, args);
+    const result = await callTool(toolName, buildSchemaArgs(toolName, args));
     const parsed = extractContent(result);
     console.log(`  [RH] Option order result:`, typeof parsed === "string" ? parsed.slice(0, 200) : JSON.stringify(parsed).slice(0, 200));
     return parsed;
@@ -631,7 +633,8 @@ const robinhood = {
     const toolName = discoveredTools.has("cancel_option_order") ? "cancel_option_order"
       : discoveredTools.has("cancel_options_order") ? "cancel_options_order"
       : "cancel_option_order";
-    const result = await callTool(toolName, { account_number: acctNum, order_id: orderId });
+    const args = buildSchemaArgs(toolName, { account_number: acctNum, order_id: orderId });
+    const result = await callTool(toolName, args);
     return extractContent(result);
   },
 
