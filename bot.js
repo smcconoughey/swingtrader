@@ -9496,9 +9496,62 @@ async function syncRobinhoodAccount(acct, quotes) {
       }
     }
 
-    // Fetch live bid prices for Robinhood options positions that have no live mark.
-    // The positions endpoint doesn't return bid/ask/mark, so we call getOptionMarketData
-    // separately. Bid = what we'd actually receive when selling to close.
+    // Step 1: Resolve strike/expiry for options positions where those fields are missing.
+    // The positions endpoint sometimes omits these. Filled orders always have them — scrape there.
+    if (robinhood.optionsEnabled) {
+      const strikeUnknown = positions.filter(
+        p => p.optionsSource === "robinhood" && p.type !== "equity" && p.strike === 0
+      );
+      if (strikeUnknown.length > 0) {
+        try {
+          const filledRes = await robinhood.getOptionsOrders({ state: "filled" }).catch(() => null);
+          const filledRaw = filledRes && filledRes.data ? filledRes.data : filledRes;
+          const filledOrders = Array.isArray(filledRaw) ? filledRaw
+            : (filledRaw && Array.isArray(filledRaw.orders)) ? filledRaw.orders
+            : (filledRaw && Array.isArray(filledRaw.results)) ? filledRaw.results
+            : [];
+
+          for (const pos of strikeUnknown) {
+            // Find a filled order that matches this ticker + option type
+            const order = filledOrders.find(o => {
+              const sym = (o.chain_symbol || o.symbol || "").toUpperCase();
+              if (sym !== pos.ticker) return false;
+              const oType = (o.legs?.[0]?.option_type || o.option_type || "").toLowerCase();
+              return !oType || oType === pos.type;
+            });
+            if (!order) continue;
+
+            const leg = (order.legs || [])[0] || order;
+            const resolvedStrike = parseFloat(leg.strike_price || leg.strike || 0);
+            const resolvedExp = leg.expiration_date || leg.expiration || null;
+
+            if (resolvedStrike > 0) {
+              pos.strike = resolvedStrike;
+              const occ = resolvedExp ? robinhood.buildOCC(pos.ticker, resolvedExp, pos.type, resolvedStrike) : pos.occSymbol;
+              // Persist into meta so it survives the next cycle
+              if (!state.meta[occ]) state.meta[occ] = { ...(state.meta[pos.occSymbol] || {}) };
+              state.meta[occ].resolvedStrike = resolvedStrike;
+              if (resolvedExp) state.meta[occ].resolvedExpiry = resolvedExp;
+              pos.occSymbol = occ;
+              seen.add(occ);
+              log(acct, `ROBINHOOD SYNC: resolved ${pos.ticker} ${pos.type} strike=$${resolvedStrike} exp=${resolvedExp || "?"} from filled order`);
+            }
+            if (resolvedExp && !pos.expiryDate) {
+              const expMs = new Date(resolvedExp).getTime();
+              if (expMs > 0) {
+                pos.expiryDate = expMs;
+                pos.dteRemaining = Math.max(0, Math.ceil((expMs - now) / 86400000));
+              }
+            }
+          }
+        } catch (e) {
+          log(acct, `ROBINHOOD SYNC: strike resolve error — ${e.message}`);
+        }
+      }
+    }
+
+    // Step 2: Fetch live bid prices for options positions that still have no live mark.
+    // Bid = what we'd actually receive when selling to close.
     if (robinhood.optionsEnabled) {
       const needsMark = positions.filter(
         p => p.optionsSource === "robinhood" && p.type !== "equity" && p.liveMark == null
@@ -9515,14 +9568,16 @@ async function syncRobinhoodAccount(acct, quotes) {
             : (mdRaw && Array.isArray(mdRaw.contracts)) ? mdRaw.contracts
             : [];
 
-          console.log(`  [RH-MD-DEBUG] market data response shape: ${typeof mdRaw}, keys: ${Object.keys(mdRaw || {}).join(", ")}, items: ${mdItems.length}`, mdItems.length > 0 ? JSON.stringify(mdItems[0]).slice(0, 200) : "none");
+          // Log response shape to dashboard so we can diagnose format issues
+          const firstKeys = mdItems.length > 0 ? Object.keys(mdItems[0]).join(",") : "none";
+          log(acct, `ROBINHOOD SYNC: market data — ${mdItems.length} items, keys: ${firstKeys}`);
 
           for (const pos of needsMark) {
-            // Strict match first: ticker + type + strike (when known) + expiry (when known)
+            // Try to match by ticker/symbol fields (handles chain_symbol, OCC-format symbol, etc.)
             let match = mdItems.find(item => {
               const rawSym = (item.symbol || item.occ_symbol || "").toUpperCase();
               const itemTicker = (item.chain_symbol || rawSym.replace(/\d.*/, "").trim() || "").toUpperCase();
-              if (itemTicker !== pos.ticker) return false;
+              if (itemTicker && itemTicker !== pos.ticker) return false;
               const itemType = (item.option_type || item.type || "").toLowerCase();
               if (itemType && itemType !== pos.type) return false;
               if (pos.strike > 0) {
@@ -9537,16 +9592,15 @@ async function syncRobinhoodAccount(acct, quotes) {
               return true;
             });
 
-            // Fallback: if the market data response is for held positions only (not the full chain),
-            // any item matching ticker+type is our contract
-            if (!match && mdItems.length <= 20) {
-              match = mdItems.find(item => {
-                const rawSym = (item.symbol || item.occ_symbol || "").toUpperCase();
-                const itemTicker = (item.chain_symbol || rawSym.replace(/\d.*/, "").trim() || "").toUpperCase();
-                if (itemTicker !== pos.ticker) return false;
-                const itemType = (item.option_type || item.type || "").toLowerCase();
-                return !itemType || itemType === pos.type;
-              });
+            // Broader fallback: Robinhood's market data response often uses instrument URLs
+            // as identifiers (no chain_symbol/symbol). When itemTicker is blank, any item
+            // with a valid bid_price is assumed to be our held contract (since we queried
+            // by our held tickers). Pick the first item with a positive bid.
+            if (!match) {
+              const allHaveTicker = mdItems.every(item => item.chain_symbol || item.symbol);
+              if (!allHaveTicker) {
+                match = mdItems.find(item => parseFloat(item.bid_price || 0) > 0 || parseFloat(item.mark_price || item.adjusted_mark_price || 0) > 0);
+              }
             }
 
             if (match) {
@@ -9555,21 +9609,18 @@ async function syncRobinhoodAccount(acct, quotes) {
               const mark = parseFloat(match.mark_price || match.adjusted_mark_price || 0) || null;
               pos.liveBid = bid;
               pos.liveAsk = ask;
-              // Bid = actual sell price (what you'd receive to close). Use as liveMark so
-              // P&L and exit gates reflect the true realizable value, not a theoretical mid.
               pos.liveMark = bid ?? mark;
-              console.log(`  [RH-MD-DEBUG] ${pos.ticker} ${pos.type}: bid=${bid} ask=${ask} mark=${mark} → liveMark=${pos.liveMark}`);
+              log(acct, `ROBINHOOD SYNC: ${pos.ticker} ${pos.type} live bid=${bid} ask=${ask} mark=${mark}`);
               if (pos.liveMark != null && pos.entryPremium > 0) {
                 const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
                 if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
               }
             } else {
-              console.log(`  [RH-MD-DEBUG] ${pos.ticker} ${pos.type}: no match found in ${mdItems.length} items`);
+              log(acct, `ROBINHOOD SYNC: ${pos.ticker} ${pos.type} — no live bid match in ${mdItems.length} items`);
             }
           }
         } catch (e) {
           log(acct, `ROBINHOOD SYNC: live bid fetch error — ${e.message}`);
-          console.log(`  [RH-MD-DEBUG] live bid fetch threw:`, e.message);
         }
       }
     }
