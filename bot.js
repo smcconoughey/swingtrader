@@ -9449,6 +9449,12 @@ async function syncRobinhoodAccount(acct, quotes) {
           const bid = parseFloat(op.bid_price || 0) || null;
           const ask = parseFloat(op.ask_price || 0) || null;
 
+          // Robinhood's own option-position record carries the canonical instrument URL for this
+          // exact contract. This is the only fully unambiguous identifier we have — strike/expiry
+          // string matching against the market-data response can mismatch within a multi-strike
+          // chain, but the instrument URL cannot.
+          const instrumentUrl = op.instrument || op.instrument_id || op.option_id || null;
+
           const pos = {
             ...(meta.ai || {}),
             ticker,
@@ -9458,6 +9464,7 @@ async function syncRobinhoodAccount(acct, quotes) {
             dteRemaining,
             expiryDate: expMs || meta.expiryDate || 0,
             occSymbol: occ,
+            instrumentUrl,
             // Prefer the actual Robinhood fill price over our pre-order limit estimate.
             // Fall back to meta only when RH hasn't reported an average_price yet (pending fill).
             entryPremium: entryPremium > 0 ? entryPremium : (meta.entryPremium ?? 0),
@@ -9623,34 +9630,52 @@ async function syncRobinhoodAccount(acct, quotes) {
           log(acct, `ROBINHOOD SYNC: market data — ${mdItems.length} items, keys: ${firstKeys}`);
 
           for (const pos of needsMark) {
-            // Try to match by ticker/symbol fields (handles chain_symbol, OCC-format symbol, etc.)
-            let match = mdItems.find(item => {
-              const rawSym = (item.symbol || item.occ_symbol || "").toUpperCase();
-              const itemTicker = (item.chain_symbol || rawSym.replace(/\d.*/, "").trim() || "").toUpperCase();
-              if (itemTicker && itemTicker !== pos.ticker) return false;
-              const itemType = (item.option_type || item.type || "").toLowerCase();
-              if (itemType && itemType !== pos.type) return false;
-              if (pos.strike > 0) {
-                const itemStrike = parseFloat(item.strike_price || item.strike || 0);
-                if (itemStrike > 0 && Math.abs(itemStrike - pos.strike) > 0.01) return false;
-              }
-              if (pos.expiryDate) {
-                const posExpStr = new Date(pos.expiryDate).toISOString().slice(0, 10);
-                const itemExp = (item.expiration_date || item.expiration || "").slice(0, 10);
-                if (itemExp && itemExp !== posExpStr) return false;
-              }
-              return true;
-            });
-
-            // Broader fallback: Robinhood's market data response often uses instrument URLs
-            // as identifiers (no chain_symbol/symbol). When itemTicker is blank, any item
-            // with a valid bid_price is assumed to be our held contract (since we queried
-            // by our held tickers). Pick the first item with a positive bid.
+            // Identifier priority, most to least reliable:
+            // 1. Instrument URL — Robinhood's canonical id for this exact contract (from the
+            //    positions endpoint). Unambiguous when present on both sides.
+            // 2. OCC symbol — exact ticker+expiry+type+strike encoded string.
+            // 3. ticker+type+strike+expiry field-by-field match.
+            // 4. If we queried for exactly one ticker and got back exactly one item, it must be ours
+            //    (no ambiguity possible). This does NOT apply when multiple strikes/expiries came back.
+            let match = null;
+            if (pos.instrumentUrl) {
+              match = mdItems.find(item => item.instrument && item.instrument === pos.instrumentUrl);
+            }
             if (!match) {
-              const allHaveTicker = mdItems.every(item => item.chain_symbol || item.symbol);
-              if (!allHaveTicker) {
-                match = mdItems.find(item => parseFloat(item.bid_price || 0) > 0 || parseFloat(item.mark_price || item.adjusted_mark_price || 0) > 0);
-              }
+              match = mdItems.find(item => {
+                const rawSym = (item.symbol || item.occ_symbol || "").toUpperCase();
+                return rawSym && pos.occSymbol && rawSym === pos.occSymbol.toUpperCase();
+              });
+            }
+            if (!match) {
+              match = mdItems.find(item => {
+                const rawSym = (item.symbol || item.occ_symbol || "").toUpperCase();
+                const itemTicker = (item.chain_symbol || rawSym.replace(/\d.*/, "").trim() || "").toUpperCase();
+                if (itemTicker && itemTicker !== pos.ticker) return false;
+                const itemType = (item.option_type || item.type || "").toLowerCase();
+                if (itemType && itemType !== pos.type) return false;
+                if (pos.strike > 0) {
+                  const itemStrike = parseFloat(item.strike_price || item.strike || 0);
+                  if (itemStrike > 0 && Math.abs(itemStrike - pos.strike) > 0.01) return false;
+                }
+                if (pos.expiryDate) {
+                  const posExpStr = new Date(pos.expiryDate).toISOString().slice(0, 10);
+                  const itemExp = (item.expiration_date || item.expiration || "").slice(0, 10);
+                  if (itemExp && itemExp !== posExpStr) return false;
+                }
+                return true;
+              });
+            }
+            // Single-ticker, single-item response: no ambiguity, safe to use even without a
+            // field-level match (covers responses that only carry an opaque instrument URL).
+            // Requires needsMark.length === 1 too — if we're tracking two distinct contracts on
+            // the same ticker, a single returned item still can't be safely assigned to either.
+            // Deliberately NOT applied when multiple items came back — picking the "first" one
+            // out of a multi-strike/multi-expiry chain previously caused this exact position to
+            // be priced off an unrelated contract (e.g. showing -52% while Robinhood's own
+            // account page showed the real position roughly flat).
+            if (!match && tickers.length === 1 && needsMark.length === 1 && mdItems.length === 1) {
+              match = mdItems[0];
             }
 
             if (match) {
