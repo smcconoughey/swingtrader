@@ -519,7 +519,8 @@ const robinhood = {
     const toolName = discoveredTools.has("get_options_orders") ? "get_options_orders"
       : discoveredTools.has("get_option_orders") ? "get_option_orders"
       : "get_options_orders";
-    const result = await callTool(toolName, { account_number: acctNum, ...filters });
+    const args = buildSchemaArgs(toolName, { account_number: acctNum, ...filters });
+    const result = await callTool(toolName, args);
     return extractContent(result);
   },
 
