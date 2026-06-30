@@ -6034,7 +6034,9 @@ async function loadPositions() {
       for (const p of d) {
         const pnl = p.pnl || p.unrealized_pnl || '—';
         const color = parseFloat(pnl) >= 0 ? '#00a843' : '#e8473f';
-        html += '<tr><td style="color:#1c1d22;font-weight:600">'+p.symbol+'</td><td>'+p.quantity+'</td><td>$'+(p.average_cost||'?')+'</td><td>$'+(p.current_price||'?')+'</td><td style="color:'+color+'">'+pnl+'</td></tr>';
+        const avgCost = p.average_buy_price || p.average_cost || p.average_price;
+        const curPrice = p.current_price || p.last_trade_price || p.last_extended_hours_trade_price;
+        html += '<tr><td style="color:#1c1d22;font-weight:600">'+p.symbol+'</td><td>'+p.quantity+'</td><td>'+(avgCost?'$'+parseFloat(avgCost).toFixed(2):'?')+'</td><td>'+(curPrice?'$'+parseFloat(curPrice).toFixed(2):'?')+'</td><td style="color:'+color+'">'+pnl+'</td></tr>';
       }
       html += '</table>';
       el.innerHTML = html;
@@ -7198,7 +7200,8 @@ function startDashboard(defaultAcct, apiKey) {
       const list = [];
       for (const [id, a] of accounts) {
         const pv = portfolioValue(a.state, a.dashboard.quotes);
-        list.push({ id, name: a.name, paused: a.paused, cash: a.state.cash, positions: a.state.positions.length, trades: a.state.history.length, pv, pnl: ((pv - a.config.startingCash) / a.config.startingCash * 100).toFixed(1), config: a.config });
+        const sc = a.config.startingCash > 0 ? a.config.startingCash : null;
+        list.push({ id, name: a.name, paused: a.paused, cash: a.state.cash, positions: a.state.positions.length, trades: a.state.history.length, pv, pnl: sc ? ((pv - sc) / sc * 100).toFixed(1) : "0.0", config: a.config });
       }
       res.end(JSON.stringify(list));
       return;
@@ -7729,6 +7732,26 @@ function startDashboard(defaultAcct, apiKey) {
       try {
         const positionsRes = await robinhood.getPositions();
         const positions = positionsRes && positionsRes.data && Array.isArray(positionsRes.data.positions) ? positionsRes.data.positions : (Array.isArray(positionsRes) ? positionsRes : []);
+        // Enrich with quotes so current_price is available for display
+        if (positions.length > 0) {
+          const syms = positions.map(p => p.symbol).filter(Boolean);
+          try {
+            const quotes = await robinhood.getQuotes(syms);
+            const qMap = {};
+            if (quotes && quotes.data && Array.isArray(quotes.data.results)) {
+              for (const q of quotes.data.results) if (q.symbol) qMap[q.symbol] = q;
+            } else if (Array.isArray(quotes)) {
+              for (const q of quotes) if (q.symbol) qMap[q.symbol] = q;
+            }
+            for (const p of positions) {
+              const q = qMap[p.symbol];
+              if (q) {
+                p.current_price = q.last_trade_price || q.adjusted_previous_close || p.current_price;
+                p.last_trade_price = q.last_trade_price;
+              }
+            }
+          } catch { }
+        }
         res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
         res.end(JSON.stringify(positions));
       } catch (e) {
@@ -8674,25 +8697,26 @@ async function ensureRobinhoodAccount() {
     if (typeof seedCash === "number") {
       acct.state.cash = seedCash;
       if (typeof acct.state.brokerEquity !== "number" || acct.state.brokerEquity <= 0) acct.state.brokerEquity = seedCash;
-      if (acct.state.positions.length === 0 && acct.state.history.length === 0) acct.config.startingCash = seedCash;
+      if (acct.state.positions.length === 0 && acct.state.history.length === 0 && seedCash > 0) acct.config.startingCash = seedCash;
     }
+    // Guard: startingCash must be > 0 to avoid +Infinity% P&L
+    if (!(acct.config.startingCash > 0)) acct.config.startingCash = DEFAULT_CONFIG.startingCash;
     console.log(`  Robinhood: live account present — cash $${acct.state.cash.toFixed(2)} (starting $${acct.config.startingCash})`);
     return;
   }
 
+  const safeSeed = (typeof seedCash === "number" && seedCash > 0) ? seedCash : DEFAULT_CONFIG.startingCash;
   const config = {
     ...DEFAULT_CONFIG,
     broker: "robinhood",
     useCashReserve: false,
     autoExecute: true,
-
-    startingCash: typeof seedCash === "number" ? seedCash : DEFAULT_CONFIG.startingCash,
+    startingCash: safeSeed,
   };
   const state = {
-    cash: typeof seedCash === "number" ? seedCash : DEFAULT_CONFIG.startingCash,
+    cash: safeSeed,
     positions: [],
     history: [],
-
     meta: {},
   };
   const acct = createAccountRuntime("robinhood", `Robinhood Live`, config, state);
@@ -10301,6 +10325,7 @@ async function main() {
 
         for (const [, acct] of accounts) {
           try {
+            if (acct.config.broker === "robinhood") await syncRobinhoodAccount(acct, sharedQuotes).catch(e => log(acct, `ROBINHOOD SYNC: ${e.message}`));
             const tradeThis = marketOpen || acct.config.tradeWhenClosed;
             if (acct.paused) {
               await runPausedCycle(acct, sharedQuotes);
@@ -10333,6 +10358,7 @@ async function main() {
         }
 
         for (const [, acct] of accounts) {
+          if (acct.config.broker === "robinhood") await syncRobinhoodAccount(acct, sharedQuotes).catch(e => log(acct, `ROBINHOOD SYNC: ${e.message}`));
           if (!acct.paused) await runAfterHoursScan(acct, sharedQuotes, apiKey);
           // paused accounts: candles already synced above, no further action needed after hours
         }
