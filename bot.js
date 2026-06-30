@@ -2346,23 +2346,28 @@ async function refreshMarketClock(force = false) {
 
 // True only when the regular session is open. Prefers the broker clock; falls back to a local ET
 // calculation with the US holiday/half-day calendar so we're still correct when Tradier is down.
-function isMarketOpen() {
-  if (_marketClock.source === "tradier" && _marketClock.state && Date.now() - _marketClock.fetchedAt < 5 * 60_000) {
-    return _marketClock.state === "open"; // "premarket"/"postmarket"/"closed" are all NOT regular-session open
-  }
+// Local-time-only market open check — never consults Tradier.
+// Used for Robinhood accounts so Tradier's API state never blocks RH trade cycles.
+function isMarketOpenLocal() {
   try {
     const { day, h, m, dateStr } = getETParts();
     if (day === "Sat" || day === "Sun") return false;
     if (MARKET_HOLIDAYS.has(dateStr)) return false;
     const mins = h * 60 + m;
-    const close = MARKET_HALF_DAYS.has(dateStr) ? 780 : 960; // 1:00 PM half-day, else 4:00 PM
-    return mins >= 570 && mins < close; // 9:30 AM (570) open
+    const close = MARKET_HALF_DAYS.has(dateStr) ? 780 : 960;
+    return mins >= 570 && mins < close;
   } catch (e) {
-    // Fallback if Intl is broken
     const d = new Date();
-    const mins = d.getUTCHours() * 60 + d.getUTCMinutes() - 240; // Approx ET (EDT is UTC-4)
+    const mins = d.getUTCHours() * 60 + d.getUTCMinutes() - 240;
     return mins >= 570 && mins < 960;
   }
+}
+
+function isMarketOpen() {
+  if (_marketClock.source === "tradier" && _marketClock.state && Date.now() - _marketClock.fetchedAt < 5 * 60_000) {
+    return _marketClock.state === "open"; // "premarket"/"postmarket"/"closed" are all NOT regular-session open
+  }
+  return isMarketOpenLocal();
 }
 
 function getETDateStr() {
@@ -9646,7 +9651,7 @@ async function runCycle(acct, sharedQuotes, apiKey) {
   const state = acct.state;
   const cfg = acct.config;
   const dash = acct.dashboard;
-  const mktOpen = isMarketOpen();
+  const mktOpen = acct.config.broker === "robinhood" ? isMarketOpenLocal() : isMarketOpen();
   log(acct, mktOpen ? "MARKET OPEN — Starting auto-trade cycle" : "MARKET CLOSED — Starting trade cycle (trade-when-closed)");
   dash.marketOpen = mktOpen;
 
@@ -9834,7 +9839,7 @@ async function runPausedCycle(acct, sharedQuotes) {
   const state = acct.state;
   const cfg = acct.config;
   const dash = acct.dashboard;
-  dash.marketOpen = isMarketOpen();
+  dash.marketOpen = acct.config.broker === "robinhood" ? isMarketOpenLocal() : isMarketOpen();
 
   // Keep dashboard quotes alive so PV and UI don't freeze while paused
   for (const ticker of Object.keys(sharedQuotes)) {
@@ -10404,7 +10409,9 @@ async function main() {
   await refreshMarketClock(true);
   const initialMarketOpen = isMarketOpen();
   for (const [, acct] of accounts) {
-    if (acct.dashboard) acct.dashboard.marketOpen = initialMarketOpen;
+    if (acct.dashboard) {
+      acct.dashboard.marketOpen = acct.config.broker === "robinhood" ? isMarketOpenLocal() : initialMarketOpen;
+    }
   }
 
   // Start web dashboard  
@@ -10464,15 +10471,20 @@ async function main() {
 
     // Pull the authoritative exchange state from Tradier (cached 30s) before deciding what to run.
     await refreshMarketClock();
+    // marketOpen uses Tradier clock (authoritative for Tradier-brokered accounts).
+    // marketOpenLocal uses only ET time — never touches Tradier — and is the sole signal for
+    // Robinhood accounts so that a Tradier API outage or stale state never blocks RH exits.
     const marketOpen = isMarketOpen();
+    const marketOpenLocal = isMarketOpenLocal();
     // Accounts may opt into trading while closed (e.g. broker sandbox testing). If any non-paused
     // account does, we run the fast cycle so its full runCycle (entries+exits) executes now.
     const forcedAccts = [...accounts.values()].filter(a => !a.paused && a.config.tradeWhenClosed);
-    const activeCycle = marketOpen || forcedAccts.length > 0;
+    const rhAccts = [...accounts.values()].filter(a => !a.paused && a.config.broker === "robinhood");
+    const activeCycle = marketOpen || forcedAccts.length > 0 || (rhAccts.length > 0 && marketOpenLocal);
 
     if (activeCycle) {
       const today = getETDateStr();
-      if (marketOpen && lastCandleDate !== today) {
+      if ((marketOpen || marketOpenLocal) && lastCandleDate !== today) {
         sharedCandleCache = {};
         for (const [, acct] of accounts) acct.candleCache = {};
         lastCandleDate = today;
@@ -10490,11 +10502,13 @@ async function main() {
         for (const [, acct] of accounts) {
           try {
             if (acct.config.broker === "robinhood") await syncRobinhoodAccount(acct, sharedQuotes).catch(e => log(acct, `ROBINHOOD SYNC: ${e.message}`));
-            const tradeThis = marketOpen || acct.config.tradeWhenClosed;
+            // Robinhood uses local ET time only — Tradier clock is irrelevant for RH.
+            const acctMarketOpen = acct.config.broker === "robinhood" ? marketOpenLocal : marketOpen;
+            const tradeThis = acctMarketOpen || acct.config.tradeWhenClosed;
             if (acct.paused) {
               await runPausedCycle(acct, sharedQuotes);
             } else if (tradeThis) {
-              if (!marketOpen) log(acct, "TRADE-WHEN-CLOSED — running full cycle while market is closed (test mode)");
+              if (!acctMarketOpen) log(acct, "TRADE-WHEN-CLOSED — running full cycle while market is closed (test mode)");
               await runCycle(acct, sharedQuotes, apiKey);
             } else {
               await runAfterHoursScan(acct, sharedQuotes, apiKey);
@@ -10510,9 +10524,9 @@ async function main() {
 
       saveAccounts();
       console.log("");
-      await delay(marketOpen ? CYCLE_MS : CYCLE_MS_CLOSED);
+      await delay((marketOpen || marketOpenLocal) ? CYCLE_MS : CYCLE_MS_CLOSED);
     } else {
-      // After hours
+      // After hours (both Tradier clock and local ET time say market is closed)
       try {
         const { sharedQuotes } = await fetchSharedMarketData(apiKey, sharedCandleCache);
         for (const [, acct] of accounts) {
@@ -10537,7 +10551,7 @@ async function main() {
       const sleepStart = Date.now();
       while (Date.now() - sleepStart < 15 * 60_000) {
         await refreshMarketClock(true);
-        if (isMarketOpen()) {
+        if (isMarketOpen() || isMarketOpenLocal()) {
           console.log("  [WAKE] Market open detected — starting trading cycle now");
           break;
         }
