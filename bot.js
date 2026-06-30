@@ -2741,7 +2741,7 @@ function portfolioValue(state, quotes) {
     const isEquity = pos.type === "equity";
     const currentPremium = isEquity
       ? (pos.liveMark ?? spot)
-      : (pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type));
+      : (pos.liveMark ?? (pos.strike > 0 ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
     val += currentPremium * pos.qty * (isEquity ? 1 : 100);
   }
   return val;
@@ -4601,7 +4601,9 @@ function dashboardHTML(acct, { spectator = false } = {}) {
         ? Math.max(0, (pos.expiryDate - now) / 86400_000)
         : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
       const isEq = pos.type === "equity";
-      const curPremium = isEq ? (pos.liveMark ?? spot) : (pos.liveMark ?? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type));
+      const strikeKnown = isEq || pos.strike > 0;
+      const curPremium = isEq ? (pos.liveMark ?? spot)
+        : (pos.liveMark ?? (strikeKnown ? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
       const pnlPct = pos.entryPremium > 0 ? (curPremium - pos.entryPremium) / pos.entryPremium : 0;
       const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * (isEq ? 1 : 100);
       const profitPrice = pos.entryPremium * (1 + PROFIT_TARGET);
@@ -4612,7 +4614,7 @@ function dashboardHTML(acct, { spectator = false } = {}) {
         stopLoss: { pct: `${(STOP_LOSS * 100).toFixed(0)}%`, premium: stopPrice.toFixed(2) },
         pctToProfit: ((profitPrice - curPremium) / curPremium * 100).toFixed(1),
         pctToStop: ((stopPrice - curPremium) / curPremium * 100).toFixed(1),
-        greeks: optGreeks(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type),
+        greeks: strikeKnown ? optGreeks(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : { delta: "?", theta: "?" },
       };
     });
   }
@@ -9409,8 +9411,15 @@ async function syncRobinhoodAccount(acct, quotes) {
           const optType = (rawSide === "long" || rawSide === "short")
             ? (op.option_type || op.legs?.[0]?.option_type || "call").toLowerCase()
             : (rawSide || op.option_type || "call").toLowerCase();
-          const strike = parseFloat(op.strike_price || op.strike || op.legs?.[0]?.strike_price || 0);
-          const expDate = op.expiration_date || op.expiration || null;
+          const strike = parseFloat(
+            op.strike_price || op.strike ||
+            op.legs?.[0]?.strike_price || op.legs?.[0]?.strike ||
+            op.instrument_data?.strike_price || op.option_data?.strike_price ||
+            op.contract?.strike_price || op.details?.strike_price || 0
+          );
+          const expDate = op.expiration_date || op.expiration || op.legs?.[0]?.expiration_date || null;
+          // Log raw structure once per ticker so we can identify which fields carry strike/type
+          if (strike === 0) console.log(`  [RH-OPT-DEBUG] ${ticker} raw keys:`, Object.keys(op).join(", "), "legs:", JSON.stringify(op.legs || []).slice(0, 300));
           const avgPrice = parseFloat(op.average_price || op.average_buy_price || 0);
           const entryPremium = avgPrice > 1 ? avgPrice / 100 : avgPrice; // RH may return per-contract cost
 
@@ -9776,7 +9785,12 @@ function buildPositionDetails(acct, quotes) {
     }
 
     const isEq = pos.type === "equity";
-    const curPremium = isEq ? (pos.liveMark ?? spot) : (pos.liveMark ?? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type));
+    // When strike is unknown (0) for an options position, synthetic pricing is wildly wrong
+    // (optPrice treats it as a deeply ITM call, returning ~stock price). Fall back to entryPremium
+    // so P&L shows 0% rather than an absurd number until the strike is resolved.
+    const strikeKnown = isEq || pos.strike > 0;
+    const curPremium = isEq ? (pos.liveMark ?? spot)
+      : (pos.liveMark ?? (strikeKnown ? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
     const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
     const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * (isEq ? 1 : 100);
     const profitPrice = pos.entryPremium * (1 + cfg.profitTarget);
@@ -9795,7 +9809,7 @@ function buildPositionDetails(acct, quotes) {
       pctToStop: ((effectiveStop - curPremium) / curPremium * 100).toFixed(1),
       greeks: pos.liveGreeks
         ? { delta: (pos.liveGreeks.delta ?? 0).toFixed(3), theta: (pos.liveGreeks.theta ?? 0).toFixed(3) }
-        : optGreeks(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type),
+        : (strikeKnown ? optGreeks(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : { delta: "?", theta: "?" }),
     };
   });
 }
