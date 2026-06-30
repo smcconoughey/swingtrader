@@ -3790,36 +3790,38 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
       const expStr = selectedCandidate.expiryStr || new Date(expiryDate).toISOString().slice(0, 10);
       const occ = robinhood.buildOCC(ticker, expStr, type, strike);
 
-      if (!acct.state.meta) acct.state.meta = {};
-      acct.state.meta[occ] = {
-        entryPremium: +premium.toFixed(2),
-        entrySpot: spot,
-        dte,
-        originalQty: qty,
-        openDate: getETDateStr(),
-        openTime: Date.now(),
-        trimLevel: 0,
-        bestPnlPct: 0,
-        entryAtrPct: analysis.atrPct ?? null,
-        setupQuality: effectiveQuality,
-        ai: aiThesis || null,
-      };
-
       try {
         const conviction = Math.max(0, Math.min(1, (claudeResult.confidence || 0) / 100));
         const bid = selectedCandidate.bid, ask = selectedCandidate.ask;
 
-        // Hard stop: reject if spread at order time is too wide
+        // Hard stop: reject if spread at order time is too wide (before writing any state)
         if (bid > 0 && ask > 0 && premium > 0) {
           const liveSpreadPct = (ask - bid) / premium;
           if (liveSpreadPct > MAX_ENTRY_SPREAD_PCT) {
-            delete acct.state.meta[occ];
             return { skipped: true, reason: `Robinhood: spread ${(liveSpreadPct * 100).toFixed(0)}% at order time exceeds ${(MAX_ENTRY_SPREAD_PCT * 100).toFixed(0)}% cap — refusing entry on ${ticker}` };
           }
         }
 
         const limit = entryLimitPrice(bid, ask, premium, conviction);
         const aggrLabel = limit >= (ask || limit) ? "at ask" : limit > premium ? "toward ask" : "at mid";
+
+        // Write meta AFTER limit is computed so entryPremium matches what we actually sent.
+        // intendedEntryPremium keeps the mid for UI reference (shown as "intended $X" when fill differs).
+        if (!acct.state.meta) acct.state.meta = {};
+        acct.state.meta[occ] = {
+          entryPremium: +limit.toFixed(2),
+          intendedEntryPremium: +premium.toFixed(2),
+          entrySpot: spot,
+          dte,
+          originalQty: qty,
+          openDate: getETDateStr(),
+          openTime: Date.now(),
+          trimLevel: 0,
+          bestPnlPct: 0,
+          entryAtrPct: analysis.atrPct ?? null,
+          setupQuality: effectiveQuality,
+          ai: aiThesis || null,
+        };
 
         const res = await robinhood.placeOptionOrder({
           symbol: ticker,
@@ -3831,6 +3833,11 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
           type: "limit",
           limitPrice: limit.toFixed(2),
         });
+
+        // If the MCP response includes an immediate fill price, update meta now so the first
+        // sync cycle gets the real fill rather than our limit estimate.
+        const immediateFill = parseFloat(res?.average_price || res?.price || 0);
+        if (immediateFill > 0) acct.state.meta[occ].entryPremium = immediateFill > 1 ? immediateFill / 100 : immediateFill;
 
         if (!acct._inflightTickers) acct._inflightTickers = new Set();
         acct._inflightTickers.add(ticker.toUpperCase());
@@ -3844,7 +3851,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
           conviction: Math.round((conviction || 0) * 100), setupQuality: effectiveQuality,
         });
 
-        return { ticker, type, strike, dte, qty, entryPremium: +limit.toFixed(2), cost: qty * limit * 100, direction, optionsSource: "robinhood", setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence, brokerOrder: true, watchlistCandidate: selectedCandidate };
+        return { ticker, type, strike, dte, qty, entryPremium: +limit.toFixed(2), intendedEntryPremium: +premium.toFixed(2), cost: qty * limit * 100, direction, optionsSource: "robinhood", setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence, brokerOrder: true, watchlistCandidate: selectedCandidate };
       } catch (e) {
         delete acct.state.meta[occ];
         log(acct, `ROBINHOOD OPTION ENTRY FAILED ${ticker}: ${e.message}`);
@@ -9421,7 +9428,10 @@ async function syncRobinhoodAccount(acct, quotes) {
             dteRemaining,
             expiryDate: expMs || meta.expiryDate || 0,
             occSymbol: occ,
-            entryPremium: meta.entryPremium ?? entryPremium,
+            // Prefer the actual Robinhood fill price over our pre-order limit estimate.
+            // Fall back to meta only when RH hasn't reported an average_price yet (pending fill).
+            entryPremium: entryPremium > 0 ? entryPremium : (meta.entryPremium ?? 0),
+            intendedEntryPremium: meta.intendedEntryPremium ?? null,
             entrySpot: meta.entrySpot ?? (quotes[ticker]?.c ?? null),
             qty,
             originalQty: meta.originalQty ?? qty,
