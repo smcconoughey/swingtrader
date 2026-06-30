@@ -9515,21 +9515,20 @@ async function syncRobinhoodAccount(acct, quotes) {
             : (mdRaw && Array.isArray(mdRaw.contracts)) ? mdRaw.contracts
             : [];
 
+          console.log(`  [RH-MD-DEBUG] market data response shape: ${typeof mdRaw}, keys: ${Object.keys(mdRaw || {}).join(", ")}, items: ${mdItems.length}`, mdItems.length > 0 ? JSON.stringify(mdItems[0]).slice(0, 200) : "none");
+
           for (const pos of needsMark) {
-            const match = mdItems.find(item => {
-              // Match by underlying ticker
+            // Strict match first: ticker + type + strike (when known) + expiry (when known)
+            let match = mdItems.find(item => {
               const rawSym = (item.symbol || item.occ_symbol || "").toUpperCase();
               const itemTicker = (item.chain_symbol || rawSym.replace(/\d.*/, "").trim() || "").toUpperCase();
               if (itemTicker !== pos.ticker) return false;
-              // Match by option type (call/put) when present
               const itemType = (item.option_type || item.type || "").toLowerCase();
               if (itemType && itemType !== pos.type) return false;
-              // Match by strike when known
               if (pos.strike > 0) {
                 const itemStrike = parseFloat(item.strike_price || item.strike || 0);
                 if (itemStrike > 0 && Math.abs(itemStrike - pos.strike) > 0.01) return false;
               }
-              // Match by expiry when known
               if (pos.expiryDate) {
                 const posExpStr = new Date(pos.expiryDate).toISOString().slice(0, 10);
                 const itemExp = (item.expiration_date || item.expiration || "").slice(0, 10);
@@ -9537,6 +9536,18 @@ async function syncRobinhoodAccount(acct, quotes) {
               }
               return true;
             });
+
+            // Fallback: if the market data response is for held positions only (not the full chain),
+            // any item matching ticker+type is our contract
+            if (!match && mdItems.length <= 20) {
+              match = mdItems.find(item => {
+                const rawSym = (item.symbol || item.occ_symbol || "").toUpperCase();
+                const itemTicker = (item.chain_symbol || rawSym.replace(/\d.*/, "").trim() || "").toUpperCase();
+                if (itemTicker !== pos.ticker) return false;
+                const itemType = (item.option_type || item.type || "").toLowerCase();
+                return !itemType || itemType === pos.type;
+              });
+            }
 
             if (match) {
               const bid = parseFloat(match.bid_price || 0) || null;
@@ -9547,14 +9558,18 @@ async function syncRobinhoodAccount(acct, quotes) {
               // Bid = actual sell price (what you'd receive to close). Use as liveMark so
               // P&L and exit gates reflect the true realizable value, not a theoretical mid.
               pos.liveMark = bid ?? mark;
+              console.log(`  [RH-MD-DEBUG] ${pos.ticker} ${pos.type}: bid=${bid} ask=${ask} mark=${mark} → liveMark=${pos.liveMark}`);
               if (pos.liveMark != null && pos.entryPremium > 0) {
                 const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
                 if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
               }
+            } else {
+              console.log(`  [RH-MD-DEBUG] ${pos.ticker} ${pos.type}: no match found in ${mdItems.length} items`);
             }
           }
         } catch (e) {
           log(acct, `ROBINHOOD SYNC: live bid fetch error — ${e.message}`);
+          console.log(`  [RH-MD-DEBUG] live bid fetch threw:`, e.message);
         }
       }
     }

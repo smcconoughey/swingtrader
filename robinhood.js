@@ -530,8 +530,12 @@ const robinhood = {
     const toolName = discoveredTools.has("get_options_market_data") ? "get_options_market_data"
       : discoveredTools.has("get_option_market_data") ? "get_option_market_data"
       : "get_options_market_data";
-    const args = { symbols: syms.map(s => s.toUpperCase()) };
-    if (acctNum) args.account_number = acctNum;
+    // Use buildSchemaArgs to avoid sending params the tool schema doesn't accept
+    const args = buildSchemaArgs(toolName, {
+      symbols: syms.map(s => s.toUpperCase()),
+      symbol: syms[0]?.toUpperCase(),
+      account_number: acctNum,
+    });
     const result = await callTool(toolName, args);
     return extractContent(result);
   },
