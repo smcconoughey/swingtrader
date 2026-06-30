@@ -9609,7 +9609,10 @@ async function syncRobinhoodAccount(acct, quotes) {
               const mark = parseFloat(match.mark_price || match.adjusted_mark_price || 0) || null;
               pos.liveBid = bid;
               pos.liveAsk = ask;
-              pos.liveMark = bid ?? mark;
+              // Use mark (mid) for P&L display and exit threshold checks — that's the fair value.
+              // liveBid is kept for actual sell order limit prices (filled at bid, not mid).
+              // Using raw bid inflates losses on wide-spread options (bid can be 30-40% below mid).
+              pos.liveMark = mark ?? bid;
               log(acct, `ROBINHOOD SYNC: ${pos.ticker} ${pos.type} live bid=${bid} ask=${ask} mark=${mark}`);
               if (pos.liveMark != null && pos.entryPremium > 0) {
                 const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
