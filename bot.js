@@ -9496,6 +9496,69 @@ async function syncRobinhoodAccount(acct, quotes) {
       }
     }
 
+    // Fetch live bid prices for Robinhood options positions that have no live mark.
+    // The positions endpoint doesn't return bid/ask/mark, so we call getOptionMarketData
+    // separately. Bid = what we'd actually receive when selling to close.
+    if (robinhood.optionsEnabled) {
+      const needsMark = positions.filter(
+        p => p.optionsSource === "robinhood" && p.type !== "equity" && p.liveMark == null
+      );
+      if (needsMark.length > 0) {
+        const tickers = [...new Set(needsMark.map(p => p.ticker))];
+        try {
+          const mdRes = await robinhood.getOptionMarketData(tickers);
+          const mdRaw = mdRes && mdRes.data ? mdRes.data : mdRes;
+          // Flatten multiple possible response shapes into an array of contract items
+          const mdItems = Array.isArray(mdRaw) ? mdRaw
+            : (mdRaw && Array.isArray(mdRaw.options)) ? mdRaw.options
+            : (mdRaw && Array.isArray(mdRaw.results)) ? mdRaw.results
+            : (mdRaw && Array.isArray(mdRaw.contracts)) ? mdRaw.contracts
+            : [];
+
+          for (const pos of needsMark) {
+            const match = mdItems.find(item => {
+              // Match by underlying ticker
+              const rawSym = (item.symbol || item.occ_symbol || "").toUpperCase();
+              const itemTicker = (item.chain_symbol || rawSym.replace(/\d.*/, "").trim() || "").toUpperCase();
+              if (itemTicker !== pos.ticker) return false;
+              // Match by option type (call/put) when present
+              const itemType = (item.option_type || item.type || "").toLowerCase();
+              if (itemType && itemType !== pos.type) return false;
+              // Match by strike when known
+              if (pos.strike > 0) {
+                const itemStrike = parseFloat(item.strike_price || item.strike || 0);
+                if (itemStrike > 0 && Math.abs(itemStrike - pos.strike) > 0.01) return false;
+              }
+              // Match by expiry when known
+              if (pos.expiryDate) {
+                const posExpStr = new Date(pos.expiryDate).toISOString().slice(0, 10);
+                const itemExp = (item.expiration_date || item.expiration || "").slice(0, 10);
+                if (itemExp && itemExp !== posExpStr) return false;
+              }
+              return true;
+            });
+
+            if (match) {
+              const bid = parseFloat(match.bid_price || 0) || null;
+              const ask = parseFloat(match.ask_price || 0) || null;
+              const mark = parseFloat(match.mark_price || match.adjusted_mark_price || 0) || null;
+              pos.liveBid = bid;
+              pos.liveAsk = ask;
+              // Bid = actual sell price (what you'd receive to close). Use as liveMark so
+              // P&L and exit gates reflect the true realizable value, not a theoretical mid.
+              pos.liveMark = bid ?? mark;
+              if (pos.liveMark != null && pos.entryPremium > 0) {
+                const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
+                if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
+              }
+            }
+          }
+        } catch (e) {
+          log(acct, `ROBINHOOD SYNC: live bid fetch error — ${e.message}`);
+        }
+      }
+    }
+
     // Prune stale meta
     for (const k of Object.keys(state.meta)) {
       if (!seen.has(k)) delete state.meta[k];
