@@ -9606,14 +9606,17 @@ async function syncRobinhoodAccount(acct, quotes) {
             if (match) {
               const bid = parseFloat(match.bid_price || 0) || null;
               const ask = parseFloat(match.ask_price || 0) || null;
-              const mark = parseFloat(match.mark_price || match.adjusted_mark_price || 0) || null;
+              const markRaw = parseFloat(match.mark_price || match.adjusted_mark_price || 0) || null;
+              const lastTrade = parseFloat(match.last_trade_price || match.last_trade || 0) || null;
+              // Compute mid from two-sided market — Robinhood MCP sometimes returns mark_price=0.00
+              // even during market hours. Mid is a better fair-value estimate than raw bid.
+              const mid = (bid != null && ask != null) ? +((bid + ask) / 2).toFixed(2) : null;
               pos.liveBid = bid;
               pos.liveAsk = ask;
-              // Use mark (mid) for P&L display and exit threshold checks — that's the fair value.
+              // Priority: API mark → computed mid → last trade → bid as last resort.
               // liveBid is kept for actual sell order limit prices (filled at bid, not mid).
-              // Using raw bid inflates losses on wide-spread options (bid can be 30-40% below mid).
-              pos.liveMark = mark ?? bid;
-              log(acct, `ROBINHOOD SYNC: ${pos.ticker} ${pos.type} live bid=${bid} ask=${ask} mark=${mark}`);
+              pos.liveMark = markRaw ?? mid ?? lastTrade ?? bid;
+              log(acct, `ROBINHOOD SYNC: ${pos.ticker} ${pos.type} live bid=${bid} ask=${ask} mark=${markRaw} mid=${mid} → liveMark=${pos.liveMark}`);
               if (pos.liveMark != null && pos.entryPremium > 0) {
                 const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
                 if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
