@@ -586,10 +586,44 @@ const robinhood = {
       : null;
     if (!toolName) throw new Error("get_option_instruments not available");
     const args = buildSchemaArgs(toolName, {
+      chain_symbol: symbol.toUpperCase(),
       symbol: symbol.toUpperCase(),
       symbols: [symbol.toUpperCase()],
     });
     return extractContent(await callTool(toolName, args));
+  },
+
+  // Resolve the option instrument UUID for a specific contract. Orders (place/review) reference
+  // the contract only by option_id, but our chain candidates come from Tradier/Finnhub which don't
+  // carry Robinhood's id — so we look it up by chain_symbol + expiration + strike + type.
+  async resolveOptionId(symbol, expirationDate, optionType, strikePrice, accountNumber) {
+    const toolName = discoveredTools.has("get_option_instruments") ? "get_option_instruments"
+      : findTool(/option_instruments/i);
+    if (!toolName) throw new Error("get_option_instruments not available");
+    const exp = String(expirationDate).slice(0, 10);
+    const args = buildSchemaArgs(toolName, {
+      chain_symbol: String(symbol).toUpperCase(),
+      expiration_dates: exp,
+      strike_price: Number(strikePrice).toFixed(4),
+      type: String(optionType).toLowerCase(),
+      state: "active",
+    });
+    const res = extractContent(await callTool(toolName, args));
+    const raw = res && res.data ? res.data : res;
+    const items = Array.isArray(raw) ? raw
+      : Array.isArray(raw?.results) ? raw.results
+      : Array.isArray(raw?.instruments) ? raw.instruments
+      : Array.isArray(raw?.option_instruments) ? raw.option_instruments : [];
+    const want = Number(strikePrice);
+    const match = items.find(it => {
+      const s = parseFloat(it.strike_price ?? it.strike ?? 0);
+      const t = String(it.type || it.option_type || "").toLowerCase();
+      const e = String(it.expiration_date || it.expiration || "").slice(0, 10);
+      return (!want || Math.abs(s - want) < 0.01)
+        && (!optionType || t === String(optionType).toLowerCase())
+        && (!exp || e === exp);
+    }) || items[0] || null;
+    return match ? (match.id || match.option_id || match.instrument_id || null) : null;
   },
 
   async getHistoricals(symbol, span = "year", interval = "day") {
@@ -607,55 +641,57 @@ const robinhood = {
     return extractContent(await callTool(toolName, args));
   },
 
-  async reviewOptionOrder({ symbol, expirationDate, strikePrice, optionType, side, quantity, type, limitPrice, stopPrice, timeInForce, refId } = {}, accountNumber) {
+  // Build the exact wire args for place_option_order / review_option_order. The tool takes a
+  // single-leg `legs` array (option_id + side + position_effect) and a top-level `price`, NOT the
+  // flat symbol/strike/limit_price fields — additionalProperties:false rejects anything else.
+  async _buildOptionOrderArgs({ acctNum, symbol, expirationDate, strikePrice, optionType, side, quantity, type, limitPrice, stopPrice, timeInForce, refId, optionId, positionEffect }) {
+    let instrId = optionId;
+    if (!instrId) instrId = await this.resolveOptionId(symbol, expirationDate, optionType, strikePrice, acctNum);
+    if (!instrId) throw new Error(`could not resolve option_id for ${symbol} $${strikePrice} ${optionType} ${expirationDate}`);
+    // Compound sides (buy_to_open / sell_to_close / ...) → leg side + position_effect.
+    const s = String(side || "").toLowerCase();
+    const legSide = s.includes("sell") ? "sell" : "buy";
+    const posEffect = positionEffect
+      || (s.includes("close") ? "close" : s.includes("open") ? "open" : (legSide === "buy" ? "open" : "close"));
+    const ordType = type || "limit";
+    const args = {
+      account_number: acctNum,
+      legs: [{ option_id: instrId, side: legSide, position_effect: posEffect, ratio_quantity: 1 }],
+      type: ordType,
+      quantity: String(parseInt(quantity, 10) || quantity),
+      time_in_force: timeInForce || "gfd",
+      ref_id: refId || crypto.randomUUID(),
+    };
+    // price only for limit / stop_limit; stop_price only for stop_limit / stop_market.
+    if ((ordType === "limit" || ordType === "stop_limit") && limitPrice != null) args.price = String(limitPrice);
+    if ((ordType === "stop_limit" || ordType === "stop_market") && stopPrice != null) args.stop_price = String(stopPrice);
+    return { args, optionId: instrId, legSide, posEffect, ordType };
+  },
+
+  async reviewOptionOrder(params = {}, accountNumber) {
     if (!optionsSupported) throw new Error("Options not supported on this MCP session");
     const acctNum = accountNumber || discoveredAccountNumber;
     if (!acctNum) throw new Error("No account number");
     const toolName = discoveredTools.has("review_option_order") ? "review_option_order"
-      : discoveredTools.has("review_options_order") ? "review_options_order"
-      : "review_option_order";
-    const args = {
-      account_number: acctNum,
-      symbol: symbol.toUpperCase(),
-      expiration_date: expirationDate,
-      strike_price: String(strikePrice),
-      option_type: optionType,
-      side,
-      quantity: String(quantity),
-      type: type || "limit",
-    };
-    if (limitPrice) args.limit_price = String(limitPrice);
-    if (stopPrice) args.stop_price = String(stopPrice);
-    if (timeInForce) args.time_in_force = timeInForce;
-    if (refId) args.ref_id = refId;
-    const result = await callTool(toolName, args);
+      : findTool(/review_options?_order/i) || "review_option_order";
+    const { args } = await this._buildOptionOrderArgs({ ...params, acctNum });
+    // review takes chain_symbol + underlying_type (for fees/collateral) instead of ref_id.
+    if (params.symbol) { args.chain_symbol = String(params.symbol).toUpperCase(); args.underlying_type = "equity"; }
+    const result = await callTool(toolName, buildSchemaArgs(toolName, args));
     return extractContent(result);
   },
 
-  async placeOptionOrder({ symbol, expirationDate, strikePrice, optionType, side, quantity, type, limitPrice, stopPrice, timeInForce, refId } = {}, accountNumber) {
+  async placeOptionOrder(params = {}, accountNumber) {
     if (!optionsSupported) throw new Error("Options not supported on this MCP session");
     const acctNum = accountNumber || discoveredAccountNumber;
     if (!acctNum) throw new Error("No account number");
     const toolName = discoveredTools.has("place_option_order") ? "place_option_order"
-      : discoveredTools.has("place_options_order") ? "place_options_order"
-      : "place_option_order";
-    const args = {
-      account_number: acctNum,
-      symbol: symbol.toUpperCase(),
-      expiration_date: expirationDate,
-      strike_price: String(strikePrice),
-      option_type: optionType,
-      side,
-      quantity: String(quantity),
-      type: type || "limit",
-      ref_id: refId || crypto.randomUUID(),
-    };
-    if (limitPrice) args.limit_price = String(limitPrice);
-    if (stopPrice) args.stop_price = String(stopPrice);
-    if (timeInForce) args.time_in_force = timeInForce || "gfd";
-
-    const occ = buildOCC(symbol, expirationDate, optionType, parseFloat(strikePrice));
-    console.log(`  [RH] Placing OPTION ${side.toUpperCase()} ${quantity}x ${occ} (${type || "limit"}${limitPrice ? ` @ $${limitPrice}` : ""})`);
+      : findTool(/place_options?_order/i) || "place_option_order";
+    const { args, optionId, legSide, posEffect } = await this._buildOptionOrderArgs({ ...params, acctNum });
+    const label = params.symbol
+      ? buildOCC(params.symbol, params.expirationDate, params.optionType || "call", parseFloat(params.strikePrice) || 0)
+      : optionId;
+    console.log(`  [RH] Placing OPTION ${legSide}/${posEffect} ${args.quantity}x ${label} (${args.type}${args.price ? ` @ $${args.price}` : ""})`);
 
     const result = await callTool(toolName, buildSchemaArgs(toolName, args));
     const parsed = extractContent(result);
