@@ -7311,7 +7311,15 @@ function startDashboard(defaultAcct, apiKey) {
         res.end(JSON.stringify({ error: "Robinhood MCP not connected" }));
         return;
       }
-      const out = { optionsEnabled: robinhood.optionsEnabled, optionTools: robinhood.optionToolInfo, positionsRaw: null, held: [], byOptionId: {}, byTicker: {}, byOcc: {}, errors: {} };
+      const out = { optionsEnabled: robinhood.optionsEnabled, optionTools: robinhood.optionToolInfo, orderSchemas: {}, positionsRaw: null, held: [], byOptionId: {}, byTicker: {}, byOcc: {}, errors: {} };
+      // Full input schemas for the order tools — need the legs sub-schema to build orders in the
+      // exact wire format the MCP expects (additionalProperties:false rejects extra leg fields).
+      try {
+        const allSchemas = robinhood.toolSchemas;
+        for (const t of ["place_option_order", "review_option_order", "place_options_order", "review_options_order"]) {
+          if (allSchemas[t]) out.orderSchemas[t] = allSchemas[t];
+        }
+      } catch (e) { out.errors.orderSchemas = e.message; }
       try {
         const optRes = await robinhood.getOptionsPositions();
         out.positionsRaw = optRes && optRes.data ? optRes.data : optRes;
