@@ -4125,6 +4125,9 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
             type: "limit",
             limitPrice: limit.toFixed(2),
             refId,
+            // We already hold the contract's instrument UUID — pass it so the order layer skips the
+            // instrument lookup (and works even if strike wasn't resolved from filled orders).
+            optionId: pos.instrumentUrl || undefined,
           }).then(res => {
             const occ = robinhood.buildOCC(pos.ticker, expStr, pos.type, pos.strike);
             log(acct, `ROBINHOOD OPTION EXIT: SELL ${qty}x ${occ} @ $${limit} (${isTrimLocal ? "TRIM" : "EXIT"} — ${reason}) — order ${res?.id || "?"}`);
@@ -7355,6 +7358,22 @@ function startDashboard(defaultAcct, apiKey) {
           const occ = robinhood.buildOCC(h.ticker, h.expDate, h.optType, h.strike);
           try { out.byOcc[occ] = await robinhood.getOptionMarketData([occ]); }
           catch (e) { out.errors[`byOcc:${occ}`] = e.message; }
+        }
+        // Dry-run probe: review (NOT place) a 1-contract sell_to_close for each held contract using
+        // its option_id. review_option_order previews without executing, so this validates the legs
+        // wire format end-to-end with zero risk. If it returns a preview, the exit format is correct.
+        out.reviewProbe = {};
+        for (const h of held) {
+          if (!h.optionId || !(h.qty > 0)) continue;
+          const q = out.byOptionId[h.optionId]?.data?.results?.[0]?.quote;
+          const bid = q ? parseFloat(q.bid_price) : 0;
+          const probeLimit = (bid > 0 ? bid : 0.01).toFixed(2);
+          try {
+            out.reviewProbe[h.optionId] = await robinhood.reviewOptionOrder({
+              symbol: h.ticker, expirationDate: h.expDate, strikePrice: h.strike, optionType: h.optType,
+              side: "sell_to_close", quantity: 1, type: "limit", limitPrice: probeLimit, optionId: h.optionId,
+            });
+          } catch (e) { out.errors[`reviewProbe:${h.optionId}`] = e.message; }
         }
       } catch (e) {
         out.errors.top = e.message;
