@@ -9685,23 +9685,19 @@ async function syncRobinhoodAccount(acct, quotes) {
           const mdRes = await robinhood.getOptionMarketData(fetchArg);
           const mdRaw = mdRes && mdRes.data ? mdRes.data : mdRes;
           // Flatten multiple possible response shapes into an array of contract items
-          const mdItems = Array.isArray(mdRaw) ? mdRaw
-            : (mdRaw && Array.isArray(mdRaw.options)) ? mdRaw.options
+          const mdItemsRaw = Array.isArray(mdRaw) ? mdRaw
             : (mdRaw && Array.isArray(mdRaw.results)) ? mdRaw.results
+            : (mdRaw && Array.isArray(mdRaw.options)) ? mdRaw.options
             : (mdRaw && Array.isArray(mdRaw.contracts)) ? mdRaw.contracts
             : [];
-
-          // Log response shape to dashboard so we can diagnose format issues
-          const firstKeys = mdItems.length > 0 ? Object.keys(mdItems[0]).join(",") : "none";
-          log(acct, `ROBINHOOD SYNC: market data — ${mdItems.length} items, keys: ${firstKeys}`);
-          // DIAGNOSTIC: dump the raw first item AND the top-level wrapper keys so we can see the
-          // true response shape and how items are keyed/priced. Remove once matching is confirmed.
-          log(acct, `RH-RAW MKTDATA wrapper keys: ${mdRaw && typeof mdRaw === "object" ? Object.keys(mdRaw).join(",") : typeof mdRaw}`);
-          if (mdItems.length > 0) {
-            log(acct, `RH-RAW MKTDATA item[0]: ${JSON.stringify(mdItems[0]).slice(0, 900)}`);
-          } else {
-            log(acct, `RH-RAW MKTDATA (no items array): ${JSON.stringify(mdRaw).slice(0, 900)}`);
-          }
+          // get_option_quotes nests the live quote under results[].quote and the prior-session
+          // close under results[].close. Merge the quote fields up so id-matching (instrument_id)
+          // and price extraction (bid_price/ask_price/mark_price) work on a flat item, and keep the
+          // close for reference. Defensive: if there's no nested quote, treat the item as flat.
+          const mdItems = mdItemsRaw.map(it => {
+            const q = (it && typeof it.quote === "object" && it.quote) ? it.quote : it;
+            return { ...it, ...q, _quote: q, _close: (it && it.close) || null };
+          });
 
           for (const pos of needsMark) {
             // Identifier priority, most to least reliable:
@@ -9771,14 +9767,26 @@ async function syncRobinhoodAccount(acct, quotes) {
               const ask = num("ask_price", "ask", "best_ask_price");
               const markRaw = num("mark_price", "adjusted_mark_price", "mark");
               const lastTrade = num("last_trade_price", "last_trade", "last_price", "previous_close_price");
-              // Compute mid from two-sided market — Robinhood MCP sometimes returns mark_price=0.00
-              // even during market hours. Mid is a better fair-value estimate than raw bid.
+              // Compute mid from two-sided market — mark_price can be 0.00 even during hours.
               const mid = (bid != null && ask != null) ? +((bid + ask) / 2).toFixed(2) : null;
               pos.liveBid = bid;
               pos.liveAsk = ask;
               // Priority: API mark → computed mid → last trade → bid as last resort.
               // liveBid is kept for actual sell order limit prices (filled at bid, not mid).
               pos.liveMark = markRaw ?? mid ?? lastTrade ?? bid;
+              // Capture live greeks + IV straight from the quote (used for the position display).
+              // parseFloat directly (not num()) since greeks are legitimately negative.
+              const delta = parseFloat(match.delta), theta = parseFloat(match.theta), gamma = parseFloat(match.gamma), vega = parseFloat(match.vega);
+              const iv = parseFloat(match.implied_volatility);
+              if (!isNaN(delta) || !isNaN(theta)) {
+                pos.liveGreeks = {
+                  delta: isNaN(delta) ? null : +delta.toFixed(3),
+                  theta: isNaN(theta) ? null : +theta.toFixed(3),
+                  gamma: isNaN(gamma) ? null : +gamma.toFixed(3),
+                  vega: isNaN(vega) ? null : +vega.toFixed(3),
+                };
+              }
+              if (!isNaN(iv) && iv > 0) pos.iv = iv;
               log(acct, `ROBINHOOD SYNC: ${pos.ticker} ${pos.type} live bid=${bid} ask=${ask} mark=${markRaw} mid=${mid} → liveMark=${pos.liveMark}`);
               if (pos.liveMark != null && pos.entryPremium > 0) {
                 const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
