@@ -7301,6 +7301,53 @@ function startDashboard(defaultAcct, apiKey) {
       return;
     }
 
+    // On-demand raw dump of the exact Robinhood options payloads used for live pricing. This
+    // bypasses the flooded cycle log so the true API shapes can be observed directly. Fetches
+    // held option positions and their market data by BOTH bare ticker and OCC symbol so we can
+    // see which identifier the market-data endpoint actually keys on.
+    if (pathname === "/api/rh-debug") {
+      if (!robinhood.isConnected) {
+        res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: "Robinhood MCP not connected" }));
+        return;
+      }
+      const out = { optionsEnabled: robinhood.optionsEnabled, positionsRaw: null, tickers: [], byTicker: {}, byOcc: {}, errors: {} };
+      try {
+        const optRes = await robinhood.getOptionsPositions();
+        out.positionsRaw = optRes && optRes.data ? optRes.data : optRes;
+        const optArr = out.positionsRaw && Array.isArray(out.positionsRaw.positions) ? out.positionsRaw.positions
+          : Array.isArray(out.positionsRaw) ? out.positionsRaw : [];
+        const held = [];
+        for (const op of optArr) {
+          const qty = parseFloat(op.quantity || op.pending_buy_quantity || 0);
+          if (qty <= 0) continue;
+          const ticker = (op.chain_symbol || op.symbol || "").toUpperCase();
+          const rawSide = (op.type || "").toLowerCase();
+          const optType = (rawSide === "long" || rawSide === "short") ? (op.option_type || op.legs?.[0]?.option_type || "call").toLowerCase() : (rawSide || "call").toLowerCase();
+          const strike = parseFloat(op.strike_price || op.legs?.[0]?.strike_price || 0);
+          const expDate = op.expiration_date || op.legs?.[0]?.expiration_date || null;
+          held.push({ ticker, optType, strike, expDate, instrument: op.instrument || op.instrument_id || op.option_id || null });
+        }
+        out.held = held;
+        out.tickers = [...new Set(held.map(h => h.ticker).filter(Boolean))];
+        for (const t of out.tickers) {
+          try { out.byTicker[t] = await robinhood.getOptionMarketData([t]); }
+          catch (e) { out.errors[`byTicker:${t}`] = e.message; }
+        }
+        for (const h of held) {
+          if (!h.ticker || !h.strike || !h.expDate) continue;
+          const occ = robinhood.buildOCC(h.ticker, h.expDate, h.optType, h.strike);
+          try { out.byOcc[occ] = await robinhood.getOptionMarketData([occ]); }
+          catch (e) { out.errors[`byOcc:${occ}`] = e.message; }
+        }
+      } catch (e) {
+        out.errors.top = e.message;
+      }
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify(out, null, 2));
+      return;
+    }
+
     if (pathname === "/api/rh-watchlist") {
       if (!robinhood.isConnected) {
         res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
