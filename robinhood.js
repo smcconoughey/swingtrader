@@ -185,6 +185,17 @@ function buildSchemaArgs(toolName, candidateArgs) {
   return filtered;
 }
 
+// Find the first discovered tool whose name matches any of the given regexes, tried in order.
+// Lets us bind to whatever the MCP server actually named a tool instead of hardcoding guesses.
+function findTool(...patterns) {
+  for (const pat of patterns) {
+    for (const name of discoveredTools) {
+      if (pat.test(name)) return name;
+    }
+  }
+  return null;
+}
+
 function extractContent(result) {
   // MCP tool results come as { content: [{ type: "text", text: "..." }] }
   if (!result?.content) return result;
@@ -290,6 +301,16 @@ const robinhood = {
   get optionsEnabled() { return optionsSupported; },
   get availableTools() { return [...discoveredTools]; },
   get toolSchemas() { return Object.fromEntries(discoveredToolSchemas); },
+  // Option-related tool names + their input-param names, for diagnostics.
+  get optionToolInfo() {
+    const info = {};
+    for (const name of discoveredTools) {
+      if (!/option/i.test(name)) continue;
+      const schema = discoveredToolSchemas.get(name);
+      info[name] = schema?.properties ? Object.keys(schema.properties) : [];
+    }
+    return info;
+  },
   get lastInitError() { return lastInitError; },
 
   buildOCC,
@@ -526,18 +547,34 @@ const robinhood = {
     return extractContent(result);
   },
 
-  async getOptionMarketData(symbols, accountNumber) {
+  // Accepts either option instrument ids (UUIDs from the positions endpoint) or OCC/ticker
+  // symbols. The actual MCP tool name for option market data is NOT get_options_market_data on
+  // this server (that name errors as "unknown tool"), so we discover it by pattern and pass the
+  // value under every plausible param key — buildSchemaArgs keeps only the ones the tool declares.
+  async getOptionMarketData(symbolsOrIds, accountNumber) {
     if (!optionsSupported) throw new Error("Options not supported on this MCP session");
     const acctNum = accountNumber || discoveredAccountNumber;
-    const syms = Array.isArray(symbols) ? symbols : [symbols];
-    const toolName = discoveredTools.has("get_options_market_data") ? "get_options_market_data"
-      : discoveredTools.has("get_option_market_data") ? "get_option_market_data"
-      : "get_options_market_data";
-    // Use buildSchemaArgs to avoid sending params the tool schema doesn't accept
+    const list = (Array.isArray(symbolsOrIds) ? symbolsOrIds : [symbolsOrIds]).filter(Boolean).map(String);
+    const toolName = findTool(
+      /options?_market_?data/i,
+      /options?_quotes?/i,
+      /(market_?data|quote)s?.*options?/i,
+      /options?.*(market_?data|quote)/i,
+    );
+    if (!toolName) {
+      const optTools = [...discoveredTools].filter(t => /option/i.test(t)).join(", ");
+      throw new Error(`no option market-data tool discovered (option tools: ${optTools})`);
+    }
+    // ids kept raw (UUIDs are case-sensitive-ish); symbols upper-cased (tickers/OCC).
+    const idsRaw = list;
+    const symsUpper = list.map(s => s.toUpperCase());
     const args = buildSchemaArgs(toolName, {
-      symbols: syms.map(s => s.toUpperCase()),
-      symbol: syms[0]?.toUpperCase(),
       account_number: acctNum,
+      symbols: symsUpper, symbol: symsUpper[0],
+      ids: idsRaw, id: idsRaw[0],
+      option_ids: idsRaw, option_id: idsRaw[0],
+      instrument_ids: idsRaw, instrument_id: idsRaw[0],
+      instruments: idsRaw,
     });
     const result = await callTool(toolName, args);
     return extractContent(result);

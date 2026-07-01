@@ -7311,7 +7311,7 @@ function startDashboard(defaultAcct, apiKey) {
         res.end(JSON.stringify({ error: "Robinhood MCP not connected" }));
         return;
       }
-      const out = { optionsEnabled: robinhood.optionsEnabled, positionsRaw: null, tickers: [], byTicker: {}, byOcc: {}, errors: {} };
+      const out = { optionsEnabled: robinhood.optionsEnabled, optionTools: robinhood.optionToolInfo, positionsRaw: null, held: [], byOptionId: {}, byTicker: {}, byOcc: {}, errors: {} };
       try {
         const optRes = await robinhood.getOptionsPositions();
         out.positionsRaw = optRes && optRes.data ? optRes.data : optRes;
@@ -7319,17 +7319,25 @@ function startDashboard(defaultAcct, apiKey) {
           : Array.isArray(out.positionsRaw) ? out.positionsRaw : [];
         const held = [];
         for (const op of optArr) {
-          const qty = parseFloat(op.quantity || op.pending_buy_quantity || 0);
-          if (qty <= 0) continue;
+          const qty = parseFloat(op.quantity || op.pending_buy_quantity || op.pending_sell_quantity || 0);
+          // include zero-qty rows too so the endpoint still probes market data when flat
           const ticker = (op.chain_symbol || op.symbol || "").toUpperCase();
           const rawSide = (op.type || "").toLowerCase();
           const optType = (rawSide === "long" || rawSide === "short") ? (op.option_type || op.legs?.[0]?.option_type || "call").toLowerCase() : (rawSide || "call").toLowerCase();
           const strike = parseFloat(op.strike_price || op.legs?.[0]?.strike_price || 0);
           const expDate = op.expiration_date || op.legs?.[0]?.expiration_date || null;
-          held.push({ ticker, optType, strike, expDate, instrument: op.instrument || op.instrument_id || op.option_id || null });
+          const optionId = op.option_id || op.instrument_id || op.instrument || null;
+          if (rawSide === "long") held.push({ ticker, optType, strike, expDate, optionId, qty });
         }
         out.held = held;
         out.tickers = [...new Set(held.map(h => h.ticker).filter(Boolean))];
+        // Probe the market-data tool three ways: by option_id (UUID), by bare ticker, by OCC.
+        for (const h of held) {
+          if (h.optionId) {
+            try { out.byOptionId[h.optionId] = await robinhood.getOptionMarketData([h.optionId]); }
+            catch (e) { out.errors[`byOptionId:${h.optionId}`] = e.message; }
+          }
+        }
         for (const t of out.tickers) {
           try { out.byTicker[t] = await robinhood.getOptionMarketData([t]); }
           catch (e) { out.errors[`byTicker:${t}`] = e.message; }
@@ -9669,10 +9677,12 @@ async function syncRobinhoodAccount(acct, quotes) {
       );
       if (needsMark.length > 0) {
         const tickers = [...new Set(needsMark.map(p => p.ticker))];
-        // DIAGNOSTIC: show exactly what we ask for and which contracts still need a live mark.
-        log(acct, `RH-RAW MKTDATA request: tickers=[${tickers.join(",")}] needsMark=[${needsMark.map(p => `${p.ticker} ${p.type} $${p.strike} occ=${p.occSymbol} inst=${p.instrumentUrl ? "y" : "n"}`).join(" | ")}]`);
+        // Prefer fetching by option instrument id (UUID from the positions endpoint) — that's the
+        // unambiguous key. Fall back to bare tickers only if some position lacks an id.
+        const optionIds = needsMark.map(p => p.instrumentUrl).filter(Boolean);
+        const fetchArg = optionIds.length === needsMark.length ? optionIds : tickers;
         try {
-          const mdRes = await robinhood.getOptionMarketData(tickers);
+          const mdRes = await robinhood.getOptionMarketData(fetchArg);
           const mdRaw = mdRes && mdRes.data ? mdRes.data : mdRes;
           // Flatten multiple possible response shapes into an array of contract items
           const mdItems = Array.isArray(mdRaw) ? mdRaw
@@ -9695,15 +9705,20 @@ async function syncRobinhoodAccount(acct, quotes) {
 
           for (const pos of needsMark) {
             // Identifier priority, most to least reliable:
-            // 1. Instrument URL — Robinhood's canonical id for this exact contract (from the
-            //    positions endpoint). Unambiguous when present on both sides.
+            // 1. Option instrument id (the UUID from the positions endpoint) — unambiguous. The
+            //    market-data item may echo it under option_id / instrument_id / id / instrument.
             // 2. OCC symbol — exact ticker+expiry+type+strike encoded string.
             // 3. ticker+type+strike+expiry field-by-field match.
-            // 4. If we queried for exactly one ticker and got back exactly one item, it must be ours
-            //    (no ambiguity possible). This does NOT apply when multiple strikes/expiries came back.
+            // 4. If we queried for exactly one contract and got back exactly one item, it must be
+            //    ours (no ambiguity). NOT applied when multiple items came back.
             let match = null;
             if (pos.instrumentUrl) {
-              match = mdItems.find(item => item.instrument && item.instrument === pos.instrumentUrl);
+              match = mdItems.find(item =>
+                (item.option_id && item.option_id === pos.instrumentUrl) ||
+                (item.instrument_id && item.instrument_id === pos.instrumentUrl) ||
+                (item.id && item.id === pos.instrumentUrl) ||
+                (item.instrument && (item.instrument === pos.instrumentUrl || String(item.instrument).includes(pos.instrumentUrl)))
+              );
             }
             if (!match) {
               match = mdItems.find(item => {
@@ -9743,10 +9758,19 @@ async function syncRobinhoodAccount(acct, quotes) {
             }
 
             if (match) {
-              const bid = parseFloat(match.bid_price || 0) || null;
-              const ask = parseFloat(match.ask_price || 0) || null;
-              const markRaw = parseFloat(match.mark_price || match.adjusted_mark_price || 0) || null;
-              const lastTrade = parseFloat(match.last_trade_price || match.last_trade || 0) || null;
+              // Tolerant field extraction — the exact response shape isn't documented, so accept
+              // the common Robinhood variants for each quantity.
+              const num = (...keys) => {
+                for (const k of keys) {
+                  const v = parseFloat(match[k]);
+                  if (!isNaN(v) && v > 0) return v;
+                }
+                return null;
+              };
+              const bid = num("bid_price", "bid", "best_bid_price");
+              const ask = num("ask_price", "ask", "best_ask_price");
+              const markRaw = num("mark_price", "adjusted_mark_price", "mark");
+              const lastTrade = num("last_trade_price", "last_trade", "last_price", "previous_close_price");
               // Compute mid from two-sided market — Robinhood MCP sometimes returns mark_price=0.00
               // even during market hours. Mid is a better fair-value estimate than raw bid.
               const mid = (bid != null && ask != null) ? +((bid + ask) / 2).toFixed(2) : null;
