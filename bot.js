@@ -9414,6 +9414,13 @@ async function syncRobinhoodAccount(acct, quotes) {
           : optRes && Array.isArray(optRes.positions) ? optRes.positions
           : Array.isArray(optRes) ? optRes : [];
 
+        // DIAGNOSTIC: dump the full raw shape of the first options position so we can see exactly
+        // which fields carry the instrument id / strike / pricing (the API shape has been guessed
+        // at, not observed). Remove once matching is confirmed working.
+        if (optRaw.length > 0) {
+          log(acct, `RH-RAW POSITION: ${JSON.stringify(optRaw[0]).slice(0, 900)}`);
+        }
+
         for (const op of optRaw) {
           const qty = parseFloat(op.quantity || op.pending_buy_quantity || 0);
           if (qty <= 0) continue;
@@ -9615,6 +9622,8 @@ async function syncRobinhoodAccount(acct, quotes) {
       );
       if (needsMark.length > 0) {
         const tickers = [...new Set(needsMark.map(p => p.ticker))];
+        // DIAGNOSTIC: show exactly what we ask for and which contracts still need a live mark.
+        log(acct, `RH-RAW MKTDATA request: tickers=[${tickers.join(",")}] needsMark=[${needsMark.map(p => `${p.ticker} ${p.type} $${p.strike} occ=${p.occSymbol} inst=${p.instrumentUrl ? "y" : "n"}`).join(" | ")}]`);
         try {
           const mdRes = await robinhood.getOptionMarketData(tickers);
           const mdRaw = mdRes && mdRes.data ? mdRes.data : mdRes;
@@ -9628,6 +9637,14 @@ async function syncRobinhoodAccount(acct, quotes) {
           // Log response shape to dashboard so we can diagnose format issues
           const firstKeys = mdItems.length > 0 ? Object.keys(mdItems[0]).join(",") : "none";
           log(acct, `ROBINHOOD SYNC: market data — ${mdItems.length} items, keys: ${firstKeys}`);
+          // DIAGNOSTIC: dump the raw first item AND the top-level wrapper keys so we can see the
+          // true response shape and how items are keyed/priced. Remove once matching is confirmed.
+          log(acct, `RH-RAW MKTDATA wrapper keys: ${mdRaw && typeof mdRaw === "object" ? Object.keys(mdRaw).join(",") : typeof mdRaw}`);
+          if (mdItems.length > 0) {
+            log(acct, `RH-RAW MKTDATA item[0]: ${JSON.stringify(mdItems[0]).slice(0, 900)}`);
+          } else {
+            log(acct, `RH-RAW MKTDATA (no items array): ${JSON.stringify(mdRaw).slice(0, 900)}`);
+          }
 
           for (const pos of needsMark) {
             // Identifier priority, most to least reliable:
@@ -9701,7 +9718,7 @@ async function syncRobinhoodAccount(acct, quotes) {
             }
           }
         } catch (e) {
-          log(acct, `ROBINHOOD SYNC: live bid fetch error — ${e.message}`);
+          log(acct, `ROBINHOOD SYNC: live bid fetch error — ${e.message} | ${(e.stack || "").split("\n")[1]?.trim() || ""}`);
         }
       }
     }
