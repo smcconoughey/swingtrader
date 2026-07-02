@@ -20,12 +20,23 @@ import os from "os";
 // ─── Configuration ───
 
 const MCP_ENDPOINT = "https://agent.robinhood.com/mcp/trading";
+const OAUTH_META_URL = "https://agent.robinhood.com/.well-known/oauth-authorization-server";
 const TOKEN_FILE = "rh_tokens.json";
+// Robinhood's legacy public app client_id. Only valid for tokens minted by the classic
+// api.robinhood.com OAuth flow — NOT for tokens from agent.robinhood.com dynamic client
+// registration (those must refresh with their own registered client_id). Last-resort fallback.
+const LEGACY_CLIENT_ID = "c82SH0WZOsabOXGP2sxqcj34FxkvfnWRZBKlBbFS";
+const LEGACY_TOKEN_ENDPOINT = "https://api.robinhood.com/oauth2/token/";
 
 // ─── State ───
 
 let accessToken = null;
 let refreshToken = null;
+// OAuth client identity the tokens were minted under. The agentic OAuth flow uses dynamic
+// client registration, so each auth run gets a fresh client_id — refresh_token grants are
+// only honored for that same client_id, which is why these must be persisted with the tokens.
+let oauthClientId = null;
+let oauthTokenEndpoint = null;
 let sessionId = null;
 let mcpInitialized = false;
 let discoveredAccountNumber = null;
@@ -38,6 +49,23 @@ let lastInitError = null;
 
 let refreshInProgress = null;
 
+// Resolve the token endpoint for refresh: prefer the endpoint stored alongside the tokens,
+// then the live OAuth metadata, then the legacy endpoint as a last resort.
+async function resolveTokenEndpoint() {
+  if (oauthTokenEndpoint) return oauthTokenEndpoint;
+  try {
+    const res = await fetch(OAUTH_META_URL);
+    if (res.ok) {
+      const meta = await res.json();
+      if (meta.token_endpoint) {
+        oauthTokenEndpoint = meta.token_endpoint;
+        return oauthTokenEndpoint;
+      }
+    }
+  } catch { }
+  return LEGACY_TOKEN_ENDPOINT;
+}
+
 async function tryRefreshToken() {
   if (!refreshToken) return false;
   if (refreshInProgress) return refreshInProgress;
@@ -45,19 +73,25 @@ async function tryRefreshToken() {
   refreshInProgress = (async () => {
     try {
       console.log("  [RH] Access token expired — attempting refresh...");
-      const res = await fetch("https://api.robinhood.com/oauth2/token/", {
+      const endpoint = await resolveTokenEndpoint();
+      const clientId = oauthClientId || LEGACY_CLIENT_ID;
+      if (!oauthClientId) {
+        console.log("  [RH] WARN: no OAuth client_id stored with tokens — refreshing with the legacy app id. If this token came from the agentic OAuth flow, refresh will fail; re-auth from the dashboard to store the client_id.");
+      }
+      const res = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
           grant_type: "refresh_token",
           refresh_token: refreshToken,
-          client_id: "c82SH0WZOsabOXGP2sxqcj34FxkvfnWRZBKlBbFS",
+          client_id: clientId,
         }).toString(),
       });
 
       if (!res.ok) {
         const errText = await res.text().catch(() => "");
-        console.log(`  [RH] Token refresh failed: HTTP ${res.status} — ${errText.slice(0, 200)}`);
+        lastInitError = `Token refresh failed (HTTP ${res.status}) — re-authenticate from the dashboard`;
+        console.log(`  [RH] Token refresh failed: HTTP ${res.status} @ ${endpoint} (client ${clientId.slice(0, 8)}...) — ${errText.slice(0, 200)}`);
         return false;
       }
 
@@ -233,11 +267,24 @@ function parseOCC(occ) {
 // ─── Token Loading ───
 
 function loadTokens() {
+  // OAuth client identity can come from env regardless of where the tokens come from.
+  oauthClientId = (process.env.ROBINHOOD_CLIENT_ID || "").trim() || oauthClientId;
+  oauthTokenEndpoint = (process.env.ROBINHOOD_TOKEN_ENDPOINT || "").trim() || oauthTokenEndpoint;
+
   // Priority 1: env var
   const envToken = (process.env.ROBINHOOD_ACCESS_TOKEN || "").trim();
   if (envToken) {
     accessToken = envToken;
     refreshToken = (process.env.ROBINHOOD_REFRESH_TOKEN || "").trim() || null;
+    // Even with env tokens, pick up a persisted client_id/endpoint (from a prior dashboard auth)
+    // so refresh still works when ROBINHOOD_CLIENT_ID isn't set.
+    try {
+      if (!oauthClientId && fs.existsSync(TOKEN_FILE)) {
+        const data = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf-8"));
+        oauthClientId = data.clientId || null;
+        oauthTokenEndpoint = oauthTokenEndpoint || data.tokenEndpoint || null;
+      }
+    } catch { }
     return true;
   }
 
@@ -248,6 +295,8 @@ function loadTokens() {
       if (data.accessToken) {
         accessToken = data.accessToken;
         refreshToken = data.refreshToken || null;
+        oauthClientId = oauthClientId || data.clientId || null;
+        oauthTokenEndpoint = oauthTokenEndpoint || data.tokenEndpoint || null;
         return true;
       }
     }
@@ -285,6 +334,9 @@ function saveTokens() {
     fs.writeFileSync(TOKEN_FILE, JSON.stringify({
       accessToken,
       refreshToken,
+      // Persist the OAuth client identity so refresh_token grants work across restarts.
+      clientId: oauthClientId,
+      tokenEndpoint: oauthTokenEndpoint,
       updatedAt: new Date().toISOString(),
     }, null, 2));
   } catch (e) {
@@ -555,12 +607,15 @@ const robinhood = {
     if (!optionsSupported) throw new Error("Options not supported on this MCP session");
     const acctNum = accountNumber || discoveredAccountNumber;
     const list = (Array.isArray(symbolsOrIds) ? symbolsOrIds : [symbolsOrIds]).filter(Boolean).map(String);
-    const toolName = findTool(
-      /options?_market_?data/i,
-      /options?_quotes?/i,
-      /(market_?data|quote)s?.*options?/i,
-      /options?.*(market_?data|quote)/i,
-    );
+    // Exact names observed on the live MCP server first; regex discovery as fallback.
+    const toolName = discoveredTools.has("get_option_quotes") ? "get_option_quotes"
+      : discoveredTools.has("get_options_quotes") ? "get_options_quotes"
+      : findTool(
+        /options?_market_?data/i,
+        /options?_quotes?/i,
+        /(market_?data|quote)s?.*options?/i,
+        /options?.*(market_?data|quote)/i,
+      );
     if (!toolName) {
       const optTools = [...discoveredTools].filter(t => /option/i.test(t)).join(", ");
       throw new Error(`no option market-data tool discovered (option tools: ${optTools})`);
@@ -801,11 +856,17 @@ const robinhood = {
 
   // ─── Token Management ───
 
-  setToken(token, refresh = null) {
+  // meta: { clientId, tokenEndpoint } — the OAuth client identity the tokens were minted under
+  // (from dynamic client registration). Required for refresh_token grants to succeed later.
+  setToken(token, refresh = null, meta = {}) {
     accessToken = (token || "").trim() || null;
     refreshToken = refresh != null ? String(refresh).trim() || null : refreshToken;
+    if (meta.clientId) oauthClientId = meta.clientId;
+    if (meta.tokenEndpoint) oauthTokenEndpoint = meta.tokenEndpoint;
     if (!accessToken) {
       refreshToken = null;
+      oauthClientId = null;
+      oauthTokenEndpoint = null;
       mcpInitialized = false;
       sessionId = null;
       try { fs.unlinkSync(TOKEN_FILE); } catch { }
