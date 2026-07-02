@@ -506,6 +506,11 @@ const GLOBAL_TICKER_BLOCKLIST = new Set([
   "UVXY", "VIX", "VXX", "SVXY", "VIXY", "UVIX",
   // Common Claude misfires — names/words that pass shape but aren't tradable tickers.
   "WARSH", "POWELL", "TRUMP", "BIDEN", "FED",
+  // English words the hint parser has extracted from chat messages ("add rddt and hims" →
+  // "AND"; "add X to the watchlist" → "LIST"). None of these are active US tickers — but note
+  // real word-tickers like A, T, IT, ALL, ON, ANY, FOR, NOW must NOT be added here.
+  "AND", "THE", "LIST", "ADD", "REMOVE", "WATCH", "PLEASE", "THIS", "THAT",
+  "WITH", "FROM", "INTO", "ABOUT", "STOCK", "TICKER", "BUY", "SELL",
 ]);
 const DIRECTIVE_WORD_BLOCKLIST = new Set([
   "ADD", "ADDED", "WATCH", "WATCHING", "WATCHLIST", "TRACK", "TRACKING", "MONITOR", "MONITORING",
@@ -664,6 +669,18 @@ async function fetchDynamicWatchlist() {
 }
 
 async function refreshWatchlist(acct) {
+  // Learning variants scan exactly what their parent scans — same tickers, same data, so the
+  // only difference between variants is the strategy knob under test. If the parent is idle
+  // (paused since restart, watchlist never rebuilt), fall through and build our own list so
+  // data collection continues regardless.
+  if (acct.learning) {
+    const parent = accounts.get(acct.learningParent);
+    if (parent && (parent.tickers || []).length > 5) {
+      acct.tickers = [...parent.tickers];
+      acct.dynamicWatchlist = [...(parent.dynamicWatchlist || [])];
+      return;
+    }
+  }
   const now = Date.now();
   if (now - acct.lastWatchlistRefresh < WATCHLIST_REFRESH_MS && acct.dynamicWatchlist.length > 0) return;
   acct.lastWatchlistRefresh = now;
@@ -956,6 +973,110 @@ function createAccountRuntime(id, name, config, state) {
   };
 }
 
+// ─── Learning Lab ───
+// Shadow paper accounts spawned from a live (Robinhood) account. Each runs the full trading
+// cycle against the SAME market data and watchlist as the parent, but with one strategy knob
+// turned — so relative performance across variants is a controlled experiment, collected
+// continuously while the real account waits on settlement/capital. LLM-free by design:
+// variants trade deterministically on the numeric gates (which ARE the experiment variables).
+const LEARNING_VARIANTS = [
+  { key: "baseline", name: "Baseline", desc: "parent config, unchanged", tweak: {} },
+  { key: "selective", name: "High conviction", desc: "quality ≥75, half size", tweak: { minSetupQuality: 75, baseRiskPct: 0.5 } },
+  { key: "loose", name: "Looser filter", desc: "quality ≥45 — more shots", tweak: { minSetupQuality: 45 } },
+  { key: "quicktp", name: "Quick profits", desc: "TP +20% / SL -20%", tweak: { profitTarget: 0.20, stopLoss: -0.20 } },
+  { key: "runner", name: "Let it run", desc: "TP +80%, later trims", tweak: { profitTarget: 0.80, trim1Pct: 0.30, trim2Pct: 0.60 } },
+  { key: "smallsize", name: "Quarter size", desc: "25% risk, up to 4 positions", tweak: { baseRiskPct: 0.25, maxPositions: 4 } },
+];
+
+function learningVariantsFor(parentId) {
+  return [...accounts.values()].filter(a => a.learning && a.learningParent === parentId);
+}
+
+// Create any missing variants for a parent. Idempotent; seeds with the parent's current PV
+// (mirroring the real balance) unless an explicit theoretical bankroll is given.
+function ensureLearningAccounts(parent, baseCash = null) {
+  if (!parent || parent.learning) return;
+  const seed = Math.max(50, Math.round(baseCash ?? portfolioValue(parent.state, parent.dashboard?.quotes || {})));
+  let spawned = 0;
+  for (const v of LEARNING_VARIANTS) {
+    const id = `${parent.id}-learn-${v.key}`;
+    if (accounts.has(id)) continue;
+    const cfg = {
+      ...parent.config, ...v.tweak,
+      broker: "paper",
+      startingCash: seed,
+      tradeWhenClosed: false,
+      autoExecute: false,
+    };
+    const acct = createAccountRuntime(`${parent.id}-learn-${v.key}`, `🧠 ${v.name}`, cfg, null);
+    acct.learning = true;
+    acct.learningParent = parent.id;
+    acct.learningKey = v.key;
+    acct.state.cash = seed;
+    acct.tickers = [...parent.tickers];
+    accounts.set(id, acct);
+    spawned++;
+  }
+  if (spawned > 0) {
+    log(parent, `LEARNING: spawned ${spawned} variant account(s) seeded at $${seed} — running continuously alongside this account`);
+    saveAccounts();
+  }
+}
+
+function learningStats(v) {
+  const closed = (v.state.history || []).filter(t => t && typeof t.pnlDollar === "number");
+  const wins = closed.filter(t => t.pnlDollar > 0).length;
+  const pv = portfolioValue(v.state, v.dashboard?.quotes || {});
+  const realized = closed.reduce((s, t) => s + t.pnlDollar, 0);
+  return {
+    key: v.learningKey, name: v.name, id: v.id,
+    pv, startingCash: v.config.startingCash,
+    pnlPct: v.config.startingCash > 0 ? (pv - v.config.startingCash) / v.config.startingCash * 100 : 0,
+    trades: closed.length, wins,
+    winRate: closed.length > 0 ? wins / closed.length * 100 : null,
+    realized, open: (v.state.positions || []).length,
+  };
+}
+
+// Archive a snapshot of every variant's results into the parent (the collected data survives
+// resets), then re-seed each variant to the given bankroll with a clean slate.
+function resetLearningAccounts(parent, baseCash = null) {
+  const variants = learningVariantsFor(parent.id);
+  const seed = Math.max(50, Math.round(baseCash ?? portfolioValue(parent.state, parent.dashboard?.quotes || {})));
+  if (variants.length > 0) {
+    parent.state.learningLog = parent.state.learningLog || [];
+    parent.state.learningLog.push({
+      ts: Date.now(), date: getETDateStr(),
+      variants: variants.map(v => {
+        const s = learningStats(v);
+        return { key: s.key, name: v.name, pv: +s.pv.toFixed(2), pnlPct: +s.pnlPct.toFixed(1), trades: s.trades, winRate: s.winRate != null ? +s.winRate.toFixed(0) : null };
+      }),
+    });
+    if (parent.state.learningLog.length > 200) parent.state.learningLog = parent.state.learningLog.slice(-200);
+  }
+  for (const v of variants) {
+    v.config.startingCash = seed;
+    v.state.cash = seed;
+    v.state.positions = [];
+    v.state.history = [];
+    v.state.meta = {};
+    v.state.realizedPnl = 0;
+    delete v.state.risk;
+    v.dashboard.portfolioHistory = [];
+  }
+  ensureLearningAccounts(parent, seed); // fill in any missing variants at the same seed
+  log(parent, `LEARNING: reset ${Math.max(variants.length, LEARNING_VARIANTS.length)} variants to $${seed}${variants.length > 0 ? " (previous run archived)" : ""}`);
+  saveAccounts();
+}
+
+function removeLearningAccounts(parent) {
+  const variants = learningVariantsFor(parent.id);
+  if (variants.length === 0) return;
+  resetLearningAccounts(parent); // archives the final snapshot first
+  for (const v of learningVariantsFor(parent.id)) accounts.delete(v.id);
+  saveAccounts();
+}
+
 // ─── Portfolio History Helpers ───
 
 // Push a point onto the portfolio-value series, with dedup/decimation so it can span weeks
@@ -1058,6 +1179,10 @@ function loadAccounts() {
         for (const [id, acctData] of Object.entries(data.accounts)) {
           const acct = createAccountRuntime(id, acctData.name, acctData.config, acctData.state);
           acct.paused = acctData.paused || false;
+          acct.pausedBy = acctData.pausedBy || (acctData.paused ? "user" : null);
+          acct.learning = acctData.learning || false;
+          acct.learningParent = acctData.learningParent || null;
+          acct.learningKey = acctData.learningKey || null;
           acct.createdAt = acctData.createdAt || Date.now();
           if (Array.isArray(acctData.tickers)) acct.tickers = acctData.tickers.filter(isValidTickerSymbol);
           if (Array.isArray(acctData.dynamicWatchlist)) acct.dynamicWatchlist = acctData.dynamicWatchlist.filter(isValidTickerSymbol);
@@ -1120,6 +1245,10 @@ function saveAccounts() {
       name: acct.name,
       createdAt: acct.createdAt,
       paused: acct.paused,
+      pausedBy: acct.pausedBy || null,
+      learning: acct.learning || false,
+      learningParent: acct.learningParent || null,
+      learningKey: acct.learningKey || null,
       config: acct.config,
       state: acct.state,
       tickers: (acct.tickers || []).filter(isValidTickerSymbol),
@@ -2798,6 +2927,10 @@ function portfolioValue(state, quotes) {
   // into pending orders the way cash+positions alone would.
   if (typeof state.brokerEquity === "number" && state.brokerEquity > 0) return state.brokerEquity;
   let val = state.cash;
+  // Robinhood fallback: state.cash is buying power, which excludes today's sale proceeds until
+  // T+1 settlement. Without this credit every exit looks like the proceeds evaporated (a real
+  // ~-10% day once read as -77.8% and falsely tripped the daily-loss breaker).
+  if (Array.isArray(state.rhUnsettled)) for (const u of state.rhUnsettled) val += u.amount || 0;
   for (const pos of state.positions) {
     const q = quotes[pos.ticker];
     const spot = q ? q.c : pos.entrySpot;
@@ -2936,9 +3069,10 @@ function evaluateRiskHalts(acct, pv) {
   const msg = `Portfolio ${(dayPnlPct * 100).toFixed(1)}% on the day (start $${r.dayStartPV.toFixed(0)} → $${pv.toFixed(0)}), limit -${(cfg.dailyLossLimitPct * 100).toFixed(0)}%.${isLive ? " Account PAUSED — exits keep running; resume manually from the dashboard." : " New entries blocked for the day."}`;
   log(acct, `🚨 DAILY LOSS HALT: ${msg}`);
   diag("risk_halt", acct, { kind: "daily_loss", dayPnlPct: +(dayPnlPct * 100).toFixed(1), dayStartPV: +r.dayStartPV.toFixed(2), pv: +pv.toFixed(2), paused: isLive });
-  sendPush(`🚨 Daily loss halt [${acct.name}]`, msg, true).catch(() => {});
+  if (!acct.learning) sendPush(`🚨 Daily loss halt [${acct.name}]`, msg, true).catch(() => {});
   if (isLive) {
     acct.paused = true;
+    acct.pausedBy = "risk"; // breaker pause: exits keep managing open positions
     saveAccounts();
   }
 }
@@ -3142,7 +3276,18 @@ function extractLLMJSON(raw) {
 async function processHint(hintText, acct) {
   const state = acct.state;
   const dash = acct.dashboard;
-  const portfolioContext = `Portfolio: $${state.cash.toFixed(0)} cash, ${state.positions.length} positions open (${state.positions.map(p => `${p.ticker} ${p.type} @ $${p.entrySpot?.toFixed(0)}`).join(", ") || "none"}). Watchlist: ${acct.tickers.join(", ")}. Active hints: ${acct.activeHints.map(h => `${h.ticker} ${h.bias > 0 ? '+' : ''}${h.bias}`).join(", ") || "none"}.`;
+  // Full per-position detail (basis, live mark, P&L, stop/target levels) so the assistant can
+  // answer "will it hit my stop?" instead of claiming not to know its own bot's stop level.
+  const cfg = acct.config;
+  const positionLines = state.positions.map(p => {
+    const isEq = p.type === "equity";
+    const cur = p.liveMark ?? null;
+    const pnlStr = cur != null && p.entryPremium > 0 ? `${(((cur - p.entryPremium) / p.entryPremium) * 100).toFixed(1)}%` : "?";
+    const stopP = p.entryPremium > 0 ? (p.entryPremium * (1 + cfg.stopLoss)).toFixed(2) : "?";
+    const tpP = p.entryPremium > 0 ? (p.entryPremium * (1 + cfg.profitTarget)).toFixed(2) : "?";
+    return `${p.ticker} ${isEq ? "shares" : `$${p.strike} ${p.type.toUpperCase()}`} x${p.qty}: entry $${p.entryPremium?.toFixed(2)}, now $${cur != null ? cur.toFixed(2) : "?"} (${pnlStr}), stop $${stopP} (${(cfg.stopLoss * 100).toFixed(0)}%), target $${tpP} (+${(cfg.profitTarget * 100).toFixed(0)}%)${isEq ? "" : `, ${(p.dteRemaining ?? p.dte ?? 0).toFixed(0)} DTE`}`;
+  });
+  const portfolioContext = `Portfolio: $${state.cash.toFixed(0)} cash, ${state.positions.length} positions open${positionLines.length ? `:\n${positionLines.join("\n")}` : " (none)"}. Watchlist: ${acct.tickers.join(", ")}. Active hints: ${acct.activeHints.map(h => `${h.ticker} ${h.bias > 0 ? '+' : ''}${h.bias}`).join(", ") || "none"}.`;
 
   // Gather any available analysis for tickers mentioned in the message
   const mentionedTickers = Object.keys(dash.analyses).filter(t =>
@@ -3174,6 +3319,7 @@ Rules:
 - type="action" for directives: "watch X", "focus on Y", "remove Z", "go bullish on X". Fill tickers/removeTickers/urgency/advice AND a confirmation in "response".
 - For type="question", "advice" can be empty string.
 - bias is -30 to +30 score adjustment. direction is "bullish" or "bearish".
+- "tickers" symbols MUST be stock symbols the user explicitly named. NEVER turn ordinary English words from the message (like "and", "list", "watch") into symbols. If unsure a word is a ticker, leave it out and ask in "response".
 - Keep responses concise and direct — this is shown in a trading terminal.`;
 
   try {
@@ -3199,6 +3345,7 @@ Rules:
 }
 
 async function checkHints(acct) {
+  if (acct.learning) return; // variants take no chat directives — the experiment stays controlled
   // Check file-based hints (for default account or single-account mode)
   try {
     const hintFile = accounts.size <= 1 ? HINT_FILE : `hint-${acct.id}.txt`;
@@ -3361,6 +3508,7 @@ function todayStr() {
 }
 
 async function runNewsScan(acct, apiKey) {
+  if (acct.learning) return; // no LLM spend and no hint injection on learning variants
   const now = Date.now();
   if (now - globalLastNewsScan < NEWS_INTERVAL) return;
   globalLastNewsScan = now;
@@ -3787,6 +3935,18 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     }
 
     // ─── Step 3: Claude validates setup AND selects best contract ───
+    // Learning variants trade deterministically — zero LLM spend, and the numeric gates
+    // (quality/score/risk knobs) ARE the experiment variables. Pick the candidate nearest
+    // the target DTE and approve on the gates that already passed above.
+    if (acct.learning) {
+      claudeResult = { approve: true, confidence: 60, concerns: [], reasoning: "Learning variant — deterministic entry, no LLM validation", suggestion: "", contractIdx: 0 };
+      selectedCandidate = candidates.length > 0
+        ? [...candidates].sort((a, b) => Math.abs(a.dte - TARGET_DTE) - Math.abs(b.dte - TARGET_DTE))[0]
+        : null;
+      if (!selectedCandidate) {
+        return { skipped: true, reason: "Learning variant: no real-chain contract available — synthetic entries disabled" };
+      }
+    } else {
     try {
       claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, rhUsesOptionsForEntry(cfg) ? candidates : null);
       selectedCandidate = candidates.length > 0 ? candidates[claudeResult.contractIdx ?? 0] : null;
@@ -3829,6 +3989,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     if (!claudeResult.approve) {
       return { skipped: true, reason: `Claude rejected: ${claudeResult.suggestion} (${(claudeResult.concerns || []).join(', ')})` };
     }
+    } // end non-learning validation path
   }
 
   // ─── Step 4: Pick an affordable real contract before sizing ───
@@ -3902,6 +4063,11 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
       const cheapest = candidates.reduce((a, b) => (b.mid < a.mid ? b : a));
       return { skipped: true, reason: `No quality contract within budget: cheapest near-the-money ${type} is $${(cheapest.mid * 100).toFixed(0)} (δ${cheapest.delta != null ? Math.abs(cheapest.delta).toFixed(2) : "?"}) but only $${maxContractCost.toFixed(0)} is deployable — skipping rather than buying a cheap OTM lottery ticket` };
     } else {
+      // Learning variants never trade invented contracts — synthetic pricing is exactly the
+      // fantasy that inflated past sims (δ0.01 lottery tickets, currency-code "options").
+      if (acct.learning) {
+        return { skipped: true, reason: "Learning variant: no real chain data — synthetic entries disabled" };
+      }
       // Synthetic fallback: 1 strike OTM, expiry chosen from the ticker's cadence near TARGET_DTE
       // and staggered away from over-concentrated expirations.
       const atm = Math.round(spot / 5) * 5;
@@ -3943,6 +4109,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   if (totalCost > maxSize) {
     if (cfg.broker === "tradier" || cfg.broker === "robinhood") {
       acct.paused = true; // Hard stop for real money
+      acct.pausedBy = "risk"; // breaker pause: exits keep managing open positions
       saveAccounts();
       const msg = `🚨 CIRCUIT BREAKER TRIPPED: Trade for ${ticker} costs $${totalCost.toFixed(2)} (exceeds $${maxSize} max). Account is now PAUSED.`;
       log(acct, msg);
@@ -4502,8 +4669,21 @@ function tryExits(acct, quotes) {
       fullClose = true;
     }
     else if (pnlPct <= cfg.stopLoss) {
-      reason = `stop loss ${(pnlPct * 100).toFixed(0)}%`;
-      fullClose = true;
+      // Options premium is a leveraged, noisy signal: a δ0.35 contract can print -30% on a
+      // fraction-of-ATR wiggle in the underlying, then recover within the hour. Require the
+      // underlying to confirm the breakdown (≥0.75×ATR adverse) before honoring a premium stop.
+      // Disaster floor at 1.8× the configured stop still exits unconditionally — that depth of
+      // premium loss (IV crush, gap) is real regardless of what the underlying looks like.
+      const stopConfirmMove = Math.max(0.75 * atrPct, 0.005);
+      const disasterFloor = cfg.stopLoss * 1.8;
+      if (isEquity || adverseSpotMove >= stopConfirmMove || pnlPct <= disasterFloor) {
+        reason = isEquity
+          ? `stop loss ${(pnlPct * 100).toFixed(0)}%`
+          : `stop loss ${(pnlPct * 100).toFixed(0)}% (underlying ${(adverseSpotMove * 100).toFixed(1)}% adverse${pnlPct <= disasterFloor ? ", disaster floor" : ""})`;
+        fullClose = true;
+      } else {
+        pos._stopSuppressed = `premium ${(pnlPct * 100).toFixed(0)}% but underlying only ${(adverseSpotMove * 100).toFixed(1)}% adverse (needs ${(stopConfirmMove * 100).toFixed(1)}%) — holding, noise not structure`;
+      }
     }
     else if (!isEquity && pos.dteRemaining <= 1) {
       reason = "DTE expiring";
@@ -5231,6 +5411,8 @@ ${marketCard}
   <table><tr><th>Ticker</th><th>Type</th><th>Strike</th><th>Stock Price</th><th>DTE</th><th>Qty</th><th>Entry</th><th>Current</th><th>P&L</th><th>Profit Target</th><th>Stop Loss</th><th>Opened</th><th>Greeks</th></tr>${posRows}</table>
   ${positionCharts}
 </div>
+
+${learningPanelHTML(acct, { spectator })}
 
 <div class="card" style="margin-bottom:16px" id="bot-thinking-card">
   <h2 style="display:flex;align-items:center;justify-content:space-between;cursor:pointer;margin:0" onclick="toggleBotThinking()">
@@ -6484,12 +6666,79 @@ setInterval(() => { loadAccount(); loadPositions(); loadOrders(); loadWatchlist(
 </body></html>`;
 }
 
+// ─── Learning Panel HTML ───
+
+function learningPanelHTML(acct, { spectator = false } = {}) {
+  // On a variant's own page: banner linking back to the parent.
+  if (acct.learning) {
+    const parent = accounts.get(acct.learningParent);
+    const variant = LEARNING_VARIANTS.find(v => v.key === acct.learningKey);
+    return `<div class="card" style="margin-bottom:16px;border-left:3px solid #6a4df4">
+      <div style="font-size:12px;color:#3a3b42">🧠 <b>Learning variant</b>${variant ? ` — ${variant.desc}` : ""} · shadow paper account of
+      ${parent ? `<a href="/?a=${parent.id}" style="color:#6a4df4">${parent.name}</a>` : "(parent deleted)"} · real chains only, no LLM, no notifications</div>
+    </div>`;
+  }
+  if (acct.config.broker !== "robinhood") return "";
+
+  const enabled = acct.config.learningEnabled !== false;
+  const variants = learningVariantsFor(acct.id);
+  const rows = variants
+    .map(v => ({ v, s: learningStats(v), meta: LEARNING_VARIANTS.find(x => x.key === v.learningKey) }))
+    .sort((a, b) => b.s.pv - a.s.pv);
+  const bestPv = rows.length > 0 ? rows[0].s.pv : null;
+
+  const tableRows = rows.map(({ v, s, meta }, i) => {
+    const color = s.pnlPct >= 0 ? "#00a843" : "#e8473f";
+    const crown = i === 0 && rows.length > 1 && s.trades > 0 ? " 👑" : "";
+    return `<tr>
+      <td><a href="/?a=${v.id}" style="color:#1c1d22;text-decoration:none"><b>${v.name.replace("🧠 ", "")}</b>${crown}</a></td>
+      <td style="color:#6b7280;font-size:11px">${meta?.desc || ""}</td>
+      <td>$${s.pv.toFixed(0)}</td>
+      <td style="color:${color}">${s.pnlPct >= 0 ? "+" : ""}${s.pnlPct.toFixed(1)}%</td>
+      <td>${s.open}</td>
+      <td>${s.trades}</td>
+      <td>${s.winRate != null ? s.winRate.toFixed(0) + "%" : "—"}</td>
+      <td style="color:${s.realized >= 0 ? "#00a843" : "#e8473f"}">${s.realized >= 0 ? "+" : ""}$${s.realized.toFixed(0)}</td>
+    </tr>`;
+  }).join("");
+
+  const archivedRuns = (acct.state.learningLog || []).length;
+  const controls = spectator ? "" : `
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px">
+      <form method="POST" action="/api/accounts/${acct.id}/learning/reset" style="display:flex;gap:6px;align-items:center"
+        onsubmit="return confirm('Reset all learning variants? Current results are archived first.')">
+        <input name="cash" type="number" step="1" min="50" placeholder="mirror balance"
+          style="width:110px;padding:6px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;font-size:11px" title="Theoretical bankroll ($). Leave blank to mirror this account's current balance.">
+        <button type="submit" class="acct-btn" style="font-size:11px">↺ Reset / Re-seed</button>
+      </form>
+      <form method="POST" action="/api/accounts/${acct.id}/learning/toggle" style="display:inline"
+        ${enabled ? `onsubmit="return confirm('Disable the learning lab? Variants are archived and removed.')"` : ""}>
+        <button type="submit" class="acct-btn ${enabled ? "delete" : ""}" style="font-size:11px">${enabled ? "✕ Disable lab" : "▶ Enable lab"}</button>
+      </form>
+      ${archivedRuns > 0 ? `<span style="font-size:10px;color:#8a909b">${archivedRuns} archived run${archivedRuns !== 1 ? "s" : ""}</span>` : ""}
+    </div>`;
+
+  return `<div class="card" style="margin-bottom:16px" id="learning-card">
+  <h2>🧠 Learning Lab <span style="color:#6b7280;font-weight:400;font-size:11px">(${enabled ? `${variants.length} shadow strategies trading this account's watchlist` : "disabled"})</span></h2>
+  ${enabled && rows.length > 0 ? `
+  <div style="font-size:10px;color:#8a909b;margin:6px 0 8px">Paper variants mirror your watchlist + bankroll and run every cycle — real option chains only, deterministic entries (no LLM), so relative performance isolates each strategy knob. Best PV: <b>$${bestPv.toFixed(0)}</b></div>
+  <div style="overflow-x:auto"><table>
+    <tr><th>Variant</th><th>Tweak</th><th>PV</th><th>P&L</th><th>Open</th><th>Trades</th><th>Win rate</th><th>Realized</th></tr>
+    ${tableRows}
+  </table></div>` : enabled ? `<div style="font-size:11px;color:#8a909b;margin-top:8px">Variants spawn on the next trading cycle.</div>` : `<div style="font-size:11px;color:#8a909b;margin-top:8px">Enable to run shadow strategy experiments against this account's watchlist while you wait for funds to settle.</div>`}
+  ${controls}
+</div>`;
+}
+
 // ─── Tab Bar HTML ───
 
 function tabBarHTML(activeId, { spectator = false } = {}) {
   let totalPV = 0;
   const tabs = [];
+  let mainCount = 0;
   for (const [id, acct] of accounts) {
+    if (acct.learning) continue; // shadow variants live in the Learning panel, not the tab bar
+    mainCount++;
     const pv = portfolioValue(acct.state, acct.dashboard.quotes);
     totalPV += pv;
     const pnl = ((pv - acct.config.startingCash) / acct.config.startingCash * 100).toFixed(1);
@@ -6522,7 +6771,7 @@ function tabBarHTML(activeId, { spectator = false } = {}) {
   <div class="global-stats">
     <span>Total PV: <b>$${totalPV.toFixed(0)}</b></span>
     ${llmBadge}
-    <span>${accounts.size} account${accounts.size !== 1 ? "s" : ""}</span>
+    <span>${mainCount} account${mainCount !== 1 ? "s" : ""}</span>
     ${spectator ? '<span style="color:#2f6fed;font-weight:700">Spectator</span>' : ''}
   </div>
 </div>
@@ -7415,8 +7664,53 @@ function startDashboard(defaultAcct, apiKey) {
     if (req.method === "POST" && pauseMatch) {
       const id = pauseMatch[1];
       const target = accounts.get(id);
-      if (target) { target.paused = !target.paused; saveAccounts(); console.log(`  [${id}] ${target.paused ? "Paused" : "Resumed"}`); }
+      if (target) {
+        target.paused = !target.paused;
+        // Manual pause = hands off entirely (no entries, no automated exits). A breaker pause
+        // ("risk") keeps exits alive; the user hitting the button means "stop touching my account".
+        target.pausedBy = target.paused ? "user" : null;
+        saveAccounts();
+        console.log(`  [${id}] ${target.paused ? "Paused (manual — all automated trading halted)" : "Resumed"}`);
+      }
       res.writeHead(302, { Location: `/?a=${id}` });
+      res.end();
+      return;
+    }
+
+    // ─── Learning lab controls ───
+    const learnResetMatch = pathname.match(/^\/api\/accounts\/([^/]+)\/learning\/reset$/);
+    if (req.method === "POST" && learnResetMatch) {
+      const parent = accounts.get(learnResetMatch[1]);
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", () => {
+        if (parent && !parent.learning) {
+          const cash = parseFloat(new URLSearchParams(body).get("cash"));
+          parent.config.learningEnabled = true;
+          resetLearningAccounts(parent, cash > 0 ? cash : null);
+        }
+        res.writeHead(302, { Location: `/?a=${learnResetMatch[1]}` });
+        res.end();
+      });
+      return;
+    }
+
+    const learnToggleMatch = pathname.match(/^\/api\/accounts\/([^/]+)\/learning\/toggle$/);
+    if (req.method === "POST" && learnToggleMatch) {
+      const parent = accounts.get(learnToggleMatch[1]);
+      if (parent && !parent.learning) {
+        const enabled = parent.config.learningEnabled !== false;
+        parent.config.learningEnabled = !enabled;
+        if (enabled) {
+          removeLearningAccounts(parent); // archives final snapshot, then removes variants
+          log(parent, "LEARNING: lab disabled — variants archived and removed");
+        } else {
+          ensureLearningAccounts(parent);
+          log(parent, "LEARNING: lab enabled");
+        }
+        saveAccounts();
+      }
+      res.writeHead(302, { Location: `/?a=${learnToggleMatch[1]}` });
       res.end();
       return;
     }
@@ -7424,7 +7718,10 @@ function startDashboard(defaultAcct, apiKey) {
     const delMatch = pathname.match(/^\/api\/accounts\/([^/]+)\/delete$/);
     if (req.method === "POST" && delMatch) {
       const id = delMatch[1];
-      if (id !== "default" && accounts.has(id)) { accounts.delete(id); saveAccounts(); console.log(`  [${id}] Deleted`); }
+      if (id !== "default" && accounts.has(id)) {
+        for (const v of learningVariantsFor(id)) accounts.delete(v.id); // cascade shadow variants
+        accounts.delete(id); saveAccounts(); console.log(`  [${id}] Deleted`);
+      }
       res.writeHead(302, { Location: "/" });
       res.end();
       return;
@@ -7480,7 +7777,7 @@ function startDashboard(defaultAcct, apiKey) {
       for (const [id, a] of accounts) {
         const pv = portfolioValue(a.state, a.dashboard.quotes);
         const sc = a.config.startingCash > 0 ? a.config.startingCash : null;
-        list.push({ id, name: a.name, paused: a.paused, cash: a.state.cash, positions: a.state.positions.length, trades: a.state.history.length, pv, pnl: sc ? ((pv - sc) / sc * 100).toFixed(1) : "0.0", config: a.config });
+        list.push({ id, name: a.name, paused: a.paused, learning: a.learning || false, learningParent: a.learningParent || null, cash: a.state.cash, positions: a.state.positions.length, trades: a.state.history.length, pv, pnl: sc ? ((pv - sc) / sc * 100).toFixed(1) : "0.0", config: a.config });
       }
       res.end(JSON.stringify(list));
       return;
@@ -9761,12 +10058,26 @@ async function syncRobinhoodAccount(acct, quotes) {
     const res = await robinhood.getPortfolio();
     const port = res && res.data ? res.data : res;
     if (port) {
-      const eq = port.equity_value || port.total_value;
+      // DIAGNOSTIC (once per process): the payload's field names have been guessed at, and the
+      // guess missing means PV silently degrades to buying power — which excludes unsettled sale
+      // proceeds and made a ~-10% day read as -77.8%, falsely tripping the daily-loss breaker.
+      if (!acct._rhPortfolioShapeLogged) {
+        acct._rhPortfolioShapeLogged = true;
+        log(acct, `RH-RAW PORTFOLIO: ${JSON.stringify(port).slice(0, 600)}`);
+      }
+      const eq = port.equity_value ?? port.total_value ?? port.total_equity ?? port.portfolio_value
+        ?? port.equity ?? port.market_value ?? port.portfolio?.equity ?? port.portfolio?.market_value;
       const eqNum = typeof eq === "string" ? parseFloat(eq) : (typeof eq === "number" ? eq : NaN);
       if (!isNaN(eqNum) && eqNum >= 0) state.brokerEquity = eqNum;
       const bp = port.buying_power?.buying_power || port.buying_power || port.cash;
       const bpNum = typeof bp === "string" ? parseFloat(bp) : (typeof bp === "number" ? bp : NaN);
       if (!isNaN(bpNum) && bpNum >= 0) state.cash = bpNum;
+    }
+    // Sale proceeds settle T+1: anything booked on a prior day is assumed absorbed into buying
+    // power by now, so drop it from the unsettled credit (portfolioValue adds what remains).
+    if (Array.isArray(state.rhUnsettled) && state.rhUnsettled.length > 0) {
+      const today = getETDateStr();
+      state.rhUnsettled = state.rhUnsettled.filter(e => e.date === today);
     }
   } catch (e) { log(acct, `ROBINHOOD SYNC: balance error — ${e.message}`); }
 
@@ -9874,10 +10185,10 @@ async function syncRobinhoodAccount(acct, quotes) {
           : Array.isArray(optRes) ? optRes : [];
         optionsFetchOk = true;
 
-        // DIAGNOSTIC: dump the full raw shape of the first options position so we can see exactly
-        // which fields carry the instrument id / strike / pricing (the API shape has been guessed
-        // at, not observed). Remove once matching is confirmed working.
-        if (optRaw.length > 0) {
+        // DIAGNOSTIC (once per process): dump the raw shape of the first options position so
+        // field mapping can be verified from the logs without spamming every cycle.
+        if (optRaw.length > 0 && !acct._rhRawPosLogged) {
+          acct._rhRawPosLogged = true;
           log(acct, `RH-RAW POSITION: ${JSON.stringify(optRaw[0]).slice(0, 900)}`);
         }
 
@@ -9954,6 +10265,18 @@ async function syncRobinhoodAccount(acct, quotes) {
             direction: optType === "call" ? "BULLISH" : "BEARISH",
           };
 
+          // Basis bookkeeping: when RH reports an actual average fill, persist it so stop/target
+          // math and closure booking use the real basis even if the field is absent next cycle.
+          // When it doesn't, mark the basis as an estimate so Step 1.2 reconciles it from the
+          // filled-orders feed (an unreconciled chase-limit basis caused a premature stop-out).
+          if (entryPremium > 0) {
+            if (!state.meta[occ]) state.meta[occ] = {};
+            state.meta[occ].entryPremium = entryPremium;
+            state.meta[occ].entryFillReconciled = true;
+          } else {
+            pos._basisEstimated = !meta.entryFillReconciled;
+          }
+
           if (pos.liveMark != null && pos.entryPremium > 0) {
             const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
             if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
@@ -9985,6 +10308,59 @@ async function syncRobinhoodAccount(acct, quotes) {
         log(acct, `ROBINHOOD SYNC: options positions error — ${e.message}`);
       }
     }
+
+    // ── Broker-fill reconciliation helpers ──
+    // Our own limit prices are working estimates, not fills. Booking them as truth has already
+    // produced a phantom stop-out (basis recorded $4.69 vs actual fill ~$3.69 → a -12% dip read
+    // as -31% and was sold). Everything below prefers the fill Robinhood actually reports.
+    let _filledOptOrders = null; // lazy, fetched at most once per sync
+    const getFilledOptionOrders = async () => {
+      if (_filledOptOrders) return _filledOptOrders;
+      try {
+        const fRes = await robinhood.getOptionsOrders({ state: "filled" }).catch(() => null);
+        const fRaw = fRes && fRes.data ? fRes.data : fRes;
+        _filledOptOrders = Array.isArray(fRaw) ? fRaw
+          : (fRaw && Array.isArray(fRaw.orders)) ? fRaw.orders
+          : (fRaw && Array.isArray(fRaw.results)) ? fRaw.results : [];
+      } catch { _filledOptOrders = []; }
+      return _filledOptOrders;
+    };
+    // Extract a normalized per-share fill premium from a filled order. `refMark` (live mark/bid)
+    // disambiguates per-contract vs per-share units when available.
+    const orderFillPremium = (o, refMark = null) => {
+      const leg = (o.legs || [])[0] || {};
+      const exec = (leg.executions || o.executions || [])[0] || {};
+      const cands = [exec.price, o.average_price, leg.average_price, o.price, o.premium, o.processed_premium];
+      for (const c of cands) {
+        let v = parseFloat(c);
+        if (!(v > 0)) continue;
+        if (refMark > 0) {
+          if (v / refMark > 20) v /= 100;      // per-contract dollars reported
+          else if (refMark / v > 20) v *= 100; // cents/fractional form
+        } else if (v > 50) {
+          v /= 100; // no reference: >$50/share premium is almost surely per-contract dollars
+        }
+        return +v.toFixed(2);
+      }
+      return null;
+    };
+    const matchFilledOrder = (orders, { ticker, strike, expDate, side }) => {
+      const tU = (ticker || "").toUpperCase();
+      return orders.find(o => {
+        const sym = (o.chain_symbol || o.symbol || "").toUpperCase();
+        if (sym !== tU) return false;
+        const leg = (o.legs || [])[0] || o;
+        const oSide = (leg.side || o.side || "").toLowerCase();
+        const effect = (leg.position_effect || o.position_effect || "").toLowerCase();
+        if (side === "buy" && !(oSide.includes("buy") || effect === "open")) return false;
+        if (side === "sell" && !(oSide.includes("sell") || effect === "close")) return false;
+        const oStrike = parseFloat(leg.strike_price || leg.strike || 0);
+        if (strike > 0 && oStrike > 0 && Math.abs(oStrike - strike) > 0.001) return false;
+        const oExp = leg.expiration_date || leg.expiration || o.expiration_date || null;
+        if (expDate && oExp && oExp !== expDate) return false;
+        return true;
+      });
+    };
 
     // Step 0.5: Detect positions that closed (or shrank) at the broker since last cycle and
     // record them as trades. Robinhood exits fire-and-forget a sell order and keep the position
@@ -10018,20 +10394,40 @@ async function syncRobinhoodAccount(acct, quotes) {
         }
 
         const mult = prev.type === "equity" ? 1 : 100;
-        // Best available estimate of the fill: the limit we worked, else last live bid/mark.
-        const closePremium = expired && !weExited ? 0
-          : (posMeta?.exitOrderLimit ?? prev.liveBid ?? prev.liveMark ?? prev.entryPremium);
+        // Prefer the actual broker fill from the filled-orders feed; fall back to the limit we
+        // worked (or last bid/mark) only when no matching fill is found.
+        let closePremium = null;
+        let fillConfirmed = false;
+        if (expired && !weExited) {
+          closePremium = 0;
+        } else if (prev.type !== "equity") {
+          const orders = await getFilledOptionOrders();
+          const o = matchFilledOrder(orders, {
+            ticker: prev.ticker, strike: prev.strike,
+            expDate: prev.expiryDate ? new Date(prev.expiryDate).toISOString().slice(0, 10) : null,
+            side: "sell",
+          });
+          const fill = o ? orderFillPremium(o, prev.liveMark ?? prev.liveBid ?? null) : null;
+          if (fill != null) { closePremium = fill; fillConfirmed = true; }
+        }
+        if (closePremium == null) closePremium = posMeta?.exitOrderLimit ?? prev.liveBid ?? prev.liveMark ?? prev.entryPremium;
         const pnlDollar = (closePremium - prev.entryPremium) * closedQty * mult;
         const pnlPct = (closePremium - prev.entryPremium) / prev.entryPremium;
         const reason = posMeta?.exitReason || (expired && !weExited ? "expired worthless" : "robinhood exit filled (synced)");
+        const proceeds = +(closePremium * closedQty * mult).toFixed(2);
         const trade = {
           ...prev, qty: closedQty,
           closePremium: +(+closePremium).toFixed(2),
-          proceeds: +(closePremium * closedQty * mult).toFixed(2),
+          proceeds,
           pnlDollar: +pnlDollar.toFixed(2), pnlPct,
           reason, closeDate: getETDateStr(), closeTime: now,
-          _estimated: true, // estimate from our worked limit; RH MCP doesn't echo per-fill prices here
+          _estimated: !fillConfirmed, // true = booked from our worked limit, not a broker fill
         };
+        // Sale proceeds are invisible to buying power until T+1 — credit them to PV until then.
+        if (proceeds > 0) {
+          state.rhUnsettled = state.rhUnsettled || [];
+          state.rhUnsettled.push({ amount: proceeds, date: getETDateStr() });
+        }
         state.history.push(trade);
         logTrade(trade);
         state.realizedPnl = (state.realizedPnl || 0) + pnlDollar;
@@ -10109,12 +10505,43 @@ async function syncRobinhoodAccount(acct, quotes) {
       }
     }
 
+    // Step 1.2: Reconcile entry cost basis against actual broker fills. The entry chase records
+    // "what we were willing to pay" as a working estimate; when the real fill was better, every
+    // stop/target computed off the estimate is wrong — a booked $4.69 basis on a ~$3.69 fill
+    // made a -12% dip read as -31% and triggered a premature stop-out.
+    if (robinhood.optionsEnabled) {
+      const basisUnknown = positions.filter(p => p.optionsSource === "robinhood" && p.type !== "equity" && p._basisEstimated);
+      for (const pos of basisUnknown) {
+        try {
+          const orders = await getFilledOptionOrders();
+          const o = matchFilledOrder(orders, {
+            ticker: pos.ticker, strike: pos.strike,
+            expDate: pos.expiryDate ? new Date(pos.expiryDate).toISOString().slice(0, 10) : null,
+            side: "buy",
+          });
+          const fill = o ? orderFillPremium(o, pos.liveMark ?? pos.liveBid ?? null) : null;
+          if (fill == null) continue;
+          if (!state.meta[pos.occSymbol]) state.meta[pos.occSymbol] = {};
+          state.meta[pos.occSymbol].entryPremium = fill;
+          state.meta[pos.occSymbol].entryFillReconciled = true;
+          if (Math.abs(fill - pos.entryPremium) > 0.005) {
+            log(acct, `ROBINHOOD SYNC: ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} cost basis reconciled $${pos.entryPremium.toFixed(2)} → $${fill.toFixed(2)} (actual broker fill)`);
+            pos.entryPremium = fill;
+            pos.cost = Math.abs(fill * pos.qty * 100);
+          }
+          pos._basisEstimated = false;
+        } catch (e) {
+          log(acct, `ROBINHOOD SYNC: basis reconcile error for ${pos.ticker} — ${e.message}`);
+        }
+      }
+    }
+
     // Step 1.5: Stale exit-order watchdog. A sell_to_close limit order can sit unfilled forever
     // if the market moves away from it (or it was mispriced) — there's no broker-side trailing/
     // re-pricing. If an exit order we placed hasn't filled within a few minutes, cancel it so the
     // next cycle's tryExits re-attempts at a fresh price (guaranteed-fill logic prices at the
     // current bid for losing positions, so a retry should clear immediately).
-    if (robinhood.optionsEnabled) {
+    if (robinhood.optionsEnabled && !(acct.paused && acct.pausedBy === "user")) {
       const STALE_EXIT_ORDER_MS = 3 * 60_000;
       for (const pos of positions) {
         if (pos.type === "equity" || pos.optionsSource !== "robinhood") continue;
@@ -10476,20 +10903,23 @@ async function runCycle(acct, sharedQuotes, apiKey) {
       // Count every new entry (paper position or broker order) against the day-trade cap.
       ensureRiskState(acct).dayTrades += 1;
       log(acct, `TRADE: BUY ${result.qty}x ${result.ticker} $${result.strike} ${result.type.toUpperCase()} ${result.dte}d @ $${result.entryPremium.toFixed(2)} ($${result.cost.toFixed(0)}) [setup:${result.setupQuality}/100 claude:${result.claudeConfidence}%]`);
-      // Push notification — replicate this trade
-      const entryA = analyses[ticker];
-      const topSignals = entryA?.sigs?.slice(0, 2).map(s => s.text).join(" · ") || "";
-      const tpPrice = (result.entryPremium * (1 + (acct.config.profitTarget || 0.40))).toFixed(2);
-      const slPrice = (result.entryPremium * (1 + (acct.config.stopLoss || -0.35))).toFixed(2);
-      sendPush(
-        `🤖 ${result.ticker} ${result.type.toUpperCase()} $${result.strike} [${acct.name}]`,
-        `Entry: $${result.entryPremium.toFixed(2)} · ${result.dte}d · ${result.qty}x\nTP: $${tpPrice} (+${((acct.config.profitTarget || 0.40) * 100).toFixed(0)}%) · SL: $${slPrice}\nScore: ${entryA?.score ?? '?'}/100 · Setup: ${result.setupQuality}/100\n${topSignals}`,
-        true // urgent
-      ).catch(() => {});
-      // Tweet trade entry with chart
-      const st = shortTermAnalyses[ticker];
-      const q = quotes[ticker];
-      tweetTradeEntry(acct, result, entryA, st, q).catch(e => console.log(`  [X] Entry tweet error: ${e.message}`));
+      // Learning variants trade silently — no phone pushes, no tweets, just collected data.
+      if (!acct.learning) {
+        // Push notification — replicate this trade
+        const entryA = analyses[ticker];
+        const topSignals = entryA?.sigs?.slice(0, 2).map(s => s.text).join(" · ") || "";
+        const tpPrice = (result.entryPremium * (1 + (acct.config.profitTarget || 0.40))).toFixed(2);
+        const slPrice = (result.entryPremium * (1 + (acct.config.stopLoss || -0.35))).toFixed(2);
+        sendPush(
+          `🤖 ${result.ticker} ${result.type.toUpperCase()} $${result.strike} [${acct.name}]`,
+          `Entry: $${result.entryPremium.toFixed(2)} · ${result.dte}d · ${result.qty}x\nTP: $${tpPrice} (+${((acct.config.profitTarget || 0.40) * 100).toFixed(0)}%) · SL: $${slPrice}\nScore: ${entryA?.score ?? '?'}/100 · Setup: ${result.setupQuality}/100\n${topSignals}`,
+          true // urgent
+        ).catch(() => {});
+        // Tweet trade entry with chart
+        const entrySt = shortTermAnalyses[ticker];
+        const entryQ = quotes[ticker];
+        tweetTradeEntry(acct, result, entryA, entrySt, entryQ).catch(e => console.log(`  [X] Entry tweet error: ${e.message}`));
+      }
 
       // Robinhood broker accounts already executed natively via placeBrokerEntry above.
       // No separate execution block needed — broker is per-account, same as Tradier.
@@ -10503,8 +10933,8 @@ async function runCycle(acct, sharedQuotes, apiKey) {
   const progress = ((pv / cfg.goal) * 100).toFixed(1);
   log(acct, `Portfolio: $${pv.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%) | Goal: ${progress}% of $${cfg.goal.toLocaleString()} | Cash: $${state.cash.toFixed(0)} | ${state.positions.length} open | ${regime.mode.toUpperCase()}${getActiveHintsSummary(acct)}`);
 
-  // Tweet daily watchlist summary (once per day)
-  tweetWatchlistSummary(acct, decisions, regime).catch(e => console.log(`  [X] Watchlist tweet error: ${e.message}`));
+  // Tweet daily watchlist summary (once per day) — never from learning variants
+  if (!acct.learning) tweetWatchlistSummary(acct, decisions, regime).catch(e => console.log(`  [X] Watchlist tweet error: ${e.message}`));
 
   dash.quotes = quotes;
   dash.analyses = analyses;
@@ -10568,17 +10998,23 @@ async function runPausedCycle(acct, sharedQuotes) {
   // paused (a hard risk-halt pauses entries but must not abandon open positions).
   if (cfg.broker === "tradier") await syncBrokerAccount(acct, quotes);
 
-  tryTimeBasedExits(acct, quotes);
-  tryExits(acct, quotes);
-  trySignalExits(acct, quotes, analyses);
-  tryEMATrailingExits(acct, quotes);
+  // Manual pause means hands off ENTIRELY: no entries AND no automated exits. The user hitting
+  // pause to stop an imminent auto-exit must actually stop it. Only a breaker-initiated pause
+  // ("risk") keeps the exit engines running so open positions aren't abandoned mid-halt.
+  const manualPause = acct.pausedBy === "user";
+  if (!manualPause) {
+    tryTimeBasedExits(acct, quotes);
+    tryExits(acct, quotes);
+    trySignalExits(acct, quotes, analyses);
+    tryEMATrailingExits(acct, quotes);
+  }
 
   dash.positionDetails = buildPositionDetails(acct, quotes);
   dash.lastCycle = Date.now();
 
   const pv = portfolioValue(state, quotes);
   const pnlPct = ((pv - cfg.startingCash) / cfg.startingCash * 100).toFixed(1);
-  log(acct, `[PAUSED] Portfolio: $${pv.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%) | Cash: $${state.cash.toFixed(0)} | ${state.positions.length} open | exits active, no new entries`);
+  log(acct, `[PAUSED${manualPause ? " — MANUAL" : " — RISK HALT"}] Portfolio: $${pv.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%) | Cash: $${state.cash.toFixed(0)} | ${state.positions.length} open | ${manualPause ? "ALL automated trading halted (positions are yours to manage)" : "exits active, no new entries"}`);
 
   dash.portfolioHistory = dash.portfolioHistory || [];
   appendPortfolioPoint(dash.portfolioHistory, Date.now(), pv);
@@ -11187,6 +11623,9 @@ async function main() {
         for (const [, acct] of accounts) {
           try {
             if (acct.config.broker === "robinhood") await syncRobinhoodAccount(acct, sharedQuotes).catch(e => log(acct, `ROBINHOOD SYNC: ${e.message}`));
+            // Learning lab: keep shadow variants alive for live RH accounts (idempotent) so they
+            // collect strategy data every cycle — including while the parent is paused/settling.
+            if (acct.config.broker === "robinhood" && !acct.learning && acct.config.learningEnabled !== false) ensureLearningAccounts(acct);
             // Robinhood uses local ET time only — Tradier clock is irrelevant for RH.
             const acctMarketOpen = acct.config.broker === "robinhood" ? marketOpenLocal : marketOpen;
             const tradeThis = acctMarketOpen || acct.config.tradeWhenClosed;
