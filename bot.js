@@ -330,12 +330,20 @@ const SECTOR_MAP = {
   // Space / aerospace mobility
   BKSY: "SPACE", PL: "SPACE", LUNR: "SPACE", RKLB: "SPACE", ASTS: "SPACE", RDW: "SPACE",
   SPCE: "SPACE", JOBY: "SPACE", ACHR: "SPACE", PSIX: "SPACE", LILM: "SPACE",
+  FLY: "SPACE", SATL: "SPACE", VOYG: "SPACE", SPCX: "SPACE",
   // Semiconductors (AI + general)
   NVDA: "SEMI", AMD: "SEMI", MU: "SEMI", INTC: "SEMI", AMKR: "SEMI", AVGO: "SEMI",
   TSM: "SEMI", QCOM: "SEMI", NXPI: "SEMI", MXL: "SEMI", AXTI: "SEMI", NVTS: "SEMI",
   ARM: "SEMI", MRVL: "SEMI", LSCC: "SEMI", ON: "SEMI", SWKS: "SEMI", QRVO: "SEMI",
   ASML: "SEMI", AMAT: "SEMI", LRCX: "SEMI", KLAC: "SEMI", ADI: "SEMI", TXN: "SEMI",
   MCHP: "SEMI", SMCI: "SEMI", ALAB: "SEMI", CRDO: "SEMI",
+  // AI storage / servers / networking
+  SNDK: "AI_STORAGE", WDC: "AI_STORAGE", STX: "AI_STORAGE", DELL: "AI_STORAGE",
+  HPE: "AI_STORAGE", PSTG: "AI_STORAGE",
+  ANET: "AI_NETWORKING", CIEN: "AI_NETWORKING", COHR: "AI_NETWORKING", LITE: "AI_NETWORKING",
+  // Data-center electrical, thermal, grid and construction infrastructure
+  VRT: "POWER_INFRA", ETN: "POWER_INFRA", PWR: "POWER_INFRA", POWL: "POWER_INFRA",
+  NVT: "POWER_INFRA", EME: "POWER_INFRA",
   // Quantum computing — separate sector since it moves as a group on quantum news
   IONQ: "QUANTUM", RGTI: "QUANTUM", QBTS: "QUANTUM", QUBT: "QUANTUM", QSI: "QUANTUM",
   ARQQ: "QUANTUM",
@@ -402,7 +410,7 @@ const SECTOR_MAP = {
   TPH: "HOMEBUILDER", LEN: "HOMEBUILDER", DHI: "HOMEBUILDER", NVR: "HOMEBUILDER",
   KBH: "HOMEBUILDER", PHM: "HOMEBUILDER", TOL: "HOMEBUILDER",
   // REITs (rate-sensitive)
-  O: "REIT", AMT: "REIT", PLD: "REIT", EQIX: "REIT", SPG: "REIT",
+  O: "REIT", AMT: "REIT", PLD: "REIT", EQIX: "REIT", DLR: "REIT", SPG: "REIT",
   PSA: "REIT", CCI: "REIT", WELL: "REIT",
   // Solar / clean energy
   ENPH: "SOLAR", SEDG: "SOLAR", FSLR: "SOLAR", RUN: "SOLAR", PLUG: "SOLAR",
@@ -410,7 +418,7 @@ const SECTOR_MAP = {
   // Nuclear / uranium / power-for-AI — hot 2026 theme as AI data centers chase baseload
   OKLO: "NUCLEAR", SMR: "NUCLEAR", CCJ: "NUCLEAR", UEC: "NUCLEAR", LEU: "NUCLEAR",
   BWXT: "NUCLEAR", URA: "NUCLEAR", NLR: "NUCLEAR", CEG: "NUCLEAR", VST: "NUCLEAR",
-  TLN: "NUCLEAR", PWR: "NUCLEAR", GEV: "NUCLEAR",
+  TLN: "NUCLEAR", GEV: "NUCLEAR", NRG: "NUCLEAR",
   // Utilities (rate-sensitive, ex-nuclear)
   NEE: "UTILITY", DUK: "UTILITY", SO: "UTILITY", D: "UTILITY", AEP: "UTILITY",
   XEL: "UTILITY", SRE: "UTILITY",
@@ -454,20 +462,28 @@ const MAX_PER_SECTOR = 2;
 const SR_WATCHLIST = [
   // Data center / crypto-miner AI infrastructure (SR core theme)
   "CIFR", "WULF", "HUT", "NBIS", "WGMI", "IREN", "BTDR", "CRWV", "MARA", "RIOT",
+  "APLD", "CORZ", "CLSK", "BITF", "HIVE",
   // Space / aerospace mobility
-  "BKSY", "PL", "LUNR", "RKLB", "ASTS", "RDW", "ACHR", "JOBY",
+  "BKSY", "PL", "LUNR", "RKLB", "ASTS", "RDW", "ACHR", "JOBY", "FLY", "SATL", "VOYG",
   // AI semiconductors — flow leaders
-  "NVDA", "AVGO", "AMD", "MU", "ARM", "TSM", "SMCI", "MRVL", "INTC", "ALAB",
+  "NVDA", "AVGO", "AMD", "MU", "ARM", "TSM", "SMCI", "MRVL", "INTC", "ALAB", "CRDO",
+  // Memory / storage / AI server beneficiaries
+  "SNDK", "WDC", "STX", "DELL", "HPE", "PSTG",
+  // Networking / optical interconnect
+  "ANET", "CIEN", "COHR", "LITE",
   // AI software / agents (PLTR is the perennial flow leader)
-  "PLTR", "AI", "MDB", "ESTC", "APP",
+  "PLTR", "AI", "MDB", "ESTC", "APP", "SNOW", "DDOG", "ORCL", "RBRK",
   // Cybersecurity (option flow on every breach headline)
   "CRWD", "PANW", "ZS", "NET", "S",
   // Quantum (group moves on any quantum/IBM/Google headline)
   "IONQ", "RGTI", "QBTS", "QUBT",
   // Nuclear / power-for-AI (2026's hottest secondary theme)
   "OKLO", "SMR", "CEG", "VST", "CCJ", "UEC", "BWXT", "GEV",
+  "TLN", "NRG", "VRT", "ETN", "PWR", "POWL", "NVT", "EME", "BE",
   // Crypto-adjacent (move with BTC, separate from financials)
-  "COIN", "MSTR",
+  "COIN", "MSTR", "HOOD", "SOFI", "AFRM",
+  // Data-center real estate / interconnect
+  "DLR", "EQIX",
   // Mega-cap consolidation-to-expansion leaders (May 2026 SR posts)
   "TSLA", "AAPL", "MSFT", "GOOGL", "META", "AMZN",
   // EV / clean
@@ -491,6 +507,13 @@ const GLOBAL_TICKER_BLOCKLIST = new Set([
   // Common Claude misfires — names/words that pass shape but aren't tradable tickers.
   "WARSH", "POWELL", "TRUMP", "BIDEN", "FED",
 ]);
+const DIRECTIVE_WORD_BLOCKLIST = new Set([
+  "ADD", "ADDED", "WATCH", "WATCHING", "WATCHLIST", "TRACK", "TRACKING", "MONITOR", "MONITORING",
+  "FOCUS", "REMOVE", "DROP", "DELETE", "STOP", "THE", "TO", "FROM", "ON", "IN", "MY", "A", "AN",
+  "TICKER", "TICKERS", "SYMBOL", "SYMBOLS", "STOCK", "STOCKS", "NAME", "NAMES", "BULLISH",
+  "BEARISH", "LONG", "SHORT", "CALL", "CALLS", "PUT", "PUTS", "PLEASE", "PLS",
+  "NEW", "MORE", "MANY", "BUNCH", "LOT", "LOTS", "SOME", "THIS", "THAT", "THESE", "THOSE",
+]);
 
 function isValidTickerSymbol(sym) {
   if (!sym || typeof sym !== "string") return false;
@@ -501,19 +524,72 @@ function isValidTickerSymbol(sym) {
 
 // Centralised add path so all three call sites (hint result, news impact, news newTickers)
 // go through the same validation and respect each account's auto-pruned bad-ticker list.
-function tryAddTicker(acct, sym, source) {
+function addTickerToWatchlist(acct, sym, source) {
+  sym = (sym || "").trim().toUpperCase();
   if (!isValidTickerSymbol(sym)) {
     log(acct, `WATCHLIST: rejected "${sym}" from ${source} — invalid shape or blocklisted`);
-    return false;
+    return { added: false, existing: false, rejected: true, reason: "invalid ticker shape or blocklisted" };
   }
   if (!acct.badTickers) acct.badTickers = {};
   if (acct.badTickers[sym]?.blocked) {
     log(acct, `WATCHLIST: rejected "${sym}" from ${source} — previously failed to load`);
-    return false;
+    return { added: false, existing: false, rejected: true, reason: "previously failed to load" };
   }
-  if (acct.tickers.includes(sym)) return false;
-  acct.tickers.push(sym);
-  return true;
+  if (!Array.isArray(acct.tickers)) acct.tickers = [];
+  if (!Array.isArray(acct.dynamicWatchlist)) acct.dynamicWatchlist = [];
+  const existing = acct.tickers.includes(sym) || acct.dynamicWatchlist.includes(sym);
+  if (!acct.tickers.includes(sym)) acct.tickers.push(sym);
+  if (acct.dynamicWatchlist.length > 0 && !acct.dynamicWatchlist.includes(sym)) acct.dynamicWatchlist.push(sym);
+  if (!existing) log(acct, `WATCHLIST +${sym} (${source})`);
+  return { added: !existing, existing, rejected: false, reason: existing ? "already watched" : "" };
+}
+
+function tryAddTicker(acct, sym, source) {
+  return addTickerToWatchlist(acct, sym, source).added;
+}
+
+function removeTickerFromWatchlist(acct, sym, source) {
+  sym = (sym || "").trim().toUpperCase();
+  if (!isValidTickerSymbol(sym)) return { removed: false, reason: "invalid ticker" };
+  const beforeTickers = Array.isArray(acct.tickers) ? acct.tickers.length : 0;
+  const beforeDynamic = Array.isArray(acct.dynamicWatchlist) ? acct.dynamicWatchlist.length : 0;
+  acct.tickers = (acct.tickers || []).filter(t => t !== sym);
+  acct.dynamicWatchlist = (acct.dynamicWatchlist || []).filter(t => t !== sym);
+  acct.activeHints = (acct.activeHints || []).filter(h => h.ticker !== sym);
+  const removed = acct.tickers.length !== beforeTickers || acct.dynamicWatchlist.length !== beforeDynamic;
+  if (removed) log(acct, `WATCHLIST -${sym} (${source})`);
+  return { removed, reason: removed ? "" : "not watched" };
+}
+
+function extractDirectiveSymbols(text) {
+  const raw = String(text || "").toUpperCase().match(/\$?[A-Z]{1,5}(?:\.[A-Z])?/g) || [];
+  return [...new Set(raw.map(s => s.replace(/^\$/, "")).filter(s =>
+    isValidTickerSymbol(s) && !DIRECTIVE_WORD_BLOCKLIST.has(s)
+  ))];
+}
+
+function inferDirectWatchlistDirectives(text) {
+  const upper = String(text || "").toUpperCase();
+  const addIntent = /\b(ADD|WATCH|TRACK|MONITOR|FOLLOW|FOCUS)\b/.test(upper);
+  const removeIntent = /\b(REMOVE|DROP|DELETE|UNWATCH)\b|\bSTOP\s+(WATCHING|TRACKING|MONITORING)\b/.test(upper);
+  if (!addIntent && !removeIntent) return { tickers: [], removeTickers: [], direct: false };
+
+  const symbols = extractDirectiveSymbols(upper);
+  if (symbols.length === 0) return { tickers: [], removeTickers: [], direct: addIntent || removeIntent };
+
+  const bearish = /\b(BEARISH|SHORT|PUT|PUTS|DOWNSIDE|WEAK)\b/.test(upper);
+  const bullish = /\b(BULLISH|LONG|CALL|CALLS|UPSIDE|BOOM|BREAKOUT|STRONG)\b/.test(upper);
+  const direction = bearish ? "bearish" : "bullish";
+  const bias = bearish ? -20 : bullish ? 20 : 0;
+  const reasoning = bias === 0
+    ? "Explicit user watchlist add; monitor without score bias."
+    : `Explicit user ${direction} watchlist directive.`;
+
+  return {
+    tickers: addIntent && !removeIntent ? symbols.map(symbol => ({ symbol, direction, bias, reasoning })) : [],
+    removeTickers: removeIntent ? symbols : [],
+    direct: true,
+  };
 }
 
 // Called once per cycle for each ticker that produced "No candle data" / "Insufficient data".
@@ -751,8 +827,8 @@ async function ensureRhWatchlist() {
   }
 }
 
-async function addRhWatchlistCandidate({ ticker, optionType, candidate, source = "consideration" }) {
-  if (!robinhood.isConnected || !RH_AUTO_WATCHLIST) return;
+async function addRhWatchlistCandidate({ ticker, optionType, candidate, source = "consideration", force = false }) {
+  if (!robinhood.isConnected || (!force && !RH_AUTO_WATCHLIST)) return;
   const sym = (ticker || "").toUpperCase();
   if (!sym) return;
 
@@ -973,6 +1049,15 @@ function loadAccounts() {
           const acct = createAccountRuntime(id, acctData.name, acctData.config, acctData.state);
           acct.paused = acctData.paused || false;
           acct.createdAt = acctData.createdAt || Date.now();
+          if (Array.isArray(acctData.tickers)) acct.tickers = acctData.tickers.filter(isValidTickerSymbol);
+          if (Array.isArray(acctData.dynamicWatchlist)) acct.dynamicWatchlist = acctData.dynamicWatchlist.filter(isValidTickerSymbol);
+          if (Array.isArray(acctData.activeHints)) acct.activeHints = acctData.activeHints.filter(h => h && isValidTickerSymbol(h.ticker) && h.expiresAt > Date.now());
+          if (Array.isArray(acctData.chatHistory)) acct.chatHistory = acctData.chatHistory.slice(-60);
+          if (acctData.badTickers && typeof acctData.badTickers === "object") acct.badTickers = acctData.badTickers;
+          if (typeof acctData.lastHintContent === "string") acct.lastHintContent = acctData.lastHintContent;
+          if (typeof acctData.lastWatchlistRefresh === "number") acct.lastWatchlistRefresh = acctData.lastWatchlistRefresh;
+          if (typeof acctData.lastNewsScan === "number") acct.lastNewsScan = acctData.lastNewsScan;
+          if (typeof acctData.latestNewsBrief === "string") acct.latestNewsBrief = acctData.latestNewsBrief;
           // Restore the persisted portfolio-value chart series across restarts/redeploys.
           if (Array.isArray(acctData.portfolioHistory)) acct.dashboard.portfolioHistory = acctData.portfolioHistory;
           accounts.set(id, acct);
@@ -1027,6 +1112,15 @@ function saveAccounts() {
       paused: acct.paused,
       config: acct.config,
       state: acct.state,
+      tickers: (acct.tickers || []).filter(isValidTickerSymbol),
+      dynamicWatchlist: (acct.dynamicWatchlist || []).filter(isValidTickerSymbol),
+      activeHints: (acct.activeHints || []).filter(h => h && isValidTickerSymbol(h.ticker) && h.expiresAt > Date.now()).slice(-100),
+      chatHistory: (acct.chatHistory || []).slice(-60),
+      badTickers: acct.badTickers || {},
+      lastHintContent: acct.lastHintContent || "",
+      lastWatchlistRefresh: acct.lastWatchlistRefresh || 0,
+      lastNewsScan: acct.lastNewsScan || 0,
+      latestNewsBrief: acct.latestNewsBrief || "",
       // Persist the portfolio-value series so the chart survives server restarts/redeploys
       // (previously it lived only in memory and reset every deploy). Capped to bound file size.
       portfolioHistory: (acct.dashboard?.portfolioHistory || []).slice(-10000),
@@ -3032,6 +3126,19 @@ Rules:
     return extractLLMJSON(raw);
   } catch (e) {
     log(acct, `CLAUDE WARN: Failed to parse hint response — ${e.message}`);
+    const direct = inferDirectWatchlistDirectives(hintText);
+    if (direct.tickers.length > 0 || direct.removeTickers.length > 0) {
+      return {
+        type: "action",
+        response: "",
+        tickers: direct.tickers,
+        removeTickers: direct.removeTickers,
+        urgency: "medium",
+        advice: direct.tickers.length > 0
+          ? `Adding ${direct.tickers.map(t => t.symbol).join(", ")} to the watchlist.`
+          : `Removing ${direct.removeTickers.join(", ")} from the watchlist.`,
+      };
+    }
     return null;
   }
 }
@@ -3050,7 +3157,7 @@ async function checkHints(acct) {
     const result = await processHint(content, acct);
     if (!result) return;
 
-    applyHintResult(acct, result, content);
+    await applyHintResult(acct, result, content);
 
     // Clear the hint file after processing
     fs.writeFileSync(hintFile, "");
@@ -3060,8 +3167,68 @@ async function checkHints(acct) {
   }
 }
 
-function applyHintResult(acct, result, userMessage) {
+async function applyHintResult(acct, result, userMessage) {
+  const direct = inferDirectWatchlistDirectives(userMessage);
+  if (direct.tickers.length > 0) {
+    const existing = new Set((result.tickers || []).map(t => String(t.symbol || "").toUpperCase()));
+    result.tickers = [...(result.tickers || [])];
+    for (const t of direct.tickers) {
+      if (!existing.has(t.symbol)) result.tickers.push(t);
+    }
+  }
+  if (direct.removeTickers.length > 0) {
+    result.removeTickers = [...new Set([...(result.removeTickers || []).map(s => String(s).toUpperCase()), ...direct.removeTickers])];
+  }
+
   if (result.advice) log(acct, `CLAUDE SAYS: ${result.advice || result.response}`);
+
+  const mutation = { added: [], existing: [], removed: [], notFound: [], rejected: [] };
+
+  for (const t of result.tickers || []) {
+    const symbol = String(t.symbol || "").toUpperCase();
+    const add = addTickerToWatchlist(acct, symbol, `hint ${t.direction || "watch"} bias ${t.bias > 0 ? "+" : ""}${t.bias || 0}`);
+    if (add.rejected) {
+      mutation.rejected.push(`${symbol} (${add.reason})`);
+      continue;
+    }
+    if (add.added) {
+      mutation.added.push(symbol);
+      await addRhWatchlistCandidate({ ticker: symbol, source: "chat directive", force: direct.direct });
+    } else {
+      mutation.existing.push(symbol);
+      log(acct, `BIAS ${symbol}: ${t.bias > 0 ? "+" : ""}${t.bias || 0} (${t.direction || "watch"}) — ${t.reasoning || "user directive"}`);
+    }
+
+    const bias = Number(t.bias) || 0;
+    if (bias !== 0) {
+      const existing = acct.activeHints.findIndex(h => h.ticker === symbol);
+      const hint = {
+        ticker: symbol,
+        bias,
+        direction: t.direction || (bias < 0 ? "bearish" : "bullish"),
+        reasoning: t.reasoning || "User directive",
+        expiresAt: Date.now() + 4 * 60 * 60_000,
+      };
+      if (existing >= 0) acct.activeHints[existing] = hint;
+      else acct.activeHints.push(hint);
+    }
+  }
+
+  for (const sym of result.removeTickers || []) {
+    const out = removeTickerFromWatchlist(acct, sym, "hint directive");
+    if (out.removed) mutation.removed.push(String(sym).toUpperCase());
+    else mutation.notFound.push(String(sym).toUpperCase());
+  }
+
+  if (direct.direct || mutation.added.length || mutation.removed.length || mutation.rejected.length) {
+    const parts = [];
+    if (mutation.added.length) parts.push(`Added ${mutation.added.join(", ")} to the watchlist`);
+    if (mutation.existing.length) parts.push(`${mutation.existing.join(", ")} ${mutation.existing.length === 1 ? "is" : "are"} already on the watchlist`);
+    if (mutation.removed.length) parts.push(`Removed ${mutation.removed.join(", ")} from the watchlist`);
+    if (mutation.notFound.length) parts.push(`${mutation.notFound.join(", ")} ${mutation.notFound.length === 1 ? "was" : "were"} not on the watchlist`);
+    if (mutation.rejected.length) parts.push(`Rejected ${mutation.rejected.join(", ")}`);
+    result.response = parts.join(". ") + (parts.length ? "." : "");
+  }
 
   // Store in chat history (keep last 30 exchanges)
   if (!acct.chatHistory) acct.chatHistory = [];
@@ -3069,38 +3236,16 @@ function applyHintResult(acct, result, userMessage) {
   acct.chatHistory.push({ role: "ai", content: result.response || result.advice || "", ts: Date.now() });
   if (acct.chatHistory.length > 60) acct.chatHistory = acct.chatHistory.slice(-60);
 
-  for (const t of result.tickers || []) {
-    if (!isValidTickerSymbol(t.symbol)) {
-      log(acct, `HINT: rejected "${t.symbol}" — invalid ticker shape`);
-      continue;
+  saveAccounts();
+  try {
+    for (const [, a] of accounts) {
+      if (a !== acct && mutation.added.length) {
+        for (const sym of mutation.added) addTickerToWatchlist(a, sym, `mirrored from ${acct.name} chat directive`);
+      }
     }
-    if (acct.badTickers?.[t.symbol]?.blocked) {
-      log(acct, `HINT: rejected "${t.symbol}" — on local blocklist (failed to load before)`);
-      continue;
-    }
-    if (!acct.tickers.includes(t.symbol)) {
-      acct.tickers.push(t.symbol);
-      log(acct, `WATCHLIST +${t.symbol} (${t.direction}, bias ${t.bias > 0 ? "+" : ""}${t.bias})`);
-    } else {
-      log(acct, `BIAS ${t.symbol}: ${t.bias > 0 ? "+" : ""}${t.bias} (${t.direction}) — ${t.reasoning}`);
-    }
-
-    const existing = acct.activeHints.findIndex(h => h.ticker === t.symbol);
-    const hint = {
-      ticker: t.symbol,
-      bias: t.bias,
-      direction: t.direction,
-      reasoning: t.reasoning,
-      expiresAt: Date.now() + 4 * 60 * 60_000,
-    };
-    if (existing >= 0) acct.activeHints[existing] = hint;
-    else acct.activeHints.push(hint);
-  }
-
-  for (const sym of result.removeTickers || []) {
-    acct.tickers = acct.tickers.filter(t => t !== sym);
-    acct.activeHints = acct.activeHints.filter(h => h.ticker !== sym);
-    log(acct, `WATCHLIST -${sym}`);
+    if (mutation.added.length) saveAccounts();
+  } catch {
+    // Best-effort cross-account mirroring only.
   }
 }
 
@@ -7771,7 +7916,7 @@ function startDashboard(defaultAcct, apiKey) {
           // Process hint directly via Claude instead of file
           try {
             const result = await processHint(hintText, activeAcct);
-            if (result) applyHintResult(activeAcct, result, hintText);
+            if (result) await applyHintResult(activeAcct, result, hintText);
           } catch (e) {
             log(activeAcct, `HINT ERROR: ${e.message}`);
           }
