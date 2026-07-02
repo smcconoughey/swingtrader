@@ -669,6 +669,18 @@ async function fetchDynamicWatchlist() {
 }
 
 async function refreshWatchlist(acct) {
+  // Learning variants scan exactly what their parent scans — same tickers, same data, so the
+  // only difference between variants is the strategy knob under test. If the parent is idle
+  // (paused since restart, watchlist never rebuilt), fall through and build our own list so
+  // data collection continues regardless.
+  if (acct.learning) {
+    const parent = accounts.get(acct.learningParent);
+    if (parent && (parent.tickers || []).length > 5) {
+      acct.tickers = [...parent.tickers];
+      acct.dynamicWatchlist = [...(parent.dynamicWatchlist || [])];
+      return;
+    }
+  }
   const now = Date.now();
   if (now - acct.lastWatchlistRefresh < WATCHLIST_REFRESH_MS && acct.dynamicWatchlist.length > 0) return;
   acct.lastWatchlistRefresh = now;
@@ -961,6 +973,110 @@ function createAccountRuntime(id, name, config, state) {
   };
 }
 
+// ─── Learning Lab ───
+// Shadow paper accounts spawned from a live (Robinhood) account. Each runs the full trading
+// cycle against the SAME market data and watchlist as the parent, but with one strategy knob
+// turned — so relative performance across variants is a controlled experiment, collected
+// continuously while the real account waits on settlement/capital. LLM-free by design:
+// variants trade deterministically on the numeric gates (which ARE the experiment variables).
+const LEARNING_VARIANTS = [
+  { key: "baseline", name: "Baseline", desc: "parent config, unchanged", tweak: {} },
+  { key: "selective", name: "High conviction", desc: "quality ≥75, half size", tweak: { minSetupQuality: 75, baseRiskPct: 0.5 } },
+  { key: "loose", name: "Looser filter", desc: "quality ≥45 — more shots", tweak: { minSetupQuality: 45 } },
+  { key: "quicktp", name: "Quick profits", desc: "TP +20% / SL -20%", tweak: { profitTarget: 0.20, stopLoss: -0.20 } },
+  { key: "runner", name: "Let it run", desc: "TP +80%, later trims", tweak: { profitTarget: 0.80, trim1Pct: 0.30, trim2Pct: 0.60 } },
+  { key: "smallsize", name: "Quarter size", desc: "25% risk, up to 4 positions", tweak: { baseRiskPct: 0.25, maxPositions: 4 } },
+];
+
+function learningVariantsFor(parentId) {
+  return [...accounts.values()].filter(a => a.learning && a.learningParent === parentId);
+}
+
+// Create any missing variants for a parent. Idempotent; seeds with the parent's current PV
+// (mirroring the real balance) unless an explicit theoretical bankroll is given.
+function ensureLearningAccounts(parent, baseCash = null) {
+  if (!parent || parent.learning) return;
+  const seed = Math.max(50, Math.round(baseCash ?? portfolioValue(parent.state, parent.dashboard?.quotes || {})));
+  let spawned = 0;
+  for (const v of LEARNING_VARIANTS) {
+    const id = `${parent.id}-learn-${v.key}`;
+    if (accounts.has(id)) continue;
+    const cfg = {
+      ...parent.config, ...v.tweak,
+      broker: "paper",
+      startingCash: seed,
+      tradeWhenClosed: false,
+      autoExecute: false,
+    };
+    const acct = createAccountRuntime(`${parent.id}-learn-${v.key}`, `🧠 ${v.name}`, cfg, null);
+    acct.learning = true;
+    acct.learningParent = parent.id;
+    acct.learningKey = v.key;
+    acct.state.cash = seed;
+    acct.tickers = [...parent.tickers];
+    accounts.set(id, acct);
+    spawned++;
+  }
+  if (spawned > 0) {
+    log(parent, `LEARNING: spawned ${spawned} variant account(s) seeded at $${seed} — running continuously alongside this account`);
+    saveAccounts();
+  }
+}
+
+function learningStats(v) {
+  const closed = (v.state.history || []).filter(t => t && typeof t.pnlDollar === "number");
+  const wins = closed.filter(t => t.pnlDollar > 0).length;
+  const pv = portfolioValue(v.state, v.dashboard?.quotes || {});
+  const realized = closed.reduce((s, t) => s + t.pnlDollar, 0);
+  return {
+    key: v.learningKey, name: v.name, id: v.id,
+    pv, startingCash: v.config.startingCash,
+    pnlPct: v.config.startingCash > 0 ? (pv - v.config.startingCash) / v.config.startingCash * 100 : 0,
+    trades: closed.length, wins,
+    winRate: closed.length > 0 ? wins / closed.length * 100 : null,
+    realized, open: (v.state.positions || []).length,
+  };
+}
+
+// Archive a snapshot of every variant's results into the parent (the collected data survives
+// resets), then re-seed each variant to the given bankroll with a clean slate.
+function resetLearningAccounts(parent, baseCash = null) {
+  const variants = learningVariantsFor(parent.id);
+  const seed = Math.max(50, Math.round(baseCash ?? portfolioValue(parent.state, parent.dashboard?.quotes || {})));
+  if (variants.length > 0) {
+    parent.state.learningLog = parent.state.learningLog || [];
+    parent.state.learningLog.push({
+      ts: Date.now(), date: getETDateStr(),
+      variants: variants.map(v => {
+        const s = learningStats(v);
+        return { key: s.key, name: v.name, pv: +s.pv.toFixed(2), pnlPct: +s.pnlPct.toFixed(1), trades: s.trades, winRate: s.winRate != null ? +s.winRate.toFixed(0) : null };
+      }),
+    });
+    if (parent.state.learningLog.length > 200) parent.state.learningLog = parent.state.learningLog.slice(-200);
+  }
+  for (const v of variants) {
+    v.config.startingCash = seed;
+    v.state.cash = seed;
+    v.state.positions = [];
+    v.state.history = [];
+    v.state.meta = {};
+    v.state.realizedPnl = 0;
+    delete v.state.risk;
+    v.dashboard.portfolioHistory = [];
+  }
+  ensureLearningAccounts(parent, seed); // fill in any missing variants at the same seed
+  log(parent, `LEARNING: reset ${Math.max(variants.length, LEARNING_VARIANTS.length)} variants to $${seed}${variants.length > 0 ? " (previous run archived)" : ""}`);
+  saveAccounts();
+}
+
+function removeLearningAccounts(parent) {
+  const variants = learningVariantsFor(parent.id);
+  if (variants.length === 0) return;
+  resetLearningAccounts(parent); // archives the final snapshot first
+  for (const v of learningVariantsFor(parent.id)) accounts.delete(v.id);
+  saveAccounts();
+}
+
 // ─── Portfolio History Helpers ───
 
 // Push a point onto the portfolio-value series, with dedup/decimation so it can span weeks
@@ -1064,6 +1180,9 @@ function loadAccounts() {
           const acct = createAccountRuntime(id, acctData.name, acctData.config, acctData.state);
           acct.paused = acctData.paused || false;
           acct.pausedBy = acctData.pausedBy || (acctData.paused ? "user" : null);
+          acct.learning = acctData.learning || false;
+          acct.learningParent = acctData.learningParent || null;
+          acct.learningKey = acctData.learningKey || null;
           acct.createdAt = acctData.createdAt || Date.now();
           if (Array.isArray(acctData.tickers)) acct.tickers = acctData.tickers.filter(isValidTickerSymbol);
           if (Array.isArray(acctData.dynamicWatchlist)) acct.dynamicWatchlist = acctData.dynamicWatchlist.filter(isValidTickerSymbol);
@@ -1127,6 +1246,9 @@ function saveAccounts() {
       createdAt: acct.createdAt,
       paused: acct.paused,
       pausedBy: acct.pausedBy || null,
+      learning: acct.learning || false,
+      learningParent: acct.learningParent || null,
+      learningKey: acct.learningKey || null,
       config: acct.config,
       state: acct.state,
       tickers: (acct.tickers || []).filter(isValidTickerSymbol),
@@ -2947,7 +3069,7 @@ function evaluateRiskHalts(acct, pv) {
   const msg = `Portfolio ${(dayPnlPct * 100).toFixed(1)}% on the day (start $${r.dayStartPV.toFixed(0)} → $${pv.toFixed(0)}), limit -${(cfg.dailyLossLimitPct * 100).toFixed(0)}%.${isLive ? " Account PAUSED — exits keep running; resume manually from the dashboard." : " New entries blocked for the day."}`;
   log(acct, `🚨 DAILY LOSS HALT: ${msg}`);
   diag("risk_halt", acct, { kind: "daily_loss", dayPnlPct: +(dayPnlPct * 100).toFixed(1), dayStartPV: +r.dayStartPV.toFixed(2), pv: +pv.toFixed(2), paused: isLive });
-  sendPush(`🚨 Daily loss halt [${acct.name}]`, msg, true).catch(() => {});
+  if (!acct.learning) sendPush(`🚨 Daily loss halt [${acct.name}]`, msg, true).catch(() => {});
   if (isLive) {
     acct.paused = true;
     acct.pausedBy = "risk"; // breaker pause: exits keep managing open positions
@@ -3223,6 +3345,7 @@ Rules:
 }
 
 async function checkHints(acct) {
+  if (acct.learning) return; // variants take no chat directives — the experiment stays controlled
   // Check file-based hints (for default account or single-account mode)
   try {
     const hintFile = accounts.size <= 1 ? HINT_FILE : `hint-${acct.id}.txt`;
@@ -3385,6 +3508,7 @@ function todayStr() {
 }
 
 async function runNewsScan(acct, apiKey) {
+  if (acct.learning) return; // no LLM spend and no hint injection on learning variants
   const now = Date.now();
   if (now - globalLastNewsScan < NEWS_INTERVAL) return;
   globalLastNewsScan = now;
@@ -3811,6 +3935,18 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     }
 
     // ─── Step 3: Claude validates setup AND selects best contract ───
+    // Learning variants trade deterministically — zero LLM spend, and the numeric gates
+    // (quality/score/risk knobs) ARE the experiment variables. Pick the candidate nearest
+    // the target DTE and approve on the gates that already passed above.
+    if (acct.learning) {
+      claudeResult = { approve: true, confidence: 60, concerns: [], reasoning: "Learning variant — deterministic entry, no LLM validation", suggestion: "", contractIdx: 0 };
+      selectedCandidate = candidates.length > 0
+        ? [...candidates].sort((a, b) => Math.abs(a.dte - TARGET_DTE) - Math.abs(b.dte - TARGET_DTE))[0]
+        : null;
+      if (!selectedCandidate) {
+        return { skipped: true, reason: "Learning variant: no real-chain contract available — synthetic entries disabled" };
+      }
+    } else {
     try {
       claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, rhUsesOptionsForEntry(cfg) ? candidates : null);
       selectedCandidate = candidates.length > 0 ? candidates[claudeResult.contractIdx ?? 0] : null;
@@ -3853,6 +3989,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     if (!claudeResult.approve) {
       return { skipped: true, reason: `Claude rejected: ${claudeResult.suggestion} (${(claudeResult.concerns || []).join(', ')})` };
     }
+    } // end non-learning validation path
   }
 
   // ─── Step 4: Pick an affordable real contract before sizing ───
@@ -3926,6 +4063,11 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
       const cheapest = candidates.reduce((a, b) => (b.mid < a.mid ? b : a));
       return { skipped: true, reason: `No quality contract within budget: cheapest near-the-money ${type} is $${(cheapest.mid * 100).toFixed(0)} (δ${cheapest.delta != null ? Math.abs(cheapest.delta).toFixed(2) : "?"}) but only $${maxContractCost.toFixed(0)} is deployable — skipping rather than buying a cheap OTM lottery ticket` };
     } else {
+      // Learning variants never trade invented contracts — synthetic pricing is exactly the
+      // fantasy that inflated past sims (δ0.01 lottery tickets, currency-code "options").
+      if (acct.learning) {
+        return { skipped: true, reason: "Learning variant: no real chain data — synthetic entries disabled" };
+      }
       // Synthetic fallback: 1 strike OTM, expiry chosen from the ticker's cadence near TARGET_DTE
       // and staggered away from over-concentrated expirations.
       const atm = Math.round(spot / 5) * 5;
@@ -5270,6 +5412,8 @@ ${marketCard}
   ${positionCharts}
 </div>
 
+${learningPanelHTML(acct, { spectator })}
+
 <div class="card" style="margin-bottom:16px" id="bot-thinking-card">
   <h2 style="display:flex;align-items:center;justify-content:space-between;cursor:pointer;margin:0" onclick="toggleBotThinking()">
     <span>Bot Thinking — Decision Reasoning <span style="color:#aab0bb;font-weight:400;text-transform:none;font-size:10px;letter-spacing:0">(${dashboard.decisions.length} tickers)</span></span>
@@ -6522,12 +6666,79 @@ setInterval(() => { loadAccount(); loadPositions(); loadOrders(); loadWatchlist(
 </body></html>`;
 }
 
+// ─── Learning Panel HTML ───
+
+function learningPanelHTML(acct, { spectator = false } = {}) {
+  // On a variant's own page: banner linking back to the parent.
+  if (acct.learning) {
+    const parent = accounts.get(acct.learningParent);
+    const variant = LEARNING_VARIANTS.find(v => v.key === acct.learningKey);
+    return `<div class="card" style="margin-bottom:16px;border-left:3px solid #6a4df4">
+      <div style="font-size:12px;color:#3a3b42">🧠 <b>Learning variant</b>${variant ? ` — ${variant.desc}` : ""} · shadow paper account of
+      ${parent ? `<a href="/?a=${parent.id}" style="color:#6a4df4">${parent.name}</a>` : "(parent deleted)"} · real chains only, no LLM, no notifications</div>
+    </div>`;
+  }
+  if (acct.config.broker !== "robinhood") return "";
+
+  const enabled = acct.config.learningEnabled !== false;
+  const variants = learningVariantsFor(acct.id);
+  const rows = variants
+    .map(v => ({ v, s: learningStats(v), meta: LEARNING_VARIANTS.find(x => x.key === v.learningKey) }))
+    .sort((a, b) => b.s.pv - a.s.pv);
+  const bestPv = rows.length > 0 ? rows[0].s.pv : null;
+
+  const tableRows = rows.map(({ v, s, meta }, i) => {
+    const color = s.pnlPct >= 0 ? "#00a843" : "#e8473f";
+    const crown = i === 0 && rows.length > 1 && s.trades > 0 ? " 👑" : "";
+    return `<tr>
+      <td><a href="/?a=${v.id}" style="color:#1c1d22;text-decoration:none"><b>${v.name.replace("🧠 ", "")}</b>${crown}</a></td>
+      <td style="color:#6b7280;font-size:11px">${meta?.desc || ""}</td>
+      <td>$${s.pv.toFixed(0)}</td>
+      <td style="color:${color}">${s.pnlPct >= 0 ? "+" : ""}${s.pnlPct.toFixed(1)}%</td>
+      <td>${s.open}</td>
+      <td>${s.trades}</td>
+      <td>${s.winRate != null ? s.winRate.toFixed(0) + "%" : "—"}</td>
+      <td style="color:${s.realized >= 0 ? "#00a843" : "#e8473f"}">${s.realized >= 0 ? "+" : ""}$${s.realized.toFixed(0)}</td>
+    </tr>`;
+  }).join("");
+
+  const archivedRuns = (acct.state.learningLog || []).length;
+  const controls = spectator ? "" : `
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px">
+      <form method="POST" action="/api/accounts/${acct.id}/learning/reset" style="display:flex;gap:6px;align-items:center"
+        onsubmit="return confirm('Reset all learning variants? Current results are archived first.')">
+        <input name="cash" type="number" step="1" min="50" placeholder="mirror balance"
+          style="width:110px;padding:6px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;font-size:11px" title="Theoretical bankroll ($). Leave blank to mirror this account's current balance.">
+        <button type="submit" class="acct-btn" style="font-size:11px">↺ Reset / Re-seed</button>
+      </form>
+      <form method="POST" action="/api/accounts/${acct.id}/learning/toggle" style="display:inline"
+        ${enabled ? `onsubmit="return confirm('Disable the learning lab? Variants are archived and removed.')"` : ""}>
+        <button type="submit" class="acct-btn ${enabled ? "delete" : ""}" style="font-size:11px">${enabled ? "✕ Disable lab" : "▶ Enable lab"}</button>
+      </form>
+      ${archivedRuns > 0 ? `<span style="font-size:10px;color:#8a909b">${archivedRuns} archived run${archivedRuns !== 1 ? "s" : ""}</span>` : ""}
+    </div>`;
+
+  return `<div class="card" style="margin-bottom:16px" id="learning-card">
+  <h2>🧠 Learning Lab <span style="color:#6b7280;font-weight:400;font-size:11px">(${enabled ? `${variants.length} shadow strategies trading this account's watchlist` : "disabled"})</span></h2>
+  ${enabled && rows.length > 0 ? `
+  <div style="font-size:10px;color:#8a909b;margin:6px 0 8px">Paper variants mirror your watchlist + bankroll and run every cycle — real option chains only, deterministic entries (no LLM), so relative performance isolates each strategy knob. Best PV: <b>$${bestPv.toFixed(0)}</b></div>
+  <div style="overflow-x:auto"><table>
+    <tr><th>Variant</th><th>Tweak</th><th>PV</th><th>P&L</th><th>Open</th><th>Trades</th><th>Win rate</th><th>Realized</th></tr>
+    ${tableRows}
+  </table></div>` : enabled ? `<div style="font-size:11px;color:#8a909b;margin-top:8px">Variants spawn on the next trading cycle.</div>` : `<div style="font-size:11px;color:#8a909b;margin-top:8px">Enable to run shadow strategy experiments against this account's watchlist while you wait for funds to settle.</div>`}
+  ${controls}
+</div>`;
+}
+
 // ─── Tab Bar HTML ───
 
 function tabBarHTML(activeId, { spectator = false } = {}) {
   let totalPV = 0;
   const tabs = [];
+  let mainCount = 0;
   for (const [id, acct] of accounts) {
+    if (acct.learning) continue; // shadow variants live in the Learning panel, not the tab bar
+    mainCount++;
     const pv = portfolioValue(acct.state, acct.dashboard.quotes);
     totalPV += pv;
     const pnl = ((pv - acct.config.startingCash) / acct.config.startingCash * 100).toFixed(1);
@@ -6560,7 +6771,7 @@ function tabBarHTML(activeId, { spectator = false } = {}) {
   <div class="global-stats">
     <span>Total PV: <b>$${totalPV.toFixed(0)}</b></span>
     ${llmBadge}
-    <span>${accounts.size} account${accounts.size !== 1 ? "s" : ""}</span>
+    <span>${mainCount} account${mainCount !== 1 ? "s" : ""}</span>
     ${spectator ? '<span style="color:#2f6fed;font-weight:700">Spectator</span>' : ''}
   </div>
 </div>
@@ -7466,10 +7677,51 @@ function startDashboard(defaultAcct, apiKey) {
       return;
     }
 
+    // ─── Learning lab controls ───
+    const learnResetMatch = pathname.match(/^\/api\/accounts\/([^/]+)\/learning\/reset$/);
+    if (req.method === "POST" && learnResetMatch) {
+      const parent = accounts.get(learnResetMatch[1]);
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", () => {
+        if (parent && !parent.learning) {
+          const cash = parseFloat(new URLSearchParams(body).get("cash"));
+          parent.config.learningEnabled = true;
+          resetLearningAccounts(parent, cash > 0 ? cash : null);
+        }
+        res.writeHead(302, { Location: `/?a=${learnResetMatch[1]}` });
+        res.end();
+      });
+      return;
+    }
+
+    const learnToggleMatch = pathname.match(/^\/api\/accounts\/([^/]+)\/learning\/toggle$/);
+    if (req.method === "POST" && learnToggleMatch) {
+      const parent = accounts.get(learnToggleMatch[1]);
+      if (parent && !parent.learning) {
+        const enabled = parent.config.learningEnabled !== false;
+        parent.config.learningEnabled = !enabled;
+        if (enabled) {
+          removeLearningAccounts(parent); // archives final snapshot, then removes variants
+          log(parent, "LEARNING: lab disabled — variants archived and removed");
+        } else {
+          ensureLearningAccounts(parent);
+          log(parent, "LEARNING: lab enabled");
+        }
+        saveAccounts();
+      }
+      res.writeHead(302, { Location: `/?a=${learnToggleMatch[1]}` });
+      res.end();
+      return;
+    }
+
     const delMatch = pathname.match(/^\/api\/accounts\/([^/]+)\/delete$/);
     if (req.method === "POST" && delMatch) {
       const id = delMatch[1];
-      if (id !== "default" && accounts.has(id)) { accounts.delete(id); saveAccounts(); console.log(`  [${id}] Deleted`); }
+      if (id !== "default" && accounts.has(id)) {
+        for (const v of learningVariantsFor(id)) accounts.delete(v.id); // cascade shadow variants
+        accounts.delete(id); saveAccounts(); console.log(`  [${id}] Deleted`);
+      }
       res.writeHead(302, { Location: "/" });
       res.end();
       return;
@@ -7525,7 +7777,7 @@ function startDashboard(defaultAcct, apiKey) {
       for (const [id, a] of accounts) {
         const pv = portfolioValue(a.state, a.dashboard.quotes);
         const sc = a.config.startingCash > 0 ? a.config.startingCash : null;
-        list.push({ id, name: a.name, paused: a.paused, cash: a.state.cash, positions: a.state.positions.length, trades: a.state.history.length, pv, pnl: sc ? ((pv - sc) / sc * 100).toFixed(1) : "0.0", config: a.config });
+        list.push({ id, name: a.name, paused: a.paused, learning: a.learning || false, learningParent: a.learningParent || null, cash: a.state.cash, positions: a.state.positions.length, trades: a.state.history.length, pv, pnl: sc ? ((pv - sc) / sc * 100).toFixed(1) : "0.0", config: a.config });
       }
       res.end(JSON.stringify(list));
       return;
@@ -10651,20 +10903,23 @@ async function runCycle(acct, sharedQuotes, apiKey) {
       // Count every new entry (paper position or broker order) against the day-trade cap.
       ensureRiskState(acct).dayTrades += 1;
       log(acct, `TRADE: BUY ${result.qty}x ${result.ticker} $${result.strike} ${result.type.toUpperCase()} ${result.dte}d @ $${result.entryPremium.toFixed(2)} ($${result.cost.toFixed(0)}) [setup:${result.setupQuality}/100 claude:${result.claudeConfidence}%]`);
-      // Push notification — replicate this trade
-      const entryA = analyses[ticker];
-      const topSignals = entryA?.sigs?.slice(0, 2).map(s => s.text).join(" · ") || "";
-      const tpPrice = (result.entryPremium * (1 + (acct.config.profitTarget || 0.40))).toFixed(2);
-      const slPrice = (result.entryPremium * (1 + (acct.config.stopLoss || -0.35))).toFixed(2);
-      sendPush(
-        `🤖 ${result.ticker} ${result.type.toUpperCase()} $${result.strike} [${acct.name}]`,
-        `Entry: $${result.entryPremium.toFixed(2)} · ${result.dte}d · ${result.qty}x\nTP: $${tpPrice} (+${((acct.config.profitTarget || 0.40) * 100).toFixed(0)}%) · SL: $${slPrice}\nScore: ${entryA?.score ?? '?'}/100 · Setup: ${result.setupQuality}/100\n${topSignals}`,
-        true // urgent
-      ).catch(() => {});
-      // Tweet trade entry with chart
-      const st = shortTermAnalyses[ticker];
-      const q = quotes[ticker];
-      tweetTradeEntry(acct, result, entryA, st, q).catch(e => console.log(`  [X] Entry tweet error: ${e.message}`));
+      // Learning variants trade silently — no phone pushes, no tweets, just collected data.
+      if (!acct.learning) {
+        // Push notification — replicate this trade
+        const entryA = analyses[ticker];
+        const topSignals = entryA?.sigs?.slice(0, 2).map(s => s.text).join(" · ") || "";
+        const tpPrice = (result.entryPremium * (1 + (acct.config.profitTarget || 0.40))).toFixed(2);
+        const slPrice = (result.entryPremium * (1 + (acct.config.stopLoss || -0.35))).toFixed(2);
+        sendPush(
+          `🤖 ${result.ticker} ${result.type.toUpperCase()} $${result.strike} [${acct.name}]`,
+          `Entry: $${result.entryPremium.toFixed(2)} · ${result.dte}d · ${result.qty}x\nTP: $${tpPrice} (+${((acct.config.profitTarget || 0.40) * 100).toFixed(0)}%) · SL: $${slPrice}\nScore: ${entryA?.score ?? '?'}/100 · Setup: ${result.setupQuality}/100\n${topSignals}`,
+          true // urgent
+        ).catch(() => {});
+        // Tweet trade entry with chart
+        const entrySt = shortTermAnalyses[ticker];
+        const entryQ = quotes[ticker];
+        tweetTradeEntry(acct, result, entryA, entrySt, entryQ).catch(e => console.log(`  [X] Entry tweet error: ${e.message}`));
+      }
 
       // Robinhood broker accounts already executed natively via placeBrokerEntry above.
       // No separate execution block needed — broker is per-account, same as Tradier.
@@ -10678,8 +10933,8 @@ async function runCycle(acct, sharedQuotes, apiKey) {
   const progress = ((pv / cfg.goal) * 100).toFixed(1);
   log(acct, `Portfolio: $${pv.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%) | Goal: ${progress}% of $${cfg.goal.toLocaleString()} | Cash: $${state.cash.toFixed(0)} | ${state.positions.length} open | ${regime.mode.toUpperCase()}${getActiveHintsSummary(acct)}`);
 
-  // Tweet daily watchlist summary (once per day)
-  tweetWatchlistSummary(acct, decisions, regime).catch(e => console.log(`  [X] Watchlist tweet error: ${e.message}`));
+  // Tweet daily watchlist summary (once per day) — never from learning variants
+  if (!acct.learning) tweetWatchlistSummary(acct, decisions, regime).catch(e => console.log(`  [X] Watchlist tweet error: ${e.message}`));
 
   dash.quotes = quotes;
   dash.analyses = analyses;
@@ -11368,6 +11623,9 @@ async function main() {
         for (const [, acct] of accounts) {
           try {
             if (acct.config.broker === "robinhood") await syncRobinhoodAccount(acct, sharedQuotes).catch(e => log(acct, `ROBINHOOD SYNC: ${e.message}`));
+            // Learning lab: keep shadow variants alive for live RH accounts (idempotent) so they
+            // collect strategy data every cycle — including while the parent is paused/settling.
+            if (acct.config.broker === "robinhood" && !acct.learning && acct.config.learningEnabled !== false) ensureLearningAccounts(acct);
             // Robinhood uses local ET time only — Tradier clock is irrelevant for RH.
             const acctMarketOpen = acct.config.broker === "robinhood" ? marketOpenLocal : marketOpen;
             const tradeThis = acctMarketOpen || acct.config.tradeWhenClosed;
