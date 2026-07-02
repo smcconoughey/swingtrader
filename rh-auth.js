@@ -166,6 +166,8 @@ async function main() {
     refreshToken: tokens.refresh_token || null,
     expiresIn: tokens.expires_in || null,
     clientId: client.client_id,
+    // Refresh grants must go to the same endpoint (and client_id) that minted the tokens.
+    tokenEndpoint: meta.token_endpoint,
     updatedAt: new Date().toISOString(),
   };
   fs.writeFileSync(TOKEN_FILE, JSON.stringify(saved, null, 2));
