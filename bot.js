@@ -3498,12 +3498,14 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   }
 
   // Hard cap on concurrent positions — prevents over-deployment that drained cash to $25.
-  // In choppy regimes, cap at 3 regardless of config (correlation + whipsaw risk).
+  // null means unlimited (user explicitly cleared the cap).
+  // In choppy regimes, always cap at 3 (correlation + whipsaw risk), even when unlimited.
+  const configuredMax = cfg.maxPositions != null ? cfg.maxPositions : null;
   const maxPos = regime?.mode === "choppy"
-    ? Math.min(cfg.maxPositions || 6, 3)
-    : (cfg.maxPositions || 6);
+    ? (configuredMax != null ? Math.min(configuredMax, 3) : 3)
+    : configuredMax;
   const openCount = (cfg.broker === "tradier" || cfg.broker === "robinhood") ? effectivePositionCount(acct) : state.positions.length;
-  if (maxPos && openCount >= maxPos) {
+  if (maxPos !== null && openCount >= maxPos) {
     return { skipped: true, reason: `Max positions (${maxPos}${regime?.mode === "choppy" ? ", choppy cap" : ""}) already open or pending` };
   }
   // Sector concentration cap — prevent doubling/tripling-down on correlated names.
@@ -4030,9 +4032,9 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
   if (state.positions.some(p => p.ticker === ticker)) return null;
   // In sim mode, allow trading as long as we have enough for at least 1 contract
   if (state.cash < 10) return null;
-  // Limit concurrent positions to avoid overexposure
-  const maxPos = cfg.maxPositions || 5;
-  if (state.positions.length >= maxPos) return null;
+  // Limit concurrent positions to avoid overexposure (null = unlimited)
+  const maxPos = cfg.maxPositions != null ? cfg.maxPositions : null;
+  if (maxPos !== null && state.positions.length >= maxPos) return null;
   if (analysis.score < cfg.bullEntry && analysis.score > cfg.bearEntry) return null;
 
   const isBullish = analysis.score >= cfg.bullEntry;
@@ -6834,7 +6836,7 @@ function simulatorPageHTML(simId) {
       stopLoss: c.stopLoss != null ? Math.round(c.stopLoss * 100) : -35,
       bullEntry: c.bullEntry || 65,
       bearEntry: c.bearEntry || 35,
-      maxPositions: c.maxPositions || 5,
+      maxPositions: c.maxPositions != null ? c.maxPositions : "",
       tickers: c.tickers ? c.tickers.join(",") : "SPY,QQQ,AAPL,NVDA,TSLA,MSFT,META,AMZN,GOOGL,AMD",
       speedMs: c.speedMs || 3000,
       useClaude: c.useClaude || false,
@@ -8162,7 +8164,7 @@ function startDashboard(defaultAcct, apiKey) {
           bullEntry: parseInt(params.get("bullEntry")) || 65,
           bearEntry: parseInt(params.get("bearEntry")) || 35,
           minSetupQuality: parseInt(params.get("minSetupQuality")) || 50,
-          maxPositions: parseInt(params.get("maxPositions")) || 5,
+          maxPositions: parseInt(params.get("maxPositions")) || null,
           useClaude: params.get("useClaude") === "true",
           speedMs: parseInt(params.get("speedMs")) || 3000,
           tickers: (params.get("tickers") || "SPY,QQQ,AAPL,NVDA,TSLA,MSFT,META,AMZN,GOOGL,AMD").split(",").map(s => s.trim()).filter(Boolean),
