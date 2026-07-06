@@ -924,6 +924,10 @@ const DEFAULT_CONFIG = {
   dailyLossLimitPct: 0.15,
   // Hard cap on new entries per ET day. null disables.
   maxDayTrades: null,
+  // Which named strategy preset (see LEARNING_VARIANTS) was last applied via the dashboard's
+  // strategy toggle, if any. Purely a UI label — the actual behavior lives in the fields above,
+  // which the toggle sets directly. null = never used the toggle / since manually edited.
+  strategyPreset: null,
 };
 
 // ─── Multi-Account Runtime ───
@@ -987,6 +991,35 @@ const LEARNING_VARIANTS = [
   { key: "runner", name: "Let it run", desc: "TP +80%, later trims", tweak: { profitTarget: 0.80, trim1Pct: 0.30, trim2Pct: 0.60 } },
   { key: "smallsize", name: "Quarter size", desc: "25% risk, up to 4 positions", tweak: { baseRiskPct: 0.25, maxPositions: 4 } },
 ];
+
+// The Learning Lab's "baseline" tweak is intentionally empty (it means "mirror whatever the
+// parent account currently has"). That's meaningless as a target for the LIVE strategy toggle
+// below — there'd be nothing to switch TO — so give it real default values there instead.
+const BASELINE_STRATEGY_TWEAK = {
+  bullEntry: 65, bearEntry: 35, minSetupQuality: 50, baseRiskPct: 0.15,
+  profitTarget: 0.40, stopLoss: -0.35, trim1Pct: 0.25, trim2Pct: 0.50, maxPositions: null,
+};
+
+// ─── Live Strategy Preset Toggle ───
+// Applies one of the LEARNING_VARIANTS tweaks directly to a real account's config — the same
+// knob combinations the Learning Lab tests in shadow paper accounts, but for the live strategy
+// itself. Switching presets only touches the numeric fields the preset defines; everything else
+// (broker, watchlist, autoExecute, risk breakers) is left alone.
+function applyStrategyPreset(acct, key) {
+  const variant = LEARNING_VARIANTS.find(v => v.key === key);
+  if (!variant) return { ok: false, reason: `Unknown strategy preset "${key}"` };
+  const tweak = key === "baseline" ? BASELINE_STRATEGY_TWEAK : variant.tweak;
+  const changes = [];
+  for (const [k, v] of Object.entries(tweak)) {
+    const before = acct.config[k];
+    if (before !== v) changes.push(`${k} ${before} → ${v}`);
+    acct.config[k] = v;
+  }
+  acct.config.strategyPreset = key;
+  log(acct, `STRATEGY: switched to "${variant.name}" (${variant.desc})${changes.length ? " — " + changes.join(", ") : " — already matched, no fields changed"}`);
+  saveAccounts();
+  return { ok: true, variant, changes };
+}
 
 function learningVariantsFor(parentId) {
   return [...accounts.values()].filter(a => a.learning && a.learningParent === parentId);
@@ -5355,6 +5388,7 @@ function dashboardHTML(acct, { spectator = false } = {}) {
 </style></head><body>
 ${tabBarHTML(acct.id, { spectator })}
 ${accountActionsHTML(acct.id, { spectator })}
+${strategyPresetHTML(acct.id, { spectator })}
 <h1>${acct.name || "Swing Trader"}</h1>
 ${spectator ? '<div style="margin:8px 0 12px;padding:8px 12px;border:1px solid #2f6fed40;background:#2f6fed12;color:#2f6fed;border-radius:8px;font-size:12px;font-weight:700">Spectator mode: read-only dashboard. Settings, broker controls, notifications, and AI prompts are disabled.</div>' : ''}
 <div class="sub">$${STARTING_CASH} → $${GOAL.toLocaleString()} Challenge &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}" id="mkt-badge">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; <span id="live-indicator" style="color:#00a843">LIVE</span> updates every 5s &nbsp;|&nbsp; <span id="pv-header">$${pv.toFixed(0)}</span> <span id="pnl-header" style="color:${pnlPct >= 0 ? '#00a843' : '#e8473f'}">(${pnlPct >= 0 ? '+' : ''}${pnlPct}%)</span> &nbsp;|&nbsp; <span style="color:${currentRegime.mode === 'risk-on' ? '#00a843' : currentRegime.mode === 'cautious' ? '#b07400' : '#e8473f'};font-size:10px">${currentRegime.mode.toUpperCase()}</span> &nbsp;|&nbsp; <span class="llm-toggle" onclick="fetch('/api/llm-provider',{method:'POST'}).then(()=>location.reload())" title="Click to switch LLM provider">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>${acct.paused ? ' &nbsp;|&nbsp; <span style="color:#e8473f;font-weight:bold">⏸ PAUSED</span>' : ''}</div>
@@ -6821,6 +6855,29 @@ ${spectator ? "" : `<div id="acct-modal" style="display:none;position:fixed;top:
 `;
 }
 
+// Quick toggle between named strategy presets (the same knob combinations the Learning Lab
+// tests as shadow paper accounts) applied directly to this real account's config.
+function strategyPresetHTML(acctId, { spectator = false } = {}) {
+  const acct = accounts.get(acctId);
+  if (!acct || acct.learning) return ""; // shadow variants already ARE a fixed preset
+  const active = acct.config.strategyPreset;
+  const pills = LEARNING_VARIANTS.map(v => {
+    const isActive = active === v.key;
+    const style = isActive
+      ? "background:#6a4df4;color:#fff;border-color:#6a4df4"
+      : "background:#f6f7f9;color:#3a3b42;border-color:#d4d8e0";
+    return spectator
+      ? `<span class="acct-btn" style="${style};cursor:default" title="${v.desc}">${v.name}</span>`
+      : `<form method="POST" action="/api/accounts/${acctId}/strategy" style="display:inline">
+        <input type="hidden" name="preset" value="${v.key}">
+        <button type="submit" class="acct-btn" style="${style}" title="${v.desc}"${isActive ? " disabled" : ""}>${v.name}</button>
+      </form>`;
+  }).join("");
+  return `<div class="acct-actions" style="margin-top:-4px;margin-bottom:12px;flex-wrap:wrap;align-items:center">
+    <span style="font-size:11px;color:#8a909b;align-self:center">🎯 Strategy:</span>${pills}
+  </div>`;
+}
+
 function accountActionsHTML(acctId, { spectator = false } = {}) {
   const acct = accounts.get(acctId);
   if (!acct) return "";
@@ -7676,6 +7733,25 @@ function startDashboard(defaultAcct, apiKey) {
       }
       res.writeHead(302, { Location: `/?a=${id}` });
       res.end();
+      return;
+    }
+
+    // ─── Live strategy preset toggle ───
+    const strategyMatch = pathname.match(/^\/api\/accounts\/([^/]+)\/strategy$/);
+    if (req.method === "POST" && strategyMatch) {
+      const id = strategyMatch[1];
+      const target = accounts.get(id);
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", () => {
+        if (target && !target.learning) {
+          const preset = new URLSearchParams(body).get("preset");
+          const out = applyStrategyPreset(target, preset);
+          if (!out.ok) console.log(`  [${id}] STRATEGY: ${out.reason}`);
+        }
+        res.writeHead(302, { Location: `/?a=${id}` });
+        res.end();
+      });
       return;
     }
 
