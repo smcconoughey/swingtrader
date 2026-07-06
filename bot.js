@@ -765,11 +765,23 @@ function noteDataSource(src) {
 }
 
 // ─── Trimming & EOD/EOW Constants ───
-const EOD_FREEZE_HOUR = 15;    // No new entries after 3:00 PM ET
-const EOD_TIGHTEN_HOUR = 15.5; // Tighten stops after 3:30 PM ET
-const EOW_TRIM_HOUR = 14;      // Friday profit-taking starts at 2:00 PM ET
+// Both EOD windows used to open a full hour (freeze) / 30 min (tighten) before the 4:00 PM ET
+// close, which cut off a large chunk of the trading day for no strong reason — a decent setup
+// at 3:05 PM isn't meaningfully riskier than one at 2:55 PM. Narrowed to the last 15 minutes,
+// where the concern (thin closing liquidity, overnight gap risk) is actually concentrated.
+const EOD_FREEZE_HOUR = 15.75;  // No new entries in the last 15 min (after 3:45 PM ET)
+const EOD_TIGHTEN_HOUR = 15.75; // Tighten stops in the last 15 min (after 3:45 PM ET)
+const EOW_TRIM_HOUR = 14;      // Friday profit-taking starts at 2:00 PM ET (separate concern —
+                               // weekend theta decay over 2 non-trading days, not close proximity — left as-is)
 const LOW_DTE_THRESHOLD = 5;   // Accelerate exits when DTE <= 5
 const CRITICAL_DTE = 3;        // Force-close when DTE <= 3 (give exits room before gamma cliff)
+
+// Opening-range freeze: the first few minutes after the 9:30 ET bell have the widest, least
+// reliable option spreads and the most noise-driven price action of the day — a "signal" here is
+// often just the open's own volatility, not a real setup. No new entries until it settles.
+const MARKET_OPEN_HOUR = 9.5;         // Regular session opens 9:30 AM ET
+const OPEN_FREEZE_MINUTES = 15;       // No new entries in the first 15 min after open
+const OPEN_FREEZE_END_HOUR = MARKET_OPEN_HOUR + OPEN_FREEZE_MINUTES / 60;
 
 // ─── Trust-Scaled Cash Reserve ───
 // Keep a minimum cash buffer sized as a fraction of total portfolio value. The buffer starts
@@ -3855,6 +3867,12 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
 
   const et = getETDate();
   const etHour = et.getHours() + et.getMinutes() / 60;
+  // Unlike the EOD freeze, this applies regardless of score — the concern is execution quality
+  // (spreads/whipsaws in the opening minutes), not signal quality, so a strong score doesn't buy
+  // an exemption the way it does near the close.
+  if (etHour >= MARKET_OPEN_HOUR && etHour < OPEN_FREEZE_END_HOUR) {
+    return { skipped: true, reason: `Opening freeze — waiting ${OPEN_FREEZE_MINUTES}min after the 9:30 ET open for spreads to settle (${etHour.toFixed(2)}h)` };
+  }
   if (etHour >= EOD_FREEZE_HOUR && analysis.score < 80 && analysis.score > 20) {
     return { skipped: true, reason: `EOD freeze (${etHour.toFixed(1)} >= ${EOD_FREEZE_HOUR}h, score ${analysis.score} not extreme enough)` };
   }
@@ -4873,7 +4891,7 @@ function tryTimeBasedExits(acct, quotes) {
 
     if (!reason && etHour >= EOD_TIGHTEN_HOUR) {
       if (pnlPct >= 0.10 && pos.trimLevel === 0) {
-        reason = `EOD lock +${(pnlPct * 100).toFixed(0)}% (3:30 PM tighten, protecting overnight)`;
+        reason = `EOD lock +${(pnlPct * 100).toFixed(0)}% (3:45 PM tighten, protecting overnight)`;
       }
     }
 
