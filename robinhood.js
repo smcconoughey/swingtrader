@@ -234,8 +234,18 @@ function extractContent(result) {
   // MCP tool results come as { content: [{ type: "text", text: "..." }] }
   if (!result?.content) return result;
   const textParts = result.content.filter(c => c.type === "text");
-  if (textParts.length === 0) return result;
   const combined = textParts.map(c => c.text).join("\n");
+  // Per the MCP spec, a failed tool execution (e.g. Robinhood rejecting an order — insufficient
+  // buying power, invalid instrument, etc.) is signaled via isError:true on an otherwise-normal
+  // 200/JSON-RPC-success response, NOT a thrown transport error. mcpCall() only throws on HTTP/
+  // JSON-RPC-level failures, so without this check a broker-side order rejection was silently
+  // returned as if it were a successful placement — callers never entered their catch block, so
+  // cash got decremented and a "trade placed" push notification fired for an order that never
+  // reached Robinhood.
+  if (result.isError) {
+    throw new Error(combined || "Robinhood MCP tool call failed (isError, no detail text)");
+  }
+  if (textParts.length === 0) return result;
   try { return JSON.parse(combined); } catch { return combined; }
 }
 

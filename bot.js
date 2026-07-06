@@ -1324,11 +1324,13 @@ function diag(type, acct, payload = {}) {
       ts: Date.now(),
       iso: new Date().toISOString(),
       et: new Date().toLocaleString("en-US", { timeZone: "America/New_York", hour12: false }),
-      type,
       acct: typeof acct === "string" ? acct : (acct?.id ?? null),
       marketOpen: isMarketOpen(),
       clock: _marketClock.source === "tradier" ? (_marketClock.state || "?") : "local",
       ...payload,
+      type, // set last — payloads for option entries/exits carry their own "type" (call/put) that
+            // would otherwise silently overwrite the event kind (e.g. "entry" events were being
+            // filed as "call"/"put", making /api/diagnostics?type=entry return nothing)
     };
     fs.appendFileSync(DIAG_LOG_FILE, JSON.stringify(evt) + "\n");
     // Trim lazily — every 250 appends rewrite the tail so the file stays bounded.
@@ -10093,7 +10095,7 @@ async function syncRobinhoodAccount(acct, quotes) {
     // Also fetch confirmed orders to count working orders (equity + options)
     const workingRes = await robinhood.getOrders({ state: 'confirmed' }).catch(() => []);
     const workingOrders = workingRes && workingRes.data && Array.isArray(workingRes.data.orders) ? workingRes.data.orders : (Array.isArray(workingRes) ? workingRes : []);
-    acct._inflightTickers = new Set(workingOrders.map(o => o.symbol?.toUpperCase()).filter(Boolean));
+    const freshInflight = new Set(workingOrders.map(o => o.symbol?.toUpperCase()).filter(Boolean));
 
     // If options are enabled, also fetch options orders for inflight tracking
     if (robinhood.optionsEnabled) {
@@ -10102,10 +10104,26 @@ async function syncRobinhoodAccount(acct, quotes) {
         const optWorkingOrders = optWorkingRes && optWorkingRes.data && Array.isArray(optWorkingRes.data.orders) ? optWorkingRes.data.orders : (Array.isArray(optWorkingRes) ? optWorkingRes : []);
         for (const o of optWorkingOrders) {
           const sym = (o.chain_symbol || o.symbol || "").toUpperCase();
-          if (sym) acct._inflightTickers.add(sym);
+          if (sym) freshInflight.add(sym);
         }
       } catch { }
     }
+    // Grace period: an order we just placed may not show up as "confirmed" at the broker for a
+    // few seconds (or, previously, could be silently dropped entirely if it was rejected — see
+    // the isError fix in robinhood.js). Overwriting _inflightTickers wholesale from this fetch
+    // let a not-yet-confirmed (or wrongly-believed-successful) order fall out of the in-flight
+    // set on the very next cycle, so tryEntry() would re-target the same contract again — this
+    // is how KO got three duplicate buy attempts within three minutes. Keep any ticker we placed
+    // an entry order for in the last 2 minutes in the set regardless of what the broker reports.
+    const ENTRY_INFLIGHT_GRACE_MS = 2 * 60_000;
+    if (state.meta) {
+      for (const meta of Object.values(state.meta)) {
+        if (meta?.entryOrderPlacedAt && now - meta.entryOrderPlacedAt < ENTRY_INFLIGHT_GRACE_MS && meta.entryOrderCtx?.ticker) {
+          freshInflight.add(meta.entryOrderCtx.ticker.toUpperCase());
+        }
+      }
+    }
+    acct._inflightTickers = freshInflight;
 
     // Fetch quotes for equity positions
     const positionSymbols = raw.map(p => p.symbol).filter(Boolean);
