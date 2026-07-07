@@ -6906,11 +6906,16 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
       <span style="font-size:11px;color:#8a909b;align-self:center">Read-only: settings, pause/delete, notifications, broker tokens, and AI prompts are unavailable.</span>
     </div>`;
   }
+  const activeHalt = riskBreakerStatus(acct);
   return `<div class="acct-actions">
     <button type="button" class="acct-btn edit" onclick="document.getElementById('edit-modal').style.display='flex'">⚙ Settings</button>
     <form method="POST" action="/api/accounts/${acctId}/pause" style="display:inline">
       <button type="submit" class="acct-btn ${acct.paused ? "resume" : "pause"}">${acct.paused ? "▶ Resume" : "⏸ Pause"}</button>
     </form>
+    ${activeHalt ? `<form method="POST" action="/api/accounts/${acctId}/risk-reset" style="display:inline"
+      onsubmit="return confirm('Clear the risk halt and re-baseline today\\'s daily-loss reference to the current portfolio value?\\n\\nActive halt: ${activeHalt.replace(/'/g, "\\'")}\\n\\nOnly do this if the halt is from a tracking error, not a real loss.')">
+      <button type="submit" class="acct-btn resume" title="${activeHalt}">🟢 Clear risk halt</button>
+    </form>` : ""}
     <button type="button" class="acct-btn" id="push-btn" onclick="togglePush()" title="Toggle push notifications on this device">🔔 Notify</button>
     ${acctId !== "default" ? `<form method="POST" action="/api/accounts/${acctId}/delete" style="display:inline" onsubmit="return confirm('Delete account ${acct.name}? This cannot be undone.')">
       <button type="submit" class="acct-btn delete">🗑 Delete</button>
@@ -7754,6 +7759,32 @@ function startDashboard(defaultAcct, apiKey) {
       return;
     }
 
+    // ─── Risk-halt manual reset ───
+    // Re-baselines today's daily-loss reference to the CURRENT portfolio value and clears the
+    // halt flag. For when the breaker tripped on bad accounting (e.g. a manual broker-side sale
+    // whose proceeds were invisible to PV) rather than a real loss — the user can see the real
+    // account and knows better than the stale baseline does.
+    const riskResetMatch = pathname.match(/^\/api\/accounts\/([^/]+)\/risk-reset$/);
+    if (req.method === "POST" && riskResetMatch) {
+      const target = accounts.get(riskResetMatch[1]);
+      if (target) {
+        const pv = portfolioValue(target.state, target.dashboard?.quotes || {});
+        const r = ensureRiskState(target, pv);
+        const oldBase = r.dayStartPV;
+        if (pv > 0) r.dayStartPV = pv;
+        r.haltNotified = null;
+        if (target.paused && target.pausedBy === "risk") {
+          target.paused = false;
+          target.pausedBy = null;
+        }
+        log(target, `RISK: daily-loss baseline manually reset $${(oldBase ?? 0).toFixed(0)} → $${pv.toFixed(0)} — halt cleared, trading resumes (consecutive-loss and day-trade counters untouched)`);
+        saveAccounts();
+      }
+      res.writeHead(302, { Location: `/?a=${riskResetMatch[1]}` });
+      res.end();
+      return;
+    }
+
     // ─── Live strategy preset toggle ───
     const strategyMatch = pathname.match(/^\/api\/accounts\/([^/]+)\/strategy$/);
     if (req.method === "POST" && strategyMatch) {
@@ -7958,7 +7989,11 @@ function startDashboard(defaultAcct, apiKey) {
         res.end(JSON.stringify({ error: "Robinhood MCP not connected" }));
         return;
       }
-      const out = { optionsEnabled: robinhood.optionsEnabled, optionTools: robinhood.optionToolInfo, orderSchemas: {}, positionsRaw: null, held: [], byOptionId: {}, byTicker: {}, byOcc: {}, errors: {} };
+      const out = { optionsEnabled: robinhood.optionsEnabled, optionTools: robinhood.optionToolInfo, orderSchemas: {}, portfolioRaw: null, accountsRaw: null, positionsRaw: null, held: [], byOptionId: {}, byTicker: {}, byOcc: {}, errors: {} };
+      // Raw balance payloads — the exact field names for equity/buying-power have repeatedly had
+      // to be guessed; this makes them observable on demand instead of relying on one-shot logs.
+      try { out.portfolioRaw = await robinhood.getPortfolio(); } catch (e) { out.errors.portfolioRaw = e.message; }
+      try { out.accountsRaw = await robinhood.getAccounts(); } catch (e) { out.errors.accountsRaw = e.message; }
       // Full input schemas for the order tools — need the legs sub-schema to build orders in the
       // exact wire format the MCP expects (additionalProperties:false rejects extra leg fields).
       try {
@@ -10152,20 +10187,30 @@ async function syncRobinhoodAccount(acct, quotes) {
 
   try {
     const res = await robinhood.getPortfolio();
-    const port = res && res.data ? res.data : res;
-    if (port) {
-      // DIAGNOSTIC (once per process): the payload's field names have been guessed at, and the
-      // guess missing means PV silently degrades to buying power — which excludes unsettled sale
-      // proceeds and made a ~-10% day read as -77.8%, falsely tripping the daily-loss breaker.
+    const env = res && res.data ? res.data : res;
+    // Robinhood's other MCP endpoints wrap their payload in a {results:[...]} envelope; the
+    // equity fields were being read off the wrapper (where they don't exist), so brokerEquity
+    // never populated and PV silently degraded to buying power — which excludes unsettled sale
+    // proceeds. That's how a manual KO close read as a phantom -40% day and tripped the breaker.
+    const port = env?.results?.[0] ?? env?.portfolio ?? env;
+    if (port && typeof port === "object") {
+      // DIAGNOSTIC (once per process): log the FULL envelope so field names are observable
+      // from the deploy logs, not guessed at.
       if (!acct._rhPortfolioShapeLogged) {
         acct._rhPortfolioShapeLogged = true;
-        log(acct, `RH-RAW PORTFOLIO: ${JSON.stringify(port).slice(0, 600)}`);
+        log(acct, `RH-RAW PORTFOLIO: ${JSON.stringify(env).slice(0, 900)}`);
       }
-      const eq = port.equity_value ?? port.total_value ?? port.total_equity ?? port.portfolio_value
-        ?? port.equity ?? port.market_value ?? port.portfolio?.equity ?? port.portfolio?.market_value;
+      let eq = port.equity_value ?? port.total_value ?? port.total_equity ?? port.portfolio_value
+        ?? port.equity ?? port.market_value ?? port.total_market_value ?? port.extended_hours_equity;
+      if (eq && typeof eq === "object") eq = eq.amount ?? eq.value; // {amount:"429.11",currency:"USD"} shape
       const eqNum = typeof eq === "string" ? parseFloat(eq) : (typeof eq === "number" ? eq : NaN);
-      if (!isNaN(eqNum) && eqNum >= 0) state.brokerEquity = eqNum;
-      const bp = port.buying_power?.buying_power || port.buying_power || port.cash;
+      if (!isNaN(eqNum) && eqNum >= 0) {
+        state.brokerEquity = eqNum;
+      } else {
+        delete state.brokerEquity; // never let a stale equity reading override the live fallback math
+      }
+      let bp = port.buying_power?.buying_power ?? port.buying_power ?? port.options_buying_power ?? port.cash;
+      if (bp && typeof bp === "object") bp = bp.amount ?? bp.value;
       const bpNum = typeof bp === "string" ? parseFloat(bp) : (typeof bp === "number" ? bp : NaN);
       if (!isNaN(bpNum) && bpNum >= 0) state.cash = bpNum;
     }
@@ -10496,13 +10541,32 @@ async function syncRobinhoodAccount(acct, quotes) {
         const closedQty = cur ? Math.max(0, prev.qty - cur.qty) : prev.qty;
         if (closedQty <= 0) continue;
 
-        // Only record closes WE initiated (an exit order was working) or expiry lapses.
-        // A vanish without either is a manual action or an API hiccup — log, don't book it.
+        // Record closes WE initiated (an exit order was working), expiry lapses, AND — new —
+        // manual closes confirmed by the broker's own filled-orders feed. A user-entered stop
+        // on the Robinhood app fires while the bot's API link is down, the position vanishes,
+        // and previously we refused to book it: no trade record, and (worse) the sale proceeds
+        // never got credited to the unsettled bucket, so PV lost the position's entire value
+        // and the daily-loss breaker halted the account over a phantom -40% "loss" (7/7).
+        // The filled-order lookup doubles as proof a real sale occurred — an API hiccup that
+        // merely hides the position has no matching filled sell, and still gets skipped.
         const weExited = !!(posMeta && (posMeta.exitOrderPlacedAt || posMeta.exitOrderId));
         const expired = !cur && prev.expiryDate && prev.expiryDate < now;
+        let manualFill = null;
         if (!weExited && !expired) {
-          if (!cur) log(acct, `ROBINHOOD SYNC: ${prev.ticker} ${prev.type} position gone without a bot exit order — assuming manual close/API gap, not booking a trade`);
-          continue;
+          if (prev.type !== "equity") {
+            const orders = await getFilledOptionOrders();
+            const o = matchFilledOrder(orders, {
+              ticker: prev.ticker, strike: prev.strike,
+              expDate: prev.expiryDate ? new Date(prev.expiryDate).toISOString().slice(0, 10) : null,
+              side: "sell",
+            });
+            manualFill = o ? orderFillPremium(o, prev.liveMark ?? prev.liveBid ?? null) : null;
+          }
+          if (manualFill == null) {
+            if (!cur) log(acct, `ROBINHOOD SYNC: ${prev.ticker} ${prev.type} position gone without a bot exit order or a matching broker fill — assuming API gap, not booking a trade`);
+            continue;
+          }
+          log(acct, `ROBINHOOD SYNC: ${prev.ticker} ${prev.type} closed manually at the broker (filled sell @ $${manualFill.toFixed(2)}) — booking it and crediting proceeds`);
         }
 
         const mult = prev.type === "equity" ? 1 : 100;
@@ -10510,7 +10574,10 @@ async function syncRobinhoodAccount(acct, quotes) {
         // worked (or last bid/mark) only when no matching fill is found.
         let closePremium = null;
         let fillConfirmed = false;
-        if (expired && !weExited) {
+        if (manualFill != null) {
+          closePremium = manualFill;
+          fillConfirmed = true;
+        } else if (expired && !weExited) {
           closePremium = 0;
         } else if (prev.type !== "equity") {
           const orders = await getFilledOptionOrders();
@@ -10525,7 +10592,8 @@ async function syncRobinhoodAccount(acct, quotes) {
         if (closePremium == null) closePremium = posMeta?.exitOrderLimit ?? prev.liveBid ?? prev.liveMark ?? prev.entryPremium;
         const pnlDollar = (closePremium - prev.entryPremium) * closedQty * mult;
         const pnlPct = (closePremium - prev.entryPremium) / prev.entryPremium;
-        const reason = posMeta?.exitReason || (expired && !weExited ? "expired worthless" : "robinhood exit filled (synced)");
+        const reason = manualFill != null ? "manual close at broker (synced)"
+          : posMeta?.exitReason || (expired && !weExited ? "expired worthless" : "robinhood exit filled (synced)");
         const proceeds = +(closePremium * closedQty * mult).toFixed(2);
         const trade = {
           ...prev, qty: closedQty,
