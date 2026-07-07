@@ -783,6 +783,15 @@ const MARKET_OPEN_HOUR = 9.5;         // Regular session opens 9:30 AM ET
 const OPEN_FREEZE_MINUTES = 15;       // No new entries in the first 15 min after open
 const OPEN_FREEZE_END_HOUR = MARKET_OPEN_HOUR + OPEN_FREEZE_MINUTES / 60;
 
+// Premium disaster floor for OPTIONS positions — the only premium-based loss exit (structural
+// spot stops and the DTE ladder are the real risk exits; see tryExits). Never shallower than
+// -60%: live trades have repeatedly bounced from the -40%/-50% zone and gone on to win (KO
+// 7/6-7/7), so 1.8× a tight configured stop (e.g. the Quick-profits preset's -20% → -36%)
+// would put the salvage exit right back inside the bounce zone this design exists to survive.
+function optionDisasterFloor(cfg) {
+  return Math.min((cfg.stopLoss || -0.35) * 1.8, -0.60);
+}
+
 // ─── Trust-Scaled Cash Reserve ───
 // Keep a minimum cash buffer sized as a fraction of total portfolio value. The buffer starts
 // defensive (CASH_RESERVE_MAX) and only shrinks toward CASH_RESERVE_MIN as conviction ("trust")
@@ -3330,7 +3339,7 @@ async function processHint(hintText, acct) {
     const isEq = p.type === "equity";
     const cur = p.liveMark ?? null;
     const pnlStr = cur != null && p.entryPremium > 0 ? `${(((cur - p.entryPremium) / p.entryPremium) * 100).toFixed(1)}%` : "?";
-    const stopMult = isEq ? cfg.stopLoss : cfg.stopLoss * 1.8; // options: disaster floor (structural spot stop is the primary loss exit)
+    const stopMult = isEq ? cfg.stopLoss : optionDisasterFloor(cfg); // options: disaster floor (structural spot stop is the primary loss exit)
     const stopP = p.entryPremium > 0 ? (p.entryPremium * (1 + stopMult)).toFixed(2) : "?";
     const tpP = p.entryPremium > 0 ? (p.entryPremium * (1 + cfg.profitTarget)).toFixed(2) : "?";
     return `${p.ticker} ${isEq ? "shares" : `$${p.strike} ${p.type.toUpperCase()}`} x${p.qty}: entry $${p.entryPremium?.toFixed(2)}, now $${cur != null ? cur.toFixed(2) : "?"} (${pnlStr}), ${isEq ? "stop" : "disaster stop"} $${stopP} (${(stopMult * 100).toFixed(0)}%${isEq ? "" : "; primary loss exit is a structural break in the underlying"}), target $${tpP} (+${(cfg.profitTarget * 100).toFixed(0)}%)${isEq ? "" : `, ${(p.dteRemaining ?? p.dte ?? 0).toFixed(0)} DTE`}`;
@@ -4734,7 +4743,7 @@ function tryExits(acct, quotes) {
       // where IV crush / theta bleed has destroyed the position regardless of the chart, and
       // selling salvages residual value. Max loss per trade is already bounded by the premium
       // paid; sizing, not a premium tripwire, is the risk control between those exits.
-      const disasterFloor = cfg.stopLoss * 1.8;
+      const disasterFloor = optionDisasterFloor(cfg);
       if (isEquity) {
         reason = `stop loss ${(pnlPct * 100).toFixed(0)}%`;
         fullClose = true;
@@ -11245,7 +11254,7 @@ function buildPositionDetails(acct, quotes) {
     // Options don't exit on the configured premium stop anymore — their loss exits are the
     // structural spot stop and the 1.8× disaster floor. Show the disaster floor so the panel
     // reflects the price at which the bot would actually sell, not a line it will hold through.
-    const stopMult = isEq ? cfg.stopLoss : cfg.stopLoss * 1.8;
+    const stopMult = isEq ? cfg.stopLoss : optionDisasterFloor(cfg);
     const stopLossPrice = pos.entryPremium * (1 + stopMult);
 
     let effectiveStop;
