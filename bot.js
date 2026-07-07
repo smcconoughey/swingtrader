@@ -3330,9 +3330,10 @@ async function processHint(hintText, acct) {
     const isEq = p.type === "equity";
     const cur = p.liveMark ?? null;
     const pnlStr = cur != null && p.entryPremium > 0 ? `${(((cur - p.entryPremium) / p.entryPremium) * 100).toFixed(1)}%` : "?";
-    const stopP = p.entryPremium > 0 ? (p.entryPremium * (1 + cfg.stopLoss)).toFixed(2) : "?";
+    const stopMult = isEq ? cfg.stopLoss : cfg.stopLoss * 1.8; // options: disaster floor (structural spot stop is the primary loss exit)
+    const stopP = p.entryPremium > 0 ? (p.entryPremium * (1 + stopMult)).toFixed(2) : "?";
     const tpP = p.entryPremium > 0 ? (p.entryPremium * (1 + cfg.profitTarget)).toFixed(2) : "?";
-    return `${p.ticker} ${isEq ? "shares" : `$${p.strike} ${p.type.toUpperCase()}`} x${p.qty}: entry $${p.entryPremium?.toFixed(2)}, now $${cur != null ? cur.toFixed(2) : "?"} (${pnlStr}), stop $${stopP} (${(cfg.stopLoss * 100).toFixed(0)}%), target $${tpP} (+${(cfg.profitTarget * 100).toFixed(0)}%)${isEq ? "" : `, ${(p.dteRemaining ?? p.dte ?? 0).toFixed(0)} DTE`}`;
+    return `${p.ticker} ${isEq ? "shares" : `$${p.strike} ${p.type.toUpperCase()}`} x${p.qty}: entry $${p.entryPremium?.toFixed(2)}, now $${cur != null ? cur.toFixed(2) : "?"} (${pnlStr}), ${isEq ? "stop" : "disaster stop"} $${stopP} (${(stopMult * 100).toFixed(0)}%${isEq ? "" : "; primary loss exit is a structural break in the underlying"}), target $${tpP} (+${(cfg.profitTarget * 100).toFixed(0)}%)${isEq ? "" : `, ${(p.dteRemaining ?? p.dte ?? 0).toFixed(0)} DTE`}`;
   });
   const portfolioContext = `Portfolio: $${state.cash.toFixed(0)} cash, ${state.positions.length} positions open${positionLines.length ? `:\n${positionLines.join("\n")}` : " (none)"}. Watchlist: ${acct.tickers.join(", ")}. Active hints: ${acct.activeHints.map(h => `${h.ticker} ${h.bias > 0 ? '+' : ''}${h.bias}`).join(", ") || "none"}.`;
 
@@ -4722,20 +4723,26 @@ function tryExits(acct, quotes) {
       fullClose = true;
     }
     else if (pnlPct <= cfg.stopLoss) {
-      // Options premium is a leveraged, noisy signal: a δ0.35 contract can print -30% on a
-      // fraction-of-ATR wiggle in the underlying, then recover within the hour. Require the
-      // underlying to confirm the breakdown (≥0.75×ATR adverse) before honoring a premium stop.
-      // Disaster floor at 1.8× the configured stop still exits unconditionally — that depth of
-      // premium loss (IV crush, gap) is real regardless of what the underlying looks like.
-      const stopConfirmMove = Math.max(0.75 * atrPct, 0.005);
+      // Equity: premium == price, the configured stop is meaningful — unchanged.
+      // Options: the premium percentage is NOT a loss trigger. Premium is leveraged noise —
+      // a δ0.45 KO call has ~12x leverage, so a -30% premium print is a ~2.4% stock dip on a
+      // 1.3%-ATR name: an ordinary red day, not a broken thesis. The earlier "0.75×ATR
+      // confirmation" gate proved far too weak (KO 7/6-7/7: premium hit -45% on an intact
+      // structure, then popped hard — the confirm would have sold it). The REAL loss exits for
+      // options are, in order: the structural spot stop above (max(4%, 1.5×ATR) against entry),
+      // the DTE ladder, and a premium disaster floor at 1.8× the configured stop — the depth
+      // where IV crush / theta bleed has destroyed the position regardless of the chart, and
+      // selling salvages residual value. Max loss per trade is already bounded by the premium
+      // paid; sizing, not a premium tripwire, is the risk control between those exits.
       const disasterFloor = cfg.stopLoss * 1.8;
-      if (isEquity || adverseSpotMove >= stopConfirmMove || pnlPct <= disasterFloor) {
-        reason = isEquity
-          ? `stop loss ${(pnlPct * 100).toFixed(0)}%`
-          : `stop loss ${(pnlPct * 100).toFixed(0)}% (underlying ${(adverseSpotMove * 100).toFixed(1)}% adverse${pnlPct <= disasterFloor ? ", disaster floor" : ""})`;
+      if (isEquity) {
+        reason = `stop loss ${(pnlPct * 100).toFixed(0)}%`;
+        fullClose = true;
+      } else if (pnlPct <= disasterFloor) {
+        reason = `disaster stop ${(pnlPct * 100).toFixed(0)}% (premium collapse past ${(disasterFloor * 100).toFixed(0)}% — salvaging residual value)`;
         fullClose = true;
       } else {
-        pos._stopSuppressed = `premium ${(pnlPct * 100).toFixed(0)}% but underlying only ${(adverseSpotMove * 100).toFixed(1)}% adverse (needs ${(stopConfirmMove * 100).toFixed(1)}%) — holding, noise not structure`;
+        pos._stopSuppressed = `premium ${(pnlPct * 100).toFixed(0)}% — holding: structural stop is the underlying (${(adverseSpotMove * 100).toFixed(1)}% adverse vs ${(spotStopThreshold * 100).toFixed(1)}% threshold); premium alone doesn't exit until ${(disasterFloor * 100).toFixed(0)}%`;
       }
     }
     else if (!isEquity && pos.dteRemaining <= 1) {
@@ -11235,7 +11242,11 @@ function buildPositionDetails(acct, quotes) {
     const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
     const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * (isEq ? 1 : 100);
     const profitPrice = pos.entryPremium * (1 + cfg.profitTarget);
-    const stopLossPrice = pos.entryPremium * (1 + cfg.stopLoss);
+    // Options don't exit on the configured premium stop anymore — their loss exits are the
+    // structural spot stop and the 1.8× disaster floor. Show the disaster floor so the panel
+    // reflects the price at which the bot would actually sell, not a line it will hold through.
+    const stopMult = isEq ? cfg.stopLoss : cfg.stopLoss * 1.8;
+    const stopLossPrice = pos.entryPremium * (1 + stopMult);
 
     let effectiveStop;
     if ((pos.trimLevel || 0) >= 2) effectiveStop = pos.entryPremium * 1.15;
@@ -11245,7 +11256,7 @@ function buildPositionDetails(acct, quotes) {
     return {
       ...pos, spot, dteLeft, curPremium, pnlPct, pnlDollar,
       profitTarget: { pct: `+${(cfg.profitTarget * 100).toFixed(0)}%`, premium: profitPrice.toFixed(2) },
-      stopLoss: { pct: `${(cfg.stopLoss * 100).toFixed(0)}%`, premium: effectiveStop.toFixed(2) },
+      stopLoss: { pct: `${(stopMult * 100).toFixed(0)}%${isEq ? "" : " (disaster floor; structural stop leads)"}`, premium: effectiveStop.toFixed(2) },
       pctToProfit: ((profitPrice - curPremium) / curPremium * 100).toFixed(1),
       pctToStop: ((effectiveStop - curPremium) / curPremium * 100).toFixed(1),
       greeks: pos.liveGreeks
