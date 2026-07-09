@@ -897,6 +897,16 @@ const DEFAULT_CONFIG = {
   // explicit spend limit without ever planning beyond this max negative-cash floor.
   marginZeroCashSpendLimit: 200,
   marginMaxDebt: 250,
+  // ─── Loss circuit breakers (enforced in riskBreakerStatus / evaluateRiskHalts) ───
+  // After this many consecutive losing closes, stop opening NEW positions for the rest of the
+  // ET day (exits keep running). Streak resets on any winning close and at the next day open.
+  maxConsecutiveLosses: 3,
+  // If portfolio value drops this fraction below the day's starting value, halt: broker (live)
+  // accounts are PAUSED (manual resume; exits keep running via the paused cycle), paper accounts
+  // just stop opening new positions for the day. null/0 disables.
+  dailyLossLimitPct: 0.15,
+  // Hard cap on new entries per ET day. null disables.
+  maxDayTrades: null,
 };
 
 // ─── Multi-Account Runtime ───
@@ -2172,53 +2182,7 @@ function detectMomentumQuality(candles) {
   return { quality, direction, movePct: movePct.toFixed(1), volRatio: volRatio.toFixed(2), trendDays };
 }
 
-// ─── Gap Detection & Base Size Scoring ───
-
-function detectGap(candles) {
-  // Detect gap down or gap up on the latest candle relative to prior close
-  if (!candles || candles.length < 2) return { type: "none", pct: 0 };
-  const prev = candles[candles.length - 2];
-  const curr = candles[candles.length - 1];
-  const gapPct = ((curr.o - prev.c) / prev.c) * 100;
-  if (gapPct < -0.5) return { type: "gap_down", pct: Math.abs(gapPct).toFixed(2) };
-  if (gapPct > 0.5) return { type: "gap_up", pct: gapPct.toFixed(2) };
-  return { type: "none", pct: 0 };
-}
-
-function measureBaseSize(candles) {
-  // Measure how long price has been consolidating (bigger base = bigger breakout potential)
-  // Counts consecutive days within a tight range before the current move
-  if (!candles || candles.length < 20) return { days: 0, rangePct: 0 };
-  const lookback = candles.slice(-60, -3); // exclude last 3 days (the move itself)
-  if (lookback.length < 10) return { days: 0, rangePct: 0 };
-
-  // Find the range of the base: how tight was price action?
-  const closes = lookback.map(d => d.c);
-  let baseDays = 0;
-  const recentClose = closes[closes.length - 1];
-  const tolerance = 0.08; // 8% range counts as a base
-
-  // Walk backwards from the end of lookback, count days within tolerance of the range
-  const rangeHigh = Math.max(...closes.slice(-20));
-  const rangeLow = Math.min(...closes.slice(-20));
-  const rangePct = ((rangeHigh - rangeLow) / rangeLow) * 100;
-
-  if (rangePct <= tolerance * 100) {
-    // Tight base — count how many consecutive days are within the range
-    for (let i = closes.length - 1; i >= 0; i--) {
-      if (closes[i] >= rangeLow * 0.98 && closes[i] <= rangeHigh * 1.02) baseDays++;
-      else break;
-    }
-  } else {
-    // Wider base — count days in the broader range
-    for (let i = closes.length - 1; i >= 0; i--) {
-      if (closes[i] >= rangeLow * 0.95 && closes[i] <= rangeHigh * 1.05) baseDays++;
-      else break;
-    }
-  }
-
-  return { days: baseDays, rangePct: rangePct.toFixed(1) };
-}
+// (detectGap / measureBaseSize removed — never referenced by any signal or entry path)
 
 // ─── SRxTrades: Undercut & Reclaim / Uppercut Detection ───
 
@@ -2440,23 +2404,28 @@ async function refreshMarketClock(force = false) {
 
 // True only when the regular session is open. Prefers the broker clock; falls back to a local ET
 // calculation with the US holiday/half-day calendar so we're still correct when Tradier is down.
-function isMarketOpen() {
-  if (_marketClock.source === "tradier" && _marketClock.state && Date.now() - _marketClock.fetchedAt < 5 * 60_000) {
-    return _marketClock.state === "open"; // "premarket"/"postmarket"/"closed" are all NOT regular-session open
-  }
+// Local-time-only market open check — never consults Tradier.
+// Used for Robinhood accounts so Tradier's API state never blocks RH trade cycles.
+function isMarketOpenLocal() {
   try {
     const { day, h, m, dateStr } = getETParts();
     if (day === "Sat" || day === "Sun") return false;
     if (MARKET_HOLIDAYS.has(dateStr)) return false;
     const mins = h * 60 + m;
-    const close = MARKET_HALF_DAYS.has(dateStr) ? 780 : 960; // 1:00 PM half-day, else 4:00 PM
-    return mins >= 570 && mins < close; // 9:30 AM (570) open
+    const close = MARKET_HALF_DAYS.has(dateStr) ? 780 : 960;
+    return mins >= 570 && mins < close;
   } catch (e) {
-    // Fallback if Intl is broken
     const d = new Date();
-    const mins = d.getUTCHours() * 60 + d.getUTCMinutes() - 240; // Approx ET (EDT is UTC-4)
+    const mins = d.getUTCHours() * 60 + d.getUTCMinutes() - 240;
     return mins >= 570 && mins < 960;
   }
+}
+
+function isMarketOpen() {
+  if (_marketClock.source === "tradier" && _marketClock.state && Date.now() - _marketClock.fetchedAt < 5 * 60_000) {
+    return _marketClock.state === "open"; // "premarket"/"postmarket"/"closed" are all NOT regular-session open
+  }
+  return isMarketOpenLocal();
 }
 
 function getETDateStr() {
@@ -2835,7 +2804,7 @@ function portfolioValue(state, quotes) {
     const isEquity = pos.type === "equity";
     const currentPremium = isEquity
       ? (pos.liveMark ?? spot)
-      : (pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type));
+      : (pos.liveMark ?? (pos.strike > 0 ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
     val += currentPremium * pos.qty * (isEquity ? 1 : 100);
   }
   return val;
@@ -2886,6 +2855,92 @@ function signalLabel(score) {
   if (score >= 45) return "NEUTRAL";
   if (score >= 30) return "SELL WATCH";
   return "STRONG SELL";
+}
+
+// ─── Loss Circuit Breakers ───
+// Enforces the config knobs that previously existed but were never checked anywhere:
+//   maxConsecutiveLosses — N losing closes in a row → no new entries for the rest of the ET day
+//   dailyLossLimitPct    — PV down X% from the day's start → live accounts PAUSE, paper blocks entries
+//   maxDayTrades         — hard cap on new entries per ET day
+// State lives in state.risk (persisted via saveAccounts) and resets at each new ET day.
+
+function ensureRiskState(acct, pv = null) {
+  const state = acct.state;
+  const today = getETDateStr();
+  if (!state.risk || state.risk.date !== today) {
+    state.risk = {
+      date: today,
+      // Baseline for the daily loss limit. Falls back to the first PV we see today.
+      dayStartPV: (typeof pv === "number" && pv > 0) ? pv : null,
+      dayTrades: 0,
+      consecLosses: 0,
+      haltNotified: null,
+    };
+  } else if (state.risk.dayStartPV == null && typeof pv === "number" && pv > 0) {
+    state.risk.dayStartPV = pv;
+  }
+  return state.risk;
+}
+
+// Feed a realized close into the consecutive-loss streak. Called from every close path:
+// paper closes (real fills), Tradier exit submissions (estimates, reconciled later), and
+// Robinhood closes detected by sync. Sim accounts never touch live breaker state.
+function recordTradeOutcome(acct, pnlDollar) {
+  if (acct._simMode) return;
+  const r = ensureRiskState(acct);
+  if (pnlDollar < 0) r.consecLosses += 1;
+  else if (pnlDollar > 0) r.consecLosses = 0;
+  const max = acct.config.maxConsecutiveLosses;
+  if (max && r.consecLosses >= max && r.haltNotified !== "consec") {
+    r.haltNotified = "consec";
+    const msg = `${r.consecLosses} consecutive losing closes — new entries blocked until tomorrow (exits keep running).`;
+    log(acct, `🛑 CIRCUIT BREAKER: ${msg}`);
+    diag("risk_halt", acct, { kind: "consecutive_losses", consecLosses: r.consecLosses, max });
+    sendPush(`🛑 Loss streak halt [${acct.name}]`, msg, true).catch(() => {});
+  }
+}
+
+// Entry-time gate. Returns a human-readable reason when new entries are blocked, else null.
+function riskBreakerStatus(acct) {
+  const cfg = acct.config;
+  const pv = portfolioValue(acct.state, acct.dashboard?.quotes || {});
+  const r = ensureRiskState(acct, pv);
+
+  if (cfg.maxDayTrades && r.dayTrades >= cfg.maxDayTrades) {
+    return `Circuit breaker: day-trade cap reached (${r.dayTrades}/${cfg.maxDayTrades} entries today)`;
+  }
+  if (cfg.maxConsecutiveLosses && r.consecLosses >= cfg.maxConsecutiveLosses) {
+    return `Circuit breaker: ${r.consecLosses} consecutive losses (max ${cfg.maxConsecutiveLosses}) — no new entries until tomorrow`;
+  }
+  if (cfg.dailyLossLimitPct > 0 && r.dayStartPV > 0 && pv > 0) {
+    const dayPnlPct = (pv - r.dayStartPV) / r.dayStartPV;
+    if (dayPnlPct <= -cfg.dailyLossLimitPct) {
+      return `Circuit breaker: daily loss ${(dayPnlPct * 100).toFixed(1)}% breaches -${(cfg.dailyLossLimitPct * 100).toFixed(0)}% limit`;
+    }
+  }
+  return null;
+}
+
+// Cycle-level halt check (runs even when no entry is attempted, so a drawdown on OPEN positions
+// still trips it). Live broker accounts are paused outright — the paused cycle keeps managing
+// exits but nothing new opens until manually resumed.
+function evaluateRiskHalts(acct, pv) {
+  const cfg = acct.config;
+  const r = ensureRiskState(acct, pv);
+  if (!(cfg.dailyLossLimitPct > 0) || !(r.dayStartPV > 0) || !(pv > 0)) return;
+  const dayPnlPct = (pv - r.dayStartPV) / r.dayStartPV;
+  if (dayPnlPct > -cfg.dailyLossLimitPct) return;
+  if (r.haltNotified === "daily") return;
+  r.haltNotified = "daily";
+  const isLive = cfg.broker === "tradier" || cfg.broker === "robinhood";
+  const msg = `Portfolio ${(dayPnlPct * 100).toFixed(1)}% on the day (start $${r.dayStartPV.toFixed(0)} → $${pv.toFixed(0)}), limit -${(cfg.dailyLossLimitPct * 100).toFixed(0)}%.${isLive ? " Account PAUSED — exits keep running; resume manually from the dashboard." : " New entries blocked for the day."}`;
+  log(acct, `🚨 DAILY LOSS HALT: ${msg}`);
+  diag("risk_halt", acct, { kind: "daily_loss", dayPnlPct: +(dayPnlPct * 100).toFixed(1), dayStartPV: +r.dayStartPV.toFixed(2), pv: +pv.toFixed(2), paused: isLive });
+  sendPush(`🚨 Daily loss halt [${acct.name}]`, msg, true).catch(() => {});
+  if (isLive) {
+    acct.paused = true;
+    saveAccounts();
+  }
 }
 
 // ─── LLM API Usage Tracking (global/shared) ───
@@ -3497,7 +3552,14 @@ covering the setup read, the main risk, and why you approve/reject the ${isEquit
     }
     return result;
   } catch (e) {
-    log(acct, `CLAUDE VALIDATE WARN: Parse failed — ${e.message}. Defaulting to approve.`);
+    // Live-broker accounts FAIL CLOSED: an unreadable/unavailable risk check must never turn
+    // into an auto-approval with real money (this exact fail-open produced a run of junk
+    // synthetic entries in the trade log). Paper accounts keep the old permissive behavior.
+    const live = cfg.broker === "tradier" || cfg.broker === "robinhood";
+    log(acct, `CLAUDE VALIDATE WARN: Parse failed — ${e.message}. ${live ? "Live account → failing CLOSED (skip trade)." : "Paper account → defaulting to approve."}`);
+    if (live) {
+      return { approve: false, confidence: 0, concerns: ["validation parse failed"], reasoning: "AI validation unreadable — refusing to risk live capital without a completed risk check.", suggestion: "validation failed, trade skipped", contractIdx: 0 };
+    }
     return { approve: true, confidence: 50, concerns: ["validation parse failed"], reasoning: "AI response could not be parsed; proceeding with caution on technicals alone.", suggestion: "proceeding with caution", contractIdx: 0 };
   }
 }
@@ -3567,6 +3629,17 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   // stack duplicate orders while an earlier one is still resting.
   if ((cfg.broker === "tradier" || cfg.broker === "robinhood") && acct._inflightTickers?.has(ticker.toUpperCase())) {
     return { skipped: true, reason: `Broker: working order already open for ${ticker}` };
+  }
+
+  // Loss circuit breakers: consecutive-loss streak, daily loss limit, day-trade cap.
+  const breaker = acct._simMode ? null : riskBreakerStatus(acct);
+  if (breaker) return { skipped: true, reason: breaker };
+
+  // Recently walked away from a runaway entry on this name — don't chase it through the
+  // back door with an immediate fresh order at the worse price.
+  const cooldownUntil = acct._chaseCooldownUntil?.[ticker.toUpperCase()];
+  if (cooldownUntil && cooldownUntil > Date.now()) {
+    return { skipped: true, reason: `Cooling down ${Math.ceil((cooldownUntil - Date.now()) / 60000)}m after walking away from a runaway entry on ${ticker}` };
   }
 
   // Hard cap on concurrent positions — prevents over-deployment that drained cash to $25.
@@ -3743,7 +3816,12 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
         regime: regime.label,
       });
     } catch (e) {
-      log(acct, `CLAUDE VALIDATE ${ticker}: Error — ${e.message}, proceeding anyway`);
+      // Same fail-closed rule as the parse path: live capital never trades on a skipped check.
+      if (cfg.broker === "tradier" || cfg.broker === "robinhood") {
+        log(acct, `CLAUDE VALIDATE ${ticker}: Error — ${e.message}. Live account → skipping trade (fail closed).`);
+        return { skipped: true, reason: `AI validation errored (${e.message}) — failing closed on a live account` };
+      }
+      log(acct, `CLAUDE VALIDATE ${ticker}: Error — ${e.message}, proceeding anyway (paper)`);
     }
 
     if (!claudeResult.approve) {
@@ -3935,36 +4013,38 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
       const expStr = selectedCandidate.expiryStr || new Date(expiryDate).toISOString().slice(0, 10);
       const occ = robinhood.buildOCC(ticker, expStr, type, strike);
 
-      if (!acct.state.meta) acct.state.meta = {};
-      acct.state.meta[occ] = {
-        entryPremium: +premium.toFixed(2),
-        entrySpot: spot,
-        dte,
-        originalQty: qty,
-        openDate: getETDateStr(),
-        openTime: Date.now(),
-        trimLevel: 0,
-        bestPnlPct: 0,
-        entryAtrPct: analysis.atrPct ?? null,
-        setupQuality: effectiveQuality,
-        ai: aiThesis || null,
-      };
-
       try {
         const conviction = Math.max(0, Math.min(1, (claudeResult.confidence || 0) / 100));
         const bid = selectedCandidate.bid, ask = selectedCandidate.ask;
 
-        // Hard stop: reject if spread at order time is too wide
+        // Hard stop: reject if spread at order time is too wide (before writing any state)
         if (bid > 0 && ask > 0 && premium > 0) {
           const liveSpreadPct = (ask - bid) / premium;
           if (liveSpreadPct > MAX_ENTRY_SPREAD_PCT) {
-            delete acct.state.meta[occ];
             return { skipped: true, reason: `Robinhood: spread ${(liveSpreadPct * 100).toFixed(0)}% at order time exceeds ${(MAX_ENTRY_SPREAD_PCT * 100).toFixed(0)}% cap — refusing entry on ${ticker}` };
           }
         }
 
         const limit = entryLimitPrice(bid, ask, premium, conviction);
         const aggrLabel = limit >= (ask || limit) ? "at ask" : limit > premium ? "toward ask" : "at mid";
+
+        // Write meta AFTER limit is computed so entryPremium matches what we actually sent.
+        // intendedEntryPremium keeps the mid for UI reference (shown as "intended $X" when fill differs).
+        if (!acct.state.meta) acct.state.meta = {};
+        acct.state.meta[occ] = {
+          entryPremium: +limit.toFixed(2),
+          intendedEntryPremium: +premium.toFixed(2),
+          entrySpot: spot,
+          dte,
+          originalQty: qty,
+          openDate: getETDateStr(),
+          openTime: Date.now(),
+          trimLevel: 0,
+          bestPnlPct: 0,
+          entryAtrPct: analysis.atrPct ?? null,
+          setupQuality: effectiveQuality,
+          ai: aiThesis || null,
+        };
 
         const res = await robinhood.placeOptionOrder({
           symbol: ticker,
@@ -3976,6 +4056,21 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
           type: "limit",
           limitPrice: limit.toFixed(2),
         });
+
+        // If the MCP response includes an immediate fill price, update meta now so the first
+        // sync cycle gets the real fill rather than our limit estimate.
+        const immediateFill = parseFloat(res?.average_price || res?.price || 0);
+        if (immediateFill > 0) acct.state.meta[occ].entryPremium = immediateFill > 1 ? immediateFill / 100 : immediateFill;
+
+        // Entry-order working context: lets workRobinhoodEntryOrders() re-quote this resting
+        // limit each sync and chase toward the ask (within a conviction-scaled ceiling) or
+        // cancel and walk away if the price runs — instead of sitting stale all day.
+        acct.state.meta[occ].entryOrderId = res?.id || res?.order_id || null;
+        acct.state.meta[occ].entryOrderPlacedAt = Date.now();
+        acct.state.meta[occ].entryFirstPlacedAt = Date.now();
+        acct.state.meta[occ].entryOrderLimit = +limit.toFixed(2);
+        acct.state.meta[occ].entryChaseCount = 0;
+        acct.state.meta[occ].entryOrderCtx = { ticker, expStr, strike, optionType: type, qty };
 
         if (!acct._inflightTickers) acct._inflightTickers = new Set();
         acct._inflightTickers.add(ticker.toUpperCase());
@@ -3989,7 +4084,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
           conviction: Math.round((conviction || 0) * 100), setupQuality: effectiveQuality,
         });
 
-        return { ticker, type, strike, dte, qty, entryPremium: +limit.toFixed(2), cost: qty * limit * 100, direction, optionsSource: "robinhood", setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence, brokerOrder: true, watchlistCandidate: selectedCandidate };
+        return { ticker, type, strike, dte, qty, entryPremium: +limit.toFixed(2), intendedEntryPremium: +premium.toFixed(2), cost: qty * limit * 100, direction, optionsSource: "robinhood", setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence, brokerOrder: true, watchlistCandidate: selectedCandidate };
       } catch (e) {
         delete acct.state.meta[occ];
         log(acct, `ROBINHOOD OPTION ENTRY FAILED ${ticker}: ${e.message}`);
@@ -4213,6 +4308,13 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
           symbol: pos.ticker, side: "sell", type: "limit", quantity: qty, limitPrice, refId
         }).then(res => {
           log(acct, `ROBINHOOD EXIT: SELL ${qty}x ${pos.ticker} @ $${limitPrice.toFixed(2)} limit (${isTrimLocal ? "TRIM" : "EXIT"} — ${reason}) — order ${res?.id || "?"}`);
+          // Track the working exit so the sync diff can book the trade when it fills.
+          if (!acct.state.meta[pos.ticker]) acct.state.meta[pos.ticker] = {};
+          acct.state.meta[pos.ticker].exitOrderId = res?.id || res?.order_id || null;
+          acct.state.meta[pos.ticker].exitOrderPlacedAt = Date.now();
+          acct.state.meta[pos.ticker].exitOrderLimit = limitPrice;
+          acct.state.meta[pos.ticker].exitReason = reason;
+          acct.state.meta[pos.ticker].exitIsTrim = isTrimLocal;
         }).catch(e => {
           acct._inflightTickers.delete(pos.ticker.toUpperCase());
           log(acct, `ROBINHOOD EXIT FAILED ${pos.ticker}: ${e.message}`);
@@ -4224,23 +4326,40 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
         const mid = (bid != null && ask != null && ask >= bid) ? (bid + ask) / 2
                   : (typeof pos.liveMark === "number" && pos.liveMark > 0 ? pos.liveMark : currentPremium);
         const spreadPct = (bid != null && ask != null && mid > 0) ? (ask - bid) / mid : 0;
-        const protective = pnlPct <= 0 || /stop|critical|expir|reversed|breakeven|low-dte|theta/i.test(reason);
-        const urgent = /critical|expir|low-dte/i.test(reason);
+        // Any exit that is cutting a loss (or genuinely time-critical) MUST guarantee a fill —
+        // price at the bid, which is what a real buyer is actually willing to pay right now.
+        // Negotiating off mid in a wide market (the old behavior) could park the limit ABOVE the
+        // achievable bid, so the order sits open forever while the position keeps bleeding.
+        const guaranteedFill = pnlPct <= 0 || /critical|expir|low-dte/i.test(reason);
+        const protective = guaranteedFill || /stop|reversed|breakeven|theta/i.test(reason);
+
+        // How many exit attempts on this contract have already gone stale (canceled by the
+        // watchdog). Each retry escalates: attempt 0 negotiates, later attempts hit the bid,
+        // and from the 3rd attempt price one tick UNDER the bid so the order is unambiguously
+        // marketable (a sell limit below the bid still fills at the bid or better).
+        const occKey = pos.occSymbol || (pos.expiryDate ? robinhood.buildOCC(pos.ticker, new Date(pos.expiryDate).toISOString().slice(0, 10), pos.type, pos.strike) : null);
+        const exitAttempts = (occKey && acct.state.meta[occKey]?.exitAttempts) || 0;
 
         let limit = +mid.toFixed(2);
-        if (protective) {
-          if (urgent && bid != null) {
-            limit = +bid.toFixed(2);
-          } else if (spreadPct <= WIDE_SPREAD_EXIT_PCT && bid != null) {
+        if ((guaranteedFill || exitAttempts >= 1) && bid != null) {
+          limit = +bid.toFixed(2);
+        } else if (protective) {
+          if (spreadPct <= WIDE_SPREAD_EXIT_PCT && bid != null) {
             limit = +bid.toFixed(2);
           } else if (mid > 0) {
             const floor = bid != null ? bid : 0;
             limit = +Math.max(floor, mid * (1 - MAX_EXIT_CONCESSION_PCT)).toFixed(2);
           }
         }
+        if (exitAttempts >= 2 && bid != null) {
+          limit = Math.max(0.01, +(bid - 0.01).toFixed(2)); // 3rd+ attempt: cross the bid, get out
+        }
 
         const expStr = pos.expiryDate ? new Date(pos.expiryDate).toISOString().slice(0, 10) : null;
         if (expStr) {
+          // Log synchronously, before the async call, so the cycle log always shows what was
+          // attempted (and at what price) even if the network call hangs or the process restarts.
+          log(acct, `ROBINHOOD OPTION EXIT: attempting SELL ${qty}x ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} @ $${limit} limit (bid=${bid ?? "?"} ask=${ask ?? "?"} mid=${mid != null ? mid.toFixed(2) : "?"} spread=${(spreadPct * 100).toFixed(0)}% guaranteedFill=${guaranteedFill} attempt=${exitAttempts + 1}) — ${isTrimLocal ? "TRIM" : "EXIT"}: ${reason}`);
           robinhood.placeOptionOrder({
             symbol: pos.ticker,
             expirationDate: expStr,
@@ -4251,9 +4370,20 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
             type: "limit",
             limitPrice: limit.toFixed(2),
             refId,
+            // We already hold the contract's instrument UUID — pass it so the order layer skips the
+            // instrument lookup (and works even if strike wasn't resolved from filled orders).
+            optionId: pos.instrumentUrl || undefined,
           }).then(res => {
-            const occ = robinhood.buildOCC(pos.ticker, expStr, pos.type, pos.strike);
+            const occ = occKey || robinhood.buildOCC(pos.ticker, expStr, pos.type, pos.strike);
             log(acct, `ROBINHOOD OPTION EXIT: SELL ${qty}x ${occ} @ $${limit} (${isTrimLocal ? "TRIM" : "EXIT"} — ${reason}) — order ${res?.id || "?"}`);
+            if (!acct.state.meta[occ]) acct.state.meta[occ] = {};
+            acct.state.meta[occ].exitOrderId = res?.id || res?.order_id || null;
+            acct.state.meta[occ].exitOrderPlacedAt = Date.now();
+            acct.state.meta[occ].exitOrderLimit = limit;
+            // Exit intent — used by the sync diff to book the trade with the real reason and to
+            // advance trim levels once the fill is confirmed.
+            acct.state.meta[occ].exitReason = reason;
+            acct.state.meta[occ].exitIsTrim = isTrimLocal;
           }).catch(e => {
             acct._inflightTickers.delete(pos.ticker.toUpperCase());
             log(acct, `ROBINHOOD OPTION EXIT FAILED ${pos.ticker}: ${e.message}`);
@@ -4282,6 +4412,7 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
   state.realizedPnl = (state.realizedPnl || 0) + realPnlDollar;
   const trade = { ...pos, qty: qty, closePremium: fillPx, proceeds, pnlDollar: realPnlDollar, pnlPct: realPnlPct, reason, closeDate: getETDateStr(), closeTime: acct._simNow || Date.now() };
   if (!acct._simMode) logTrade(trade);
+  recordTradeOutcome(acct, realPnlDollar); // consecutive-loss circuit breaker
 
   const trimLabel = qty < pos.qty ? `TRIM ${qty}/${pos.qty}` : "EXIT";
   log(acct, `${trimLabel}: ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} ${realPnlDollar >= 0 ? "+" : ""}$${realPnlDollar.toFixed(0)} (${realPnlPct >= 0 ? "+" : ""}${(realPnlPct * 100).toFixed(0)}%) — ${reason}`);
@@ -4444,7 +4575,7 @@ function trySignalExits(acct, quotes, analyses) {
 
   for (const pos of state.positions) {
     if (pos._pending) { remaining.push(pos); continue; } // unfilled broker order, not a holding
-    if (acct.config.broker === "tradier" && pos.liveMark == null) { remaining.push(pos); continue; } // no reliable mark — hold
+    if ((acct.config.broker === "tradier" || (acct.config.broker === "robinhood" && pos.type !== "equity")) && pos.liveMark == null) { remaining.push(pos); continue; } // no reliable mark — hold, never place live orders on model prices
     const a = analyses[pos.ticker];
     if (!a) { remaining.push(pos); continue; }
 
@@ -4506,7 +4637,7 @@ function tryTimeBasedExits(acct, quotes) {
 
   for (const pos of state.positions) {
     if (pos._pending) { remaining.push(pos); continue; } // unfilled broker order, not a holding
-    if (acct.config.broker === "tradier" && pos.liveMark == null) { remaining.push(pos); continue; } // no reliable mark — hold
+    if ((acct.config.broker === "tradier" || (acct.config.broker === "robinhood" && pos.type !== "equity")) && pos.liveMark == null) { remaining.push(pos); continue; } // no reliable mark — hold, never place live orders on model prices
     const q = quotes[pos.ticker];
     if (!q) { remaining.push(pos); continue; }
 
@@ -4557,7 +4688,7 @@ function tryEMATrailingExits(acct, quotes) {
 
   for (const pos of state.positions) {
     if (pos._pending) { remaining.push(pos); continue; } // unfilled broker order, not a holding
-    if (acct.config.broker === "tradier" && pos.liveMark == null) { remaining.push(pos); continue; } // no reliable mark — hold
+    if ((acct.config.broker === "tradier" || (acct.config.broker === "robinhood" && pos.type !== "equity")) && pos.liveMark == null) { remaining.push(pos); continue; } // no reliable mark — hold, never place live orders on model prices
     if ((pos.trimLevel || 0) < 2) { remaining.push(pos); continue; }
 
     const candles = acct.candleCache[pos.ticker];
@@ -4739,7 +4870,9 @@ function dashboardHTML(acct, { spectator = false } = {}) {
         ? Math.max(0, (pos.expiryDate - now) / 86400_000)
         : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
       const isEq = pos.type === "equity";
-      const curPremium = isEq ? (pos.liveMark ?? spot) : (pos.liveMark ?? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type));
+      const strikeKnown = isEq || pos.strike > 0;
+      const curPremium = isEq ? (pos.liveMark ?? spot)
+        : (pos.liveMark ?? (strikeKnown ? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
       const pnlPct = pos.entryPremium > 0 ? (curPremium - pos.entryPremium) / pos.entryPremium : 0;
       const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * (isEq ? 1 : 100);
       const profitPrice = pos.entryPremium * (1 + PROFIT_TARGET);
@@ -4750,7 +4883,7 @@ function dashboardHTML(acct, { spectator = false } = {}) {
         stopLoss: { pct: `${(STOP_LOSS * 100).toFixed(0)}%`, premium: stopPrice.toFixed(2) },
         pctToProfit: ((profitPrice - curPremium) / curPremium * 100).toFixed(1),
         pctToStop: ((stopPrice - curPremium) / curPremium * 100).toFixed(1),
-        greeks: optGreeks(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type),
+        greeks: strikeKnown ? optGreeks(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : { delta: "?", theta: "?" },
       };
     });
   }
@@ -6179,7 +6312,9 @@ async function loadPositions() {
       for (const p of d) {
         const pnl = p.pnl || p.unrealized_pnl || '—';
         const color = parseFloat(pnl) >= 0 ? '#00a843' : '#e8473f';
-        html += '<tr><td style="color:#1c1d22;font-weight:600">'+p.symbol+'</td><td>'+p.quantity+'</td><td>$'+(p.average_cost||'?')+'</td><td>$'+(p.current_price||'?')+'</td><td style="color:'+color+'">'+pnl+'</td></tr>';
+        const avgCost = p.average_buy_price || p.average_cost || p.average_price;
+        const curPrice = p.current_price || p.last_trade_price || p.last_extended_hours_trade_price;
+        html += '<tr><td style="color:#1c1d22;font-weight:600">'+p.symbol+'</td><td>'+p.quantity+'</td><td>'+(avgCost?'$'+parseFloat(avgCost).toFixed(2):'?')+'</td><td>'+(curPrice?'$'+parseFloat(curPrice).toFixed(2):'?')+'</td><td style="color:'+color+'">'+pnl+'</td></tr>';
       }
       html += '</table>';
       el.innerHTML = html;
@@ -6261,11 +6396,6 @@ async function connectRH() {
 function disconnectRH() {
   if (!confirm('Disconnect from Robinhood? This will clear your token.')) return;
   fetch('/api/rh-token', { method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'}, body: 'token=' }).then(()=>location.reload());
-}
-
-async function toggleMode() {
-  await fetch('/api/trading-mode', { method: 'POST' });
-  location.reload();
 }
 
 async function toggleApproval() {
@@ -7319,6 +7449,10 @@ function startDashboard(defaultAcct, apiKey) {
         if (params.has("marginZeroCashSpendLimit")) cfg.marginZeroCashSpendLimit = Math.max(0, parseFloat(params.get("marginZeroCashSpendLimit")) || 0);
         if (params.has("marginMaxDebt")) cfg.marginMaxDebt = Math.max(0, parseFloat(params.get("marginMaxDebt")) || 0);
         if (params.has("minSetupQuality")) cfg.minSetupQuality = parseInt(params.get("minSetupQuality")) ?? 50;
+        // Loss circuit breakers — empty value disables the breaker (null).
+        if (params.has("maxConsecutiveLosses")) cfg.maxConsecutiveLosses = params.get("maxConsecutiveLosses") ? Math.max(1, parseInt(params.get("maxConsecutiveLosses")) || 0) || null : null;
+        if (params.has("dailyLossLimitPct")) cfg.dailyLossLimitPct = params.get("dailyLossLimitPct") ? Math.max(0, parseFloat(params.get("dailyLossLimitPct")) / 100) || null : null;
+        if (params.has("maxDayTrades")) cfg.maxDayTrades = params.get("maxDayTrades") ? Math.max(1, parseInt(params.get("maxDayTrades")) || 0) || null : null;
         if (params.has("bullEntry")) cfg.bullEntry = Math.min(100, Math.max(50, parseInt(params.get("bullEntry")) || 68));
         if (params.has("bearEntry")) cfg.bearEntry = Math.min(50, Math.max(0, parseInt(params.get("bearEntry")) || 32));
         cfg.customPromptSuffix = params.get("customPromptSuffix") || "";
@@ -7343,7 +7477,8 @@ function startDashboard(defaultAcct, apiKey) {
       const list = [];
       for (const [id, a] of accounts) {
         const pv = portfolioValue(a.state, a.dashboard.quotes);
-        list.push({ id, name: a.name, paused: a.paused, cash: a.state.cash, positions: a.state.positions.length, trades: a.state.history.length, pv, pnl: ((pv - a.config.startingCash) / a.config.startingCash * 100).toFixed(1), config: a.config });
+        const sc = a.config.startingCash > 0 ? a.config.startingCash : null;
+        list.push({ id, name: a.name, paused: a.paused, cash: a.state.cash, positions: a.state.positions.length, trades: a.state.history.length, pv, pnl: sc ? ((pv - sc) / sc * 100).toFixed(1) : "0.0", config: a.config });
       }
       res.end(JSON.stringify(list));
       return;
@@ -7407,6 +7542,96 @@ function startDashboard(defaultAcct, apiKey) {
     }
 
     // ─── Robinhood: Get Watchlist ───
+    if (pathname === "/api/rh-tools") {
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({
+        connected: robinhood.isConnected,
+        optionsEnabled: robinhood.optionsEnabled,
+        tools: robinhood.availableTools,
+        schemas: robinhood.toolSchemas,
+      }, null, 2));
+      return;
+    }
+
+    // On-demand raw dump of the exact Robinhood options payloads used for live pricing. This
+    // bypasses the flooded cycle log so the true API shapes can be observed directly. Fetches
+    // held option positions and their market data by BOTH bare ticker and OCC symbol so we can
+    // see which identifier the market-data endpoint actually keys on.
+    if (pathname === "/api/rh-debug") {
+      if (!robinhood.isConnected) {
+        res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: "Robinhood MCP not connected" }));
+        return;
+      }
+      const out = { optionsEnabled: robinhood.optionsEnabled, optionTools: robinhood.optionToolInfo, orderSchemas: {}, positionsRaw: null, held: [], byOptionId: {}, byTicker: {}, byOcc: {}, errors: {} };
+      // Full input schemas for the order tools — need the legs sub-schema to build orders in the
+      // exact wire format the MCP expects (additionalProperties:false rejects extra leg fields).
+      try {
+        const allSchemas = robinhood.toolSchemas;
+        for (const t of ["place_option_order", "review_option_order", "place_options_order", "review_options_order"]) {
+          if (allSchemas[t]) out.orderSchemas[t] = allSchemas[t];
+        }
+      } catch (e) { out.errors.orderSchemas = e.message; }
+      try {
+        const optRes = await robinhood.getOptionsPositions();
+        out.positionsRaw = optRes && optRes.data ? optRes.data : optRes;
+        const optArr = out.positionsRaw && Array.isArray(out.positionsRaw.positions) ? out.positionsRaw.positions
+          : Array.isArray(out.positionsRaw) ? out.positionsRaw : [];
+        const held = [];
+        for (const op of optArr) {
+          const qty = parseFloat(op.quantity || op.pending_buy_quantity || op.pending_sell_quantity || 0);
+          // include zero-qty rows too so the endpoint still probes market data when flat
+          const ticker = (op.chain_symbol || op.symbol || "").toUpperCase();
+          const rawSide = (op.type || "").toLowerCase();
+          const optType = (rawSide === "long" || rawSide === "short") ? (op.option_type || op.legs?.[0]?.option_type || "call").toLowerCase() : (rawSide || "call").toLowerCase();
+          const strike = parseFloat(op.strike_price || op.legs?.[0]?.strike_price || 0);
+          const expDate = op.expiration_date || op.legs?.[0]?.expiration_date || null;
+          const optionId = op.option_id || op.instrument_id || op.instrument || null;
+          if (rawSide === "long") held.push({ ticker, optType, strike, expDate, optionId, qty });
+        }
+        out.held = held;
+        out.tickers = [...new Set(held.map(h => h.ticker).filter(Boolean))];
+        // Probe the market-data tool three ways: by option_id (UUID), by bare ticker, by OCC.
+        for (const h of held) {
+          if (h.optionId) {
+            try { out.byOptionId[h.optionId] = await robinhood.getOptionMarketData([h.optionId]); }
+            catch (e) { out.errors[`byOptionId:${h.optionId}`] = e.message; }
+          }
+        }
+        for (const t of out.tickers) {
+          try { out.byTicker[t] = await robinhood.getOptionMarketData([t]); }
+          catch (e) { out.errors[`byTicker:${t}`] = e.message; }
+        }
+        for (const h of held) {
+          if (!h.ticker || !h.strike || !h.expDate) continue;
+          const occ = robinhood.buildOCC(h.ticker, h.expDate, h.optType, h.strike);
+          try { out.byOcc[occ] = await robinhood.getOptionMarketData([occ]); }
+          catch (e) { out.errors[`byOcc:${occ}`] = e.message; }
+        }
+        // Dry-run probe: review (NOT place) a 1-contract sell_to_close for each held contract using
+        // its option_id. review_option_order previews without executing, so this validates the legs
+        // wire format end-to-end with zero risk. If it returns a preview, the exit format is correct.
+        out.reviewProbe = {};
+        for (const h of held) {
+          if (!h.optionId || !(h.qty > 0)) continue;
+          const q = out.byOptionId[h.optionId]?.data?.results?.[0]?.quote;
+          const bid = q ? parseFloat(q.bid_price) : 0;
+          const probeLimit = (bid > 0 ? bid : 0.01).toFixed(2);
+          try {
+            out.reviewProbe[h.optionId] = await robinhood.reviewOptionOrder({
+              symbol: h.ticker, expirationDate: h.expDate, strikePrice: h.strike, optionType: h.optType,
+              side: "sell_to_close", quantity: 1, type: "limit", limitPrice: probeLimit, optionId: h.optionId,
+            });
+          } catch (e) { out.errors[`reviewProbe:${h.optionId}`] = e.message; }
+        }
+      } catch (e) {
+        out.errors.top = e.message;
+      }
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify(out, null, 2));
+      return;
+    }
+
     if (pathname === "/api/rh-watchlist") {
       if (!robinhood.isConnected) {
         res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -7479,8 +7704,11 @@ function startDashboard(defaultAcct, apiKey) {
             res.end(JSON.stringify({ error: "symbol required" }));
           }
         } catch (e) {
+          const msg = e.message.includes("not available")
+            ? `Watchlist tool not available on this Robinhood MCP session. Available tools: ${robinhood.availableTools.filter(t => /watch/i.test(t)).join(", ") || "none"}`
+            : e.message;
           res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-          res.end(JSON.stringify({ error: e.message }));
+          res.end(JSON.stringify({ error: msg }));
         }
       });
       return;
@@ -7702,8 +7930,10 @@ function startDashboard(defaultAcct, apiKey) {
           const tokens = await tokenRes.json();
           if (!tokens.access_token) throw new Error("No access_token in response");
 
+          // Keep the dynamic client_id + token endpoint with the tokens so refresh works later.
+          const authMeta = { clientId: rhOAuthPending.clientId, tokenEndpoint: rhOAuthPending.tokenEndpoint };
           rhOAuthPending = null;
-          robinhood.setToken(tokens.access_token, tokens.refresh_token || null);
+          robinhood.setToken(tokens.access_token, tokens.refresh_token || null, authMeta);
           const connected = await robinhood.init({ reload: false });
           const optLabel = robinhood.optionsEnabled ? "Options + Equity" : "Equity only";
 
@@ -7775,9 +8005,13 @@ function startDashboard(defaultAcct, apiKey) {
         const tokens = await tokenRes.json();
         if (!tokens.access_token) throw new Error("No access_token in response");
 
+        // Persist the dynamic-registration client identity WITH the tokens — refresh_token
+        // grants are only honored for the client_id that minted them, so without this the
+        // bot silently loses the session (and the ability to exit positions) at token expiry.
+        const authMeta = { clientId: rhOAuthPending.clientId, tokenEndpoint: rhOAuthPending.tokenEndpoint };
         rhOAuthPending = null;
 
-        robinhood.setToken(tokens.access_token, tokens.refresh_token || null);
+        robinhood.setToken(tokens.access_token, tokens.refresh_token || null, authMeta);
         const connected = await robinhood.init({ reload: false });
         const optLabel = robinhood.optionsEnabled ? "Options + Equity" : "Equity only";
 
@@ -7860,6 +8094,26 @@ function startDashboard(defaultAcct, apiKey) {
       try {
         const positionsRes = await robinhood.getPositions();
         const positions = positionsRes && positionsRes.data && Array.isArray(positionsRes.data.positions) ? positionsRes.data.positions : (Array.isArray(positionsRes) ? positionsRes : []);
+        // Enrich with quotes so current_price is available for display
+        if (positions.length > 0) {
+          const syms = positions.map(p => p.symbol).filter(Boolean);
+          try {
+            const quotes = await robinhood.getQuotes(syms);
+            const qMap = {};
+            if (quotes && quotes.data && Array.isArray(quotes.data.results)) {
+              for (const q of quotes.data.results) if (q.symbol) qMap[q.symbol] = q;
+            } else if (Array.isArray(quotes)) {
+              for (const q of quotes) if (q.symbol) qMap[q.symbol] = q;
+            }
+            for (const p of positions) {
+              const q = qMap[p.symbol];
+              if (q) {
+                p.current_price = q.last_trade_price || q.adjusted_previous_close || p.current_price;
+                p.last_trade_price = q.last_trade_price;
+              }
+            }
+          } catch { }
+        }
         res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
         res.end(JSON.stringify(positions));
       } catch (e) {
@@ -8276,9 +8530,13 @@ self.addEventListener('pushsubscriptionchange', e => {
       try {
         const sym = url.searchParams.get("symbol");
         if (!sym) { res.writeHead(400); res.end(JSON.stringify({ error: "symbol required" })); return; }
-        const optPositions = await robinhood.getOptionsPositions();
+        const result = {};
+        try { result.positions = await robinhood.getOptionsPositions(); } catch { result.positions = { data: { positions: [] } }; }
+        try { result.instruments = await robinhood.getOptionInstruments(sym); } catch { }
+        try { result.marketData = await robinhood.getOptionMarketData([sym]); } catch { }
+        result.optionsEnabled = true;
         res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-        res.end(JSON.stringify({ positions: optPositions, optionsEnabled: true }));
+        res.end(JSON.stringify(result));
       } catch (e) {
         res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
         res.end(JSON.stringify({ error: e.message }));
@@ -8801,25 +9059,26 @@ async function ensureRobinhoodAccount() {
     if (typeof seedCash === "number") {
       acct.state.cash = seedCash;
       if (typeof acct.state.brokerEquity !== "number" || acct.state.brokerEquity <= 0) acct.state.brokerEquity = seedCash;
-      if (acct.state.positions.length === 0 && acct.state.history.length === 0) acct.config.startingCash = seedCash;
+      if (acct.state.positions.length === 0 && acct.state.history.length === 0 && seedCash > 0) acct.config.startingCash = seedCash;
     }
+    // Guard: startingCash must be > 0 to avoid +Infinity% P&L
+    if (!(acct.config.startingCash > 0)) acct.config.startingCash = DEFAULT_CONFIG.startingCash;
     console.log(`  Robinhood: live account present — cash $${acct.state.cash.toFixed(2)} (starting $${acct.config.startingCash})`);
     return;
   }
 
+  const safeSeed = (typeof seedCash === "number" && seedCash > 0) ? seedCash : DEFAULT_CONFIG.startingCash;
   const config = {
     ...DEFAULT_CONFIG,
     broker: "robinhood",
     useCashReserve: false,
     autoExecute: true,
-
-    startingCash: typeof seedCash === "number" ? seedCash : DEFAULT_CONFIG.startingCash,
+    startingCash: safeSeed,
   };
   const state = {
-    cash: typeof seedCash === "number" ? seedCash : DEFAULT_CONFIG.startingCash,
+    cash: safeSeed,
     positions: [],
     history: [],
-
     meta: {},
   };
   const acct = createAccountRuntime("robinhood", `Robinhood Live`, config, state);
@@ -9039,6 +9298,7 @@ function placeBrokerExit(acct, pos, currentPremium, reason, qty, pnlPct, pnlDoll
   };
   logTrade(trade);
   state.history.push(trade);
+  recordTradeOutcome(acct, pnlDollar); // consecutive-loss circuit breaker (estimate; reconciled later)
   diag("exit_submit", acct, {
     ticker, occ: occForTrade, reason,
     intendedLimit: +limit.toFixed(2), mid: +mid.toFixed(2), bid, ask,
@@ -9372,10 +9632,128 @@ async function syncBrokerAccount(acct, quotes) {
   }
 }
 
+// ─── Robinhood Entry-Order Working (active bidding) ───
+// A resting entry limit is a DECISION, not a fire-and-forget. Each sync we re-quote the contract
+// and choose one of three things, in the spirit of "a great stock at a fair price beats a fair
+// stock at a great price":
+//   1. Market came to us / hasn't run → leave the order resting (we ARE the fair price).
+//   2. It's moving up but still within a conviction-scaled ceiling → cancel/replace toward the
+//      new ask ("worth paying up a little for the good one").
+//   3. It ran past the ceiling (mooning) → cancel and WALK AWAY rather than pay a bad price,
+//      with a cooldown so the next cycle doesn't immediately chase it through the back door.
+const ENTRY_WORK_MIN_AGE_MS = 90_000;        // let each limit rest ~1.5 min before touching it
+const ENTRY_GIVEUP_MS = 20 * 60_000;         // total time we'll work one entry decision
+const ENTRY_MAX_CHASES = 3;                  // max cancel/replace rounds per entry
+const ENTRY_WALKAWAY_COOLDOWN_MS = 15 * 60_000;
+
+async function workRobinhoodEntryOrders(acct, now) {
+  const state = acct.state;
+  if (!state.meta) return;
+  if (!acct._inflightTickers) acct._inflightTickers = new Set();
+  if (!acct._chaseCooldownUntil) acct._chaseCooldownUntil = {};
+
+  for (const [occ, m] of Object.entries(state.meta)) {
+    if (!m || !m.entryOrderPlacedAt || !m.entryOrderCtx || !m.entryOrderId) continue;
+    const ctx = m.entryOrderCtx;
+    const tickerU = (ctx.ticker || "").toUpperCase();
+
+    if (!acct._inflightTickers.has(tickerU)) {
+      // No longer working at the broker — it filled (position appears this sync) or was
+      // canceled externally. Either way stop managing the order; keep the entry context.
+      delete m.entryOrderId; delete m.entryOrderPlacedAt; delete m.entryOrderCtx;
+      continue;
+    }
+
+    const age = now - m.entryOrderPlacedAt;
+    if (age < ENTRY_WORK_MIN_AGE_MS) continue;
+    const workedFor = now - (m.entryFirstPlacedAt || m.entryOrderPlacedAt);
+
+    const walkAway = async (why) => {
+      try { await robinhood.cancelOptionOrder(m.entryOrderId); } catch (e) {
+        log(acct, `RH ENTRY WORK: cancel failed for ${tickerU} — ${e.message}`);
+      }
+      acct._inflightTickers.delete(tickerU);
+      acct._chaseCooldownUntil[tickerU] = now + ENTRY_WALKAWAY_COOLDOWN_MS;
+      log(acct, `RH ENTRY WORK: WALKED AWAY from ${tickerU} ${occ} — ${why}. Cooling down ${ENTRY_WALKAWAY_COOLDOWN_MS / 60000}m; a fresh signal can re-evaluate at the new price after that.`);
+      diag("entry_walkaway", acct, { ticker: tickerU, occ, why, chases: m.entryChaseCount || 0, lastLimit: m.entryOrderLimit ?? null, intendedMid: m.intendedEntryPremium ?? null });
+      delete state.meta[occ];
+    };
+
+    // Fresh two-sided quote (Tradier NBBO by OCC — our most reliable second source).
+    let q = null;
+    if (tradier.isConnected && robinhood.parseOCC(occ)) {
+      try { q = await tradier.getOptionQuote(occ); } catch { }
+    }
+    if (!q || !q.twoSided) {
+      if (workedFor >= ENTRY_GIVEUP_MS) await walkAway(`no fresh quote and order unfilled ${(workedFor / 60000).toFixed(0)}m`);
+      continue; // can't re-price blind — leave the order resting
+    }
+
+    const intended = m.intendedEntryPremium || m.entryPremium || q.mid;
+    const conviction = Math.max(0, Math.min(1, (m.ai?.claudeConfidence ?? 50) / 100));
+    // Conviction-scaled chase ceiling above the mid we originally decided was fair:
+    // 50% conviction → +10.5%, 90% → +14%. Beyond this the trade thesis is priced out.
+    const chaseCapPct = 0.06 + 0.09 * conviction;
+    const ceiling = intended * (1 + chaseCapPct);
+    const freshLimit = entryLimitPrice(q.bid, q.ask, q.mid, conviction);
+    const chases = m.entryChaseCount || 0;
+
+    if (workedFor >= ENTRY_GIVEUP_MS) {
+      await walkAway(`unfilled after ${(workedFor / 60000).toFixed(0)}m (bid ${q.bid}/ask ${q.ask}, our limit $${m.entryOrderLimit})`);
+      continue;
+    }
+    if (freshLimit <= (m.entryOrderLimit || 0) + 0.009) {
+      continue; // market hasn't moved past our price — stay patient, we're the fair bid
+    }
+    if (freshLimit > ceiling || chases >= ENTRY_MAX_CHASES) {
+      await walkAway(freshLimit > ceiling
+        ? `price ran away — re-fill needs $${freshLimit.toFixed(2)} vs ceiling $${ceiling.toFixed(2)} (intended mid $${(+intended).toFixed(2)} +${(chaseCapPct * 100).toFixed(0)}%)`
+        : `already chased ${chases}x without a fill`);
+      continue;
+    }
+
+    // Chase: cancel and re-place toward the new ask, still under the ceiling.
+    try {
+      await robinhood.cancelOptionOrder(m.entryOrderId);
+    } catch (e) {
+      log(acct, `RH ENTRY WORK: cancel-for-chase failed for ${tickerU} (${e.message}) — leaving original order`);
+      continue;
+    }
+    try {
+      const res = await robinhood.placeOptionOrder({
+        symbol: ctx.ticker,
+        expirationDate: ctx.expStr,
+        strikePrice: ctx.strike,
+        optionType: ctx.optionType,
+        side: "buy_to_open",
+        quantity: ctx.qty,
+        type: "limit",
+        limitPrice: freshLimit.toFixed(2),
+      });
+      m.entryOrderId = res?.id || res?.order_id || m.entryOrderId;
+      m.entryOrderPlacedAt = now;
+      m.entryOrderLimit = +freshLimit.toFixed(2);
+      m.entryChaseCount = chases + 1;
+      m.entryPremium = +freshLimit.toFixed(2); // what we're now willing to pay = working basis estimate
+      log(acct, `RH ENTRY WORK: CHASE ${m.entryChaseCount}/${ENTRY_MAX_CHASES} on ${tickerU} ${occ} → $${freshLimit.toFixed(2)} (bid ${q.bid}/ask ${q.ask}, ceiling $${ceiling.toFixed(2)}, conviction ${(conviction * 100).toFixed(0)}%)`);
+      diag("entry_chase", acct, { ticker: tickerU, occ, newLimit: +freshLimit.toFixed(2), ceiling: +ceiling.toFixed(2), chase: m.entryChaseCount, bid: q.bid, ask: q.ask });
+    } catch (e) {
+      // Canceled but couldn't re-place — release the slot so the next cycle can decide fresh.
+      acct._inflightTickers.delete(tickerU);
+      log(acct, `RH ENTRY WORK: re-place failed for ${tickerU} — ${e.message}. Order canceled; next cycle re-evaluates.`);
+      delete m.entryOrderId; delete m.entryOrderPlacedAt; delete m.entryOrderCtx;
+    }
+  }
+}
+
 async function syncRobinhoodAccount(acct, quotes) {
   if (acct.config.broker !== "robinhood" || !robinhood.isConnected) return;
   const state = acct.state;
   if (!state.meta) state.meta = {};
+  // Snapshot last cycle's positions BEFORE rebuilding — closed/shrunk positions are detected by
+  // diffing against this so Robinhood exits produce real trade-history records (and feed the
+  // consecutive-loss breaker), which they previously never did.
+  const prevPositions = Array.isArray(state.positions) ? state.positions.filter(p => !p._pending) : [];
 
   try {
     const res = await robinhood.getPortfolio();
@@ -9485,12 +9863,21 @@ async function syncRobinhoodAccount(acct, quotes) {
     }
 
     // Sync options positions when enabled
+    let optionsFetchOk = false; // gates the closure diff below — a failed fetch must not read as "everything closed"
     if (robinhood.optionsEnabled) {
       try {
         const optRes = await robinhood.getOptionsPositions();
         const optRaw = optRes && optRes.data && Array.isArray(optRes.data.positions) ? optRes.data.positions
           : optRes && Array.isArray(optRes.positions) ? optRes.positions
           : Array.isArray(optRes) ? optRes : [];
+        optionsFetchOk = true;
+
+        // DIAGNOSTIC: dump the full raw shape of the first options position so we can see exactly
+        // which fields carry the instrument id / strike / pricing (the API shape has been guessed
+        // at, not observed). Remove once matching is confirmed working.
+        if (optRaw.length > 0) {
+          log(acct, `RH-RAW POSITION: ${JSON.stringify(optRaw[0]).slice(0, 900)}`);
+        }
 
         for (const op of optRaw) {
           const qty = parseFloat(op.quantity || op.pending_buy_quantity || 0);
@@ -9499,9 +9886,21 @@ async function syncRobinhoodAccount(acct, quotes) {
           const ticker = (op.chain_symbol || op.symbol || "").toUpperCase();
           if (!ticker) continue;
 
-          const optType = (op.type || op.option_type || "call").toLowerCase();
-          const strike = parseFloat(op.strike_price || op.strike || 0);
-          const expDate = op.expiration_date || op.expiration || null;
+          // Robinhood returns `type: "long"/"short"` (position side), not the option type.
+          // The actual call/put type lives in `option_type`. Normalize before using.
+          const rawSide = (op.type || "").toLowerCase();
+          const optType = (rawSide === "long" || rawSide === "short")
+            ? (op.option_type || op.legs?.[0]?.option_type || "call").toLowerCase()
+            : (rawSide || op.option_type || "call").toLowerCase();
+          const strike = parseFloat(
+            op.strike_price || op.strike ||
+            op.legs?.[0]?.strike_price || op.legs?.[0]?.strike ||
+            op.instrument_data?.strike_price || op.option_data?.strike_price ||
+            op.contract?.strike_price || op.details?.strike_price || 0
+          );
+          const expDate = op.expiration_date || op.expiration || op.legs?.[0]?.expiration_date || null;
+          // Log raw structure once per ticker so we can identify which fields carry strike/type
+          if (strike === 0) console.log(`  [RH-OPT-DEBUG] ${ticker} raw keys:`, Object.keys(op).join(", "), "legs:", JSON.stringify(op.legs || []).slice(0, 300));
           const avgPrice = parseFloat(op.average_price || op.average_buy_price || 0);
           const entryPremium = avgPrice > 1 ? avgPrice / 100 : avgPrice; // RH may return per-contract cost
 
@@ -9515,6 +9914,12 @@ async function syncRobinhoodAccount(acct, quotes) {
           const bid = parseFloat(op.bid_price || 0) || null;
           const ask = parseFloat(op.ask_price || 0) || null;
 
+          // Robinhood's own option-position record carries the canonical instrument URL for this
+          // exact contract. This is the only fully unambiguous identifier we have — strike/expiry
+          // string matching against the market-data response can mismatch within a multi-strike
+          // chain, but the instrument URL cannot.
+          const instrumentUrl = op.instrument || op.instrument_id || op.option_id || null;
+
           const pos = {
             ...(meta.ai || {}),
             ticker,
@@ -9524,7 +9929,11 @@ async function syncRobinhoodAccount(acct, quotes) {
             dteRemaining,
             expiryDate: expMs || meta.expiryDate || 0,
             occSymbol: occ,
-            entryPremium: meta.entryPremium ?? entryPremium,
+            instrumentUrl,
+            // Prefer the actual Robinhood fill price over our pre-order limit estimate.
+            // Fall back to meta only when RH hasn't reported an average_price yet (pending fill).
+            entryPremium: entryPremium > 0 ? entryPremium : (meta.entryPremium ?? 0),
+            intendedEntryPremium: meta.intendedEntryPremium ?? null,
             entrySpot: meta.entrySpot ?? (quotes[ticker]?.c ?? null),
             qty,
             originalQty: meta.originalQty ?? qty,
@@ -9575,9 +9984,339 @@ async function syncRobinhoodAccount(acct, quotes) {
       }
     }
 
-    // Prune stale meta
+    // Step 0.5: Detect positions that closed (or shrank) at the broker since last cycle and
+    // record them as trades. Robinhood exits fire-and-forget a sell order and keep the position
+    // until sync; without this, filled exits simply vanished — no history entry, no realized
+    // P&L, no trim-level advancement, and nothing feeding the loss circuit breakers.
+    {
+      const findCurrent = (prev) => prev.type === "equity"
+        ? positions.find(p => p.type === "equity" && p.ticker === prev.ticker)
+        : positions.find(p => p.type !== "equity" && (
+            (prev.occSymbol && p.occSymbol === prev.occSymbol) ||
+            (prev.instrumentUrl && p.instrumentUrl && p.instrumentUrl === prev.instrumentUrl)
+          ));
+      for (const prev of prevPositions) {
+        if (!(prev.qty > 0) || !(prev.entryPremium > 0)) continue;
+        // If the options fetch failed this cycle, we can't tell "closed" from "API error" for
+        // option positions — skip them entirely rather than book phantom exits.
+        if (prev.type !== "equity" && !optionsFetchOk) continue;
+        const metaKey = prev.type === "equity" ? prev.ticker : prev.occSymbol;
+        const posMeta = metaKey ? state.meta[metaKey] : null;
+        const cur = findCurrent(prev);
+        const closedQty = cur ? Math.max(0, prev.qty - cur.qty) : prev.qty;
+        if (closedQty <= 0) continue;
+
+        // Only record closes WE initiated (an exit order was working) or expiry lapses.
+        // A vanish without either is a manual action or an API hiccup — log, don't book it.
+        const weExited = !!(posMeta && (posMeta.exitOrderPlacedAt || posMeta.exitOrderId));
+        const expired = !cur && prev.expiryDate && prev.expiryDate < now;
+        if (!weExited && !expired) {
+          if (!cur) log(acct, `ROBINHOOD SYNC: ${prev.ticker} ${prev.type} position gone without a bot exit order — assuming manual close/API gap, not booking a trade`);
+          continue;
+        }
+
+        const mult = prev.type === "equity" ? 1 : 100;
+        // Best available estimate of the fill: the limit we worked, else last live bid/mark.
+        const closePremium = expired && !weExited ? 0
+          : (posMeta?.exitOrderLimit ?? prev.liveBid ?? prev.liveMark ?? prev.entryPremium);
+        const pnlDollar = (closePremium - prev.entryPremium) * closedQty * mult;
+        const pnlPct = (closePremium - prev.entryPremium) / prev.entryPremium;
+        const reason = posMeta?.exitReason || (expired && !weExited ? "expired worthless" : "robinhood exit filled (synced)");
+        const trade = {
+          ...prev, qty: closedQty,
+          closePremium: +(+closePremium).toFixed(2),
+          proceeds: +(closePremium * closedQty * mult).toFixed(2),
+          pnlDollar: +pnlDollar.toFixed(2), pnlPct,
+          reason, closeDate: getETDateStr(), closeTime: now,
+          _estimated: true, // estimate from our worked limit; RH MCP doesn't echo per-fill prices here
+        };
+        state.history.push(trade);
+        logTrade(trade);
+        state.realizedPnl = (state.realizedPnl || 0) + pnlDollar;
+        recordTradeOutcome(acct, pnlDollar);
+        log(acct, `ROBINHOOD ${cur ? "TRIM" : "EXIT"} FILLED: ${prev.ticker} ${prev.type === "equity" ? "" : `$${prev.strike} ${prev.type.toUpperCase()} `}${closedQty}x @ ~$${(+closePremium).toFixed(2)} → ${pnlDollar >= 0 ? "+" : ""}$${pnlDollar.toFixed(0)} (${(pnlPct * 100).toFixed(0)}%) — ${reason}`);
+        diag("exit_fill", acct, { ticker: prev.ticker, occ: prev.occSymbol || prev.ticker, qty: closedQty, estClose: +(+closePremium).toFixed(2), pnl: +pnlDollar.toFixed(2), pnlPct: +(pnlPct * 100).toFixed(1), reason, source: "rh-sync-diff" });
+
+        if (cur && posMeta) {
+          // Partial close: if it was a planned trim, advance the trim level so the next trim
+          // tier arms (previously stuck at 0 forever on Robinhood — trims re-fired every cycle).
+          if (posMeta.exitIsTrim) {
+            posMeta.trimLevel = Math.min(4, (posMeta.trimLevel || 0) + 1);
+            cur.trimLevel = posMeta.trimLevel;
+            log(acct, `ROBINHOOD SYNC: ${prev.ticker} trim level → ${posMeta.trimLevel}`);
+          }
+          delete posMeta.exitOrderId; delete posMeta.exitOrderPlacedAt; delete posMeta.exitOrderLimit;
+          delete posMeta.exitReason; delete posMeta.exitIsTrim; delete posMeta.exitAttempts;
+        } else if (!cur && metaKey) {
+          delete state.meta[metaKey]; // fully closed — retire the side-metadata
+        }
+      }
+    }
+
+    // Step 1: Resolve strike/expiry for options positions where those fields are missing.
+    // The positions endpoint sometimes omits these. Filled orders always have them — scrape there.
+    if (robinhood.optionsEnabled) {
+      const strikeUnknown = positions.filter(
+        p => p.optionsSource === "robinhood" && p.type !== "equity" && p.strike === 0
+      );
+      if (strikeUnknown.length > 0) {
+        try {
+          const filledRes = await robinhood.getOptionsOrders({ state: "filled" }).catch(() => null);
+          const filledRaw = filledRes && filledRes.data ? filledRes.data : filledRes;
+          const filledOrders = Array.isArray(filledRaw) ? filledRaw
+            : (filledRaw && Array.isArray(filledRaw.orders)) ? filledRaw.orders
+            : (filledRaw && Array.isArray(filledRaw.results)) ? filledRaw.results
+            : [];
+
+          for (const pos of strikeUnknown) {
+            // Find a filled order that matches this ticker + option type
+            const order = filledOrders.find(o => {
+              const sym = (o.chain_symbol || o.symbol || "").toUpperCase();
+              if (sym !== pos.ticker) return false;
+              const oType = (o.legs?.[0]?.option_type || o.option_type || "").toLowerCase();
+              return !oType || oType === pos.type;
+            });
+            if (!order) continue;
+
+            const leg = (order.legs || [])[0] || order;
+            const resolvedStrike = parseFloat(leg.strike_price || leg.strike || 0);
+            const resolvedExp = leg.expiration_date || leg.expiration || null;
+
+            if (resolvedStrike > 0) {
+              pos.strike = resolvedStrike;
+              const occ = resolvedExp ? robinhood.buildOCC(pos.ticker, resolvedExp, pos.type, resolvedStrike) : pos.occSymbol;
+              // Persist into meta so it survives the next cycle
+              if (!state.meta[occ]) state.meta[occ] = { ...(state.meta[pos.occSymbol] || {}) };
+              state.meta[occ].resolvedStrike = resolvedStrike;
+              if (resolvedExp) state.meta[occ].resolvedExpiry = resolvedExp;
+              pos.occSymbol = occ;
+              seen.add(occ);
+              log(acct, `ROBINHOOD SYNC: resolved ${pos.ticker} ${pos.type} strike=$${resolvedStrike} exp=${resolvedExp || "?"} from filled order`);
+            }
+            if (resolvedExp && !pos.expiryDate) {
+              const expMs = new Date(resolvedExp).getTime();
+              if (expMs > 0) {
+                pos.expiryDate = expMs;
+                pos.dteRemaining = Math.max(0, Math.ceil((expMs - now) / 86400000));
+              }
+            }
+          }
+        } catch (e) {
+          log(acct, `ROBINHOOD SYNC: strike resolve error — ${e.message}`);
+        }
+      }
+    }
+
+    // Step 1.5: Stale exit-order watchdog. A sell_to_close limit order can sit unfilled forever
+    // if the market moves away from it (or it was mispriced) — there's no broker-side trailing/
+    // re-pricing. If an exit order we placed hasn't filled within a few minutes, cancel it so the
+    // next cycle's tryExits re-attempts at a fresh price (guaranteed-fill logic prices at the
+    // current bid for losing positions, so a retry should clear immediately).
+    if (robinhood.optionsEnabled) {
+      const STALE_EXIT_ORDER_MS = 3 * 60_000;
+      for (const pos of positions) {
+        if (pos.type === "equity" || pos.optionsSource !== "robinhood") continue;
+        const posMeta = state.meta[pos.occSymbol];
+        if (!posMeta || !posMeta.exitOrderPlacedAt) continue;
+        const age = now - posMeta.exitOrderPlacedAt;
+        const stillInflight = acct._inflightTickers && acct._inflightTickers.has(pos.ticker.toUpperCase());
+        if (!stillInflight) {
+          // No longer a working order on the broker — either it filled or was canceled
+          // externally. Either way, stop tracking it; the position list reflects current truth.
+          delete posMeta.exitOrderId;
+          delete posMeta.exitOrderPlacedAt;
+          delete posMeta.exitOrderLimit;
+        } else if (age >= STALE_EXIT_ORDER_MS && posMeta.exitOrderId) {
+          try {
+            await robinhood.cancelOptionOrder(posMeta.exitOrderId);
+            posMeta.exitAttempts = (posMeta.exitAttempts || 0) + 1;
+            log(acct, `ROBINHOOD SYNC: canceled stale exit order for ${pos.ticker} (unfilled ${(age / 60000).toFixed(1)}m @ $${posMeta.exitOrderLimit}, attempt ${posMeta.exitAttempts}) — will re-price more aggressively next cycle`);
+          } catch (e) {
+            log(acct, `ROBINHOOD SYNC: cancel stale exit order failed for ${pos.ticker} — ${e.message}`);
+          }
+          delete posMeta.exitOrderId;
+          delete posMeta.exitOrderPlacedAt;
+          delete posMeta.exitOrderLimit;
+          acct._inflightTickers.delete(pos.ticker.toUpperCase());
+        }
+      }
+    }
+
+    // Step 2: Fetch live bid prices for options positions that still have no live mark.
+    // Bid = what we'd actually receive when selling to close.
+    if (robinhood.optionsEnabled) {
+      const needsMark = positions.filter(
+        p => p.optionsSource === "robinhood" && p.type !== "equity" && p.liveMark == null
+      );
+      if (needsMark.length > 0) {
+        const tickers = [...new Set(needsMark.map(p => p.ticker))];
+        // Prefer fetching by option instrument id (UUID from the positions endpoint) — that's the
+        // unambiguous key. Fall back to bare tickers only if some position lacks an id.
+        const optionIds = needsMark.map(p => p.instrumentUrl).filter(Boolean);
+        const fetchArg = optionIds.length === needsMark.length ? optionIds : tickers;
+        try {
+          const mdRes = await robinhood.getOptionMarketData(fetchArg);
+          const mdRaw = mdRes && mdRes.data ? mdRes.data : mdRes;
+          // Flatten multiple possible response shapes into an array of contract items
+          const mdItems = Array.isArray(mdRaw) ? mdRaw
+            : (mdRaw && Array.isArray(mdRaw.options)) ? mdRaw.options
+            : (mdRaw && Array.isArray(mdRaw.results)) ? mdRaw.results
+            : (mdRaw && Array.isArray(mdRaw.contracts)) ? mdRaw.contracts
+            : [];
+
+          // Log response shape to dashboard so we can diagnose format issues
+          const firstKeys = mdItems.length > 0 ? Object.keys(mdItems[0]).join(",") : "none";
+          log(acct, `ROBINHOOD SYNC: market data — ${mdItems.length} items, keys: ${firstKeys}`);
+          // DIAGNOSTIC: dump the raw first item AND the top-level wrapper keys so we can see the
+          // true response shape and how items are keyed/priced. Remove once matching is confirmed.
+          log(acct, `RH-RAW MKTDATA wrapper keys: ${mdRaw && typeof mdRaw === "object" ? Object.keys(mdRaw).join(",") : typeof mdRaw}`);
+          if (mdItems.length > 0) {
+            log(acct, `RH-RAW MKTDATA item[0]: ${JSON.stringify(mdItems[0]).slice(0, 900)}`);
+          } else {
+            log(acct, `RH-RAW MKTDATA (no items array): ${JSON.stringify(mdRaw).slice(0, 900)}`);
+          }
+
+          for (const pos of needsMark) {
+            // Identifier priority, most to least reliable:
+            // 1. Option instrument id (the UUID from the positions endpoint) — unambiguous. The
+            //    market-data item may echo it under option_id / instrument_id / id / instrument.
+            // 2. OCC symbol — exact ticker+expiry+type+strike encoded string.
+            // 3. ticker+type+strike+expiry field-by-field match.
+            // 4. If we queried for exactly one contract and got back exactly one item, it must be
+            //    ours (no ambiguity). NOT applied when multiple items came back.
+            let match = null;
+            if (pos.instrumentUrl) {
+              match = mdItems.find(item =>
+                (item.option_id && item.option_id === pos.instrumentUrl) ||
+                (item.instrument_id && item.instrument_id === pos.instrumentUrl) ||
+                (item.id && item.id === pos.instrumentUrl) ||
+                (item.instrument && (item.instrument === pos.instrumentUrl || String(item.instrument).includes(pos.instrumentUrl)))
+              );
+            }
+            if (!match) {
+              match = mdItems.find(item => {
+                const rawSym = (item.symbol || item.occ_symbol || "").toUpperCase();
+                return rawSym && pos.occSymbol && rawSym === pos.occSymbol.toUpperCase();
+              });
+            }
+            if (!match) {
+              match = mdItems.find(item => {
+                const rawSym = (item.symbol || item.occ_symbol || "").toUpperCase();
+                const itemTicker = (item.chain_symbol || rawSym.replace(/\d.*/, "").trim() || "").toUpperCase();
+                if (itemTicker && itemTicker !== pos.ticker) return false;
+                const itemType = (item.option_type || item.type || "").toLowerCase();
+                if (itemType && itemType !== pos.type) return false;
+                if (pos.strike > 0) {
+                  const itemStrike = parseFloat(item.strike_price || item.strike || 0);
+                  if (itemStrike > 0 && Math.abs(itemStrike - pos.strike) > 0.01) return false;
+                }
+                if (pos.expiryDate) {
+                  const posExpStr = new Date(pos.expiryDate).toISOString().slice(0, 10);
+                  const itemExp = (item.expiration_date || item.expiration || "").slice(0, 10);
+                  if (itemExp && itemExp !== posExpStr) return false;
+                }
+                return true;
+              });
+            }
+            // Single-ticker, single-item response: no ambiguity, safe to use even without a
+            // field-level match (covers responses that only carry an opaque instrument URL).
+            // Requires needsMark.length === 1 too — if we're tracking two distinct contracts on
+            // the same ticker, a single returned item still can't be safely assigned to either.
+            // Deliberately NOT applied when multiple items came back — picking the "first" one
+            // out of a multi-strike/multi-expiry chain previously caused this exact position to
+            // be priced off an unrelated contract (e.g. showing -52% while Robinhood's own
+            // account page showed the real position roughly flat).
+            if (!match && tickers.length === 1 && needsMark.length === 1 && mdItems.length === 1) {
+              match = mdItems[0];
+            }
+
+            if (match) {
+              // Tolerant field extraction. The live server nests pricing in a `quote` sub-object
+              // ({ ..., quote: { bid_price, ask_price, mark_price, ... } }) — observed via
+              // /api/rh-debug — so merge that over the top-level fields before extracting.
+              // Older/top-level variants still work as fallbacks.
+              const src = (match.quote && typeof match.quote === "object")
+                ? { ...match, ...match.quote }
+                : (match.market_data && typeof match.market_data === "object")
+                  ? { ...match, ...match.market_data }
+                  : match;
+              const num = (...keys) => {
+                for (const k of keys) {
+                  const v = parseFloat(src[k]);
+                  if (!isNaN(v) && v > 0) return v;
+                }
+                return null;
+              };
+              const bid = num("bid_price", "bid", "best_bid_price");
+              const ask = num("ask_price", "ask", "best_ask_price");
+              const markRaw = num("mark_price", "adjusted_mark_price", "mark");
+              const lastTrade = num("last_trade_price", "last_trade", "last_price", "previous_close_price");
+              // Compute mid from two-sided market — Robinhood MCP sometimes returns mark_price=0.00
+              // even during market hours. Mid is a better fair-value estimate than raw bid.
+              const mid = (bid != null && ask != null) ? +((bid + ask) / 2).toFixed(2) : null;
+              pos.liveBid = bid;
+              pos.liveAsk = ask;
+              // Priority: API mark → computed mid → last trade → bid as last resort.
+              // liveBid is kept for actual sell order limit prices (filled at bid, not mid).
+              pos.liveMark = markRaw ?? mid ?? lastTrade ?? bid;
+              log(acct, `ROBINHOOD SYNC: ${pos.ticker} ${pos.type} live bid=${bid} ask=${ask} mark=${markRaw} mid=${mid} → liveMark=${pos.liveMark}`);
+              if (pos.liveMark != null && pos.entryPremium > 0) {
+                const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
+                if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
+              }
+            } else {
+              log(acct, `ROBINHOOD SYNC: ${pos.ticker} ${pos.type} — no live bid match in ${mdItems.length} items`);
+            }
+          }
+        } catch (e) {
+          log(acct, `ROBINHOOD SYNC: live bid fetch error — ${e.message} | ${(e.stack || "").split("\n")[1]?.trim() || ""}`);
+        }
+      }
+
+      // Step 2.5: Tradier NBBO fallback. If Robinhood's market data still didn't yield a mark
+      // (tool missing, shape drift, zero'd quotes), price the contract off Tradier by its OCC
+      // symbol — a real two-sided market from a second source beats holding blind. Positions
+      // with no reliable mark from EITHER source stay null and the exit logic holds them.
+      const stillUnmarked = positions.filter(
+        p => p.optionsSource === "robinhood" && p.type !== "equity" && p.liveMark == null
+          && p.occSymbol && robinhood.parseOCC(p.occSymbol)
+      );
+      if (stillUnmarked.length > 0 && tradier.isConnected) {
+        try {
+          const tq = await tradier.getOptionQuotes(stillUnmarked.map(p => p.occSymbol));
+          for (const pos of stillUnmarked) {
+            const q = tq[pos.occSymbol];
+            if (q && q.twoSided) {
+              pos.liveBid = q.bid;
+              pos.liveAsk = q.ask;
+              pos.liveMark = q.mid;
+              pos.markSource = "tradier";
+              log(acct, `ROBINHOOD SYNC: ${pos.ticker} ${pos.type} priced via Tradier fallback — bid=${q.bid} ask=${q.ask} mid=${q.mid}`);
+              if (pos.entryPremium > 0) {
+                const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
+                if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
+              }
+            }
+          }
+        } catch (e) {
+          log(acct, `ROBINHOOD SYNC: Tradier mark fallback error — ${e.message}`);
+        }
+      }
+    }
+
+    // Step 3: Work unfilled ENTRY orders — the "chase or walk away" decision.
+    await workRobinhoodEntryOrders(acct, now);
+
+    // Prune stale meta — but never prune fresh metadata for an order that hasn't produced a
+    // broker position yet (unfilled entries). Pruning those (the old behavior) destroyed the
+    // AI thesis + entry context between order placement and fill.
+    const META_GRACE_MS = 24 * 60 * 60_000;
     for (const k of Object.keys(state.meta)) {
-      if (!seen.has(k)) delete state.meta[k];
+      if (seen.has(k)) continue;
+      const m = state.meta[k] || {};
+      const lastActivity = Math.max(m.openTime || 0, m.entryOrderPlacedAt || 0, m.exitOrderPlacedAt || 0);
+      if (lastActivity && now - lastActivity < META_GRACE_MS) continue;
+      delete state.meta[k];
     }
 
     state.positions = positions;
@@ -9590,7 +10329,7 @@ async function runCycle(acct, sharedQuotes, apiKey) {
   const state = acct.state;
   const cfg = acct.config;
   const dash = acct.dashboard;
-  const mktOpen = isMarketOpen();
+  const mktOpen = acct.config.broker === "robinhood" ? isMarketOpenLocal() : isMarketOpen();
   log(acct, mktOpen ? "MARKET OPEN — Starting auto-trade cycle" : "MARKET CLOSED — Starting trade cycle (trade-when-closed)");
   dash.marketOpen = mktOpen;
 
@@ -9707,6 +10446,9 @@ async function runCycle(acct, sharedQuotes, apiKey) {
   acct.riskPct = effectiveRiskPct(cfg.baseRiskPct, regime);
   log(acct, `REGIME: ${regime.label} | Risk: ${(acct.riskPct * 100).toFixed(1)}% per trade (${cfg.baseRiskPct >= 1.0 ? "max risk override, regime scale skipped" : `${regime.riskScale}x base`})`);
 
+  // Daily loss halt fires off open-position drawdown too — check before entries, after sync.
+  evaluateRiskHalts(acct, portfolioValue(state, quotes));
+
   tryTimeBasedExits(acct, quotes);
   tryExits(acct, quotes);
   trySignalExits(acct, quotes, analyses);
@@ -9729,6 +10471,8 @@ async function runCycle(acct, sharedQuotes, apiKey) {
         dec.reason = result.reason;
       }
     } else if (result && result.ticker) {
+      // Count every new entry (paper position or broker order) against the day-trade cap.
+      ensureRiskState(acct).dayTrades += 1;
       log(acct, `TRADE: BUY ${result.qty}x ${result.ticker} $${result.strike} ${result.type.toUpperCase()} ${result.dte}d @ $${result.entryPremium.toFixed(2)} ($${result.cost.toFixed(0)}) [setup:${result.setupQuality}/100 claude:${result.claudeConfidence}%]`);
       // Push notification — replicate this trade
       const entryA = analyses[ticker];
@@ -9778,7 +10522,7 @@ async function runPausedCycle(acct, sharedQuotes) {
   const state = acct.state;
   const cfg = acct.config;
   const dash = acct.dashboard;
-  dash.marketOpen = isMarketOpen();
+  dash.marketOpen = acct.config.broker === "robinhood" ? isMarketOpenLocal() : isMarketOpen();
 
   // Keep dashboard quotes alive so PV and UI don't freeze while paused
   for (const ticker of Object.keys(sharedQuotes)) {
@@ -9864,7 +10608,12 @@ function buildPositionDetails(acct, quotes) {
     }
 
     const isEq = pos.type === "equity";
-    const curPremium = isEq ? (pos.liveMark ?? spot) : (pos.liveMark ?? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type));
+    // When strike is unknown (0) for an options position, synthetic pricing is wildly wrong
+    // (optPrice treats it as a deeply ITM call, returning ~stock price). Fall back to entryPremium
+    // so P&L shows 0% rather than an absurd number until the strike is resolved.
+    const strikeKnown = isEq || pos.strike > 0;
+    const curPremium = isEq ? (pos.liveMark ?? spot)
+      : (pos.liveMark ?? (strikeKnown ? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
     const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
     const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * (isEq ? 1 : 100);
     const profitPrice = pos.entryPremium * (1 + cfg.profitTarget);
@@ -9883,7 +10632,7 @@ function buildPositionDetails(acct, quotes) {
       pctToStop: ((effectiveStop - curPremium) / curPremium * 100).toFixed(1),
       greeks: pos.liveGreeks
         ? { delta: (pos.liveGreeks.delta ?? 0).toFixed(3), theta: (pos.liveGreeks.theta ?? 0).toFixed(3) }
-        : optGreeks(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type),
+        : (strikeKnown ? optGreeks(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : { delta: "?", theta: "?" }),
     };
   });
 }
@@ -10343,7 +11092,9 @@ async function main() {
   await refreshMarketClock(true);
   const initialMarketOpen = isMarketOpen();
   for (const [, acct] of accounts) {
-    if (acct.dashboard) acct.dashboard.marketOpen = initialMarketOpen;
+    if (acct.dashboard) {
+      acct.dashboard.marketOpen = acct.config.broker === "robinhood" ? isMarketOpenLocal() : initialMarketOpen;
+    }
   }
 
   // Start web dashboard  
@@ -10403,15 +11154,20 @@ async function main() {
 
     // Pull the authoritative exchange state from Tradier (cached 30s) before deciding what to run.
     await refreshMarketClock();
+    // marketOpen uses Tradier clock (authoritative for Tradier-brokered accounts).
+    // marketOpenLocal uses only ET time — never touches Tradier — and is the sole signal for
+    // Robinhood accounts so that a Tradier API outage or stale state never blocks RH exits.
     const marketOpen = isMarketOpen();
+    const marketOpenLocal = isMarketOpenLocal();
     // Accounts may opt into trading while closed (e.g. broker sandbox testing). If any non-paused
     // account does, we run the fast cycle so its full runCycle (entries+exits) executes now.
     const forcedAccts = [...accounts.values()].filter(a => !a.paused && a.config.tradeWhenClosed);
-    const activeCycle = marketOpen || forcedAccts.length > 0;
+    const rhAccts = [...accounts.values()].filter(a => !a.paused && a.config.broker === "robinhood");
+    const activeCycle = marketOpen || forcedAccts.length > 0 || (rhAccts.length > 0 && marketOpenLocal);
 
     if (activeCycle) {
       const today = getETDateStr();
-      if (marketOpen && lastCandleDate !== today) {
+      if ((marketOpen || marketOpenLocal) && lastCandleDate !== today) {
         sharedCandleCache = {};
         for (const [, acct] of accounts) acct.candleCache = {};
         lastCandleDate = today;
@@ -10428,11 +11184,14 @@ async function main() {
 
         for (const [, acct] of accounts) {
           try {
-            const tradeThis = marketOpen || acct.config.tradeWhenClosed;
+            if (acct.config.broker === "robinhood") await syncRobinhoodAccount(acct, sharedQuotes).catch(e => log(acct, `ROBINHOOD SYNC: ${e.message}`));
+            // Robinhood uses local ET time only — Tradier clock is irrelevant for RH.
+            const acctMarketOpen = acct.config.broker === "robinhood" ? marketOpenLocal : marketOpen;
+            const tradeThis = acctMarketOpen || acct.config.tradeWhenClosed;
             if (acct.paused) {
               await runPausedCycle(acct, sharedQuotes);
             } else if (tradeThis) {
-              if (!marketOpen) log(acct, "TRADE-WHEN-CLOSED — running full cycle while market is closed (test mode)");
+              if (!acctMarketOpen) log(acct, "TRADE-WHEN-CLOSED — running full cycle while market is closed (test mode)");
               await runCycle(acct, sharedQuotes, apiKey);
             } else {
               await runAfterHoursScan(acct, sharedQuotes, apiKey);
@@ -10448,9 +11207,9 @@ async function main() {
 
       saveAccounts();
       console.log("");
-      await delay(marketOpen ? CYCLE_MS : CYCLE_MS_CLOSED);
+      await delay((marketOpen || marketOpenLocal) ? CYCLE_MS : CYCLE_MS_CLOSED);
     } else {
-      // After hours
+      // After hours (both Tradier clock and local ET time say market is closed)
       try {
         const { sharedQuotes } = await fetchSharedMarketData(apiKey, sharedCandleCache);
         for (const [, acct] of accounts) {
@@ -10460,6 +11219,7 @@ async function main() {
         }
 
         for (const [, acct] of accounts) {
+          if (acct.config.broker === "robinhood") await syncRobinhoodAccount(acct, sharedQuotes).catch(e => log(acct, `ROBINHOOD SYNC: ${e.message}`));
           if (!acct.paused) await runAfterHoursScan(acct, sharedQuotes, apiKey);
           // paused accounts: candles already synced above, no further action needed after hours
         }
@@ -10474,7 +11234,7 @@ async function main() {
       const sleepStart = Date.now();
       while (Date.now() - sleepStart < 15 * 60_000) {
         await refreshMarketClock(true);
-        if (isMarketOpen()) {
+        if (isMarketOpen() || isMarketOpenLocal()) {
           console.log("  [WAKE] Market open detected — starting trading cycle now");
           break;
         }
