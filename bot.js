@@ -770,9 +770,16 @@ function noteDataSource(src) {
 // at 3:05 PM isn't meaningfully riskier than one at 2:55 PM. Narrowed to the last 15 minutes,
 // where the concern (thin closing liquidity, overnight gap risk) is actually concentrated.
 const EOD_FREEZE_HOUR = 15.75;  // No new entries in the last 15 min (after 3:45 PM ET)
-const EOD_TIGHTEN_HOUR = 15.75; // Tighten stops in the last 15 min (after 3:45 PM ET)
-const EOW_TRIM_HOUR = 14;      // Friday profit-taking starts at 2:00 PM ET (separate concern —
-                               // weekend theta decay over 2 non-trading days, not close proximity — left as-is)
+const EOD_TIGHTEN_HOUR = 15.75; // Hard EOD profit lock (after 3:45 PM ET)
+const EOD_SOFT_HOUR = 15.0;     // Soft EOD: lock winners that are stalling / giving back (after 3:00 PM)
+const EOW_TRIM_HOUR = 14;       // Friday soft/hard profit-taking starts at 2:00 PM ET
+const EOW_SOFT_MIN_PNL = 0.10;  // Fri soft lock floor (+10%) when stalling near the close
+const EOD_SOFT_MIN_PNL = 0.10;  // Weekday soft lock floor when stalling after 3:00
+const EOD_HARD_MIN_PNL = 0.10;  // Hard lock at 3:45 regardless of stall
+const EOW_HARD_MIN_PNL = 0.20;  // Fri hard lock (+20%) — weekend theta
+const NEAR_TARGET_FRAC = 0.70;  // "Close enough" to configured profit target to bank on stall
+const PEAK_GIVEBACK_FRAC = 0.30; // Gave back ≥30% of peak gains
+const PEAK_GIVEBACK_MIN = 0.04;  // …and at least 4 percentage points off the peak
 const LOW_DTE_THRESHOLD = 5;   // Accelerate exits when DTE <= 5
 const CRITICAL_DTE = 3;        // Force-close when DTE <= 3 (give exits room before gamma cliff)
 
@@ -2999,6 +3006,101 @@ function portfolioValue(state, quotes) {
   return val;
 }
 
+/**
+ * Keep startingCash (= capital contributed / zero-point) in sync with external deposits/withdrawals.
+ * Without this, funding the Robinhood agentic account looks like +700% "profit".
+ *
+ * Heuristic: equity jumps of >= $100 (or 8% of capital base) between syncs are treated as external
+ * capital flows, not trading P&L. Manual corrections via Settings still win for exact accounting.
+ */
+function reconcileBrokerCapital(acct, newEquity, { cashDelta = null } = {}) {
+  if (!(newEquity > 0) || acct._simMode) return;
+  const state = acct.state;
+  const prevEquity = state.lastBrokerEquity;
+  state.lastBrokerEquity = newEquity;
+
+  if (!(prevEquity > 0)) return; // first observation — just arm the tracker
+
+  const equityDelta = newEquity - prevEquity;
+  const threshold = Math.max(100, (acct.config.startingCash || 200) * 0.08);
+  // Prefer cash-confirmed deposits: buying power jumped with equity (funding), not just MTM.
+  const cashConfirmed = typeof cashDelta === "number" && Math.abs(cashDelta) >= 75
+    && Math.sign(cashDelta) === Math.sign(equityDelta);
+  if (Math.abs(equityDelta) < threshold && !cashConfirmed) return;
+  // Ignore tiny residual mismatches when cash didn't move (pure mark-to-market).
+  if (!cashConfirmed && Math.abs(equityDelta) < threshold * 1.5) return;
+
+  const amount = cashConfirmed
+    // When cash confirms, use the cash delta (closer to the wire deposit amount) but never larger
+    // than the equity move by more than a few bucks of noise.
+    ? (Math.abs(cashDelta) <= Math.abs(equityDelta) + 5 ? cashDelta : equityDelta)
+    : equityDelta;
+
+  const before = acct.config.startingCash || 0;
+  acct.config.startingCash = Math.max(1, +(before + amount).toFixed(2));
+  if (!state.capitalEvents) state.capitalEvents = [];
+  state.capitalEvents.push({
+    ts: Date.now(),
+    type: amount > 0 ? "deposit" : "withdrawal",
+    amount: +amount.toFixed(2),
+    equity: +newEquity.toFixed(2),
+    capitalBase: acct.config.startingCash,
+    auto: true,
+  });
+  // Deposits shouldn't look like a green day against the daily-loss breaker baseline.
+  if (state.risk && typeof state.risk.dayStartPV === "number" && state.risk.dayStartPV > 0) {
+    state.risk.dayStartPV = +(state.risk.dayStartPV + amount).toFixed(2);
+  }
+  log(acct, `CAPITAL: ${amount > 0 ? "deposit" : "withdrawal"} $${Math.abs(amount).toFixed(0)} ${cashConfirmed ? "(cash-confirmed) " : ""}→ capital base $${before.toFixed(0)} → $${acct.config.startingCash.toFixed(0)} (equity $${newEquity.toFixed(0)})`);
+  saveAccounts();
+}
+
+function setCapitalBase(acct, newBase, { note = "manual" } = {}) {
+  const base = Math.max(1, +parseFloat(newBase) || 0);
+  const before = acct.config.startingCash || 0;
+  const amount = base - before;
+  acct.config.startingCash = +base.toFixed(2);
+  if (!acct.state.capitalEvents) acct.state.capitalEvents = [];
+  acct.state.capitalEvents.push({
+    ts: Date.now(),
+    type: amount >= 0 ? "set_base" : "set_base",
+    amount: +amount.toFixed(2),
+    equity: acct.state.brokerEquity ?? null,
+    capitalBase: acct.config.startingCash,
+    note,
+    auto: false,
+  });
+  if (acct.state.risk && typeof acct.state.risk.dayStartPV === "number" && acct.state.risk.dayStartPV > 0) {
+    acct.state.risk.dayStartPV = +(acct.state.risk.dayStartPV + amount).toFixed(2);
+  }
+  log(acct, `CAPITAL: set base $${before.toFixed(0)} → $${acct.config.startingCash.toFixed(0)} (${note})`);
+  saveAccounts();
+  return acct.config.startingCash;
+}
+
+function recordCapitalDeposit(acct, amount, { note = "manual deposit" } = {}) {
+  const amt = +parseFloat(amount) || 0;
+  if (!amt) return acct.config.startingCash;
+  const before = acct.config.startingCash || 0;
+  acct.config.startingCash = Math.max(1, +(before + amt).toFixed(2));
+  if (!acct.state.capitalEvents) acct.state.capitalEvents = [];
+  acct.state.capitalEvents.push({
+    ts: Date.now(),
+    type: amt > 0 ? "deposit" : "withdrawal",
+    amount: +amt.toFixed(2),
+    equity: acct.state.brokerEquity ?? null,
+    capitalBase: acct.config.startingCash,
+    note,
+    auto: false,
+  });
+  if (acct.state.risk && typeof acct.state.risk.dayStartPV === "number" && acct.state.risk.dayStartPV > 0) {
+    acct.state.risk.dayStartPV = +(acct.state.risk.dayStartPV + amt).toFixed(2);
+  }
+  log(acct, `CAPITAL: ${amt > 0 ? "deposit" : "withdrawal"} $${Math.abs(amt).toFixed(0)} recorded → capital base $${acct.config.startingCash.toFixed(0)} (${note})`);
+  saveAccounts();
+  return acct.config.startingCash;
+}
+
 // ─── Trust-Scaled Cash Reserve ───
 // "Trust" blends the conviction signals available at entry into a 0..1 score. Higher trust lets
 // the bot draw the cash buffer down from CASH_RESERVE_MAX toward CASH_RESERVE_MIN.
@@ -4715,6 +4817,7 @@ function tryExits(acct, quotes) {
 
     if (!pos.bestPnlPct) pos.bestPnlPct = 0;
     if (pnlPct > pos.bestPnlPct) pos.bestPnlPct = pnlPct;
+    persistPosTrailMeta(acct, pos);
     if (!pos.trimLevel) pos.trimLevel = 0;
     if (!pos.originalQty) pos.originalQty = pos.qty;
 
@@ -4892,38 +4995,171 @@ function trySignalExits(acct, quotes, analyses) {
 }
 
 // ─── EOD / EOW Theta-Aware Exits ───
+// Hard locks (existing): Fri +20% from 2pm, any day +10% from 3:45pm.
+// Soft locks (new): earlier in the afternoon, bank a good winner when the move is clearly
+ // stalling or giving back from its session peak — the Friday SPY case (manual close near EOD
+ // after leveling off shy of the formal target).
 
-function tryTimeBasedExits(acct, quotes) {
+function recordMarkTrail(pos, mark) {
+  if (!(mark > 0)) return;
+  if (!pos.markTrail) pos.markTrail = [];
+  const now = Date.now();
+  const last = pos.markTrail[pos.markTrail.length - 1];
+  // Coalesce sub-minute duplicates so the trail spans real time, not sync spam.
+  if (last && now - last.ts < 45_000) {
+    last.mark = mark;
+    last.ts = now;
+  } else {
+    pos.markTrail.push({ ts: now, mark });
+  }
+  if (pos.markTrail.length > 16) pos.markTrail.shift();
+}
+
+// Broker syncs rebuild positions each cycle — keep peak/trail on meta so soft EOD can see them.
+function persistPosTrailMeta(acct, pos) {
+  if (!acct?.state) return;
+  if (!acct.state.meta) acct.state.meta = {};
+  const key = pos.occSymbol || pos.ticker;
+  if (!key) return;
+  if (!acct.state.meta[key]) acct.state.meta[key] = {};
+  const m = acct.state.meta[key];
+  if (typeof pos.bestPnlPct === "number") m.bestPnlPct = Math.max(m.bestPnlPct || 0, pos.bestPnlPct);
+  if (Array.isArray(pos.markTrail) && pos.markTrail.length) m.markTrail = pos.markTrail.slice(-16);
+}
+
+function restorePosTrail(pos, meta, prev) {
+  const fromMeta = Array.isArray(meta?.markTrail) ? meta.markTrail : null;
+  const fromPrev = Array.isArray(prev?.markTrail) ? prev.markTrail : null;
+  pos.markTrail = (fromMeta && fromMeta.length ? fromMeta : fromPrev || []).slice(-16);
+  pos.bestPnlPct = Math.max(meta?.bestPnlPct ?? 0, prev?.bestPnlPct ?? 0, pos.bestPnlPct || 0);
+}
+
+function premiumTrailStalling(pos) {
+  const trail = pos.markTrail || [];
+  if (trail.length < 4) return false;
+  const recent = trail.slice(-5).map(t => t.mark).filter(m => m > 0);
+  if (recent.length < 4) return false;
+  const peak = Math.max(...recent);
+  const first = recent[0];
+  const last = recent[recent.length - 1];
+  // Peaked in-window and last print is off that peak, with little net progress from the window start.
+  const offPeak = peak > 0 && (peak - last) / peak >= 0.015;
+  const flatNet = peak > 0 && Math.abs(last - first) / peak <= 0.025;
+  const declining = last <= recent[recent.length - 2] && last <= recent[recent.length - 3];
+  return offPeak && (flatNet || declining);
+}
+
+function premiumNotMakingHighs(pos) {
+  const trail = pos.markTrail || [];
+  const recent = trail.slice(-4).map(t => t.mark).filter(m => m > 0);
+  if (recent.length < 3) return false;
+  const peak = Math.max(...recent);
+  const last = recent[recent.length - 1];
+  if (!(peak > 0)) return false;
+  // Still printing near the window high → not a stall (let it run).
+  return (peak - last) / peak >= 0.008 && Math.abs(last - recent[0]) / peak <= 0.03;
+}
+
+function positionMoveStalling(pos, shortTerm, analysis) {
+  // Premium leveling is the primary signal (Friday SPY case: option stopped making highs near EOD).
+  if (premiumTrailStalling(pos)) return true;
+
+  // Underlying/thesis fade only counts when the premium itself has also stopped advancing —
+  // don't soft-exit a grinding winner just because 1d mom is flat.
+  if (!premiumNotMakingHighs(pos)) return false;
+
+  const mom = shortTerm?.mom1d;
+  if (typeof mom === "number") {
+    if (pos.type === "call" && mom <= 0.25) return true;
+    if (pos.type === "put" && mom >= -0.25) return true;
+    if (pos.type === "equity" && mom <= 0.15) return true;
+  }
+  const score = analysis?.score;
+  if (typeof score === "number") {
+    if (pos.type === "call" && score < 55) return true;
+    if (pos.type === "put" && score > 45) return true;
+  }
+  return false;
+}
+
+function peakGiveback(pos, pnlPct) {
+  const best = pos.bestPnlPct || 0;
+  if (best < EOD_SOFT_MIN_PNL) return false;
+  const giveback = best - pnlPct;
+  return giveback >= Math.max(PEAK_GIVEBACK_MIN, best * PEAK_GIVEBACK_FRAC);
+}
+
+function nearProfitTarget(cfg, pnlPct) {
+  const target = cfg.profitTarget || 0.40;
+  return pnlPct >= target * NEAR_TARGET_FRAC;
+}
+
+function tryTimeBasedExits(acct, quotes, analyses = null, shortTermAnalyses = null) {
   const state = acct.state;
+  const cfg = acct.config;
   const et = getETDate();
   const etHour = et.getHours() + et.getMinutes() / 60;
   const isFriday = et.getDay() === 5;
+  const anMap = analyses || acct.dashboard?.analyses || {};
+  const stMap = shortTermAnalyses || acct.dashboard?.shortTermAnalyses || {};
 
   const closed = [];
   const remaining = [];
 
   for (const pos of state.positions) {
-    if (pos._pending) { remaining.push(pos); continue; } // unfilled broker order, not a holding
-    if ((acct.config.broker === "tradier" || (acct.config.broker === "robinhood" && pos.type !== "equity")) && pos.liveMark == null) { remaining.push(pos); continue; } // no reliable mark — hold, never place live orders on model prices
+    if (pos._pending) { remaining.push(pos); continue; }
+    if ((acct.config.broker === "tradier" || (acct.config.broker === "robinhood" && pos.type !== "equity")) && pos.liveMark == null) {
+      remaining.push(pos); continue;
+    }
     const q = quotes[pos.ticker];
     if (!q) { remaining.push(pos); continue; }
 
     const spot = q.c;
-    const currentPremium = pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
+    const isEquity = pos.type === "equity";
+    const currentPremium = isEquity
+      ? (pos.liveMark ?? spot)
+      : (pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type));
+    if (!(pos.entryPremium > 0) || !(currentPremium > 0)) { remaining.push(pos); continue; }
+
     const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
+    if (pnlPct > (pos.bestPnlPct || 0)) pos.bestPnlPct = pnlPct;
+    recordMarkTrail(pos, currentPremium);
+    persistPosTrailMeta(acct, pos);
+
+    const st = stMap[pos.ticker];
+    const an = anMap[pos.ticker];
+    const stalling = positionMoveStalling(pos, st, an);
+    const givingBack = peakGiveback(pos, pnlPct);
+    const nearTP = nearProfitTarget(cfg, pnlPct);
     let reason = null;
 
+    // ── Friday afternoon ──
     if (isFriday && etHour >= EOW_TRIM_HOUR) {
-      if (pnlPct >= 0.20) {
+      if (pnlPct >= EOW_HARD_MIN_PNL) {
         reason = `EOW profit lock +${(pnlPct * 100).toFixed(0)}% (Fri ${etHour.toFixed(1)}h, avoid weekend theta)`;
       } else if (pos.dteRemaining <= CRITICAL_DTE) {
         reason = `EOW + low DTE (${pos.dteRemaining.toFixed(1)}d, Fri close)`;
+      } else if (pnlPct >= EOW_SOFT_MIN_PNL && (stalling || givingBack || nearTP)) {
+        const why = nearTP ? "near target" : givingBack ? `gave back from +${((pos.bestPnlPct || 0) * 100).toFixed(0)}% peak` : "move stalling";
+        reason = `EOW soft lock +${(pnlPct * 100).toFixed(0)}% (Fri ${etHour.toFixed(1)}h, ${why})`;
       }
     }
 
+    // ── Soft EOD from 3:00 — bank stalling winners before the final auction ──
+    if (!reason && etHour >= EOD_SOFT_HOUR && etHour < EOD_TIGHTEN_HOUR) {
+      if (pnlPct >= EOD_SOFT_MIN_PNL && (stalling || givingBack || nearTP)) {
+        const why = nearTP ? "near target" : givingBack ? `gave back from +${((pos.bestPnlPct || 0) * 100).toFixed(0)}% peak` : "move stalling";
+        reason = `EOD soft lock +${(pnlPct * 100).toFixed(0)}% (from 3:00, ${why})`;
+      }
+    }
+
+    // ── Hard EOD from 3:45 ──
     if (!reason && etHour >= EOD_TIGHTEN_HOUR) {
-      if (pnlPct >= 0.10 && pos.trimLevel === 0) {
+      if (pnlPct >= EOD_HARD_MIN_PNL && (pos.trimLevel || 0) === 0) {
         reason = `EOD lock +${(pnlPct * 100).toFixed(0)}% (3:45 PM tighten, protecting overnight)`;
+      } else if (pnlPct >= EOD_HARD_MIN_PNL * 0.8 && (stalling || givingBack) && (pos.trimLevel || 0) <= 1) {
+        // Already trimmed but still green into the close with a stall — don't gift overnight theta.
+        reason = `EOD lock +${(pnlPct * 100).toFixed(0)}% (3:45 PM, post-trim stall)`;
       }
     }
 
@@ -5441,13 +5677,14 @@ ${accountActionsHTML(acct.id, { spectator })}
 ${strategyPresetHTML(acct.id, { spectator })}
 <h1>${acct.name || "Swing Trader"}</h1>
 ${spectator ? '<div style="margin:8px 0 12px;padding:8px 12px;border:1px solid #2f6fed40;background:#2f6fed12;color:#2f6fed;border-radius:8px;font-size:12px;font-weight:700">Spectator mode: read-only dashboard. Settings, broker controls, notifications, and AI prompts are disabled.</div>' : ''}
-<div class="sub">$${STARTING_CASH} → $${GOAL.toLocaleString()} Challenge &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}" id="mkt-badge">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; <span id="live-indicator" style="color:#00a843">LIVE</span> updates every 5s &nbsp;|&nbsp; <span id="pv-header">$${pv.toFixed(0)}</span> <span id="pnl-header" style="color:${pnlPct >= 0 ? '#00a843' : '#e8473f'}">(${pnlPct >= 0 ? '+' : ''}${pnlPct}%)</span> &nbsp;|&nbsp; <span style="color:${currentRegime.mode === 'risk-on' ? '#00a843' : currentRegime.mode === 'cautious' ? '#b07400' : '#e8473f'};font-size:10px">${currentRegime.mode.toUpperCase()}</span> &nbsp;|&nbsp; <span class="llm-toggle" onclick="fetch('/api/llm-provider',{method:'POST'}).then(()=>location.reload())" title="Click to switch LLM provider">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>${acct.paused ? ' &nbsp;|&nbsp; <span style="color:#e8473f;font-weight:bold">⏸ PAUSED</span>' : ''}</div>
+<div class="sub">Capital $${STARTING_CASH.toLocaleString(undefined, { maximumFractionDigits: 0 })} → $${GOAL.toLocaleString()} Goal &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}" id="mkt-badge">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; <span id="live-indicator" style="color:#00a843">LIVE</span> updates every 5s &nbsp;|&nbsp; <span id="pv-header">$${pv.toFixed(0)}</span> <span id="pnl-header" style="color:${pnlPct >= 0 ? '#00a843' : '#e8473f'}">(${pnlPct >= 0 ? '+' : ''}${pnlPct}%)</span> &nbsp;|&nbsp; <span style="color:${currentRegime.mode === 'risk-on' ? '#00a843' : currentRegime.mode === 'cautious' ? '#b07400' : '#e8473f'};font-size:10px">${currentRegime.mode.toUpperCase()}</span> &nbsp;|&nbsp; <span class="llm-toggle" onclick="fetch('/api/llm-provider',{method:'POST'}).then(()=>location.reload())" title="Click to switch LLM provider">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>${acct.paused ? ' &nbsp;|&nbsp; <span style="color:#e8473f;font-weight:bold">⏸ PAUSED</span>' : ''}</div>
 
 <div class="grid">
   <div class="card">
     <h2>Portfolio</h2>
     <div class="stat ${pnlPct >= 0 ? "" : "neg"}" id="pv-card-wrap"><div class="val" id="pv-card">$${pv.toFixed(0)}</div><div class="lbl">Total Value</div></div>
-    <div class="stat ${pnlPct >= 0 ? "" : "neg"}" id="pnl-card-wrap"><div class="val" id="pnl-card">${pnlPct >= 0 ? "+" : ""}${pnlPct}%</div><div class="lbl">P&L</div></div>
+    <div class="stat ${pnlPct >= 0 ? "" : "neg"}" id="pnl-card-wrap"><div class="val" id="pnl-card">${pnlPct >= 0 ? "+" : ""}${pnlPct}%</div><div class="lbl">P&L vs capital</div></div>
+    <div class="stat"><div class="val" id="capital-card">$${STARTING_CASH.toFixed(0)}</div><div class="lbl">Capital in</div></div>
     <div class="stat"><div class="val" id="cash-card">$${state.cash.toFixed(0)}</div><div class="lbl">${cfg.broker === "tradier" ? ((state.accountType || "") === "cash" ? "Settled Cash" : "Spend Limit") : "Cash"}</div></div>
 
     ${cfg.broker === "tradier" ? `
@@ -5835,14 +6072,22 @@ async function pollLive() {
     const pnlEl = document.getElementById('pnl-header');
     if (pvEl) {
       pvEl.textContent = '$' + d.pv.toFixed(0);
-      const pnl = ((d.pv - ${STARTING_CASH}) / ${STARTING_CASH} * 100).toFixed(1);
+      const capital = (typeof d.startingCash === 'number' && d.startingCash > 0) ? d.startingCash : ${STARTING_CASH};
+      const pnl = ((d.pv - capital) / capital * 100).toFixed(1);
       pnlEl.textContent = '(' + (pnl >= 0 ? '+' : '') + pnl + '%)';
       pnlEl.style.color = pnl >= 0 ? '#00a843' : '#e8473f';
       const pvCard = document.getElementById('pv-card');
       const pnlCard = document.getElementById('pnl-card');
       const pvWrap = document.getElementById('pv-card-wrap');
       const pnlWrap = document.getElementById('pnl-card-wrap');
-      if (pvCard) pvCard.textContent = '
+      const cashCard = document.getElementById('cash-card');
+      const capitalCard = document.getElementById('capital-card');
+      if (pvCard) pvCard.textContent = '$' + d.pv.toFixed(0);
+      if (pnlCard) pnlCard.textContent = (pnl >= 0 ? '+' : '') + pnl + '%';
+      if (cashCard && typeof d.cash === 'number') cashCard.textContent = '$' + d.cash.toFixed(0);
+      if (capitalCard) capitalCard.textContent = '$' + capital.toFixed(0);
+      if (pvWrap) pvWrap.className = 'stat ' + (pnl >= 0 ? '' : 'neg');
+      if (pnlWrap) pnlWrap.className = 'stat ' + (pnl >= 0 ? '' : 'neg');
     }
     // Pulse indicator
     const ind = document.getElementById('live-indicator');
@@ -6965,6 +7210,13 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
         <input name="stopLoss" type="number" step="1" value="${(cfg.stopLoss * 100).toFixed(0)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Goal ($)</label>
         <input name="goal" type="number" value="${cfg.goal}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
+        <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Capital contributed / zero-point ($)${cfg.broker === "robinhood" || cfg.broker === "tradier" ? " — deposits go here, not into P&L" : ""}</label>
+        <input name="startingCash" type="number" step="0.01" value="${cfg.startingCash || 0}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:6px;box-sizing:border-box">
+        <p style="font-size:11px;color:#6b7280;margin:0 0 12px">P&amp;L = portfolio value − this number. When you deposit into Robinhood, update this (or use Record deposit below) so funding isn’t counted as profit.</p>
+        ${(cfg.broker === "robinhood" || cfg.broker === "tradier") ? `
+        <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Record deposit / withdrawal ($)</label>
+        <input name="capitalDeposit" type="number" step="0.01" placeholder="e.g. 100 or -50" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
+        ` : ""}
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Max Positions (blank = unlimited)</label>
         <input name="maxPositions" type="number" value="${cfg.maxPositions || ""}" placeholder="unlimited" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Max Trade Size ($ Circuit Breaker)</label>
@@ -7900,6 +8152,17 @@ function startDashboard(defaultAcct, apiKey) {
         if (params.has("profitTarget")) cfg.profitTarget = parseFloat(params.get("profitTarget")) / 100;
         if (params.has("stopLoss")) cfg.stopLoss = parseFloat(params.get("stopLoss")) / 100;
         if (params.has("goal")) cfg.goal = parseFloat(params.get("goal")) || cfg.goal;
+        // Capital base (zero-point). Prefer absolute set; optional deposit delta stacks on top.
+        if (params.has("startingCash") && params.get("startingCash") !== "") {
+          const next = parseFloat(params.get("startingCash"));
+          if (!isNaN(next) && next > 0 && Math.abs(next - (cfg.startingCash || 0)) > 0.005) {
+            setCapitalBase(target, next, { note: "settings" });
+          }
+        }
+        if (params.has("capitalDeposit") && params.get("capitalDeposit") !== "") {
+          const dep = parseFloat(params.get("capitalDeposit"));
+          if (!isNaN(dep) && dep !== 0) recordCapitalDeposit(target, dep, { note: "settings deposit field" });
+        }
         if (params.get("maxPositions")) cfg.maxPositions = parseInt(params.get("maxPositions")) || null;
         else cfg.maxPositions = null;
         if (params.get("maxTradeSize")) cfg.maxTradeSize = parseFloat(params.get("maxTradeSize")) || null;
@@ -8748,7 +9011,7 @@ function startDashboard(defaultAcct, apiKey) {
         if (pos) { const spot = q ? q.c : pos.entrySpot; const _isEq = pos.type === "equity"; const _now = Date.now(); const dteLeft = pos.expiryDate ? Math.max(0, (pos.expiryDate - _now) / 86400_000) : Math.max(0, pos.dte - (_now - pos.openTime) / 86400_000); const curPremium = _isEq ? (pos.liveMark ?? spot) : (pos.liveMark ?? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type)); const _mult = _isEq ? 1 : 100; posPnl = { pct: ((curPremium - pos.entryPremium) / pos.entryPremium * 100).toFixed(1), dollar: ((curPremium - pos.entryPremium) * pos.qty * _mult).toFixed(0) }; }
         tickers[sym] = { c: q.c, pc: q.pc, d: q.d, dp: q.dp, h: q.h, l: q.l, score: a?.score, signal: a?.signal, stScore: st?.score, mom1d: st?.mom1d, mom3d: st?.mom3d, mom7d: st?.mom7d, held: !!pos, type: pos?.type, posPnl };
       }
-      res.end(JSON.stringify({ tickers, pv: portfolioValue(state, dashboard.quotes), cash: state.cash, balanceInfo, open: state.positions.length, marketOpen: dashboard.marketOpen, lastCycle: dashboard.lastCycle }));
+      res.end(JSON.stringify({ tickers, pv: portfolioValue(state, dashboard.quotes), cash: state.cash, startingCash: activeAcct.config.startingCash, balanceInfo, open: state.positions.length, marketOpen: dashboard.marketOpen, lastCycle: dashboard.lastCycle }));
       return;
     }
 
@@ -9519,13 +9782,31 @@ async function ensureRobinhoodAccount() {
     if (acct.config.autoExecute === undefined) acct.config.autoExecute = true;
 
     if (typeof seedCash === "number") {
-      acct.state.cash = seedCash;
-      if (typeof acct.state.brokerEquity !== "number" || acct.state.brokerEquity <= 0) acct.state.brokerEquity = seedCash;
-      if (acct.state.positions.length === 0 && acct.state.history.length === 0 && seedCash > 0) acct.config.startingCash = seedCash;
+      // seedCash here is equity (preferred) or buying power — never overwrite spendable cash with
+      // total equity. Cash is refreshed properly in syncRobinhoodAccount from buying_power.
+      if (typeof acct.state.brokerEquity !== "number" || acct.state.brokerEquity <= 0) {
+        acct.state.brokerEquity = seedCash;
+        acct.state.lastBrokerEquity = seedCash;
+      }
+      // Only seed the capital base on a brand-new account. Later deposits are handled by
+      // reconcileBrokerCapital / Settings — overwriting here made deposits look like profit.
+      if (acct.state.positions.length === 0 && acct.state.history.length === 0
+          && !(acct.config.startingCash > DEFAULT_CONFIG.startingCash) && seedCash > 0) {
+        acct.config.startingCash = seedCash;
+      }
     }
+    // One-time repair: early RH accounts seeded startingCash at ~$100 while the user later
+    // funded ~$850. That made deposits read as +700% "profit". Snap the zero-point once.
+    if (!acct.state._capitalRepaired850
+        && (acct.config.startingCash || 0) > 0 && (acct.config.startingCash || 0) < 300
+        && ((acct.state.brokerEquity || 0) > 500 || (acct.state.history || []).length > 0)) {
+      setCapitalBase(acct, 850, { note: "one-time repair: ~$850 total deposits" });
+      acct.state._capitalRepaired850 = true;
+    }
+
     // Guard: startingCash must be > 0 to avoid +Infinity% P&L
     if (!(acct.config.startingCash > 0)) acct.config.startingCash = DEFAULT_CONFIG.startingCash;
-    console.log(`  Robinhood: live account present — cash $${acct.state.cash.toFixed(2)} (starting $${acct.config.startingCash})`);
+    console.log(`  Robinhood: live account present — cash $${(acct.state.cash || 0).toFixed(2)} (capital base $${acct.config.startingCash})`);
     return;
   }
 
@@ -9982,10 +10263,13 @@ async function syncBrokerAccount(acct, quotes) {
         direction: parsed.type === "call" ? "BULLISH" : "BEARISH",
       };
 
+      restorePosTrail(pos, meta, null);
       if (pos.liveMark != null && pos.entryPremium > 0) {
         const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
         if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
+        recordMarkTrail(pos, pos.liveMark);
       }
+      persistPosTrailMeta(acct, pos);
 
       // Backfill AI metadata for positions that pre-date the aiThesis feature (or were
       // opened outside the bot). Synthesize a basic thesis from current analysis data so
@@ -10015,6 +10299,7 @@ async function syncBrokerAccount(acct, quotes) {
         entryPremium: pos.entryPremium, entrySpot: pos.entrySpot, dte: pos.dte,
         originalQty: pos.originalQty, openDate: pos.openDate, openTime: pos.openTime,
         trimLevel: pos.trimLevel, bestPnlPct: pos.bestPnlPct, entryAtrPct: pos.entryAtrPct,
+        markTrail: Array.isArray(pos.markTrail) ? pos.markTrail.slice(-16) : undefined,
         ai: aiData, // keep the captured (or backfilled) AI thought process across syncs
       };
       seen.add(occ);
@@ -10236,15 +10521,18 @@ async function syncRobinhoodAccount(acct, quotes) {
         ?? port.equity ?? port.market_value ?? port.total_market_value ?? port.extended_hours_equity;
       if (eq && typeof eq === "object") eq = eq.amount ?? eq.value; // {amount:"429.11",currency:"USD"} shape
       const eqNum = typeof eq === "string" ? parseFloat(eq) : (typeof eq === "number" ? eq : NaN);
-      if (!isNaN(eqNum) && eqNum >= 0) {
-        state.brokerEquity = eqNum;
-      } else {
-        delete state.brokerEquity; // never let a stale equity reading override the live fallback math
-      }
       let bp = port.buying_power?.buying_power ?? port.buying_power ?? port.options_buying_power ?? port.cash;
       if (bp && typeof bp === "object") bp = bp.amount ?? bp.value;
       const bpNum = typeof bp === "string" ? parseFloat(bp) : (typeof bp === "number" ? bp : NaN);
+      const prevCash = typeof state.cash === "number" ? state.cash : null;
       if (!isNaN(bpNum) && bpNum >= 0) state.cash = bpNum;
+      if (!isNaN(eqNum) && eqNum >= 0) {
+        state.brokerEquity = eqNum;
+        const cashDelta = (prevCash != null && !isNaN(bpNum)) ? (bpNum - prevCash) : null;
+        reconcileBrokerCapital(acct, eqNum, { cashDelta });
+      } else {
+        delete state.brokerEquity; // never let a stale equity reading override the live fallback math
+      }
     }
     // Sale proceeds settle T+1: anything booked on a prior day is assumed absorbed into buying
     // power by now, so drop it from the unsettled credit (portfolioValue adds what remains).
@@ -10336,10 +10624,14 @@ async function syncRobinhoodAccount(acct, quotes) {
         direction: "BULLISH",
       };
 
+      const prevEq = prevPositions.find(pp => pp.ticker === ticker && pp.type === "equity");
+      restorePosTrail(pos, meta, prevEq);
       if (pos.liveMark != null && pos.entryPremium > 0) {
         const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
         if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
+        recordMarkTrail(pos, pos.liveMark);
       }
+      persistPosTrailMeta(acct, pos);
 
       let aiData = meta.ai || null;
       if (!aiData) {
@@ -10472,6 +10764,12 @@ async function syncRobinhoodAccount(acct, quotes) {
             direction: optType === "call" ? "BULLISH" : "BEARISH",
           };
 
+          const prevOpt = prevPositions.find(pp =>
+            (pp.occSymbol && pp.occSymbol === occ) ||
+            (pp.ticker === ticker && pp.type === optType && Math.abs((pp.strike || 0) - strike) < 0.01)
+          );
+          restorePosTrail(pos, meta, prevOpt);
+
           // Basis bookkeeping: when RH reports an actual average fill, persist it so stop/target
           // math and closure booking use the real basis even if the field is absent next cycle.
           // When it doesn't, mark the basis as an estimate so Step 1.2 reconciles it from the
@@ -10487,7 +10785,9 @@ async function syncRobinhoodAccount(acct, quotes) {
           if (pos.liveMark != null && pos.entryPremium > 0) {
             const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
             if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
+            recordMarkTrail(pos, pos.liveMark);
           }
+          persistPosTrailMeta(acct, pos);
 
           let aiData = meta.ai || null;
           if (!aiData) {
@@ -10854,6 +11154,8 @@ async function syncRobinhoodAccount(acct, quotes) {
           if (pos.liveMark != null && pos.entryPremium > 0) {
             const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
             if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
+            recordMarkTrail(pos, pos.liveMark);
+            persistPosTrailMeta(acct, pos);
           }
           return true;
         };
@@ -10932,6 +11234,8 @@ async function syncRobinhoodAccount(acct, quotes) {
               if (pos.entryPremium > 0) {
                 const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
                 if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
+                recordMarkTrail(pos, pos.liveMark);
+                persistPosTrailMeta(acct, pos);
               }
             }
           }
@@ -11086,7 +11390,7 @@ async function runCycle(acct, sharedQuotes, apiKey) {
   // Daily loss halt fires off open-position drawdown too — check before entries, after sync.
   evaluateRiskHalts(acct, portfolioValue(state, quotes));
 
-  tryTimeBasedExits(acct, quotes);
+  tryTimeBasedExits(acct, quotes, analyses, shortTermAnalyses);
   tryExits(acct, quotes);
   trySignalExits(acct, quotes, analyses);
   tryEMATrailingExits(acct, quotes);
@@ -11192,13 +11496,16 @@ async function runPausedCycle(acct, sharedQuotes) {
 
 
 
-  // Build minimal analyses for signal-based exits
+  // Build minimal analyses for signal-based / soft-EOD exits
   const analyses = {};
+  const shortTermAnalyses = {};
   for (const ticker of positionTickers) {
     const candles = acct.candleCache[ticker];
     if (candles) {
       const a = runAnalysis(candles);
       if (a) analyses[ticker] = a;
+      const st = runShortTermAnalysis(candles);
+      if (st) shortTermAnalyses[ticker] = st;
     }
   }
 
@@ -11211,7 +11518,7 @@ async function runPausedCycle(acct, sharedQuotes) {
   // ("risk") keeps the exit engines running so open positions aren't abandoned mid-halt.
   const manualPause = acct.pausedBy === "user";
   if (!manualPause) {
-    tryTimeBasedExits(acct, quotes);
+    tryTimeBasedExits(acct, quotes, analyses, shortTermAnalyses);
     tryExits(acct, quotes);
     trySignalExits(acct, quotes, analyses);
     tryEMATrailingExits(acct, quotes);
