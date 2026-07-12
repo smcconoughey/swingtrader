@@ -1342,7 +1342,7 @@ function log(acct, msg) {
   const line = `[${now}] ${prefix}${msg}`;
   console.log(line);
   acct.dashboard.cycleLog.push(line);
-  if (acct.dashboard.cycleLog.length > 200) acct.dashboard.cycleLog.shift();
+  if (acct.dashboard.cycleLog.length > 800) acct.dashboard.cycleLog.shift();
 }
 
 // Append-only trade log for Monte Carlo training
@@ -4587,7 +4587,23 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
           limit = Math.max(0.01, +(bid - 0.01).toFixed(2)); // 3rd+ attempt: cross the bid, get out
         }
 
-        const expStr = pos.expiryDate ? new Date(pos.expiryDate).toISOString().slice(0, 10) : null;
+          // Hard abort: refuse exits whose limit is clearly a different contract's premium.
+          // Friday 2026-07-10: PATH ($0.85 entry) was nearly sold at SPY's ~$6.66 mark (~$666 vs ~$85).
+          if (pos.entryPremium > 0 && limit > 0) {
+            const ratio = limit / pos.entryPremium;
+            if (ratio > 3.5 || ratio < 0.15) {
+              const badMark = pos.liveMark;
+              acct._inflightTickers.delete(pos.ticker.toUpperCase());
+              // Drop the bad mark so the next sync re-fetches instead of looping on garbage.
+              pos.liveMark = null;
+              pos.liveBid = null;
+              pos.liveAsk = null;
+              log(acct, `ROBINHOOD OPTION EXIT BLOCKED: ${pos.ticker} $${pos.strike} ${pos.type} limit $${limit} is ${ratio.toFixed(2)}x entry $${pos.entryPremium} (bid=${bid ?? "?"} mark=${badMark ?? "?"}) — refusing cross-contaminated price`);
+              return null;
+            }
+          }
+
+          const expStr = pos.expiryDate ? new Date(pos.expiryDate).toISOString().slice(0, 10) : null;
         if (expStr) {
           // Log synchronously, before the async call, so the cycle log always shows what was
           // attempted (and at what price) even if the network call hangs or the process restarts.
@@ -10406,6 +10422,24 @@ async function syncRobinhoodAccount(acct, quotes) {
           // chain, but the instrument URL cannot.
           const instrumentUrl = op.instrument || op.instrument_id || op.option_id || null;
 
+          // Reject clearly impossible marks from the positions payload itself (same failure mode
+          // as market-data cross-contamination: SPY premium attached to PATH).
+          let safeMark = mark;
+          let safeBid = bid;
+          let safeAsk = ask;
+          if (safeMark != null) {
+            const basis = entryPremium > 0 ? entryPremium : (meta.entryPremium || 0);
+            if (basis > 0) {
+              const ratio = safeMark / basis;
+              if (ratio > 3.5 || ratio < 0.15) {
+                log(acct, `ROBINHOOD SYNC: ignoring position mark $${safeMark} for ${ticker} $${strike} (entry $${basis}, ratio ${ratio.toFixed(2)}x)`);
+                safeMark = null;
+                safeBid = null;
+                safeAsk = null;
+              }
+            }
+          }
+
           const pos = {
             ...(meta.ai || {}),
             ticker,
@@ -10430,9 +10464,9 @@ async function syncRobinhoodAccount(acct, quotes) {
             bestPnlPct: meta.bestPnlPct ?? 0,
             entryAtrPct: meta.entryAtrPct ?? null,
             iv: parseFloat(op.implied_volatility || 0) || null,
-            liveMark: mark,
-            liveBid: bid,
-            liveAsk: ask,
+            liveMark: safeMark,
+            liveBid: safeBid,
+            liveAsk: safeAsk,
             liveGreeks: op.greeks || null,
             optionsSource: "robinhood",
             direction: optType === "call" ? "BULLISH" : "BEARISH",
@@ -10769,132 +10803,110 @@ async function syncRobinhoodAccount(acct, quotes) {
 
     // Step 2: Fetch live bid prices for options positions that still have no live mark.
     // Bid = what we'd actually receive when selling to close.
+    //
+    // CRITICAL: never batch-match by bare ticker / loose field equality. On 2026-07-10 the bot
+    // assigned SPY's ~$6.66 mark to PATH (entry $0.85) and tried to sell_to_close PATH at SPY's
+    // premium (~$666 contract vs ~$85 real). Matching MUST be by instrument UUID or exact OCC.
     if (robinhood.optionsEnabled) {
       const needsMark = positions.filter(
         p => p.optionsSource === "robinhood" && p.type !== "equity" && p.liveMark == null
       );
       if (needsMark.length > 0) {
-        const tickers = [...new Set(needsMark.map(p => p.ticker))];
-        // Prefer fetching by option instrument id (UUID from the positions endpoint) — that's the
-        // unambiguous key. Fall back to bare tickers only if some position lacks an id.
-        const optionIds = needsMark.map(p => p.instrumentUrl).filter(Boolean);
-        const fetchArg = optionIds.length === needsMark.length ? optionIds : tickers;
-        try {
-          const mdRes = await robinhood.getOptionMarketData(fetchArg);
+        const extractMdItems = (mdRes) => {
           const mdRaw = mdRes && mdRes.data ? mdRes.data : mdRes;
-          // Flatten multiple possible response shapes into an array of contract items
-          const mdItems = Array.isArray(mdRaw) ? mdRaw
-            : (mdRaw && Array.isArray(mdRaw.options)) ? mdRaw.options
-            : (mdRaw && Array.isArray(mdRaw.results)) ? mdRaw.results
-            : (mdRaw && Array.isArray(mdRaw.contracts)) ? mdRaw.contracts
-            : [];
-
-          // Log response shape to dashboard so we can diagnose format issues
-          const firstKeys = mdItems.length > 0 ? Object.keys(mdItems[0]).join(",") : "none";
-          log(acct, `ROBINHOOD SYNC: market data — ${mdItems.length} items, keys: ${firstKeys}`);
-          // DIAGNOSTIC: dump the raw first item AND the top-level wrapper keys so we can see the
-          // true response shape and how items are keyed/priced. Remove once matching is confirmed.
-          log(acct, `RH-RAW MKTDATA wrapper keys: ${mdRaw && typeof mdRaw === "object" ? Object.keys(mdRaw).join(",") : typeof mdRaw}`);
-          if (mdItems.length > 0) {
-            log(acct, `RH-RAW MKTDATA item[0]: ${JSON.stringify(mdItems[0]).slice(0, 900)}`);
-          } else {
-            log(acct, `RH-RAW MKTDATA (no items array): ${JSON.stringify(mdRaw).slice(0, 900)}`);
+          if (Array.isArray(mdRaw)) return mdRaw;
+          if (mdRaw && Array.isArray(mdRaw.options)) return mdRaw.options;
+          if (mdRaw && Array.isArray(mdRaw.results)) return mdRaw.results;
+          if (mdRaw && Array.isArray(mdRaw.contracts)) return mdRaw.contracts;
+          return [];
+        };
+        const applyQuoteToPos = (pos, match, sourceLabel) => {
+          const src = (match.quote && typeof match.quote === "object")
+            ? { ...match, ...match.quote }
+            : (match.market_data && typeof match.market_data === "object")
+              ? { ...match, ...match.market_data }
+              : match;
+          const num = (...keys) => {
+            for (const k of keys) {
+              const v = parseFloat(src[k]);
+              if (!isNaN(v) && v > 0) return v;
+            }
+            return null;
+          };
+          const bid = num("bid_price", "bid", "best_bid_price");
+          const ask = num("ask_price", "ask", "best_ask_price");
+          const markRaw = num("mark_price", "adjusted_mark_price", "mark");
+          const lastTrade = num("last_trade_price", "last_trade", "last_price", "previous_close_price");
+          const mid = (bid != null && ask != null) ? +((bid + ask) / 2).toFixed(2) : null;
+          const candidate = markRaw ?? mid ?? lastTrade ?? bid;
+          // Sanity: refuse marks that are clearly a different contract (e.g. SPY $6 onto PATH $0.85).
+          if (candidate != null && pos.entryPremium > 0) {
+            const ratio = candidate / pos.entryPremium;
+            if (ratio > 3.5 || ratio < 0.15) {
+              log(acct, `ROBINHOOD SYNC: REJECTED mark $${candidate} for ${pos.ticker} ${pos.type} $${pos.strike} (entry $${pos.entryPremium}, ratio ${ratio.toFixed(2)}x via ${sourceLabel}) — likely cross-contract contamination`);
+              return false;
+            }
           }
+          pos.liveBid = bid;
+          pos.liveAsk = ask;
+          pos.liveMark = candidate;
+          log(acct, `ROBINHOOD SYNC: ${pos.ticker} $${pos.strike} ${pos.type} live bid=${bid} ask=${ask} mark=${markRaw} mid=${mid} → liveMark=${pos.liveMark} (${sourceLabel})`);
+          if (pos.liveMark != null && pos.entryPremium > 0) {
+            const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
+            if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
+          }
+          return true;
+        };
+        const matchByHardId = (mdItems, pos) => {
+          if (pos.instrumentUrl) {
+            const hit = mdItems.find(item =>
+              (item.option_id && item.option_id === pos.instrumentUrl) ||
+              (item.instrument_id && item.instrument_id === pos.instrumentUrl) ||
+              (item.id && item.id === pos.instrumentUrl) ||
+              (item.instrument && (item.instrument === pos.instrumentUrl || String(item.instrument).includes(pos.instrumentUrl)))
+            );
+            if (hit) return hit;
+          }
+          if (pos.occSymbol && !String(pos.occSymbol).endsWith("_opt")) {
+            return mdItems.find(item => {
+              const rawSym = (item.symbol || item.occ_symbol || "").toUpperCase();
+              return rawSym && rawSym === pos.occSymbol.toUpperCase();
+            }) || null;
+          }
+          return null;
+        };
 
-          for (const pos of needsMark) {
-            // Identifier priority, most to least reliable:
-            // 1. Option instrument id (the UUID from the positions endpoint) — unambiguous. The
-            //    market-data item may echo it under option_id / instrument_id / id / instrument.
-            // 2. OCC symbol — exact ticker+expiry+type+strike encoded string.
-            // 3. ticker+type+strike+expiry field-by-field match.
-            // 4. If we queried for exactly one contract and got back exactly one item, it must be
-            //    ours (no ambiguity). NOT applied when multiple items came back.
-            let match = null;
+        for (const pos of needsMark) {
+          try {
+            // Prefer per-position fetch by instrument UUID — never mix SPY+PATH into one response
+            // and hope field matching sorts it out.
+            let mdItems = [];
+            let sourceLabel = "batch";
             if (pos.instrumentUrl) {
-              match = mdItems.find(item =>
-                (item.option_id && item.option_id === pos.instrumentUrl) ||
-                (item.instrument_id && item.instrument_id === pos.instrumentUrl) ||
-                (item.id && item.id === pos.instrumentUrl) ||
-                (item.instrument && (item.instrument === pos.instrumentUrl || String(item.instrument).includes(pos.instrumentUrl)))
-              );
+              const mdRes = await robinhood.getOptionMarketData([pos.instrumentUrl]);
+              mdItems = extractMdItems(mdRes);
+              sourceLabel = `id:${pos.instrumentUrl.slice(0, 8)}`;
+            } else if (pos.occSymbol && !String(pos.occSymbol).endsWith("_opt")) {
+              const mdRes = await robinhood.getOptionMarketData([pos.occSymbol]);
+              mdItems = extractMdItems(mdRes);
+              sourceLabel = `occ:${pos.occSymbol}`;
+            } else {
+              log(acct, `ROBINHOOD SYNC: ${pos.ticker} ${pos.type} — skipping mark fetch (no instrument id / OCC; strike=${pos.strike})`);
+              continue;
             }
-            if (!match) {
-              match = mdItems.find(item => {
-                const rawSym = (item.symbol || item.occ_symbol || "").toUpperCase();
-                return rawSym && pos.occSymbol && rawSym === pos.occSymbol.toUpperCase();
-              });
-            }
-            if (!match) {
-              match = mdItems.find(item => {
-                const rawSym = (item.symbol || item.occ_symbol || "").toUpperCase();
-                const itemTicker = (item.chain_symbol || rawSym.replace(/\d.*/, "").trim() || "").toUpperCase();
-                if (itemTicker && itemTicker !== pos.ticker) return false;
-                const itemType = (item.option_type || item.type || "").toLowerCase();
-                if (itemType && itemType !== pos.type) return false;
-                if (pos.strike > 0) {
-                  const itemStrike = parseFloat(item.strike_price || item.strike || 0);
-                  if (itemStrike > 0 && Math.abs(itemStrike - pos.strike) > 0.01) return false;
-                }
-                if (pos.expiryDate) {
-                  const posExpStr = new Date(pos.expiryDate).toISOString().slice(0, 10);
-                  const itemExp = (item.expiration_date || item.expiration || "").slice(0, 10);
-                  if (itemExp && itemExp !== posExpStr) return false;
-                }
-                return true;
-              });
-            }
-            // Single-ticker, single-item response: no ambiguity, safe to use even without a
-            // field-level match (covers responses that only carry an opaque instrument URL).
-            // Requires needsMark.length === 1 too — if we're tracking two distinct contracts on
-            // the same ticker, a single returned item still can't be safely assigned to either.
-            // Deliberately NOT applied when multiple items came back — picking the "first" one
-            // out of a multi-strike/multi-expiry chain previously caused this exact position to
-            // be priced off an unrelated contract (e.g. showing -52% while Robinhood's own
-            // account page showed the real position roughly flat).
-            if (!match && tickers.length === 1 && needsMark.length === 1 && mdItems.length === 1) {
-              match = mdItems[0];
-            }
+
+            let match = matchByHardId(mdItems, pos);
+            // Only when we asked for ONE id/OCC and got back exactly ONE item is identity safe.
+            if (!match && mdItems.length === 1) match = mdItems[0];
 
             if (match) {
-              // Tolerant field extraction. The live server nests pricing in a `quote` sub-object
-              // ({ ..., quote: { bid_price, ask_price, mark_price, ... } }) — observed via
-              // /api/rh-debug — so merge that over the top-level fields before extracting.
-              // Older/top-level variants still work as fallbacks.
-              const src = (match.quote && typeof match.quote === "object")
-                ? { ...match, ...match.quote }
-                : (match.market_data && typeof match.market_data === "object")
-                  ? { ...match, ...match.market_data }
-                  : match;
-              const num = (...keys) => {
-                for (const k of keys) {
-                  const v = parseFloat(src[k]);
-                  if (!isNaN(v) && v > 0) return v;
-                }
-                return null;
-              };
-              const bid = num("bid_price", "bid", "best_bid_price");
-              const ask = num("ask_price", "ask", "best_ask_price");
-              const markRaw = num("mark_price", "adjusted_mark_price", "mark");
-              const lastTrade = num("last_trade_price", "last_trade", "last_price", "previous_close_price");
-              // Compute mid from two-sided market — Robinhood MCP sometimes returns mark_price=0.00
-              // even during market hours. Mid is a better fair-value estimate than raw bid.
-              const mid = (bid != null && ask != null) ? +((bid + ask) / 2).toFixed(2) : null;
-              pos.liveBid = bid;
-              pos.liveAsk = ask;
-              // Priority: API mark → computed mid → last trade → bid as last resort.
-              // liveBid is kept for actual sell order limit prices (filled at bid, not mid).
-              pos.liveMark = markRaw ?? mid ?? lastTrade ?? bid;
-              log(acct, `ROBINHOOD SYNC: ${pos.ticker} ${pos.type} live bid=${bid} ask=${ask} mark=${markRaw} mid=${mid} → liveMark=${pos.liveMark}`);
-              if (pos.liveMark != null && pos.entryPremium > 0) {
-                const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
-                if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
-              }
+              applyQuoteToPos(pos, match, sourceLabel);
             } else {
-              log(acct, `ROBINHOOD SYNC: ${pos.ticker} ${pos.type} — no live bid match in ${mdItems.length} items`);
+              log(acct, `ROBINHOOD SYNC: ${pos.ticker} $${pos.strike} ${pos.type} — no hard id/OCC match in ${mdItems.length} items (${sourceLabel})`);
             }
+          } catch (e) {
+            log(acct, `ROBINHOOD SYNC: live bid fetch error for ${pos.ticker} — ${e.message}`);
           }
-        } catch (e) {
-          log(acct, `ROBINHOOD SYNC: live bid fetch error — ${e.message} | ${(e.stack || "").split("\n")[1]?.trim() || ""}`);
         }
       }
 
