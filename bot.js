@@ -1028,13 +1028,80 @@ const BASELINE_STRATEGY_TWEAK = {
   profitTarget: 0.40, stopLoss: -0.35, trim1Pct: 0.25, trim2Pct: 0.50, maxPositions: null,
 };
 
+// Live-only track: $1M by March 1 2027. Fat settled sleeve + bank fast so a +10–15% option
+// print moves the *account* several percent. Not added to LEARNING_VARIANTS (no shadow clone).
+const MARCH_1M_DEADLINE = "2027-03-01";
+const MARCH_1M_TRACK = {
+  key: "march1m",
+  name: "March $1M",
+  desc: "Fat sleeve, bank +12–15%, goal $1M by Mar 2027",
+  tweak: {
+    goal: 1_000_000,
+    baseRiskPct: 1.0,       // full cash sleeve (skips regime size-down)
+    maxPositions: 2,        // concentrate — account % ≈ trade %
+    useCashReserve: false,
+    profitTarget: 0.12,     // bank quick winners (minutes–hours, not days)
+    stopLoss: -0.25,
+    trim1Pct: 0.10,
+    trim2Pct: 0.18,
+    minSetupQuality: 55,
+    bullEntry: 64,
+    bearEntry: 36,
+    maxDayTrades: 3,
+    dailyLossLimitPct: 0.22,
+    maxConsecutiveLosses: 4,
+  },
+};
+
+function liveStrategyPresets() {
+  return [
+    ...LEARNING_VARIANTS,
+    MARCH_1M_TRACK,
+  ];
+}
+
+function tradingDaysBetween(isoStart, isoEnd) {
+  const a = new Date(isoStart + "T12:00:00");
+  const b = new Date(isoEnd + "T12:00:00");
+  if (!(a instanceof Date) || !(b instanceof Date) || isNaN(a) || isNaN(b) || b < a) return 0;
+  let n = 0;
+  const d = new Date(a);
+  while (d <= b) {
+    const day = d.getUTCDay();
+    if (day !== 0 && day !== 6) n++;
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return n;
+}
+
+function march1mPace(acct, pv) {
+  const cfg = acct.config;
+  if (cfg.strategyPreset !== "march1m" && cfg.goal !== 1_000_000) return null;
+  const today = getETDateStr();
+  const daysLeft = Math.max(1, tradingDaysBetween(today, MARCH_1M_DEADLINE));
+  const goal = cfg.goal || 1_000_000;
+  const needDaily = pv > 0 ? Math.pow(goal / pv, 1 / daysLeft) - 1 : 0;
+  // This-week proof target: compound ~+4.4%/day for remaining sessions this ET week (Fri close).
+  const et = getETDate();
+  const dow = et.getDay(); // 0=Sun..5=Fri
+  const sessionsLeftThisWeek = dow >= 1 && dow <= 5 ? (5 - dow + 1) : (dow === 0 ? 5 : 0);
+  const weekTarget = sessionsLeftThisWeek > 0 ? pv * Math.pow(1.044, sessionsLeftThisWeek) : pv;
+  return {
+    goal,
+    deadline: MARCH_1M_DEADLINE,
+    daysLeft,
+    needDailyPct: needDaily * 100,
+    weekTarget,
+    sessionsLeftThisWeek,
+    onPace: needDaily <= 0.05, // ≤5%/day required = still in "doable if hot" zone
+  };
+}
+
 // ─── Live Strategy Preset Toggle ───
-// Applies one of the LEARNING_VARIANTS tweaks directly to a real account's config — the same
-// knob combinations the Learning Lab tests in shadow paper accounts, but for the live strategy
-// itself. Switching presets only touches the numeric fields the preset defines; everything else
-// (broker, watchlist, autoExecute, risk breakers) is left alone.
+// Applies a named preset to a real account's config. Learning-lab variants share the same
+// knobs as shadows; March $1M is live-only. Broker / autoExecute / watchlist are left alone.
 function applyStrategyPreset(acct, key) {
-  const variant = LEARNING_VARIANTS.find(v => v.key === key);
+  const variant = liveStrategyPresets().find(v => v.key === key);
   if (!variant) return { ok: false, reason: `Unknown strategy preset "${key}"` };
   const tweak = key === "baseline" ? BASELINE_STRATEGY_TWEAK : variant.tweak;
   const changes = [];
@@ -1044,9 +1111,27 @@ function applyStrategyPreset(acct, key) {
     acct.config[k] = v;
   }
   acct.config.strategyPreset = key;
+  if (key === "march1m") {
+    acct.state.marchTrack = acct.state.marchTrack || {};
+    acct.state.marchTrack.enabledAt = Date.now();
+    acct.state.marchTrack.deadline = MARCH_1M_DEADLINE;
+    acct.state.marchTrack.startPv = portfolioValue(acct.state, acct.dashboard?.quotes || {});
+  }
   log(acct, `STRATEGY: switched to "${variant.name}" (${variant.desc})${changes.length ? " — " + changes.join(", ") : " — already matched, no fields changed"}`);
   saveAccounts();
   return { ok: true, variant, changes };
+}
+
+function ensureMarch1MTrack(acct) {
+  if (!acct || acct.learning || acct.config.broker !== "robinhood") return false;
+  if (acct.state._march1mApplied) return false;
+  const out = applyStrategyPreset(acct, "march1m");
+  if (out.ok) {
+    acct.state._march1mApplied = true;
+    log(acct, `MARCH $1M TRACK: armed — fat sleeve, bank +12%, goal $1,000,000 by ${MARCH_1M_DEADLINE}. This week: print real account-up days (target ~+4.4%/session when in).`);
+    return true;
+  }
+  return false;
 }
 
 function learningVariantsFor(parentId) {
@@ -5357,6 +5442,17 @@ function dashboardHTML(acct, { spectator = false } = {}) {
   const pv = portfolioValue(state, dashboard.quotes);
   const pnlPct = ((pv - STARTING_CASH) / STARTING_CASH * 100).toFixed(1);
   const progress = ((pv / GOAL) * 100).toFixed(1);
+  const pace = march1mPace(acct, pv);
+  const marchBanner = pace
+    ? `<div style="margin:10px 0 14px;padding:10px 12px;border-radius:8px;border:1px solid #99f6e4;background:#ecfdf5;color:#134e4a;font-size:12px;line-height:1.45">
+        <b>March $1M track</b> · ${pace.daysLeft} sessions left · need ~<b>${pace.needDailyPct.toFixed(1)}%/day</b>
+        · this week target ~$${pace.weekTarget.toFixed(0)}
+        · sleeve ${((cfg.baseRiskPct || 0) * 100).toFixed(0)}% · bank +${((cfg.profitTarget || 0) * 100).toFixed(0)}%
+        ${cfg.strategyPreset === "march1m" ? "" : " · click <b>March $1M</b> strategy pill to arm"}
+      </div>`
+    : (cfg.broker === "robinhood"
+      ? `<div style="margin:10px 0 14px;padding:10px 12px;border-radius:8px;border:1px solid #d4d8e0;background:#f6f7f9;color:#3a3b42;font-size:12px">Hit the <b>March $1M</b> strategy pill to arm fat-sleeve + quick-bank mode.</div>`
+      : "");
 
   const llmBadge = spectator
     ? `<span class="llm-toggle" title="Read-only in spectator mode">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>`
@@ -5694,6 +5790,7 @@ ${spectator ? '<div style="margin:8px 0 12px;padding:8px 12px;border:1px solid #
     ${(state.accountType && state.accountType !== "cash") ? `<div style="font-size:11px;color:#b07400;margin-top:6px">⚠️ This is a ${state.accountType.toUpperCase()} account — margin/leverage apply. You wanted a cash account.</div>` : ""}` : ""}
     <div class="progress"><div class="progress-bar" style="width:${Math.min(100, progress)}%"></div></div>
     <div style="font-size:11px;color:#6b7280">${progress}% to $${GOAL.toLocaleString()} goal</div>
+    ${marchBanner}
     <div style="font-size:10px;color:#8a909b;margin-top:6px" title="Where price/option data came from this session">
       📡 Data: <span style="color:${tradier.isConnected ? "#138f86" : "#d2691e"}">${tradier.isConnected ? "Tradier LIVE" : "Finnhub/Yahoo (fallback)"}</span>
       · last quote via <b>${(marketDataStats.lastSource || "—").toUpperCase()}</b>
@@ -7156,11 +7253,12 @@ function strategyPresetHTML(acctId, { spectator = false } = {}) {
   const acct = accounts.get(acctId);
   if (!acct || acct.learning) return ""; // shadow variants already ARE a fixed preset
   const active = acct.config.strategyPreset;
-  const pills = LEARNING_VARIANTS.map(v => {
+  const pills = liveStrategyPresets().map(v => {
     const isActive = active === v.key;
+    const isMarch = v.key === "march1m";
     const style = isActive
-      ? "background:#6a4df4;color:#fff;border-color:#6a4df4"
-      : "background:#f6f7f9;color:#3a3b42;border-color:#d4d8e0";
+      ? (isMarch ? "background:#0f766e;color:#fff;border-color:#0f766e" : "background:#6a4df4;color:#fff;border-color:#6a4df4")
+      : (isMarch ? "background:#ecfdf5;color:#0f766e;border-color:#99f6e4" : "background:#f6f7f9;color:#3a3b42;border-color:#d4d8e0");
     return spectator
       ? `<span class="acct-btn" style="${style};cursor:default" title="${v.desc}">${v.name}</span>`
       : `<form method="POST" action="/api/accounts/${acctId}/strategy" style="display:inline">
@@ -9806,6 +9904,7 @@ async function ensureRobinhoodAccount() {
 
     // Guard: startingCash must be > 0 to avoid +Infinity% P&L
     if (!(acct.config.startingCash > 0)) acct.config.startingCash = DEFAULT_CONFIG.startingCash;
+    ensureMarch1MTrack(acct);
     console.log(`  Robinhood: live account present — cash $${(acct.state.cash || 0).toFixed(2)} (capital base $${acct.config.startingCash})`);
     return;
   }
@@ -9826,6 +9925,7 @@ async function ensureRobinhoodAccount() {
   };
   const acct = createAccountRuntime("robinhood", `Robinhood Live`, config, state);
   accounts.set("robinhood", acct);
+  ensureMarch1MTrack(acct);
   saveAccounts();
   console.log(`  Robinhood: provisioned LIVE account ✓ — seeded cash $${state.cash.toFixed(2)}, autoExecute ON`);
 }
@@ -11443,6 +11543,10 @@ async function runCycle(acct, sharedQuotes, apiKey) {
   const pv = portfolioValue(state, quotes);
   const pnlPct = ((pv - cfg.startingCash) / cfg.startingCash * 100).toFixed(1);
   const progress = ((pv / cfg.goal) * 100).toFixed(1);
+  const pace = march1mPace(acct, pv);
+  if (pace) {
+    log(acct, `MARCH $1M: $${pv.toFixed(0)} → $1M by ${pace.deadline} | ${pace.daysLeft} sessions left | need ~${pace.needDailyPct.toFixed(1)}%/day | this week target ~$${pace.weekTarget.toFixed(0)} (${pace.sessionsLeftThisWeek} sessions)`);
+  }
   log(acct, `Portfolio: $${pv.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%) | Goal: ${progress}% of $${cfg.goal.toLocaleString()} | Cash: $${state.cash.toFixed(0)} | ${state.positions.length} open | ${regime.mode.toUpperCase()}${getActiveHintsSummary(acct)}`);
 
   // Tweet daily watchlist summary (once per day) — never from learning variants
