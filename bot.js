@@ -5502,17 +5502,21 @@ function dashboardHTML(acct, { spectator = false } = {}) {
   if (posSource.length === 0 && state.positions.length > 0) {
     posSource = state.positions.map(pos => {
       const q = dashboard.quotes[pos.ticker];
-      const spot = q ? q.c : pos.entrySpot;
+      const spot = (q && q.c != null) ? q.c : (pos.entrySpot ?? null);
       const now = Date.now();
       const dteLeft = pos.expiryDate
         ? Math.max(0, (pos.expiryDate - now) / 86400_000)
-        : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
+        : (pos.dte != null && pos.openTime
+          ? Math.max(0, pos.dte - (now - pos.openTime) / 86400_000)
+          : (pos.dteRemaining ?? null));
       const isEq = pos.type === "equity";
       const strikeKnown = isEq || pos.strike > 0;
+      const canModel = strikeKnown && spot != null && dteLeft != null && (pos.type === "call" || pos.type === "put");
       const curPremium = isEq ? (pos.liveMark ?? spot)
-        : (pos.liveMark ?? (strikeKnown ? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
-      const pnlPct = pos.entryPremium > 0 ? (curPremium - pos.entryPremium) / pos.entryPremium : 0;
-      const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * (isEq ? 1 : 100);
+        : (pos.liveMark ?? (canModel ? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
+      const pnlPct = pos.entryPremium > 0 && curPremium != null ? (curPremium - pos.entryPremium) / pos.entryPremium : 0;
+      const pnlDollar = (curPremium != null && pos.entryPremium > 0)
+        ? (curPremium - pos.entryPremium) * pos.qty * (isEq ? 1 : 100) : 0;
       const plan = managementPlanFor(pos, cfg, now);
       const stopMult = isEq ? plan.stopLoss : plan.disasterFloor;
       const profitPrice = pos.entryPremium * (1 + plan.profitTarget);
@@ -5521,9 +5525,9 @@ function dashboardHTML(acct, { spectator = false } = {}) {
         ...pos, spot, dteLeft, curPremium, pnlPct, pnlDollar,
         profitTarget: { pct: `+${(plan.profitTarget * 100).toFixed(0)}%`, premium: profitPrice.toFixed(2) },
         stopLoss: { pct: `${(stopMult * 100).toFixed(0)}%`, premium: stopPrice.toFixed(2) },
-        pctToProfit: ((profitPrice - curPremium) / curPremium * 100).toFixed(1),
-        pctToStop: ((stopPrice - curPremium) / curPremium * 100).toFixed(1),
-        greeks: strikeKnown ? optGreeks(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : { delta: "?", theta: "?" },
+        pctToProfit: curPremium > 0 ? ((profitPrice - curPremium) / curPremium * 100).toFixed(1) : "—",
+        pctToStop: curPremium > 0 ? ((stopPrice - curPremium) / curPremium * 100).toFixed(1) : "—",
+        greeks: canModel ? optGreeks(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : { delta: "?", theta: "?" },
       };
     });
   }
@@ -5562,11 +5566,11 @@ function dashboardHTML(acct, { spectator = false } = {}) {
       </td>
     </tr>` : "";
     return `<tr>
-      <td><a href="/ticker/${p.ticker}"><b>${p.ticker}</b></a>${managerBadge}${aiToggle}<a href="/media?a=${acct.id}&ticker=${p.ticker}" title="Compose a shareable post for ${p.ticker}" style="margin-left:6px;text-decoration:none;font-size:11px" onclick="event.stopPropagation()">📣</a></td><td>${p.type.toUpperCase()}</td><td>$${p.strike}</td>
-      <td style="white-space:nowrap">$${p.spot.toFixed(2)}<br><span style="color:${spotColor};font-size:10px">${spotChg >= 0 ? "+" : ""}${spotChg.toFixed(2)} (${spotChgPct >= 0 ? "+" : ""}${spotChgPct.toFixed(1)}%)</span><br><span style="color:${spotFromEntryColor};font-size:10px">from entry: ${spotFromEntry >= 0 ? "+" : ""}${spotFromEntry.toFixed(1)}%</span></td>
-      <td>${p.dteLeft.toFixed(1)}d</td><td>${p.qty}</td>
-      <td>$${p.entryPremium.toFixed(2)}${(p.intendedEntryPremium && Math.abs(p.intendedEntryPremium - p.entryPremium) >= 0.01) ? `<br><span style="font-size:9px;color:#9aa0aa" title="Bot's intended limit before the actual fill">intended $${(+p.intendedEntryPremium).toFixed(2)}</span>` : ''}</td><td>$${p.curPremium.toFixed(2)}</td>
-      <td style="color:${color}">${p.pnlPct >= 0 ? "+" : ""}${(p.pnlPct * 100).toFixed(1)}% ($${p.pnlDollar.toFixed(0)})</td>
+      <td><a href="/ticker/${p.ticker}"><b>${p.ticker}</b></a>${managerBadge}${aiToggle}<a href="/media?a=${acct.id}&ticker=${p.ticker}" title="Compose a shareable post for ${p.ticker}" style="margin-left:6px;text-decoration:none;font-size:11px" onclick="event.stopPropagation()">📣</a></td><td>${(p.type || "?").toUpperCase()}</td><td>${p.strike > 0 ? "$" + p.strike : "—"}</td>
+      <td style="white-space:nowrap">${p.spot != null ? "$" + Number(p.spot).toFixed(2) : "—"}<br><span style="color:${spotColor};font-size:10px">${spotChg >= 0 ? "+" : ""}${spotChg.toFixed(2)} (${spotChgPct >= 0 ? "+" : ""}${spotChgPct.toFixed(1)}%)</span><br><span style="color:${spotFromEntryColor};font-size:10px">from entry: ${spotFromEntry >= 0 ? "+" : ""}${spotFromEntry.toFixed(1)}%</span></td>
+      <td>${p.dteLeft != null ? Number(p.dteLeft).toFixed(1) + "d" : "—"}</td><td>${p.qty}</td>
+      <td>$${(+p.entryPremium || 0).toFixed(2)}${(p.intendedEntryPremium && Math.abs(p.intendedEntryPremium - p.entryPremium) >= 0.01) ? `<br><span style="font-size:9px;color:#9aa0aa" title="Bot's intended limit before the actual fill">intended $${(+p.intendedEntryPremium).toFixed(2)}</span>` : ''}</td><td>$${p.curPremium != null ? Number(p.curPremium).toFixed(2) : "—"}</td>
+      <td style="color:${color}">${p.pnlPct >= 0 ? "+" : ""}${((p.pnlPct || 0) * 100).toFixed(1)}% ($${(p.pnlDollar || 0).toFixed(0)})</td>
       <td><span style="color:#00a843">TP $${p.profitTarget.premium}</span> (${p.pctToProfit}% away)</td>
       <td><span style="color:#e8473f">SL $${p.stopLoss.premium}</span> (${p.pctToStop}% away)</td>
       <td style="font-size:10px;color:#6b7280">${p.openDate || '—'}</td>
@@ -5637,16 +5641,16 @@ function dashboardHTML(acct, { spectator = false } = {}) {
       lines,
       markers: [{ value: p.spot, color: pnlColor }],
     });
-    const fromEntry = p.entrySpot ? ((p.spot - p.entrySpot) / p.entrySpot * 100) : 0;
+    const fromEntry = (p.spot != null && p.entrySpot) ? ((p.spot - p.entrySpot) / p.entrySpot * 100) : 0;
     return `<div style="border:1px solid #e7e8ec;border-radius:10px;padding:10px">
       <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px">
         <a href="/ticker/${p.ticker}?a=${acct.id}" style="font-weight:700">${p.ticker}</a>
-        <span style="font-size:11px;color:#6b7280">${p.type.toUpperCase()} $${p.strike} · ${p.dteLeft.toFixed(0)}d</span>
+        <span style="font-size:11px;color:#6b7280">${(p.type || "?").toUpperCase()} ${p.strike > 0 ? "$" + p.strike : "?"} · ${p.dteLeft != null ? Number(p.dteLeft).toFixed(0) + "d" : "—"}</span>
       </div>
       ${chart}
       <div style="display:flex;justify-content:space-between;font-size:10px;margin-top:4px">
-        <span style="color:#6b7280">Stock <b style="color:#1c1d22">$${p.spot.toFixed(2)}</b> <span style="color:${fromEntry >= 0 ? '#00a843' : '#e8473f'}">${fromEntry >= 0 ? '+' : ''}${fromEntry.toFixed(1)}%</span></span>
-        <span style="color:${pnlColor};font-weight:700">${p.pnlPct >= 0 ? '+' : ''}${(p.pnlPct * 100).toFixed(1)}%</span>
+        <span style="color:#6b7280">Stock <b style="color:#1c1d22">${p.spot != null ? "$" + Number(p.spot).toFixed(2) : "—"}</b> <span style="color:${fromEntry >= 0 ? '#00a843' : '#e8473f'}">${fromEntry >= 0 ? '+' : ''}${fromEntry.toFixed(1)}%</span></span>
+        <span style="color:${pnlColor};font-weight:700">${p.pnlPct >= 0 ? '+' : ''}${((p.pnlPct || 0) * 100).toFixed(1)}%</span>
       </div>
       <div style="font-size:9px;color:#8a909b;margin-top:2px">TP $${p.profitTarget.premium} (${p.pctToProfit}%) · SL $${p.stopLoss.premium} (${p.pctToStop}%) · ${isCall ? 'needs price ↑' : 'needs price ↓'}</div>
     </div>`;
@@ -6512,14 +6516,14 @@ function tickerDetailHTML(sym, acct, { spectator = false } = {}) {
     const posSpotFromEntry = pos.spot && pos.entrySpot ? ((pos.spot - pos.entrySpot) / pos.entrySpot * 100) : 0;
     const posSpotEntryColor = posSpotFromEntry >= 0 ? "#00a843" : "#e8473f";
     posBlock = `
-      <div class="stat"><div class="val">${pos.type.toUpperCase()}</div><div class="lbl">Type</div></div>
-      <div class="stat"><div class="val">$${pos.strike}</div><div class="lbl">Strike</div></div>
+      <div class="stat"><div class="val">${(pos.type || "?").toUpperCase()}</div><div class="lbl">Type</div></div>
+      <div class="stat"><div class="val">${pos.strike > 0 ? "$" + pos.strike : "—"}</div><div class="lbl">Strike</div></div>
       <div class="stat"><div class="val">${pos.qty}</div><div class="lbl">Contracts</div></div>
-      <div class="stat"><div class="val">${pos.dteLeft.toFixed(1)}d</div><div class="lbl">DTE Left</div></div>
+      <div class="stat"><div class="val">${pos.dteLeft != null ? Number(pos.dteLeft).toFixed(1) + "d" : "—"}</div><div class="lbl">DTE Left</div></div>
       <hr style="border-color:#e3e6ea;margin:12px 0">
-      <div class="stat"><div class="val">$${pos.spot.toFixed(2)}</div><div class="lbl">Stock Price</div></div>
+      <div class="stat"><div class="val">${pos.spot != null ? "$" + Number(pos.spot).toFixed(2) : "—"}</div><div class="lbl">Stock Price</div></div>
       <div class="stat"><div class="val" style="color:${posSpotColor}">${posSpotChg >= 0 ? "+" : ""}${posSpotChg.toFixed(2)} (${posSpotChgPct >= 0 ? "+" : ""}${posSpotChgPct.toFixed(1)}%)</div><div class="lbl">Today's Move</div></div>
-      <div class="stat"><div class="val">$${pos.entrySpot.toFixed(2)}</div><div class="lbl">Entry Stock Price</div></div>
+      <div class="stat"><div class="val">${pos.entrySpot != null ? "$" + Number(pos.entrySpot).toFixed(2) : "—"}</div><div class="lbl">Entry Stock Price</div></div>
       <div class="stat"><div class="val" style="color:${posSpotEntryColor}">${posSpotFromEntry >= 0 ? "+" : ""}${posSpotFromEntry.toFixed(1)}%</div><div class="lbl">Stock Since Entry</div></div>
       <hr style="border-color:#e3e6ea;margin:12px 0">
       <div class="stat"><div class="val">$${pos.entryPremium.toFixed(2)}</div><div class="lbl">Entry Premium</div></div>
@@ -12318,11 +12322,13 @@ function buildPositionDetails(acct, quotes) {
   const cfg = acct.config;
   return state.positions.map(pos => {
     const q = quotes[pos.ticker];
-    const spot = q ? q.c : pos.entrySpot;
+    const spot = (q && q.c != null) ? q.c : (pos.entrySpot ?? null);
     const now = Date.now();
     const dteLeft = pos.expiryDate
       ? Math.max(0, (pos.expiryDate - now) / 86400_000)
-      : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
+      : (pos.dte != null && pos.openTime
+        ? Math.max(0, pos.dte - (now - pos.openTime) / 86400_000)
+        : (pos.dteRemaining ?? null));
 
     // Pending (unfilled) broker orders: show flat, tagged as a working order — no P&L/greeks math.
     if (pos._pending) {
@@ -12341,10 +12347,12 @@ function buildPositionDetails(acct, quotes) {
     // (optPrice treats it as a deeply ITM call, returning ~stock price). Fall back to entryPremium
     // so P&L shows 0% rather than an absurd number until the strike is resolved.
     const strikeKnown = isEq || pos.strike > 0;
+    const canModel = strikeKnown && spot != null && dteLeft != null && (pos.type === "call" || pos.type === "put");
     const curPremium = isEq ? (pos.liveMark ?? spot)
-      : (pos.liveMark ?? (strikeKnown ? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
-    const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
-    const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * (isEq ? 1 : 100);
+      : (pos.liveMark ?? (canModel ? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
+    const pnlPct = pos.entryPremium > 0 && curPremium != null ? (curPremium - pos.entryPremium) / pos.entryPremium : 0;
+    const pnlDollar = (curPremium != null && pos.entryPremium > 0)
+      ? (curPremium - pos.entryPremium) * pos.qty * (isEq ? 1 : 100) : 0;
     const plan = managementPlanFor(pos, cfg, now);
     const profitPrice = pos.entryPremium * (1 + plan.profitTarget);
     // Options don't exit on the configured premium stop anymore — their loss exits are the
@@ -12362,11 +12370,11 @@ function buildPositionDetails(acct, quotes) {
       ...pos, spot, dteLeft, curPremium, pnlPct, pnlDollar,
       profitTarget: { pct: `+${(plan.profitTarget * 100).toFixed(0)}%`, premium: profitPrice.toFixed(2) },
       stopLoss: { pct: `${(stopMult * 100).toFixed(0)}%${isEq ? "" : " (disaster floor; structural stop leads)"}`, premium: effectiveStop.toFixed(2) },
-      pctToProfit: ((profitPrice - curPremium) / curPremium * 100).toFixed(1),
-      pctToStop: ((effectiveStop - curPremium) / curPremium * 100).toFixed(1),
+      pctToProfit: curPremium > 0 ? ((profitPrice - curPremium) / curPremium * 100).toFixed(1) : "—",
+      pctToStop: curPremium > 0 ? ((effectiveStop - curPremium) / curPremium * 100).toFixed(1) : "—",
       greeks: pos.liveGreeks
         ? { delta: (pos.liveGreeks.delta ?? 0).toFixed(3), theta: (pos.liveGreeks.theta ?? 0).toFixed(3) }
-        : (strikeKnown ? optGreeks(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : { delta: "?", theta: "?" }),
+        : (canModel ? optGreeks(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : { delta: "?", theta: "?" }),
     };
   });
 }
