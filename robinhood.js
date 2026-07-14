@@ -647,16 +647,31 @@ const robinhood = {
     return extractContent(result);
   },
 
-  async getOptionInstruments(symbol) {
+  async getOptionInstruments(symbolOrOpts = {}) {
     const toolName = discoveredTools.has("get_option_instruments") ? "get_option_instruments"
       : discoveredTools.has("get_options_instruments") ? "get_options_instruments"
       : null;
     if (!toolName) throw new Error("get_option_instruments not available");
-    const args = buildSchemaArgs(toolName, {
-      chain_symbol: symbol.toUpperCase(),
-      symbol: symbol.toUpperCase(),
-      symbols: [symbol.toUpperCase()],
-    });
+    const opts = typeof symbolOrOpts === "string"
+      ? { chain_symbol: symbolOrOpts }
+      : (symbolOrOpts || {});
+    const idsRaw = Array.isArray(opts.ids) ? opts.ids.filter(Boolean).join(",")
+      : (opts.ids || opts.id || null);
+    const symbol = opts.chain_symbol || opts.symbol || null;
+    const args = idsRaw
+      ? buildSchemaArgs(toolName, {
+          ids: idsRaw, id: String(idsRaw).split(",")[0],
+          option_ids: idsRaw, option_id: String(idsRaw).split(",")[0],
+        })
+      : buildSchemaArgs(toolName, {
+          chain_symbol: String(symbol || "").toUpperCase(),
+          symbol: String(symbol || "").toUpperCase(),
+          symbols: symbol ? [String(symbol).toUpperCase()] : [],
+          expiration_dates: opts.expiration_dates || undefined,
+          type: opts.type || undefined,
+          strike_price: opts.strike_price || undefined,
+          state: opts.state || "active",
+        });
     return extractContent(await callTool(toolName, args));
   },
 

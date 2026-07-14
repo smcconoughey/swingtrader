@@ -85,11 +85,15 @@ export function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 
   return candidates.slice(0, maxCandidates);
 }
 
-export function entryLimitPrice(bid, ask, mid, conviction) {
+export function entryLimitPrice(bid, ask, mid, conviction, opts = {}) {
   const m = +(+mid).toFixed(2);
   if (!(bid > 0) || !(ask > 0) || ask < bid) return m;
-  const aggression = Math.max(0, Math.min(1, conviction));
+  const maxOverpayPct = Number.isFinite(opts.maxOverpayPct) ? opts.maxOverpayPct : MAX_ENTRY_OVERPAY_PCT;
+  // Scrape / quick-bank: don't pay up to the ask — sit closer to mid. High conviction still
+  // helps a little, but never unlocks a 15% overpay tax on a +12% target trade.
+  const aggressionScale = maxOverpayPct <= 0.08 ? 0.35 : 1;
+  const aggression = Math.max(0, Math.min(1, conviction)) * aggressionScale;
   const price = mid + aggression * (ask - mid);
-  const ceiling = +(mid * (1 + MAX_ENTRY_OVERPAY_PCT)).toFixed(2);
+  const ceiling = +(mid * (1 + maxOverpayPct)).toFixed(2);
   return +Math.min(ceiling, Math.min(ask, Math.max(bid, price))).toFixed(2);
 }

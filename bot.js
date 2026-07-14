@@ -4393,7 +4393,8 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
   let expectedEntryPremium = type === "equity" ? spot : premium;
   if ((cfg.broker === "tradier" || cfg.broker === "robinhood") && selectedCandidate && type !== "equity") {
     const conviction = Math.max(0, Math.min(1, (claudeResult.confidence || 0) / 100));
-    expectedEntryPremium = entryLimitPrice(selectedCandidate.bid, selectedCandidate.ask, premium, conviction);
+    const maxOverpayPct = Math.min(MAX_ENTRY_OVERPAY_PCT, Math.max(0.03, (cfg.profitTarget || 0.40) * 0.4));
+    expectedEntryPremium = entryLimitPrice(selectedCandidate.bid, selectedCandidate.ask, premium, conviction, { maxOverpayPct });
   } else if (isRhEquityOnly) {
     const eqBid = quote.bid ?? null;
     const eqAsk = quote.ask ?? null;
@@ -4495,7 +4496,8 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
         return { skipped: true, reason: `Tradier: ${occ} executable friction ${(frictionPct * 100).toFixed(1)}% exceeds ${(maxFrictionPct * 100).toFixed(1)}% — spread consumes the target` };
       }
       const conviction = Math.max(0, Math.min(1, (claudeResult.confidence || 0) / 100));
-      const liveLimit = entryLimitPrice(fresh.bid, fresh.ask, fresh.mid, conviction);
+      const maxOverpayPct = Math.min(MAX_ENTRY_OVERPAY_PCT, Math.max(0.03, (cfg.profitTarget || 0.40) * 0.4));
+      const liveLimit = entryLimitPrice(fresh.bid, fresh.ask, fresh.mid, conviction, { maxOverpayPct });
       const liveQty = Math.min(qty, Math.floor(budget / (liveLimit * 100)));
       if (liveQty < 1) return { skipped: true, reason: `Tradier: ${occ} no longer fits $${budget.toFixed(0)} budget` };
       selectedCandidate = {
@@ -4558,7 +4560,8 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
           roundTripFrictionPct: +(frictionPct * 100).toFixed(1),
         };
 
-        const limit = entryLimitPrice(bid, ask, premium, conviction);
+        const maxOverpayPct = Math.min(MAX_ENTRY_OVERPAY_PCT, Math.max(0.03, (cfg.profitTarget || 0.40) * 0.4));
+        const limit = entryLimitPrice(bid, ask, premium, conviction, { maxOverpayPct });
         qty = Math.min(qty, Math.floor(budget / (limit * 100)));
         if (qty < 1) {
           return { skipped: true, reason: `Robinhood: refreshed ${occ} limit $${limit.toFixed(2)} no longer fits $${budget.toFixed(0)} budget` };
@@ -10076,7 +10079,8 @@ async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, expiry
   }
 
   const conviction = Math.max(0, Math.min(1, (claudeConfidence || 0) / 100));
-  const limit = entryLimitPrice(bid, ask, premium, conviction);
+  const maxOverpayPct = Math.min(MAX_ENTRY_OVERPAY_PCT, Math.max(0.03, (acct.config.profitTarget || 0.40) * 0.4));
+  const limit = entryLimitPrice(bid, ask, premium, conviction, { maxOverpayPct });
   const hardBudget = Math.min(
     maxBudget != null ? maxBudget : Infinity,
     acct.state.cash,
@@ -10935,10 +10939,11 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
         }
 
         for (const op of optRaw) {
+          try {
           const qty = parseFloat(op.quantity || op.pending_buy_quantity || 0);
           if (qty <= 0) continue;
 
-          const ticker = (op.chain_symbol || op.symbol || "").toUpperCase();
+          const ticker = String(op.chain_symbol || op.symbol || "").toUpperCase();
           if (!ticker) continue;
 
           // The instrument UUID is the contract identity. Ticker/type/strike are not unique, and
@@ -11090,8 +11095,9 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
           if (!aiData) {
             const curAnalysis = acct.dashboard?.analyses?.[ticker];
             if (curAnalysis) {
+              const typeLabel = (optType === "call" || optType === "put") ? optType.toUpperCase() : "OPTION";
               aiData = {
-                claudeReasoning: `Options position synced from Robinhood. ${optType.toUpperCase()} $${strike} exp ${expDate || "?"}.`,
+                claudeReasoning: `Options position synced from Robinhood. ${typeLabel} $${strike || "?"} exp ${expDate || "?"}.`,
                 claudeSuggestion: "",
                 claudeConcerns: [],
                 setupQuality: meta.setupQuality ?? curAnalysis.score ?? null,
@@ -11106,8 +11112,12 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
 
           positions.push(pos);
           if (optionMetaKey) seen.add(optionMetaKey);
+          } catch (posErr) {
+            log(acct, `ROBINHOOD SYNC: skip one options position — ${posErr.message}`);
+          }
         }
       } catch (e) {
+        optionsFetchOk = false;
         log(acct, `ROBINHOOD SYNC: options positions error — ${e.message}`);
       }
     }
@@ -11349,10 +11359,15 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
           const instrumentId = normalizeOptionId(pos.instrumentUrl);
           if (!instrumentId) continue;
           try {
-            let records = instrumentCache.get(pos.ticker);
-            if (!records) {
-              records = extractRecords(await robinhood.getOptionInstruments(pos.ticker).catch(() => null));
-              instrumentCache.set(pos.ticker, records);
+            // Prefer exact UUID lookup — chain scrapes paginate and can miss the held contract.
+            let records = extractRecords(await robinhood.getOptionInstruments({ ids: instrumentId }).catch(() => null));
+            if (!records.length) {
+              let byTicker = instrumentCache.get(pos.ticker);
+              if (!byTicker) {
+                byTicker = extractRecords(await robinhood.getOptionInstruments(pos.ticker).catch(() => null));
+                instrumentCache.set(pos.ticker, byTicker);
+              }
+              records = byTicker;
             }
             let identity = resolveExactOptionIdentity(instrumentId, records);
             if (!identity) identity = resolveExactOptionIdentity(instrumentId, await getOptionOrders());
@@ -12092,7 +12107,8 @@ async function runCycle(acct, sharedQuotes, apiKey) {
       continue;
     }
     const conviction = Math.max(0, Math.min(1, (pf.claudeConfidence || 0) / 100));
-    const limit = entryLimitPrice(fresh.bid, fresh.ask, fresh.mid, conviction);
+    const maxOverpayPct = Math.min(MAX_ENTRY_OVERPAY_PCT, Math.max(0.03, (cfg.profitTarget || 0.40) * 0.4));
+    const limit = entryLimitPrice(fresh.bid, fresh.ask, fresh.mid, conviction, { maxOverpayPct });
     const qty = Math.min(pf.qty, Math.floor((pf.maxBudget || 0) / (limit * 100)));
     if (qty < 1) {
       if (jItem) { jItem.eligibility = "stale"; jItem.outcome = "blocked"; jItem.reason = "Fresh limit no longer affordable"; }
