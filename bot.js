@@ -9,6 +9,44 @@ import { Resvg } from "@resvg/resvg-js";
 import webpush from "web-push";
 import { robinhood } from "./robinhood.js";
 import { tradier } from "./tradier.js";
+import { entryPriority, momentumEntryGate, rankEntryCandidates, rankPreparedEntries } from "./strategy-priority.js";
+import { applyUnderlyingSnapshots, shouldRecordSelectionCohort, summarizeRankOne } from "./decision-telemetry.js";
+import {
+  createManagementPlan,
+  evaluatePosition,
+  managementPlanFor,
+} from "./position-manager.js";
+import {
+  FEE_PER_CONTRACT,
+  MIN_OPTION_DELTA,
+  PREFERRED_DELTA_MIN,
+  PREFERRED_DELTA_MAX,
+  MAX_ENTRY_SPREAD_PCT,
+  MAX_ENTRY_OVERPAY_PCT,
+  buildCandidateContracts,
+  entryLimitPrice,
+} from "./option-contracts.js";
+import {
+  EXIT_INFLIGHT_GRACE_MS,
+  chooseOptionSellLimit,
+  exitIntentWithinGrace,
+  mergeInflightTickers,
+} from "./exit-execution.js";
+import { ExecutionLane } from "./execution-lane.js";
+import {
+  exactOptionQuoteMatches,
+  findExactOptionOrder,
+  isVerifiedRobinhoodContract,
+  normalizeOptionId,
+  optionOrderAverageFillPrice,
+  optionOrderExecutedGross,
+  optionOrderExecutedQuantity,
+  optionOrderIsTerminal,
+  optionOrderRemainingQuantity,
+  optionExpirationTimestamp,
+  parseOccSymbol,
+  resolveExactOptionIdentity,
+} from "./robinhood-safety.js";
 
 // ─── Technical Analysis Engine (ported from live-swing-simulator.jsx) ───
 
@@ -711,30 +749,23 @@ const STATE_FILE = process.env.STATE_FILE || "state.json";
 const ACCOUNTS_FILE = process.env.ACCOUNTS_FILE || (process.env.STATE_FILE ? process.env.STATE_FILE.replace(/state\.json$/, "accounts.json") : "accounts.json");
 const HINT_FILE = "hint.txt";
 const CYCLE_MS = 60_000;       // 60s between cycles when market open
+const POSITION_MANAGEMENT_MS = 15_000; // held positions are managed independently of entry discovery
+const POSITION_MANAGER_STALE_MS = 45_000;
+const RH_OPTION_QUOTE_MAX_AGE_MS = 45_000;
 const CYCLE_MS_CLOSED = 90_000; // slower after-hours polling
 const API_DELAY_FINNHUB = 150;  // Finnhub free tier
 const API_DELAY_TRADIER = 25;   // Tradier batch-friendly
 function apiDelay() { return tradier.isConnected ? API_DELAY_TRADIER : API_DELAY_FINNHUB; }
 const DEFAULT_IV = 0.30;
 
-// Per-contract options commission (Tradier Lite = $0.35/contract). Used as a SMALL bias against
-// low-priced/small-cap underlyings in contract scoring — fees are a larger % of a cheap premium.
-const FEE_PER_CONTRACT = 0.35;
-
 // Swing-trade contract quality — we ONLY want real, near-the-money directional trades, never cheap
 // far-OTM lottery tickets (the ones that have been sinking the account). Delta is the discriminator:
 // a δ0.50 ATM call is a real trade; a δ0.15 far-OTM call is a lottery ticket regardless of price.
-const MIN_OPTION_DELTA = 0.40;        // hard floor — below this is a lottery ticket, skip the trade
-const PREFERRED_DELTA_MIN = 0.45;     // sweet spot: ATM → slightly ITM (high win probability)
-const PREFERRED_DELTA_MAX = 0.70;
 // Moneyness window for candidates: from this much ITM to this much OTM. Tight on the OTM side so we
 // never reach for cheap out-of-the-money strikes; ITM is fine (higher delta, higher win rate).
-const MAX_OTM_MONEYNESS = 0.06;       // ≤6% out-of-the-money
-const MAX_ITM_MONEYNESS = 0.15;       // up to 15% in-the-money
 // A contract whose live bid/ask spread exceeds this fraction of mid is effectively un-exitable
 // without donating the spread (e.g. the XLV $161 call at b$0.25/a$0.82 = 107% wide). Reject such
 // contracts on entry — they look "affordable" but you can't get out near fair value.
-const MAX_ENTRY_SPREAD_PCT = 0.30;
 // On protective exits, if the live spread is wider than this, do NOT dump at the raw bid (which
 // donates the whole spread). Instead post a limit a small step below mid and let it re-price each
 // cycle. Tight markets below this threshold still exit marketable (at the bid).
@@ -742,16 +773,10 @@ const WIDE_SPREAD_EXIT_PCT = 0.20;
 // Most we'll concede below mid when working a protective exit through a wide spread.
 const MAX_EXIT_CONCESSION_PCT = 0.12;
 // Hard cap on overpay: never submit a limit more than this fraction above the mid.
-const MAX_ENTRY_OVERPAY_PCT = 0.15;
 // Reject contracts whose IV exceeds this — premium is inflated by event risk, not directional value.
-const MAX_ENTRY_IV = 1.50;
 // In choppy regimes (broken EMA stack), demand stronger confirmation before new risk.
 const CHOPPY_MIN_BULL_SCORE = 72;
 const CHOPPY_MIN_BEAR_SCORE = 28; // must be <= this for puts (stricter than default bearEntry)
-// Signal exits: don't flatten on a marginal score flip while still green on spot/premium.
-const SIGNAL_EXIT_MIN_LOSS = -0.05;
-const SIGNAL_EXIT_SCORE_MARGIN = 3; // must cross threshold by this many points
-
 // Earnings calendar cache (one Finnhub call per ticker per day).
 const earningsCache = new Map();
 // Live market-data provenance counters so the UI can show whether the bot is on Tradier (live,
@@ -770,18 +795,6 @@ function noteDataSource(src) {
 // at 3:05 PM isn't meaningfully riskier than one at 2:55 PM. Narrowed to the last 15 minutes,
 // where the concern (thin closing liquidity, overnight gap risk) is actually concentrated.
 const EOD_FREEZE_HOUR = 15.75;  // No new entries in the last 15 min (after 3:45 PM ET)
-const EOD_TIGHTEN_HOUR = 15.75; // Hard EOD profit lock (after 3:45 PM ET)
-const EOD_SOFT_HOUR = 15.0;     // Soft EOD: lock winners that are stalling / giving back (after 3:00 PM)
-const EOW_TRIM_HOUR = 14;       // Friday soft/hard profit-taking starts at 2:00 PM ET
-const EOW_SOFT_MIN_PNL = 0.10;  // Fri soft lock floor (+10%) when stalling near the close
-const EOD_SOFT_MIN_PNL = 0.10;  // Weekday soft lock floor when stalling after 3:00
-const EOD_HARD_MIN_PNL = 0.10;  // Hard lock at 3:45 regardless of stall
-const EOW_HARD_MIN_PNL = 0.20;  // Fri hard lock (+20%) — weekend theta
-const NEAR_TARGET_FRAC = 0.70;  // "Close enough" to configured profit target to bank on stall
-const PEAK_GIVEBACK_FRAC = 0.30; // Gave back ≥30% of peak gains
-const PEAK_GIVEBACK_MIN = 0.04;  // …and at least 4 percentage points off the peak
-const LOW_DTE_THRESHOLD = 5;   // Accelerate exits when DTE <= 5
-const CRITICAL_DTE = 3;        // Force-close when DTE <= 3 (give exits room before gamma cliff)
 
 // Opening-range freeze: the first few minutes after the 9:30 ET bell have the widest, least
 // reliable option spreads and the most noise-driven price action of the day — a "signal" here is
@@ -789,15 +802,6 @@ const CRITICAL_DTE = 3;        // Force-close when DTE <= 3 (give exits room bef
 const MARKET_OPEN_HOUR = 9.5;         // Regular session opens 9:30 AM ET
 const OPEN_FREEZE_MINUTES = 15;       // No new entries in the first 15 min after open
 const OPEN_FREEZE_END_HOUR = MARKET_OPEN_HOUR + OPEN_FREEZE_MINUTES / 60;
-
-// Premium disaster floor for OPTIONS positions — the only premium-based loss exit (structural
-// spot stops and the DTE ladder are the real risk exits; see tryExits). Never shallower than
-// -60%: live trades have repeatedly bounced from the -40%/-50% zone and gone on to win (KO
-// 7/6-7/7), so 1.8× a tight configured stop (e.g. the Quick-profits preset's -20% → -36%)
-// would put the salvage exit right back inside the bounce zone this design exists to survive.
-function optionDisasterFloor(cfg) {
-  return Math.min((cfg.stopLoss || -0.35) * 1.8, -0.60);
-}
 
 // ─── Trust-Scaled Cash Reserve ───
 // Keep a minimum cash buffer sized as a fraction of total portfolio value. The buffer starts
@@ -952,6 +956,9 @@ const DEFAULT_CONFIG = {
   dailyLossLimitPct: 0.15,
   // Hard cap on new entries per ET day. null disables.
   maxDayTrades: null,
+  // Optional cap on ticker setups fully preflighted before package ranking. null evaluates every
+  // actionable name so rank #1 is global; set a positive cap only when an API budget requires it.
+  entryPreflightLimit: null,
   // Which named strategy preset (see LEARNING_VARIANTS) was last applied via the dashboard's
   // strategy toggle, if any. Purely a UI label — the actual behavior lives in the fields above,
   // which the toggle sets directly. null = never used the toggle / since manually edited.
@@ -984,9 +991,11 @@ function createAccountRuntime(id, name, config, state) {
       candles: {},
       lastCycle: null,
       cycleLog: [],
+      decisionJournal: [],
       marketOpen: false,
       decisions: [],
       positionDetails: [],
+      positionManagement: [],
       portfolioHistory: [],
       onDemandAnalyses: {},
     },
@@ -1024,8 +1033,14 @@ const LEARNING_VARIANTS = [
 // parent account currently has"). That's meaningless as a target for the LIVE strategy toggle
 // below — there'd be nothing to switch TO — so give it real default values there instead.
 const BASELINE_STRATEGY_TWEAK = {
+  goal: DEFAULT_CONFIG.goal,
   bullEntry: 65, bearEntry: 35, minSetupQuality: 50, baseRiskPct: 0.15,
-  profitTarget: 0.40, stopLoss: -0.35, trim1Pct: 0.25, trim2Pct: 0.50, maxPositions: null,
+  profitTarget: 0.40, stopLoss: -0.35, trim1Pct: 0.25, trim2Pct: 0.50,
+  maxPositions: null,
+  useCashReserve: DEFAULT_CONFIG.useCashReserve,
+  maxDayTrades: DEFAULT_CONFIG.maxDayTrades,
+  dailyLossLimitPct: DEFAULT_CONFIG.dailyLossLimitPct,
+  maxConsecutiveLosses: DEFAULT_CONFIG.maxConsecutiveLosses,
 };
 
 // Live-only track: $1M by March 1 2027. Fat settled sleeve + bank fast so a +10–15% option
@@ -1103,7 +1118,10 @@ function march1mPace(acct, pv) {
 function applyStrategyPreset(acct, key) {
   const variant = liveStrategyPresets().find(v => v.key === key);
   if (!variant) return { ok: false, reason: `Unknown strategy preset "${key}"` };
-  const tweak = key === "baseline" ? BASELINE_STRATEGY_TWEAK : variant.tweak;
+  // Every preset starts from a complete live baseline. Applying only the target's sparse tweak
+  // leaves dangerous settings behind when switching away from March mode (reserve=false,
+  // daily loss=22%, etc.), even though the UI says a different strategy is active.
+  const tweak = { ...BASELINE_STRATEGY_TWEAK, ...(key === "baseline" ? {} : variant.tweak) };
   const changes = [];
   for (const [k, v] of Object.entries(tweak)) {
     const before = acct.config[k];
@@ -1124,14 +1142,15 @@ function applyStrategyPreset(acct, key) {
 
 function ensureMarch1MTrack(acct) {
   if (!acct || acct.learning || acct.config.broker !== "robinhood") return false;
+  // Live leverage/risk presets require an explicit dashboard selection. Startup may resume a
+  // previously selected March track, but must never arm 100%-sleeve mode just because code deployed.
+  if (acct.config.strategyPreset !== "march1m") return false;
   if (acct.state._march1mApplied) return false;
-  const out = applyStrategyPreset(acct, "march1m");
-  if (out.ok) {
-    acct.state._march1mApplied = true;
-    log(acct, `MARCH $1M TRACK: armed — fat sleeve, bank +12%, goal $1,000,000 by ${MARCH_1M_DEADLINE}. This week: print real account-up days (target ~+4.4%/session when in).`);
-    return true;
-  }
-  return false;
+  acct.state.marchTrack = acct.state.marchTrack || {};
+  acct.state.marchTrack.deadline = MARCH_1M_DEADLINE;
+  acct.state._march1mApplied = true;
+  log(acct, `MARCH $1M TRACK: resumed — bank +12%, goal $1,000,000 by ${MARCH_1M_DEADLINE}.`);
+  return true;
 }
 
 function learningVariantsFor(parentId) {
@@ -1341,6 +1360,7 @@ function loadAccounts() {
           if (typeof acctData.latestNewsBrief === "string") acct.latestNewsBrief = acctData.latestNewsBrief;
           // Restore the persisted portfolio-value chart series across restarts/redeploys.
           if (Array.isArray(acctData.portfolioHistory)) acct.dashboard.portfolioHistory = acctData.portfolioHistory;
+          if (Array.isArray(acctData.decisionJournal)) acct.dashboard.decisionJournal = acctData.decisionJournal.slice(-500);
           accounts.set(id, acct);
         }
         return true;
@@ -1409,6 +1429,8 @@ function saveAccounts() {
       // Persist the portfolio-value series so the chart survives server restarts/redeploys
       // (previously it lived only in memory and reset every deploy). Capped to bound file size.
       portfolioHistory: (acct.dashboard?.portfolioHistory || []).slice(-10000),
+      // Keep recent entry-rank outcomes across restarts (Jul 13 postmortem: cycle decisions vanished).
+      decisionJournal: (acct.dashboard?.decisionJournal || []).slice(-500),
     };
   }
   try {
@@ -2781,6 +2803,21 @@ function countPositionsAtExpiry(state, expiryTs) {
   }).length;
 }
 
+function countCommittedAtExpiry(acct, expiryTs) {
+  let count = countPositionsAtExpiry(acct.state, expiryTs);
+  const target = new Date(expiryTs); target.setHours(0, 0, 0, 0);
+  for (const reservation of acct._inflightExpiryReservations?.values?.() || []) {
+    const d = new Date(reservation); d.setHours(0, 0, 0, 0);
+    if (d.getTime() === target.getTime()) count++;
+  }
+  return count;
+}
+
+function reserveInflightExpiry(acct, ticker, expiryTs) {
+  if (!acct._inflightExpiryReservations) acct._inflightExpiryReservations = new Map();
+  acct._inflightExpiryReservations.set(ticker.toUpperCase(), expiryTs);
+}
+
 // Picks the expiration closest to targetDTE (>= MIN_SWING_DTE) honoring the ticker's cadence.
 // If the best date is already over-concentrated in the book, steps to the next available expiry
 // so positions stagger across multiple expirations instead of synchronizing.
@@ -2879,7 +2916,7 @@ async function fetchFullOptionsChain(sym, apiKey) {
   if (tradier.isConnected) {
     try {
       const chain = await tradier.getOptionsChainNormalized(sym);
-      if (chain && chain.length > 0) return chain;
+      if (chain && chain.length > 0) return chain.map(exp => ({ ...exp, dataSource: "tradier" }));
     } catch { }
   }
   // Fallback: Finnhub option chain.
@@ -2889,108 +2926,19 @@ async function fetchFullOptionsChain(sym, apiKey) {
     if (!r.ok) return null;
     const data = await r.json();
     if (!data || !Array.isArray(data.data) || data.data.length === 0) return null;
-    return data.data;
+    return data.data.map(exp => ({ ...exp, dataSource: "finnhub" }));
   } catch {
     return null;
   }
 }
 
-// Filters the full chain down to viable candidate contracts for Claude to choose from.
-// Returns up to maxCandidates sorted by a quality score (DTE preference, liquidity, spread).
-function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 12) {
-  const now = Date.now();
-  const typeKey = type.toUpperCase();
-  const candidates = [];
-
-  for (const exp of chain) {
-    const expiryDt = new Date(exp.expirationDate);
-    expiryDt.setHours(16, 0, 0, 0);
-    const dte = Math.round((expiryDt.getTime() - now) / 86400_000);
-    if (dte < 14 || dte > 45) continue; // 14-45 DTE — gives the thesis room; short-dated bleeds theta
-
-    const contracts = exp.options?.[typeKey] || [];
-    for (const c of contracts) {
-      if (!c.strike || c.strike <= 0) continue;
-      if (!c.bid || c.bid <= 0) continue;       // no bid = can't fill
-      if ((c.openInterest || 0) < 5) continue;  // completely illiquid
-
-      const mid = +((c.bid + c.ask) / 2).toFixed(2);
-      if (mid < 0.25) continue; // penny options: bid-ask spread alone is 5-10%, kills edge
-
-      // Moneyness: positive = OTM (we want to be able to buy OTM or slight ITM)
-      const moneyness = typeKey === "CALL"
-        ? (c.strike - spotPrice) / spotPrice   // +ve = OTM call
-        : (spotPrice - c.strike) / spotPrice;  // +ve = OTM put
-
-      // Only near-the-money / ITM. Reject reaching for cheap far-OTM strikes — those are the
-      // lottery tickets that bleed the account. ITM is welcome (higher delta, higher win rate).
-      if (moneyness < -MAX_ITM_MONEYNESS || moneyness > MAX_OTM_MONEYNESS) continue;
-
-      const spread = +(c.ask - c.bid).toFixed(2);
-      const spreadPct = mid > 0 ? (spread / mid) : 1;
-      if (spreadPct > 0.40 && mid > 0.10) continue; // too wide a spread
-
-      const iv = c.impliedVolatility > 0 ? c.impliedVolatility : null;
-      const delta = c.delta != null ? c.delta : null;
-
-      // Reject IV-spiked contracts — premium is inflated by event risk, not the directional thesis.
-      if (iv != null && iv > MAX_ENTRY_IV) continue;
-
-      // Reject lottery tickets: require real directional exposure (δ ≥ MIN_OPTION_DELTA). When greeks
-      // are unavailable we already constrained moneyness to near-the-money above, so it can't be junk.
-      if (delta != null && Math.abs(delta) < MIN_OPTION_DELTA) continue;
-
-      // Commission drag: a round-trip (buy + sell) costs ~2 contracts of commission. As a fraction
-      // of premium this is far larger on cheap options (small caps), so it doubles as a SMALL bias
-      // against small-cap/low-priced names — exactly what the user asked for.
-      const feeDragPct = mid > 0 ? (2 * FEE_PER_CONTRACT) / (mid * 100) : 0;
-      // Extra gentle bias against low-priced underlyings (small caps tend to be wider/thinner).
-      const smallCapPenalty = spotPrice < 10 ? 0.6 : spotPrice < 20 ? 0.3 : 0;
-
-      // Quality score: penalise wide spreads, illiquidity, very short or very long DTE, plus the
-      // small fee/small-cap bias (kept small so it only breaks otherwise-close ties).
-      const dtePenalty = Math.abs(dte - 28); // prefer ~28 DTE — room for the thesis, less theta bleed
-      const liqScore = Math.log1p((c.openInterest || 0) + (c.volume || 0));
-      // Strongly prefer the high-probability band (ATM → slightly ITM). Weight delta heavily so a
-      // near-the-money contract always beats a cheaper, lower-delta one.
-      const absD = delta != null ? Math.abs(delta) : 0;
-      const deltaBonus = absD >= PREFERRED_DELTA_MIN && absD <= PREFERRED_DELTA_MAX ? 2.0
-        : absD >= MIN_OPTION_DELTA ? 0.6 : 0;
-      // Penalize OTM-ness directly so closer-to-the-money strikes rank higher (OTM = lower win rate).
-      const otmPenalty = Math.max(0, moneyness) * 6;
-      const quality = liqScore - spreadPct * 3 - dtePenalty * 0.1 - feeDragPct * 4 - smallCapPenalty + deltaBonus - otmPenalty;
-
-      candidates.push({
-        strike: c.strike,
-        expiryDate: expiryDt.getTime(),
-        expiryStr: exp.expirationDate,
-        dte,
-        mid,
-        bid: c.bid,
-        ask: +(c.ask || 0).toFixed(2),
-        iv,
-        delta,
-        oi: c.openInterest || 0,
-        volume: c.volume || 0,
-        spread,
-        spreadPct: +(spreadPct * 100).toFixed(1),
-        feeDragPct: +(feeDragPct * 100).toFixed(1),
-        quality,
-      });
-    }
-  }
-
-  candidates.sort((a, b) => b.quality - a.quality);
-  return candidates.slice(0, maxCandidates);
-}
-
-function chooseAffordableCandidate(candidates, selected, maxContractCost, state) {
+function chooseAffordableCandidate(candidates, selected, maxContractCost, acct) {
   if (!(maxContractCost > 0)) return selected || null;
 
   // If AI picked a specific contract and we can afford it (and it doesn't over-concentrate
   // an expiry), use it.
   if (selected && selected.mid > 0 && selected.mid * 100 <= maxContractCost
-      && (!state || countPositionsAtExpiry(state, selected.expiryDate) < MAX_PER_EXPIRY)) {
+      && (!acct || countCommittedAtExpiry(acct, selected.expiryDate) < MAX_PER_EXPIRY)) {
     return selected;
   }
 
@@ -3000,7 +2948,7 @@ function chooseAffordableCandidate(candidates, selected, maxContractCost, state)
   // can exceed a small budget even when a cheaper, perfectly tradeable real contract exists.
   const affordable = (candidates || [])
     .filter(c => c && c !== selected && c.mid > 0 && c.mid * 100 <= maxContractCost)
-    .filter(c => !state || countPositionsAtExpiry(state, c.expiryDate) < MAX_PER_EXPIRY)
+    .filter(c => !acct || countCommittedAtExpiry(acct, c.expiryDate) < MAX_PER_EXPIRY)
     .sort((a, b) => b.quality - a.quality);
   return affordable[0] || null;
 }
@@ -3052,20 +3000,6 @@ function reliableOptionMark(oq) {
   }
   return null;
 }
-
-// Entry limit price for a live options buy, trading like a disciplined human: when conviction is
-// high, lean toward the ask (even crossing to it) to actually
-// get filled; when conviction is low, sit patiently at the mid. Hard-capped
-// at MAX_ENTRY_OVERPAY_PCT above mid so a wide market never drags us into an absurd fill.
-function entryLimitPrice(bid, ask, mid, conviction) {
-  const m = +(+mid).toFixed(2);
-  if (!(bid > 0) || !(ask > 0) || ask < bid) return m;
-  let aggr = Math.max(0, Math.min(1, conviction));
-  const px = mid + aggr * (ask - mid);
-  const ceiling = +(mid * (1 + MAX_ENTRY_OVERPAY_PCT)).toFixed(2);
-  return +Math.min(ceiling, Math.min(ask, Math.max(bid, px))).toFixed(2);
-}
-
 
 // ─── Portfolio Helpers ───
 
@@ -3350,8 +3284,8 @@ const claudeValidationCache = new Map();
 const CLAUDE_VALIDATION_COOLDOWN_MS = 30 * 60_000; // 30 minutes — markets don't shift radically every 15 min
 const CLAUDE_VALIDATION_SCORE_DELTA = 8;            // re-validate only on a real shift (≥8 pts)
 
-function getCachedValidation(acctId, ticker, currentScore, direction) {
-  const cached = claudeValidationCache.get(ticker);
+function getCachedValidation(acctId, ticker, currentScore, direction, context = "") {
+  const cached = claudeValidationCache.get(`${acctId}:${ticker}:${context}`);
   if (!cached) return null;
   if (Date.now() - cached.ts > CLAUDE_VALIDATION_COOLDOWN_MS) return null;
   if (Math.abs(currentScore - cached.score) >= CLAUDE_VALIDATION_SCORE_DELTA) return null;
@@ -3359,14 +3293,16 @@ function getCachedValidation(acctId, ticker, currentScore, direction) {
   return cached;
 }
 
-function setCachedValidation(acctId, ticker, score, direction, result, selectedCandidate = null) {
-  claudeValidationCache.set(ticker, { ts: Date.now(), score, direction, result, selectedCandidate });
+function setCachedValidation(acctId, ticker, score, direction, result, selectedCandidate = null, context = "") {
+  claudeValidationCache.set(`${acctId}:${ticker}:${context}`, { ts: Date.now(), score, direction, result, selectedCandidate });
 }
 
 // ─── Options Chain Cache ───
 // Short-lived per-ticker chain cache so rapid re-attempts don't hammer Finnhub.
 const chainCache = new Map();
-const CHAIN_CACHE_TTL_MS = 10 * 60_000; // 10 minutes — chains don't move that fast intraday
+// A 10-minute option quote is stale enough to turn a tight contract into a bad fill. Keep the
+// cache only long enough for preflight + execution in the same cycle; refresh on the next cycle.
+const CHAIN_CACHE_TTL_MS = 45_000;
 
 function getCachedChain(ticker) {
   const cached = chainCache.get(ticker);
@@ -3524,12 +3460,13 @@ async function processHint(hintText, acct) {
   const cfg = acct.config;
   const positionLines = state.positions.map(p => {
     const isEq = p.type === "equity";
+    const plan = managementPlanFor(p, cfg);
     const cur = p.liveMark ?? null;
     const pnlStr = cur != null && p.entryPremium > 0 ? `${(((cur - p.entryPremium) / p.entryPremium) * 100).toFixed(1)}%` : "?";
-    const stopMult = isEq ? cfg.stopLoss : optionDisasterFloor(cfg); // options: disaster floor (structural spot stop is the primary loss exit)
+    const stopMult = isEq ? plan.stopLoss : plan.disasterFloor; // options: disaster floor (structural spot stop is the primary loss exit)
     const stopP = p.entryPremium > 0 ? (p.entryPremium * (1 + stopMult)).toFixed(2) : "?";
-    const tpP = p.entryPremium > 0 ? (p.entryPremium * (1 + cfg.profitTarget)).toFixed(2) : "?";
-    return `${p.ticker} ${isEq ? "shares" : `$${p.strike} ${p.type.toUpperCase()}`} x${p.qty}: entry $${p.entryPremium?.toFixed(2)}, now $${cur != null ? cur.toFixed(2) : "?"} (${pnlStr}), ${isEq ? "stop" : "disaster stop"} $${stopP} (${(stopMult * 100).toFixed(0)}%${isEq ? "" : "; primary loss exit is a structural break in the underlying"}), target $${tpP} (+${(cfg.profitTarget * 100).toFixed(0)}%)${isEq ? "" : `, ${(p.dteRemaining ?? p.dte ?? 0).toFixed(0)} DTE`}`;
+    const tpP = p.entryPremium > 0 ? (p.entryPremium * (1 + plan.profitTarget)).toFixed(2) : "?";
+    return `${p.ticker} ${isEq ? "shares" : `$${p.strike} ${p.type.toUpperCase()}`} x${p.qty}: entry $${p.entryPremium?.toFixed(2)}, now $${cur != null ? cur.toFixed(2) : "?"} (${pnlStr}), ${isEq ? "stop" : "disaster stop"} $${stopP} (${(stopMult * 100).toFixed(0)}%${isEq ? "" : "; primary loss exit is a structural break in the underlying"}), frozen target $${tpP} (+${(plan.profitTarget * 100).toFixed(0)}%)${isEq ? "" : `, ${(p.dteRemaining ?? p.dte ?? 0).toFixed(0)} DTE`}`;
   });
   const portfolioContext = `Portfolio: $${state.cash.toFixed(0)} cash, ${state.positions.length} positions open${positionLines.length ? `:\n${positionLines.join("\n")}` : " (none)"}. Watchlist: ${acct.tickers.join(", ")}. Active hints: ${acct.activeHints.map(h => `${h.ticker} ${h.bias > 0 ? '+' : ''}${h.bias}`).join(", ") || "none"}.`;
 
@@ -3868,7 +3805,7 @@ Rules:
 
 // ─── Claude Pre-Entry Validation ───
 
-async function validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, candidates) {
+async function validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, candidates, effectiveQuality = setupQuality.quality) {
   const cfg = acct.config;
   const isEquity = cfg.broker === "robinhood" && rhTradeMode(cfg) === "equity";
   const direction = analysis.score >= cfg.bullEntry
@@ -3921,7 +3858,7 @@ Direction: ${direction}
 Technical Score: ${analysis.score}/100
 RSI: ${analysis.rsi?.toFixed(1) || 'N/A'}
 EMA Stack: ${analysis.aligned ? 'Aligned bullish (8>21>50)' : analysis.bearish ? 'Aligned bearish (50>21>8)' : 'Mixed/transitioning'}
-Setup Quality: ${setupQuality.quality}/100 (${setupQuality.tight ? 'tight base' : 'wide range'}, ${setupQuality.breakingOut ? 'breaking out' : 'no breakout'}, vol ${setupQuality.volDeclining ? 'declining in base' : 'normal'})
+Setup Quality: ${effectiveQuality}/100 (${effectiveQuality > setupQuality.quality ? 'momentum-runner quality exceeds base quality' : setupQuality.tight ? 'tight base' : 'wide range'}, ${setupQuality.breakingOut ? 'breaking out' : 'no base breakout'}, vol ${setupQuality.volDeclining ? 'declining in base' : 'normal'})
 Market Regime: ${regime.label}
 ${earningsInfo.hasEarnings ? `⚠ EARNINGS in ${earningsInfo.daysUntil} days (${earningsInfo.date})` : 'No earnings risk in next 3 days'}
 ${cfg.customPromptSuffix ? `Additional context: ${cfg.customPromptSuffix}` : ''}
@@ -4013,7 +3950,88 @@ Respond in plain text (not JSON). Be direct and specific — mention the actual 
 
 // ─── Entry Logic (enhanced with setup quality, EOD freeze, Claude validation) ───
 
-async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
+async function fetchExactOptionQuote(occSymbol) {
+  if (robinhood.optionsEnabled) {
+    try {
+      const parsed = robinhood.parseOCC(occSymbol);
+      if (!parsed) return null;
+      const exactId = await robinhood.resolveOptionId(
+        parsed.ticker,
+        parsed.expiration,
+        parsed.type,
+        parsed.strike,
+        robinhood.accountNumber,
+      );
+      if (!exactId) return null;
+      const raw = await robinhood.getOptionMarketData([exactId]);
+      const body = raw?.data ?? raw;
+      const items = Array.isArray(body) ? body
+        : Array.isArray(body?.options) ? body.options
+        : Array.isArray(body?.results) ? body.results
+        : Array.isArray(body?.contracts) ? body.contracts : [];
+      const expected = { instrumentUrl: exactId, occSymbol };
+      const match = items.find(item => exactOptionQuoteMatches(expected, {
+        ...item,
+        ...(item.quote && typeof item.quote === "object" ? item.quote : {}),
+        ...(item.market_data && typeof item.market_data === "object" ? item.market_data : {}),
+      })) || null;
+      const src = match?.quote && typeof match.quote === "object"
+        ? { ...match, ...match.quote }
+        : match?.market_data && typeof match.market_data === "object"
+          ? { ...match, ...match.market_data }
+          : match;
+      const bid = parseFloat(src?.bid_price ?? src?.bid ?? src?.best_bid_price);
+      const ask = parseFloat(src?.ask_price ?? src?.ask ?? src?.best_ask_price);
+      if (bid > 0 && ask > 0 && ask >= bid) {
+        return { bid, ask, mid: +((bid + ask) / 2).toFixed(2), twoSided: true, tradeable: true, source: "robinhood" };
+      }
+    } catch { }
+  }
+  return null;
+}
+
+function buildEntryPreflight({
+  ticker, type, direction, strike, dte, expiryDate, qty, entryPremium, cost,
+  setupQuality, claudeConfidence, trust, selectedCandidate, optionsSource, maxBudget = null,
+}) {
+  const contract = selectedCandidate ? {
+    occSymbol: selectedCandidate.occSymbol || null,
+    strike: selectedCandidate.strike,
+    expiryDate: selectedCandidate.expiryDate,
+    expiryStr: selectedCandidate.expiryStr,
+    dte: selectedCandidate.dte,
+    mid: selectedCandidate.mid,
+    bid: selectedCandidate.bid,
+    ask: selectedCandidate.ask,
+    iv: selectedCandidate.iv,
+    delta: selectedCandidate.delta,
+    gamma: selectedCandidate.gamma,
+    theta: selectedCandidate.theta,
+    vega: selectedCandidate.vega,
+    oi: selectedCandidate.oi,
+    volume: selectedCandidate.volume,
+    spread: selectedCandidate.spread,
+    spreadPct: selectedCandidate.spreadPct,
+    roundTripFrictionPct: selectedCandidate.roundTripFrictionPct,
+    feeDragPct: selectedCandidate.feeDragPct,
+    quality: selectedCandidate.quality,
+  } : null;
+  return {
+    preflight: true,
+    preparedAt: Date.now(),
+    ticker, type, direction, strike, dte, expiryDate, qty,
+    entryPremium: +entryPremium.toFixed(2),
+    cost: +cost.toFixed(2),
+    setupQuality,
+    claudeConfidence,
+    trust,
+    maxBudget,
+    contract,
+    optionsSource,
+  };
+}
+
+async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflightOnly = false, expectedPackage = null } = {}) {
   const state = acct.state;
   const cfg = acct.config;
   if (state.positions.some(p => p.ticker === ticker)) return null;
@@ -4050,7 +4068,10 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   // OTHER sector is unlimited (unmapped tickers have unknown correlation).
   const sector = getSector(ticker);
   if (sector !== "OTHER") {
-    const inSector = countPositionsInSector(state, sector);
+    const heldTickers = new Set(state.positions.map(p => p.ticker.toUpperCase()));
+    const pendingInSector = [...(acct._inflightTickers || [])]
+      .filter(t => !heldTickers.has(t) && getSector(t) === sector).length;
+    const inSector = countPositionsInSector(state, sector) + pendingInSector;
     if (inSector >= MAX_PER_SECTOR) {
       const held = state.positions.filter(p => getSector(p.ticker) === sector).map(p => p.ticker).join(",");
       return { skipped: true, reason: `Sector cap: already ${inSector} ${sector} positions (${held}) — max ${MAX_PER_SECTOR}` };
@@ -4087,6 +4108,10 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   // ─── Local pre-filters (catch what Claude would reject without API call) ───
   const isBullish = analysis.score >= cfg.bullEntry;
   const isBearish = analysis.score <= cfg.bearEntry;
+
+  const shortTerm = acct.dashboard?.shortTermAnalyses?.[ticker] || null;
+  const momGate = momentumEntryGate(cfg, analysis, shortTerm, quote, isBullish);
+  if (momGate) return { skipped: true, reason: momGate };
 
   // SRxTrades style: relative strength names often have RSI 70-90 on 8 EMA taps — that IS the setup.
   // Only block truly parabolic RSI that indicates exhaustion, not healthy momentum.
@@ -4142,7 +4167,8 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   let selectedCandidate = null;
   let candidates = [];
 
-  const cached = getCachedValidation(acct.id, ticker, analysis.score, direction);
+  const validationContext = `${cfg.broker}:${rhTradeMode(cfg)}:${regime?.mode || "unknown"}:${cfg.customPromptSuffix || ""}`;
+  const cached = getCachedValidation(acct.id, ticker, analysis.score, direction, validationContext);
   if (cached) {
     claudeResult = cached.result;
     selectedCandidate = cached.selectedCandidate; // may be null if previously used synthetic
@@ -4159,7 +4185,17 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
           await delay(apiDelay());
           if (chain) setCachedChain(ticker, chain);
         }
-        if (chain) candidates = buildCandidateContracts(chain, type, spot, 15);
+        if (chain) {
+          candidates = buildCandidateContracts(chain, type, spot, 15);
+          // Validation may stay cached for 30 minutes, but its contract quote must not. Remap the
+          // approved strike/expiry onto the freshly built chain so bid/ask/mid are current.
+          if (selectedCandidate) {
+            const approved = selectedCandidate;
+            selectedCandidate = candidates.find(c =>
+              c.expiryStr === approved.expiryStr && Math.abs(c.strike - approved.strike) < 0.001
+            ) || candidates[cached.result?.contractIdx ?? 0] || candidates[0] || null;
+          }
+        }
       } catch (e) {
         log(acct, `OPTIONS ${ticker}: cached affordability refresh failed — ${e.message}`);
       }
@@ -4198,7 +4234,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
       }
     } else {
     try {
-      claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, rhUsesOptionsForEntry(cfg) ? candidates : null);
+      claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, rhUsesOptionsForEntry(cfg) ? candidates : null, effectiveQuality);
       selectedCandidate = candidates.length > 0 ? candidates[claudeResult.contractIdx ?? 0] : null;
       // Stagger expirations: if Claude's pick lands on an over-concentrated expiry, prefer an
       // equally-valid candidate on a less-crowded expiration date.
@@ -4211,7 +4247,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
           selectedCandidate = alt;
         }
       }
-      setCachedValidation(acct.id, ticker, analysis.score, direction, claudeResult, selectedCandidate);
+      setCachedValidation(acct.id, ticker, analysis.score, direction, claudeResult, selectedCandidate, validationContext);
       log(acct, `CLAUDE VALIDATE ${ticker}: ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%)${selectedCandidate ? ` → $${selectedCandidate.strike} ${selectedCandidate.expiryStr} (${selectedCandidate.dte}d)` : ''} — ${claudeResult.suggestion}${claudeResult.concerns?.length ? ' | ' + claudeResult.concerns.join(', ') : ''}`);
       logClaudeCall({
         type: "entry_validation",
@@ -4274,7 +4310,16 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     unitName = "share";
   } else {
     const originalCandidate = selectedCandidate;
-    selectedCandidate = chooseAffordableCandidate(candidates, selectedCandidate, maxContractCost, state);
+    selectedCandidate = chooseAffordableCandidate(candidates, selectedCandidate, maxContractCost, acct);
+    if (expectedPackage?.contract) {
+      const expected = expectedPackage.contract;
+      const sameContract = selectedCandidate
+        && selectedCandidate.expiryStr === expected.expiryStr
+        && Math.abs(selectedCandidate.strike - expected.strike) < 0.001;
+      if (!sameContract) {
+        return { skipped: true, reason: `Ranked contract ${expected.expiryStr} $${expected.strike} is no longer the executable package — refusing an unranked substitution` };
+      }
+    }
     if (selectedCandidate && originalCandidate && selectedCandidate !== originalCandidate) {
       contractDowngraded = {
         from: { strike: originalCandidate.strike, expiryStr: originalCandidate.expiryStr, mid: originalCandidate.mid, delta: originalCandidate.delta ?? null },
@@ -4300,12 +4345,21 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
       if (chosenSpreadPct != null && chosenSpreadPct > MAX_ENTRY_SPREAD_PCT) {
         return { skipped: true, reason: `Contract spread ${(chosenSpreadPct * 100).toFixed(0)}% of mid exceeds ${(MAX_ENTRY_SPREAD_PCT * 100).toFixed(0)}% cap — un-exitable without donating the spread${contractDowngraded ? " (only wide-spread junk fit the budget)" : ""}` };
       }
+      // For a quick-bank strategy, the executable ask→bid tax must be small relative to the
+      // intended winner. A 25% round-trip spread cannot support a +12% target even if the mark moves.
+      const frictionPct = selectedCandidate.roundTripFrictionPct != null
+        ? selectedCandidate.roundTripFrictionPct / 100
+        : ((selectedCandidate.ask - selectedCandidate.bid) + (2 * FEE_PER_CONTRACT / 100)) / selectedCandidate.ask;
+      const maxFrictionPct = Math.min(0.15, Math.max(0.06, 0.5 * (cfg.profitTarget || 0.12)));
+      if (!Number.isFinite(frictionPct) || frictionPct > maxFrictionPct) {
+        return { skipped: true, reason: `Contract executable friction ${(frictionPct * 100).toFixed(1)}% exceeds ${(maxFrictionPct * 100).toFixed(1)}% cap for a +${((cfg.profitTarget || 0.12) * 100).toFixed(0)}% target — spread would consume the edge` };
+      }
       strike = selectedCandidate.strike;
       dte = selectedCandidate.dte;
       expiryDate = selectedCandidate.expiryDate;
       premium = selectedCandidate.mid;
       posIv = selectedCandidate.iv || DEFAULT_IV;
-      optionsSource = tradier.isConnected ? "tradier" : "finnhub";
+      optionsSource = selectedCandidate.dataSource || "unknown";
       log(acct, `CONTRACT ${ticker}: $${strike} ${type.toUpperCase()} exp ${selectedCandidate.expiryStr} (${dte}d) @ $${premium} mid | IV ${posIv ? (posIv*100).toFixed(0)+'%' : '?'} | OI ${selectedCandidate.oi} | spread $${selectedCandidate.spread}${selectedCandidate.feeDragPct != null ? ` | fee drag ${selectedCandidate.feeDragPct}% RT` : ''}`);
     } else if ((candidates || []).length > 0) {
       // Real near-the-money contracts exist but none fit the budget. We deliberately do NOT reach for
@@ -4334,22 +4388,36 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   }
 
   const isRhEquityOnly = cfg.broker === "robinhood" && rhTradeMode(cfg) === "equity";
-  if (costPer > state.cash && !isRhEquityOnly) return { skipped: true, reason: `No affordable ${unitName}: cheapest selected ${unitName} costs $${costPer.toFixed(0)} but spend limit is $${state.cash.toFixed(0)}` };
+  // Size live orders from the price we actually plan to submit, not the optimistic midpoint.
+  // Otherwise leaning toward the ask can push the real order over its cash/risk/max-size ceiling.
+  let expectedEntryPremium = type === "equity" ? spot : premium;
+  if ((cfg.broker === "tradier" || cfg.broker === "robinhood") && selectedCandidate && type !== "equity") {
+    const conviction = Math.max(0, Math.min(1, (claudeResult.confidence || 0) / 100));
+    expectedEntryPremium = entryLimitPrice(selectedCandidate.bid, selectedCandidate.ask, premium, conviction);
+  } else if (isRhEquityOnly) {
+    const eqBid = quote.bid ?? null;
+    const eqAsk = quote.ask ?? null;
+    const eqMid = (eqBid > 0 && eqAsk > 0) ? (eqBid + eqAsk) / 2 : spot;
+    expectedEntryPremium = +(Math.min(eqAsk || spot, eqMid * (1 + MAX_ENTRY_OVERPAY_PCT))).toFixed(2);
+  }
+  const sizingCostPer = expectedEntryPremium * (type === "equity" ? 1 : 100);
 
-  if (deployable < costPer && !isRhEquityOnly) {
-    return { skipped: true, reason: `Cash reserve: ${(reservePct * 100).toFixed(0)}% buffer required (trust ${(trust * 100).toFixed(0)}%) — only $${deployable.toFixed(0)} of $${state.cash.toFixed(0)} cash deployable, need $${costPer.toFixed(0)}/${unitName}` };
+  if (sizingCostPer > state.cash && !isRhEquityOnly) return { skipped: true, reason: `No affordable ${unitName}: planned entry costs $${sizingCostPer.toFixed(0)} but spend limit is $${state.cash.toFixed(0)}` };
+
+  if (deployable < sizingCostPer && !isRhEquityOnly) {
+    return { skipped: true, reason: `Cash reserve: ${(reservePct * 100).toFixed(0)}% buffer required (trust ${(trust * 100).toFixed(0)}%) — only $${deployable.toFixed(0)} of $${state.cash.toFixed(0)} cash deployable, need $${sizingCostPer.toFixed(0)}/${unitName}` };
   }
 
-  const budget = Math.min(maxRisk, deployable);
-  let qty = Math.max(1, Math.floor(budget / costPer));
-  let totalCost = qty * costPer;
+  const budget = Math.min(maxRisk, deployable, maxSize);
+  let qty = Math.max(1, Math.floor(budget / sizingCostPer));
+  let totalCost = qty * sizingCostPer;
   
   if (isRhEquityOnly) {
     // Robinhood supports fractional shares (equity-only mode)
-    qty = parseFloat((budget / costPer).toFixed(4));
-    totalCost = qty * costPer;
+    qty = parseFloat((budget / sizingCostPer).toFixed(4));
+    totalCost = qty * sizingCostPer;
   } else {
-    if (totalCost > deployable) { qty = Math.floor(deployable / costPer); totalCost = qty * costPer; }
+    if (totalCost > deployable) { qty = Math.floor(deployable / sizingCostPer); totalCost = qty * sizingCostPer; }
   }
   
   if (qty <= 0) return { skipped: true, reason: `Insufficient deployable cash for ${unitName}` };
@@ -4357,7 +4425,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
 
   // Circuit Breaker: Max Trade Size
   if (totalCost > maxSize) {
-    if (cfg.broker === "tradier" || cfg.broker === "robinhood") {
+    if (!preflightOnly && (cfg.broker === "tradier" || cfg.broker === "robinhood")) {
       acct.paused = true; // Hard stop for real money
       acct.pausedBy = "risk"; // breaker pause: exits keep managing open positions
       saveAccounts();
@@ -4400,7 +4468,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   };
 
   // Serious consideration: Claude approved — mirror to Robinhood watchlist without blocking orders.
-  if (cfg.broker === "robinhood" && claudeResult.approve) {
+  if (!preflightOnly && cfg.broker === "robinhood" && claudeResult.approve) {
     addRhWatchlistCandidate({ ticker, optionType: type, candidate: selectedCandidate, source: "consideration" }).catch(() => {});
   }
 
@@ -4412,11 +4480,46 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     if (optionsSource === "synthetic" || !selectedCandidate || !(premium > 0)) {
       return { skipped: true, reason: `Tradier: no real option market for ${ticker} (source ${optionsSource}) — refusing to trade on synthetic pricing` };
     }
+    if (!acct.config.autoExecute) {
+      return { skipped: true, reason: `Tradier: autoExecute off — entry for ${ticker} not sent (enable on the account)` };
+    }
+    if (preflightOnly) {
+      const occ = tradier.buildOCC(ticker, selectedCandidate.expiryStr, type, strike);
+      const fresh = await fetchExactOptionQuote(occ);
+      if (!fresh?.twoSided || fresh.tradeable === false) {
+        return { skipped: true, reason: `Tradier: ${occ} has no current tradeable two-sided quote — cannot preflight` };
+      }
+      const frictionPct = ((fresh.ask - fresh.bid) + (2 * FEE_PER_CONTRACT / 100)) / fresh.ask;
+      const maxFrictionPct = Math.min(0.15, Math.max(0.06, 0.5 * (cfg.profitTarget || 0.12)));
+      if (!Number.isFinite(frictionPct) || frictionPct > maxFrictionPct) {
+        return { skipped: true, reason: `Tradier: ${occ} executable friction ${(frictionPct * 100).toFixed(1)}% exceeds ${(maxFrictionPct * 100).toFixed(1)}% — spread consumes the target` };
+      }
+      const conviction = Math.max(0, Math.min(1, (claudeResult.confidence || 0) / 100));
+      const liveLimit = entryLimitPrice(fresh.bid, fresh.ask, fresh.mid, conviction);
+      const liveQty = Math.min(qty, Math.floor(budget / (liveLimit * 100)));
+      if (liveQty < 1) return { skipped: true, reason: `Tradier: ${occ} no longer fits $${budget.toFixed(0)} budget` };
+      selectedCandidate = {
+        ...selectedCandidate,
+        bid: fresh.bid,
+        ask: fresh.ask,
+        mid: fresh.mid,
+        spread: +(fresh.ask - fresh.bid).toFixed(2),
+        spreadPct: +(((fresh.ask - fresh.bid) / fresh.mid) * 100).toFixed(1),
+        roundTripFrictionPct: +(frictionPct * 100).toFixed(1),
+      };
+      return buildEntryPreflight({
+        ticker, type, direction, strike, dte, expiryDate, qty: liveQty,
+        entryPremium: liveLimit, cost: liveQty * liveLimit * 100,
+        setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence,
+        trust, selectedCandidate, optionsSource, maxBudget: budget,
+      });
+    }
     return await placeBrokerEntry(acct, {
       ticker, type, strike, expiryDate, dte, qty, premium, direction,
+      expiryStr: selectedCandidate.expiryStr,
       bid: selectedCandidate.bid, ask: selectedCandidate.ask,
       setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence,
-      aiThesis,
+      aiThesis, maxBudget: budget,
     });
   } else if (cfg.broker === "robinhood") {
     if (!acct.config.autoExecute) {
@@ -4434,18 +4537,42 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
 
       try {
         const conviction = Math.max(0, Math.min(1, (claudeResult.confidence || 0) / 100));
-        const bid = selectedCandidate.bid, ask = selectedCandidate.ask;
+        const fresh = await fetchExactOptionQuote(occ);
+        if (!fresh?.twoSided || fresh.tradeable === false) {
+          return { skipped: true, reason: `Robinhood: ${occ} has no current tradeable two-sided quote — ranked package is stale` };
+        }
+        const bid = fresh.bid, ask = fresh.ask;
+        premium = fresh.mid;
 
-        // Hard stop: reject if spread at order time is too wide (before writing any state)
-        if (bid > 0 && ask > 0 && premium > 0) {
-          const liveSpreadPct = (ask - bid) / premium;
-          if (liveSpreadPct > MAX_ENTRY_SPREAD_PCT) {
-            return { skipped: true, reason: `Robinhood: spread ${(liveSpreadPct * 100).toFixed(0)}% at order time exceeds ${(MAX_ENTRY_SPREAD_PCT * 100).toFixed(0)}% cap — refusing entry on ${ticker}` };
-          }
+        const frictionPct = ((ask - bid) + (2 * FEE_PER_CONTRACT / 100)) / ask;
+        const maxFrictionPct = Math.min(0.15, Math.max(0.06, 0.5 * (cfg.profitTarget || 0.12)));
+        if (!Number.isFinite(frictionPct) || frictionPct > maxFrictionPct) {
+          return { skipped: true, reason: `Robinhood: ${occ} executable friction ${(frictionPct * 100).toFixed(1)}% now exceeds ${(maxFrictionPct * 100).toFixed(1)}% — ranked edge disappeared` };
         }
 
+        selectedCandidate = {
+          ...selectedCandidate,
+          bid, ask, mid: premium,
+          spread: +(ask - bid).toFixed(2),
+          spreadPct: +(((ask - bid) / premium) * 100).toFixed(1),
+          roundTripFrictionPct: +(frictionPct * 100).toFixed(1),
+        };
+
         const limit = entryLimitPrice(bid, ask, premium, conviction);
+        qty = Math.min(qty, Math.floor(budget / (limit * 100)));
+        if (qty < 1) {
+          return { skipped: true, reason: `Robinhood: refreshed ${occ} limit $${limit.toFixed(2)} no longer fits $${budget.toFixed(0)} budget` };
+        }
         const aggrLabel = limit >= (ask || limit) ? "at ask" : limit > premium ? "toward ask" : "at mid";
+
+        if (preflightOnly) {
+          return buildEntryPreflight({
+            ticker, type, direction, strike, dte, expiryDate, qty,
+            entryPremium: limit, cost: qty * limit * 100,
+            setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence,
+            trust, selectedCandidate, optionsSource, maxBudget: budget,
+          });
+        }
 
         // Write meta AFTER limit is computed so entryPremium matches what we actually sent.
         // intendedEntryPremium keeps the mid for UI reference (shown as "intended $X" when fill differs).
@@ -4460,10 +4587,27 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
           openTime: Date.now(),
           trimLevel: 0,
           bestPnlPct: 0,
+          bestExitPnlPct: 0,
+          managementPlan: createManagementPlan(cfg, { type, dte }),
           entryAtrPct: analysis.atrPct ?? null,
           setupQuality: effectiveQuality,
           ai: aiThesis || null,
         };
+
+        const entryRefId = crypto.randomUUID();
+        Object.assign(acct.state.meta[occ], {
+          entryOrderId: null,
+          entryOrderRefId: entryRefId,
+          entryOrderPlacedAt: Date.now(),
+          entryFirstPlacedAt: Date.now(),
+          entryOrderLimit: +limit.toFixed(2),
+          entryMaxBudget: budget,
+          entryChaseCount: 0,
+          entryOrderCtx: { ticker, expStr, strike, optionType: type, qty },
+        });
+        if (!acct._inflightTickers) acct._inflightTickers = new Set();
+        acct._inflightTickers.add(ticker.toUpperCase());
+        reserveInflightExpiry(acct, ticker, expiryDate);
 
         const res = await robinhood.placeOptionOrder({
           symbol: ticker,
@@ -4474,25 +4618,18 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
           quantity: qty,
           type: "limit",
           limitPrice: limit.toFixed(2),
+          refId: entryRefId,
         });
 
-        // If the MCP response includes an immediate fill price, update meta now so the first
-        // sync cycle gets the real fill rather than our limit estimate.
-        const immediateFill = parseFloat(res?.average_price || res?.price || 0);
-        if (immediateFill > 0) acct.state.meta[occ].entryPremium = immediateFill > 1 ? immediateFill / 100 : immediateFill;
+        // Only executions/processed premium are fills. `res.price` is the submitted limit.
+        const immediateFill = optionOrderExecutedQuantity(res) > 0 ? optionOrderAverageFillPrice(res) : null;
+        if (immediateFill > 0) acct.state.meta[occ].entryPremium = +immediateFill.toFixed(2);
 
         // Entry-order working context: lets workRobinhoodEntryOrders() re-quote this resting
         // limit each sync and chase toward the ask (within a conviction-scaled ceiling) or
         // cancel and walk away if the price runs — instead of sitting stale all day.
-        acct.state.meta[occ].entryOrderId = res?.id || res?.order_id || null;
-        acct.state.meta[occ].entryOrderPlacedAt = Date.now();
-        acct.state.meta[occ].entryFirstPlacedAt = Date.now();
-        acct.state.meta[occ].entryOrderLimit = +limit.toFixed(2);
-        acct.state.meta[occ].entryChaseCount = 0;
-        acct.state.meta[occ].entryOrderCtx = { ticker, expStr, strike, optionType: type, qty };
-
-        if (!acct._inflightTickers) acct._inflightTickers = new Set();
-        acct._inflightTickers.add(ticker.toUpperCase());
+        acct.state.meta[occ].entryOrderId = brokerOrderId(res);
+        if (!acct.state.meta[occ].entryOrderId) acct.state.meta[occ].entrySubmissionUnknownAt = Date.now();
         log(acct, `ROBINHOOD OPTION ENTRY: BUY ${qty}x ${occ} @ $${limit.toFixed(2)} (${aggrLabel}; conviction ${(conviction * 100).toFixed(0)}%; bid ${bid ?? "?"}/ask ${ask ?? "?"}/mid ${premium}) — order ${res?.id || JSON.stringify(res).slice(0, 80)}`);
 
         acct.state.cash = Math.max(0, acct.state.cash - qty * limit * 100);
@@ -4505,47 +4642,26 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
 
         return { ticker, type, strike, dte, qty, entryPremium: +limit.toFixed(2), intendedEntryPremium: +premium.toFixed(2), cost: qty * limit * 100, direction, optionsSource: "robinhood", setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence, brokerOrder: true, watchlistCandidate: selectedCandidate };
       } catch (e) {
-        delete acct.state.meta[occ];
-        log(acct, `ROBINHOOD OPTION ENTRY FAILED ${ticker}: ${e.message}`);
-        return { skipped: true, reason: `Robinhood option entry rejected: ${e.message}`, watchlistCandidate: selectedCandidate, watchlistType: type };
+        const entryMeta = acct.state.meta[occ];
+        if (e.brokerRejected) {
+          delete acct.state.meta[occ];
+          acct._inflightTickers?.delete(ticker.toUpperCase());
+          log(acct, `ROBINHOOD OPTION ENTRY REJECTED ${ticker}: ${e.message}`);
+          return { skipped: true, reason: `Robinhood option entry rejected: ${e.message}`, watchlistCandidate: selectedCandidate, watchlistType: type };
+        }
+        if (entryMeta) entryMeta.entrySubmissionUnknownAt = Date.now();
+        log(acct, `ROBINHOOD OPTION ENTRY STATUS UNKNOWN ${ticker}: ${e.message} — retaining ref/lock; no duplicate order will be sent`);
+        return { skipped: true, reason: `Robinhood entry status unknown; quarantined for reconciliation`, watchlistCandidate: selectedCandidate, watchlistType: type };
       }
     } else if (rhUsesEquityForEntry(cfg)) {
-      // ─── Robinhood EQUITY entry (legacy / dual mode only) ───
-      // Use bid/ask from quote if available; cap limit at MAX_ENTRY_OVERPAY_PCT above mid
-      const eqBid = quote.bid ?? null;
-      const eqAsk = quote.ask ?? null;
-      const eqMid = (eqBid > 0 && eqAsk > 0) ? (eqBid + eqAsk) / 2 : spot;
-      const eqLimit = +(Math.min(eqAsk || spot, eqMid * (1 + MAX_ENTRY_OVERPAY_PCT))).toFixed(2);
-
-      if (!acct.state.meta) acct.state.meta = {};
-      acct.state.meta[ticker] = {
-        entryPremium: eqLimit,
-        entrySpot: spot,
-        originalQty: qty,
-        openDate: getETDateStr(),
-        openTime: Date.now(),
-        trimLevel: 0,
-        bestPnlPct: 0,
-        entryAtrPct: analysis.atrPct ?? null,
-        ai: aiThesis || null,
+      // Equity order reconciliation is intentionally manual-only. Do not fall back from a failed
+      // option package to shares: the automated lifecycle below is exact-contract options only.
+      return {
+        skipped: true,
+        reason: `Robinhood equity automation is disabled — ${ticker} shares are manual-only`,
+        watchlistCandidate: selectedCandidate,
+        watchlistType: type,
       };
-
-      try {
-        const res = await robinhood.placeEquityOrder({
-          symbol: ticker, side: "buy", type: "limit", quantity: qty, limitPrice: eqLimit, refId: crypto.randomUUID()
-        });
-
-        if (!acct._inflightTickers) acct._inflightTickers = new Set();
-        acct._inflightTickers.add(ticker.toUpperCase());
-        log(acct, `ROBINHOOD ENTRY: BUY ${qty}x ${ticker} @ $${eqLimit.toFixed(2)} limit — order ${res?.id || "?"}`);
-
-        acct.state.cash = Math.max(0, acct.state.cash - totalCost);
-        return { ticker, type: "equity", strike: 0, dte: 0, qty, entryPremium: eqLimit, cost: totalCost, direction, optionsSource: "robinhood", setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence, brokerOrder: true };
-      } catch (e) {
-        delete acct.state.meta[ticker];
-        log(acct, `ROBINHOOD ENTRY FAILED ${ticker}: ${e.message}`);
-        return { skipped: true, reason: `Robinhood entry rejected: ${e.message}`, watchlistCandidate: selectedCandidate, watchlistType: type };
-      }
     } else {
       return { skipped: true, reason: `Robinhood options-only: no viable ${type} contract for ${ticker}`, watchlistCandidate: selectedCandidate, watchlistType: type };
     }
@@ -4558,6 +4674,15 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
   const entryCostPer = entryFill * 100;
   qty = Math.max(1, Math.min(qty, Math.floor(state.cash / entryCostPer)));
   totalCost = qty * entryCostPer;
+
+  if (preflightOnly) {
+    return buildEntryPreflight({
+      ticker, type, direction, strike, dte, expiryDate, qty,
+      entryPremium: entryFill, cost: totalCost,
+      setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence,
+      trust, selectedCandidate, optionsSource, maxBudget: budget,
+    });
+  }
 
   const position = {
     ticker, type, strike, dte,
@@ -4573,6 +4698,8 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey) {
     openTime: Date.now(),
     trimLevel: 0,
     bestPnlPct: 0,
+    bestExitPnlPct: 0,
+    managementPlan: createManagementPlan(cfg, { type, dte }),
     ...aiThesis,
     // Capture ATR% at entry so the spot stop can scale to the underlying's normal noise.
     // Noisy names (AMKR ~5%, NOK ~6%) need a wider stop than calm names (UNH ~2%).
@@ -4612,6 +4739,8 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
   if (isBullish && analysis.rsi > 85 && !analysis.aligned) return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} parabolic with misaligned EMAs` };
   if (isBearish && analysis.rsi > 30 && analysis.rsi < 55 && !analysis.bearish) return { skipped: true, reason: `Weak put setup` };
   if (isBullish && regime.mode === "risk-off" && !analysis.aligned) return { skipped: true, reason: `Risk-off + misaligned EMAs` };
+  const momGateSim = momentumEntryGate(cfg, analysis, acct.dashboard?.shortTermAnalyses?.[ticker] || analysis.shortTerm || null, quote, isBullish);
+  if (momGateSim) return { skipped: true, reason: momGateSim };
   const maxRange = (analysis.aligned && isBullish) || (analysis.bearish && isBearish) ? 60 : 15;
   if (parseFloat(sq.rangePct) > maxRange) return { skipped: true, reason: `Range too wide ${sq.rangePct}%` };
 
@@ -4672,7 +4801,8 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
     entryPremium: entryFill, entrySpot: spot, _lastSpot: spot, qty, originalQty: qty,
     cost: totalCost, openDate: acct._simDateStr || getETDateStr(),
     openTime: acct._simNow || Date.now(),
-    trimLevel: 0, bestPnlPct: 0,
+    trimLevel: 0, bestPnlPct: 0, bestExitPnlPct: 0,
+    managementPlan: createManagementPlan(cfg, { type, dte }, acct._simNow || Date.now()),
     claudeConfidence: claudeResult.confidence,
     claudeReasoning: (claudeResult.reasoning || "").trim() || `Backtest entry on technicals: ${isBull ? "BULLISH" : "BEARISH"} setup, score ${analysis.score}/100, setup quality ${sq.quality}/100, regime ${regime.label}.`,
     claudeSuggestion: claudeResult.suggestion || "",
@@ -4690,9 +4820,45 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
 
 // ─── Exit Logic (with trimming support) ───
 
-function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
+function clearExitOrderTracking(meta, { keepAttempts = true } = {}) {
+  if (!meta) return;
+  delete meta.exitOrderId;
+  delete meta.exitOrderPlacedAt;
+  delete meta.exitOrderLimit;
+  delete meta.exitOrderRefId;
+  delete meta.exitOrderTicker;
+  delete meta.exitPriceMode;
+  delete meta.exitReason;
+  delete meta.exitIsTrim;
+  delete meta.exitRequestedQty;
+  delete meta.exitBaselinePositionQty;
+  delete meta.exitBookedQty;
+  delete meta.exitBookedGross;
+  delete meta.exitTrimTargetLevel;
+  delete meta.exitSubmissionUnknownAt;
+  delete meta.exitStaleAfterMs;
+  delete meta.exitCancelFailedAt;
+  delete meta.exitCancelRequestedAt;
+  delete meta.exitCancelAttemptedAt;
+  delete meta.exitRecoveryAttemptAt;
+  delete meta.exitRecoveryNoIdLoggedAt;
+  delete meta.exitRecoveryErrorLoggedAt;
+  delete meta.exitRecoveryContextLoggedAt;
+  delete meta.exitReconcileWaitLoggedAt;
+  if (!keepAttempts) delete meta.exitAttempts;
+}
+
+function brokerOrderId(result) {
+  return result?.id || result?.order_id || result?.data?.id || result?.data?.order_id
+    || result?.order?.id || result?.order?.order_id
+    || result?.results?.[0]?.id || result?.results?.[0]?.order_id
+    || result?.data?.results?.[0]?.id || result?.data?.results?.[0]?.order_id
+    || null;
+}
+
+async function closePosition(acct, pos, currentPremium, reason, qtyToClose, execution = {}) {
   const state = acct.state;
-  const qty = qtyToClose || pos.qty;
+  let qty = qtyToClose || pos.qty;
   const isEquity = pos.type === "equity";
   const multiplier = isEquity ? 1 : 100;
   const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
@@ -4706,6 +4872,16 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
     if (acct.config.broker === "tradier") {
       return placeBrokerExit(acct, pos, currentPremium, reason, qty, pnlPct, pnlDollar);
     } else if (acct.config.broker === "robinhood") {
+      if (isEquity) {
+        if (!state.meta[pos.ticker]) state.meta[pos.ticker] = {};
+        const equityMeta = state.meta[pos.ticker];
+        pos._stopSuppressed = "Robinhood equity automation is manual-only";
+        if (!equityMeta.rhEquityManualOnlyNoticeAt) {
+          equityMeta.rhEquityManualOnlyNoticeAt = Date.now();
+          log(acct, `ROBINHOOD EQUITY EXIT SUPPRESSED ${pos.ticker}: equity automation is manual-only; no broker order was sent`);
+        }
+        return null;
+      }
       if (!acct._inflightTickers) acct._inflightTickers = new Set();
       if (acct._inflightTickers.has(pos.ticker.toUpperCase())) {
         log(acct, `ROBINHOOD: working order already open for ${pos.ticker} — skipping duplicate exit`);
@@ -4715,30 +4891,20 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
         log(acct, `ROBINHOOD: autoExecute off — exit for ${pos.ticker} not sent`);
         return null;
       }
+      if (!isVerifiedRobinhoodContract(pos)) {
+        log(acct, `ROBINHOOD OPTION EXIT BLOCKED: ${pos.ticker} contract identity/expiry is not verified`);
+        return null;
+      }
+      if (!(pos.liveQuoteAt > 0) || Date.now() - pos.liveQuoteAt > RH_OPTION_QUOTE_MAX_AGE_MS) {
+        log(acct, `ROBINHOOD OPTION EXIT BLOCKED: ${pos.ticker} exact-contract quote is stale or missing`);
+        return null;
+      }
       acct._inflightTickers.add(pos.ticker.toUpperCase());
 
       const isTrimLocal = qty < pos.qty;
       const refId = crypto.randomUUID();
 
-      if (isEquity) {
-        // Equity exit
-        const limitPrice = currentPremium;
-        robinhood.placeEquityOrder({
-          symbol: pos.ticker, side: "sell", type: "limit", quantity: qty, limitPrice, refId
-        }).then(res => {
-          log(acct, `ROBINHOOD EXIT: SELL ${qty}x ${pos.ticker} @ $${limitPrice.toFixed(2)} limit (${isTrimLocal ? "TRIM" : "EXIT"} — ${reason}) — order ${res?.id || "?"}`);
-          // Track the working exit so the sync diff can book the trade when it fills.
-          if (!acct.state.meta[pos.ticker]) acct.state.meta[pos.ticker] = {};
-          acct.state.meta[pos.ticker].exitOrderId = res?.id || res?.order_id || null;
-          acct.state.meta[pos.ticker].exitOrderPlacedAt = Date.now();
-          acct.state.meta[pos.ticker].exitOrderLimit = limitPrice;
-          acct.state.meta[pos.ticker].exitReason = reason;
-          acct.state.meta[pos.ticker].exitIsTrim = isTrimLocal;
-        }).catch(e => {
-          acct._inflightTickers.delete(pos.ticker.toUpperCase());
-          log(acct, `ROBINHOOD EXIT FAILED ${pos.ticker}: ${e.message}`);
-        });
-      } else if (robinhood.optionsEnabled) {
+      if (robinhood.optionsEnabled) {
         // Options exit — sell_to_close
         const bid = typeof pos.liveBid === "number" && pos.liveBid > 0 ? pos.liveBid : null;
         const ask = typeof pos.liveAsk === "number" && pos.liveAsk > 0 ? pos.liveAsk : null;
@@ -4749,8 +4915,9 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
         // price at the bid, which is what a real buyer is actually willing to pay right now.
         // Negotiating off mid in a wide market (the old behavior) could park the limit ABOVE the
         // achievable bid, so the order sits open forever while the position keeps bleeding.
-        const guaranteedFill = pnlPct <= 0 || /critical|expir|low-dte/i.test(reason);
+        const guaranteedFill = pnlPct <= 0 || /critical|expir|low-dte|time-decay/i.test(reason);
         const protective = guaranteedFill || /stop|reversed|breakeven|theta/i.test(reason);
+        const priceMode = execution.priceMode || (guaranteedFill ? "marketable" : "patient");
 
         // How many exit attempts on this contract have already gone stale (canceled by the
         // watchdog). Each retry escalates: attempt 0 negotiates, later attempts hit the bid,
@@ -4759,70 +4926,97 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
         const occKey = pos.occSymbol || (pos.expiryDate ? robinhood.buildOCC(pos.ticker, new Date(pos.expiryDate).toISOString().slice(0, 10), pos.type, pos.strike) : null);
         const exitAttempts = (occKey && acct.state.meta[occKey]?.exitAttempts) || 0;
 
-        let limit = +mid.toFixed(2);
-        if ((guaranteedFill || exitAttempts >= 1) && bid != null) {
-          limit = +bid.toFixed(2);
-        } else if (protective) {
-          if (spreadPct <= WIDE_SPREAD_EXIT_PCT && bid != null) {
-            limit = +bid.toFixed(2);
-          } else if (mid > 0) {
-            const floor = bid != null ? bid : 0;
-            limit = +Math.max(floor, mid * (1 - MAX_EXIT_CONCESSION_PCT)).toFixed(2);
-          }
+        const pricing = chooseOptionSellLimit({
+          bid,
+          ask,
+          mark: pos.liveMark,
+          referencePrice: currentPremium,
+          priceMode,
+          protective,
+          exitAttempts,
+          wideSpreadPct: WIDE_SPREAD_EXIT_PCT,
+          maxConcessionPct: MAX_EXIT_CONCESSION_PCT,
+        });
+        if (!(pricing.limit > 0)) {
+          acct._inflightTickers.delete(pos.ticker.toUpperCase());
+          log(acct, `ROBINHOOD OPTION EXIT BLOCKED: ${pos.ticker} has no executable bid for ${priceMode} exit`);
+          return null;
         }
-        if (exitAttempts >= 2 && bid != null) {
-          limit = Math.max(0.01, +(bid - 0.01).toFixed(2)); // 3rd+ attempt: cross the bid, get out
-        }
+        const limit = pricing.limit;
 
-          // Hard abort: refuse exits whose limit is clearly a different contract's premium.
-          // Friday 2026-07-10: PATH ($0.85 entry) was nearly sold at SPY's ~$6.66 mark (~$666 vs ~$85).
-          if (pos.entryPremium > 0 && limit > 0) {
-            const ratio = limit / pos.entryPremium;
-            if (ratio > 3.5 || ratio < 0.15) {
-              const badMark = pos.liveMark;
-              acct._inflightTickers.delete(pos.ticker.toUpperCase());
-              // Drop the bad mark so the next sync re-fetches instead of looping on garbage.
-              pos.liveMark = null;
-              pos.liveBid = null;
-              pos.liveAsk = null;
-              log(acct, `ROBINHOOD OPTION EXIT BLOCKED: ${pos.ticker} $${pos.strike} ${pos.type} limit $${limit} is ${ratio.toFixed(2)}x entry $${pos.entryPremium} (bid=${bid ?? "?"} mark=${badMark ?? "?"}) — refusing cross-contaminated price`);
-              return null;
+        const expStr = pos.expiryDate ? new Date(pos.expiryDate).toISOString().slice(0, 10) : null;
+        if (expStr) {
+          if (!acct.state.meta[occKey]) acct.state.meta[occKey] = {};
+          const exitMeta = acct.state.meta[occKey];
+          const requestedTrimLevel = execution.reasonCode === "TRIM_1" ? 1
+            : execution.reasonCode === "TRIM_2" ? 2
+              : execution.reasonCode === "EMA8_TRIM" ? 3 : null;
+          if (isTrimLocal && requestedTrimLevel != null) {
+            if (exitMeta.trimPendingLevel === requestedTrimLevel && exitMeta.trimPendingTargetQty > 0) {
+              const remainingTrimQty = Math.max(0, exitMeta.trimPendingTargetQty - (exitMeta.trimPendingFilledQty || 0));
+              qty = Math.min(qty, remainingTrimQty);
+              if (!(qty > 0)) {
+                acct._inflightTickers.delete(pos.ticker.toUpperCase());
+                log(acct, `ROBINHOOD OPTION EXIT BLOCKED: ${pos.ticker} trim tier ${requestedTrimLevel} already fully reconciled`);
+                return null;
+              }
+            } else {
+              exitMeta.trimPendingLevel = requestedTrimLevel;
+              exitMeta.trimPendingTargetQty = qty;
+              exitMeta.trimPendingFilledQty = 0;
             }
           }
-
-          const expStr = pos.expiryDate ? new Date(pos.expiryDate).toISOString().slice(0, 10) : null;
-        if (expStr) {
+          // Persist intent before the asynchronous broker call. The sync loop merges this grace-state
+          // with Robinhood's working-order snapshot, closing the duplicate-sell race.
+          Object.assign(exitMeta, {
+            exitOrderId: null,
+            exitOrderRefId: refId,
+            exitOrderPlacedAt: Date.now(),
+            exitOrderLimit: limit,
+            exitOrderTicker: pos.ticker.toUpperCase(),
+            exitPriceMode: priceMode,
+            exitReason: reason,
+            exitIsTrim: isTrimLocal,
+            exitRequestedQty: qty,
+            exitBaselinePositionQty: pos.qty,
+            exitBookedQty: 0,
+            exitBookedGross: 0,
+            exitTrimTargetLevel: requestedTrimLevel,
+            exitStaleAfterMs: execution.urgency === "urgent" ? 15_000
+              : execution.urgency === "protective" ? 20_000 : 3 * 60_000,
+          });
           // Log synchronously, before the async call, so the cycle log always shows what was
           // attempted (and at what price) even if the network call hangs or the process restarts.
-          log(acct, `ROBINHOOD OPTION EXIT: attempting SELL ${qty}x ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} @ $${limit} limit (bid=${bid ?? "?"} ask=${ask ?? "?"} mid=${mid != null ? mid.toFixed(2) : "?"} spread=${(spreadPct * 100).toFixed(0)}% guaranteedFill=${guaranteedFill} attempt=${exitAttempts + 1}) — ${isTrimLocal ? "TRIM" : "EXIT"}: ${reason}`);
-          robinhood.placeOptionOrder({
-            symbol: pos.ticker,
-            expirationDate: expStr,
-            strikePrice: pos.strike,
-            optionType: pos.type,
-            side: "sell_to_close",
-            quantity: qty,
-            type: "limit",
-            limitPrice: limit.toFixed(2),
-            refId,
-            // We already hold the contract's instrument UUID — pass it so the order layer skips the
-            // instrument lookup (and works even if strike wasn't resolved from filled orders).
-            optionId: pos.instrumentUrl || undefined,
-          }).then(res => {
+          log(acct, `ROBINHOOD OPTION EXIT: attempting SELL ${qty}x ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} @ $${limit} limit (bid=${bid ?? "?"} ask=${ask ?? "?"} mid=${mid != null ? mid.toFixed(2) : "?"} spread=${(spreadPct * 100).toFixed(0)}% mode=${priceMode} attempt=${exitAttempts + 1}) — ${isTrimLocal ? "TRIM" : "EXIT"}: ${reason}`);
+          try {
+            const res = await robinhood.placeOptionOrder({
+              symbol: pos.ticker,
+              expirationDate: expStr,
+              strikePrice: pos.strike,
+              optionType: pos.type,
+              side: "sell_to_close",
+              quantity: qty,
+              type: "limit",
+              limitPrice: limit.toFixed(2),
+              refId,
+              // We already hold the contract's instrument UUID — pass it so the order layer skips the
+              // instrument lookup (and works even if strike wasn't resolved from filled orders).
+              optionId: pos.instrumentUrl || undefined,
+            });
             const occ = occKey || robinhood.buildOCC(pos.ticker, expStr, pos.type, pos.strike);
             log(acct, `ROBINHOOD OPTION EXIT: SELL ${qty}x ${occ} @ $${limit} (${isTrimLocal ? "TRIM" : "EXIT"} — ${reason}) — order ${res?.id || "?"}`);
-            if (!acct.state.meta[occ]) acct.state.meta[occ] = {};
-            acct.state.meta[occ].exitOrderId = res?.id || res?.order_id || null;
-            acct.state.meta[occ].exitOrderPlacedAt = Date.now();
-            acct.state.meta[occ].exitOrderLimit = limit;
-            // Exit intent — used by the sync diff to book the trade with the real reason and to
-            // advance trim levels once the fill is confirmed.
-            acct.state.meta[occ].exitReason = reason;
-            acct.state.meta[occ].exitIsTrim = isTrimLocal;
-          }).catch(e => {
-            acct._inflightTickers.delete(pos.ticker.toUpperCase());
-            log(acct, `ROBINHOOD OPTION EXIT FAILED ${pos.ticker}: ${e.message}`);
-          });
+            exitMeta.exitOrderId = brokerOrderId(res);
+            if (!exitMeta.exitOrderId) exitMeta.exitSubmissionUnknownAt = Date.now();
+          } catch (e) {
+            if (e.brokerRejected) {
+              clearExitOrderTracking(exitMeta);
+              acct._inflightTickers.delete(pos.ticker.toUpperCase());
+              log(acct, `ROBINHOOD OPTION EXIT REJECTED ${pos.ticker}: ${e.message}`);
+            } else {
+              exitMeta.exitSubmissionUnknownAt = Date.now();
+              log(acct, `ROBINHOOD OPTION EXIT STATUS UNKNOWN ${pos.ticker}: ${e.message} — retaining ref ${refId} and duplicate-order lock`);
+            }
+          }
         } else {
           acct._inflightTickers.delete(pos.ticker.toUpperCase());
           log(acct, `ROBINHOOD OPTION EXIT SKIPPED ${pos.ticker}: no expiry date on position`);
@@ -4832,10 +5026,9 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
     }
   }
 
-  // Paper / sim accounts: peg the fill to a realistic SELL price (the bid), not the theoretical mid —
-  // you can't sell at the top with no real buyer. Live broker accounts never reach here. The exit
-  // DECISION already happened on the mid above, so timing/strategy are unchanged; only the realized
-  // fill price is made realistic. Equities trade at the spot (negligible spread).
+  // Paper / sim accounts: peg the fill to a realistic SELL price (the bid), not the theoretical mid.
+  // The lifecycle manager also evaluates the modeled bid; currentPremium is the mark here solely so
+  // simFillPrice applies the spread exactly once. Equities trade at spot (negligible spread).
   const fillPx = isEquity
     ? currentPremium
     : simFillPrice(currentPremium, posMoneyness(pos.type, pos._lastSpot ?? pos.entrySpot, pos.strike), "sell");
@@ -4868,261 +5061,53 @@ function closePosition(acct, pos, currentPremium, reason, qtyToClose) {
   return trade;
 }
 
-function tryExits(acct, quotes) {
-  const state = acct.state;
-  const cfg = acct.config;
-  const closed = [];
-  const remaining = [];
+// ─── Position-management telemetry helpers ───
 
-  for (const pos of state.positions) {
-    if (pos._pending) { remaining.push(pos); continue; } // unfilled broker order, not a holding
-    if ((acct.config.broker === "tradier" || (acct.config.broker === "robinhood" && pos.type !== "equity")) && pos.liveMark == null) { remaining.push(pos); continue; } // no reliable mark — hold, don't act on synthetic price
-    const q = quotes[pos.ticker];
-    if (!q) { remaining.push(pos); continue; }
-
-    const spot = q.c;
-    pos._lastSpot = spot; // used by the realistic paper-fill model to gauge moneyness on exit
-    const now = acct._simNow || Date.now();
-    const isEquity = pos.type === "equity";
-
-    // Equity positions don't expire; options use stored expiry date or elapsed-day fallback
-    if (!isEquity) {
-      pos.dteRemaining = pos.expiryDate
-        ? Math.max(0, (pos.expiryDate - now) / 86400_000)
-        : Math.max(0, pos.dte - (now - pos.openTime) / 86400_000);
-    } else {
-      pos.dteRemaining = 0;
-    }
-
-    // Equity: current price is just the spot; Options: use live mark or Black-Scholes
-    const currentPremium = isEquity
-      ? (pos.liveMark ?? spot)
-      : (pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type));
-    const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
-
-    if (!pos.bestPnlPct) pos.bestPnlPct = 0;
-    if (pnlPct > pos.bestPnlPct) pos.bestPnlPct = pnlPct;
-    persistPosTrailMeta(acct, pos);
-    if (!pos.trimLevel) pos.trimLevel = 0;
-    if (!pos.originalQty) pos.originalQty = pos.qty;
-
-    let reason = null;
-    let fullClose = false;
-
-    // Spot-based directional stop — exit if the underlying moved against us beyond a threshold,
-    // independent of premium/theta. Threshold is ATR-adaptive: noisy names (AMKR/NOK ~6% ATR)
-    // get a wider stop so normal intraday noise doesn't whipsaw us; calm names (UNH ~2% ATR)
-    // keep the 4% floor. Formula: max(4%, 1.5 × entry-day ATR%).
-    const spotMove = pos.entrySpot ? (spot - pos.entrySpot) / pos.entrySpot : 0;
-    // Equity longs: adverse = stock went down. Options: call adverse = down, put adverse = up.
-    const adverseSpotMove = isEquity ? -spotMove : (pos.type === "call" ? -spotMove : spotMove);
-    const atrPct = (pos.entryAtrPct || 0) / 100;
-    const spotStopThreshold = Math.max(0.04, 1.5 * atrPct);
-    if (adverseSpotMove >= spotStopThreshold) {
-      reason = isEquity
-        ? `spot stop: stock down ${(adverseSpotMove * 100).toFixed(1)}% from entry (threshold ${(spotStopThreshold * 100).toFixed(1)}%, ATR ${(atrPct * 100).toFixed(1)}%)`
-        : `spot stop: underlying ${pos.type === "call" ? "down" : "up"} ${(adverseSpotMove * 100).toFixed(1)}% from entry (threshold ${(spotStopThreshold * 100).toFixed(1)}%, ATR ${(atrPct * 100).toFixed(1)}%)`;
-      fullClose = true;
-    }
-    // DTE-based exits only apply to options, not equity positions
-    else if (!isEquity && pos.dteRemaining <= CRITICAL_DTE) {
-      reason = `DTE critical (${pos.dteRemaining.toFixed(1)}d remaining)`;
-      fullClose = true;
-    }
-    // DTE-aware stop tightening: as expiration approaches, accept smaller losses to avoid
-    // the "force-close at -60%" trap. At <=5 DTE, use a -20% stop instead of -35%.
-    else if (!isEquity && pos.dteRemaining <= LOW_DTE_THRESHOLD && pnlPct <= -0.20) {
-      reason = `low-DTE tight stop ${(pnlPct * 100).toFixed(0)}% (${pos.dteRemaining.toFixed(1)}d left, theta accelerating)`;
-      fullClose = true;
-    }
-    else if (pnlPct <= cfg.stopLoss) {
-      // Equity: premium == price, the configured stop is meaningful — unchanged.
-      // Options: the premium percentage is NOT a loss trigger. Premium is leveraged noise —
-      // a δ0.45 KO call has ~12x leverage, so a -30% premium print is a ~2.4% stock dip on a
-      // 1.3%-ATR name: an ordinary red day, not a broken thesis. The earlier "0.75×ATR
-      // confirmation" gate proved far too weak (KO 7/6-7/7: premium hit -45% on an intact
-      // structure, then popped hard — the confirm would have sold it). The REAL loss exits for
-      // options are, in order: the structural spot stop above (max(4%, 1.5×ATR) against entry),
-      // the DTE ladder, and a premium disaster floor at 1.8× the configured stop — the depth
-      // where IV crush / theta bleed has destroyed the position regardless of the chart, and
-      // selling salvages residual value. Max loss per trade is already bounded by the premium
-      // paid; sizing, not a premium tripwire, is the risk control between those exits.
-      const disasterFloor = optionDisasterFloor(cfg);
-      if (isEquity) {
-        reason = `stop loss ${(pnlPct * 100).toFixed(0)}%`;
-        fullClose = true;
-      } else if (pnlPct <= disasterFloor) {
-        reason = `disaster stop ${(pnlPct * 100).toFixed(0)}% (premium collapse past ${(disasterFloor * 100).toFixed(0)}% — salvaging residual value)`;
-        fullClose = true;
-      } else {
-        pos._stopSuppressed = `premium ${(pnlPct * 100).toFixed(0)}% — holding: structural stop is the underlying (${(adverseSpotMove * 100).toFixed(1)}% adverse vs ${(spotStopThreshold * 100).toFixed(1)}% threshold); premium alone doesn't exit until ${(disasterFloor * 100).toFixed(0)}%`;
-      }
-    }
-    else if (!isEquity && pos.dteRemaining <= 1) {
-      reason = "DTE expiring";
-      fullClose = true;
-    }
-    else if (pnlPct >= cfg.profitTarget) {
-      reason = `profit target +${(pnlPct * 100).toFixed(0)}%`;
-      fullClose = true;
-    }
-    else if (pos.trimLevel === 0 && pnlPct >= cfg.trim1Pct) {
-      const trimQty = Math.max(1, Math.floor(pos.originalQty * 0.25));
-      if (trimQty > 0 && pos.qty > trimQty) {
-        const trade = closePosition(acct, pos, currentPremium, `trim 1 (+${(pnlPct * 100).toFixed(0)}%, locking gains)`, trimQty);
-        if (trade) {
-          closed.push(trade);
-          pos.qty -= trimQty;
-          pos.trimLevel = 1;
-          log(acct, `TRIM STRATEGY: ${pos.ticker} — sold ${trimQty}/${pos.originalQty}, stop moved to breakeven`);
-        }
-      }
-      remaining.push(pos);
-      continue;
-    }
-    else if (pos.trimLevel === 1 && pnlPct >= cfg.trim2Pct) {
-      const trimQty = Math.max(1, Math.floor(pos.originalQty * 0.25));
-      if (trimQty > 0 && pos.qty > trimQty) {
-        const trade = closePosition(acct, pos, currentPremium, `trim 2 (+${(pnlPct * 100).toFixed(0)}%, trailing EMAs)`, trimQty);
-        if (trade) {
-          closed.push(trade);
-          pos.qty -= trimQty;
-          pos.trimLevel = 2;
-          log(acct, `TRIM STRATEGY: ${pos.ticker} — sold ${trimQty} more, trailing with 8 EMA`);
-        }
-      }
-      remaining.push(pos);
-      continue;
-    }
-    else if (pos.trimLevel >= 1 && pnlPct <= 0) {
-      reason = `breakeven stop (post-trim, was +${(pos.bestPnlPct * 100).toFixed(0)}%)`;
-      fullClose = true;
-    }
-    else if (pos.trimLevel >= 2 && pnlPct <= 0.15) {
-      reason = `trailing stop (post-trim2, locked +15%)`;
-      fullClose = true;
-    }
-
-    if (!reason) { remaining.push(pos); continue; }
-
-    if (fullClose) {
-      const trade = closePosition(acct, pos, currentPremium, reason);
-      if (trade) {
-        closed.push(trade);
-      } else {
-        remaining.push(pos);
-      }
-    }
-  }
-
-  state.positions = remaining;
-  state.history.push(...closed);
-  return closed;
-}
-
-// ─── Signal-Based Exit ───
-
-function trySignalExits(acct, quotes, analyses) {
-  const state = acct.state;
-  const cfg = acct.config;
-  const closed = [];
-  const remaining = [];
-
-  for (const pos of state.positions) {
-    if (pos._pending) { remaining.push(pos); continue; } // unfilled broker order, not a holding
-    if ((acct.config.broker === "tradier" || (acct.config.broker === "robinhood" && pos.type !== "equity")) && pos.liveMark == null) { remaining.push(pos); continue; } // no reliable mark — hold, never place live orders on model prices
-    const a = analyses[pos.ticker];
-    if (!a) { remaining.push(pos); continue; }
-
-    let reversed = false;
-    if (pos.type === "call" && a.score <= cfg.bearEntry) reversed = true;
-    if (pos.type === "put" && a.score >= cfg.bullEntry) reversed = true;
-
-    if (!reversed) { remaining.push(pos); continue; }
-
-    const q = quotes[pos.ticker];
-    const spot = q ? q.c : pos.entrySpot;
-    const isEquity = pos.type === "equity";
-    const now = acct._simNow || Date.now();
-    if (!isEquity && pos.expiryDate) {
-      pos.dteRemaining = Math.max(0, (pos.expiryDate - now) / 86400_000);
-    }
-    // Always reprice off the live spot when there's no live mark (don't freeze at entryPremium).
-    const currentPremium = isEquity
-      ? (pos.liveMark ?? spot)
-      : (pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type));
-    const pnlPct = pos.entryPremium > 0 ? (currentPremium - pos.entryPremium) / pos.entryPremium : 0;
-
-    // Hysteresis: don't flatten on a marginal score touch while still green on spot/premium.
-    const deepReversal = pos.type === "call"
-      ? a.score <= cfg.bearEntry - SIGNAL_EXIT_SCORE_MARGIN
-      : a.score >= cfg.bullEntry + SIGNAL_EXIT_SCORE_MARGIN;
-    const underwater = pnlPct <= SIGNAL_EXIT_MIN_LOSS;
-    const spotAgainst = pos.entrySpot && (
-      pos.type === "call" ? spot < pos.entrySpot * 0.98 : spot > pos.entrySpot * 1.02
-    );
-    if (!deepReversal && !underwater && !spotAgainst) {
-      remaining.push(pos);
-      continue;
-    }
-
-    const trade = closePosition(acct, pos, currentPremium, "signal reversed");
-    if (trade) {
-      closed.push(trade);
-    } else {
-      remaining.push(pos);
-    }
-  }
-
-  state.positions = remaining;
-  state.history.push(...closed);
-  return closed;
-}
-
-// ─── EOD / EOW Theta-Aware Exits ───
-// Hard locks (existing): Fri +20% from 2pm, any day +10% from 3:45pm.
-// Soft locks (new): earlier in the afternoon, bank a good winner when the move is clearly
- // stalling or giving back from its session peak — the Friday SPY case (manual close near EOD
- // after leveling off shy of the formal target).
-
-function recordMarkTrail(pos, mark) {
+function recordMarkTrail(pos, mark, now = Date.now(), bid = null) {
   if (!(mark > 0)) return;
   if (!pos.markTrail) pos.markTrail = [];
-  const now = Date.now();
   const last = pos.markTrail[pos.markTrail.length - 1];
   // Coalesce sub-minute duplicates so the trail spans real time, not sync spam.
   if (last && now - last.ts < 45_000) {
     last.mark = mark;
-    last.ts = now;
+    if (bid > 0) last.bid = bid;
+    last.sampledAt = now;
   } else {
-    pos.markTrail.push({ ts: now, mark });
+    pos.markTrail.push({ ts: now, mark, ...(bid > 0 ? { bid } : {}) });
   }
-  if (pos.markTrail.length > 16) pos.markTrail.shift();
+  if (pos.markTrail.length > 240) pos.markTrail.splice(0, pos.markTrail.length - 240);
 }
 
 // Broker syncs rebuild positions each cycle — keep peak/trail on meta so soft EOD can see them.
 function persistPosTrailMeta(acct, pos) {
   if (!acct?.state) return;
   if (!acct.state.meta) acct.state.meta = {};
-  const key = pos.occSymbol || pos.ticker;
+  const key = pos.type === "equity" ? pos.ticker : (pos.occSymbol || pos.optionMetaKey);
   if (!key) return;
   if (!acct.state.meta[key]) acct.state.meta[key] = {};
   const m = acct.state.meta[key];
   if (typeof pos.bestPnlPct === "number") m.bestPnlPct = Math.max(m.bestPnlPct || 0, pos.bestPnlPct);
-  if (Array.isArray(pos.markTrail) && pos.markTrail.length) m.markTrail = pos.markTrail.slice(-16);
+  if (typeof pos.bestExitPnlPct === "number") m.bestExitPnlPct = Math.max(m.bestExitPnlPct || 0, pos.bestExitPnlPct);
+  if (typeof pos.trimLevel === "number") m.trimLevel = pos.trimLevel;
+  if (pos.managementPlan) m.managementPlan = pos.managementPlan;
+  if (pos.lastManagementDecision) m.lastManagementDecision = pos.lastManagementDecision;
+  if (Array.isArray(pos.markTrail) && pos.markTrail.length) m.markTrail = pos.markTrail.slice(-240);
 }
 
 function restorePosTrail(pos, meta, prev) {
   const fromMeta = Array.isArray(meta?.markTrail) ? meta.markTrail : null;
   const fromPrev = Array.isArray(prev?.markTrail) ? prev.markTrail : null;
-  pos.markTrail = (fromMeta && fromMeta.length ? fromMeta : fromPrev || []).slice(-16);
+  pos.markTrail = (fromMeta && fromMeta.length ? fromMeta : fromPrev || []).slice(-240);
   pos.bestPnlPct = Math.max(meta?.bestPnlPct ?? 0, prev?.bestPnlPct ?? 0, pos.bestPnlPct || 0);
+  pos.bestExitPnlPct = Math.max(meta?.bestExitPnlPct ?? 0, prev?.bestExitPnlPct ?? 0, pos.bestExitPnlPct || 0);
+  pos.managementPlan = meta?.managementPlan || prev?.managementPlan || pos.managementPlan || null;
+  pos.lastManagementDecision = meta?.lastManagementDecision || prev?.lastManagementDecision || pos.lastManagementDecision || null;
 }
 
 function premiumTrailStalling(pos) {
   const trail = pos.markTrail || [];
   if (trail.length < 4) return false;
-  const recent = trail.slice(-5).map(t => t.mark).filter(m => m > 0);
+  const recent = trail.slice(-5).map(t => t.bid ?? t.mark).filter(m => m > 0);
   if (recent.length < 4) return false;
   const peak = Math.max(...recent);
   const first = recent[0];
@@ -5136,7 +5121,7 @@ function premiumTrailStalling(pos) {
 
 function premiumNotMakingHighs(pos) {
   const trail = pos.markTrail || [];
-  const recent = trail.slice(-4).map(t => t.mark).filter(m => m > 0);
+  const recent = trail.slice(-4).map(t => t.bid ?? t.mark).filter(m => m > 0);
   if (recent.length < 3) return false;
   const peak = Math.max(...recent);
   const last = recent[recent.length - 1];
@@ -5167,168 +5152,219 @@ function positionMoveStalling(pos, shortTerm, analysis) {
   return false;
 }
 
-function peakGiveback(pos, pnlPct) {
-  const best = pos.bestPnlPct || 0;
-  if (best < EOD_SOFT_MIN_PNL) return false;
-  const giveback = best - pnlPct;
-  return giveback >= Math.max(PEAK_GIVEBACK_MIN, best * PEAK_GIVEBACK_FRAC);
+// ─── Position Lifecycle Manager ───
+// Entry selection ends once a fill exists. From that point forward this adapter gathers broker
+// state/signals, asks the pure position-manager for exactly one intent, and only then translates
+// that intent into an order. Broker reconciliation remains the sole authority on whether it filled.
+
+function positionEmaSignals(acct, pos) {
+  if ((pos.trimLevel || 0) < 2) return { break8: false, break21: false };
+  const candles = acct.candleCache[pos.ticker];
+  if (!candles || candles.length < 22) return { break8: false, break21: false };
+  const closes = candles.map(candle => candle.c);
+  const ema8 = calcEMA(closes, 8);
+  const ema21 = calcEMA(closes, 21);
+  const last = closes.length - 1;
+  const bullish = pos.type !== "put";
+  return {
+    break8: bullish ? closes[last] < ema8[last] : closes[last] > ema8[last],
+    break21: bullish ? closes[last] < ema21[last] : closes[last] > ema21[last],
+  };
 }
 
-function nearProfitTarget(cfg, pnlPct) {
-  const target = cfg.profitTarget || 0.40;
-  return pnlPct >= target * NEAR_TARGET_FRAC;
+function recordPositionManagement(acct, pos, decision, now) {
+  const state = acct.state;
+  if (!state.meta) state.meta = {};
+  if (!state.managementJournal) state.managementJournal = [];
+  const key = pos.type === "equity" ? pos.ticker : (pos.occSymbol || pos.optionMetaKey);
+  if (!key) return false;
+  if (!state.meta[key]) state.meta[key] = {};
+  const meta = state.meta[key];
+  const signature = `${decision.action}:${decision.reasonCode}`;
+  const previous = meta.lastManagementDecision;
+  const lastJournaledAt = meta.lastManagementJournaledAt || 0;
+  const shouldRecord = !previous || previous.signature !== signature || now - lastJournaledAt >= 15 * 60_000;
+  const lastDecision = {
+    ts: now,
+    signature,
+    action: decision.action,
+    reasonCode: decision.reasonCode,
+    reason: decision.reason,
+    qty: decision.qty,
+    executionPrice: decision.executionPrice,
+    metrics: decision.metrics,
+  };
+  pos.lastManagementDecision = lastDecision;
+  meta.lastManagementDecision = lastDecision;
+
+  if (shouldRecord) {
+    meta.lastManagementJournaledAt = now;
+    state.managementJournal.push({
+      ts: now,
+      accountId: acct.id,
+      ticker: pos.ticker,
+      occ: pos.occSymbol || null,
+      type: pos.type,
+      action: decision.action,
+      qty: decision.qty,
+      reasonCode: decision.reasonCode,
+      reason: decision.reason,
+      executionPrice: decision.executionPrice,
+      markPrice: decision.markPrice,
+      ...decision.metrics,
+    });
+    if (state.managementJournal.length > 500) state.managementJournal.splice(0, state.managementJournal.length - 500);
+  }
+  return shouldRecord;
 }
 
-function tryTimeBasedExits(acct, quotes, analyses = null, shortTermAnalyses = null) {
+async function manageOpenPositions(acct, quotes, analyses = null, shortTermAnalyses = null) {
   const state = acct.state;
   const cfg = acct.config;
-  const et = getETDate();
-  const etHour = et.getHours() + et.getMinutes() / 60;
-  const isFriday = et.getDay() === 5;
+  const now = acct._simNow || Date.now();
   const anMap = analyses || acct.dashboard?.analyses || {};
   const stMap = shortTermAnalyses || acct.dashboard?.shortTermAnalyses || {};
-
+  // A simulation tick represents the daily close, so evaluate the same EOD/EOW locks that live
+  // positions see instead of silently disabling time-aware management in backtests.
+  const et = acct._simMode ? null : getETDate();
+  const etHour = acct._simMode ? 16 : et.getHours() + et.getMinutes() / 60;
+  const isFriday = acct._simMode ? new Date(now).getUTCDay() === 5 : et.getDay() === 5;
   const closed = [];
   const remaining = [];
+  const evaluations = [];
 
   for (const pos of state.positions) {
-    if (pos._pending) { remaining.push(pos); continue; }
-    if ((acct.config.broker === "tradier" || (acct.config.broker === "robinhood" && pos.type !== "equity")) && pos.liveMark == null) {
-      remaining.push(pos); continue;
-    }
-    const q = quotes[pos.ticker];
-    if (!q) { remaining.push(pos); continue; }
+    if (pos._pending || pos._pendingEntry || pos._pendingExit || pos._syncMissing) { remaining.push(pos); continue; }
+    const quote = quotes[pos.ticker];
+    if (!quote) { remaining.push(pos); continue; }
 
-    const spot = q.c;
     const isEquity = pos.type === "equity";
-    const currentPremium = isEquity
+    const liveOption = !isEquity && (cfg.broker === "tradier" || cfg.broker === "robinhood");
+    const spot = quote.c;
+    pos._lastSpot = spot;
+    const verifiedRobinhoodOption = cfg.broker !== "robinhood" || isEquity || isVerifiedRobinhoodContract(pos);
+    pos.dteRemaining = isEquity ? 0 : (!verifiedRobinhoodOption ? null : (
+      pos.expiryDate
+        ? Math.max(0, (pos.expiryDate - now) / 86400_000)
+        : Math.max(0, (pos.dte || 0) - (now - (pos.openTime || now)) / 86400_000)
+    ));
+
+    const currentMark = isEquity
       ? (pos.liveMark ?? spot)
-      : (pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type));
-    if (!(pos.entryPremium > 0) || !(currentPremium > 0)) { remaining.push(pos); continue; }
+      : (liveOption ? pos.liveMark : (pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type)));
+    const modeledPaperBid = !isEquity && !liveOption && currentMark > 0
+      ? simFillPrice(currentMark, posMoneyness(pos.type, spot, pos.strike), "sell")
+      : null;
+    const executableBid = isEquity ? currentMark : (pos.liveBid ?? (liveOption ? null : modeledPaperBid));
+    const trailMark = currentMark > 0 ? currentMark : executableBid;
+    if (trailMark > 0) recordMarkTrail(pos, trailMark, now, executableBid);
 
-    const pnlPct = (currentPremium - pos.entryPremium) / pos.entryPremium;
-    if (pnlPct > (pos.bestPnlPct || 0)) pos.bestPnlPct = pnlPct;
-    recordMarkTrail(pos, currentPremium);
-    persistPosTrailMeta(acct, pos);
+    // A broker holding with no frozen plan predates this lifecycle manager (or was opened manually).
+    // Freeze a modest quick-bank policy once; do not let today's account preset silently turn PATH
+    // or another legacy one-lot into a +50% runner on its first management tick.
+    const canFreezePlan = cfg.broker !== "robinhood" || isEquity || verifiedRobinhoodOption;
+    const plan = canFreezePlan && !pos.managementPlan && cfg.broker === "robinhood" && !isEquity
+      ? createManagementPlan({
+          ...cfg,
+          exitMode: "quick_bank",
+          profitTarget: Math.min(Number(cfg.profitTarget) || 0.12, 0.12),
+          trim1Pct: Math.min(Number(cfg.trim1Pct) || 0.10, 0.10),
+          trim2Pct: Math.max(0.18, Number(cfg.trim2Pct) || 0.18),
+        }, pos, now)
+      : managementPlanFor(pos, cfg, now);
+    if (canFreezePlan) pos.managementPlan = plan;
+    const analysis = anMap[pos.ticker] || null;
+    const shortTerm = stMap[pos.ticker] || null;
+    const emaSignals = positionEmaSignals(acct, pos);
+    const decision = evaluatePosition({
+      position: pos,
+      plan,
+      market: {
+        spot,
+        mark: currentMark,
+        bid: executableBid,
+        ask: pos.liveAsk,
+        dteRemaining: pos.dteRemaining,
+        requireExecutableBid: liveOption,
+        requireVerifiedContract: cfg.broker === "robinhood" && !isEquity,
+        contractIdentityVerified: verifiedRobinhoodOption,
+        requireFreshQuote: cfg.broker === "robinhood" && !isEquity,
+        quoteAsOf: pos.liveQuoteAt || 0,
+        maxQuoteAgeMs: RH_OPTION_QUOTE_MAX_AGE_MS,
+        underlyingQuoteFresh: quote._underlyingQuoteFresh !== false,
+        etHour,
+        isFriday,
+      },
+      signals: {
+        score: analysis?.score,
+        mom1d: shortTerm?.mom1d,
+        stalling: positionMoveStalling(pos, shortTerm, analysis),
+        ...emaSignals,
+      },
+      now,
+    });
 
-    const st = stMap[pos.ticker];
-    const an = anMap[pos.ticker];
-    const stalling = positionMoveStalling(pos, st, an);
-    const givingBack = peakGiveback(pos, pnlPct);
-    const nearTP = nearProfitTarget(cfg, pnlPct);
-    let reason = null;
-
-    // ── Friday afternoon ──
-    if (isFriday && etHour >= EOW_TRIM_HOUR) {
-      if (pnlPct >= EOW_HARD_MIN_PNL) {
-        reason = `EOW profit lock +${(pnlPct * 100).toFixed(0)}% (Fri ${etHour.toFixed(1)}h, avoid weekend theta)`;
-      } else if (pos.dteRemaining <= CRITICAL_DTE) {
-        reason = `EOW + low DTE (${pos.dteRemaining.toFixed(1)}d, Fri close)`;
-      } else if (pnlPct >= EOW_SOFT_MIN_PNL && (stalling || givingBack || nearTP)) {
-        const why = nearTP ? "near target" : givingBack ? `gave back from +${((pos.bestPnlPct || 0) * 100).toFixed(0)}% peak` : "move stalling";
-        reason = `EOW soft lock +${(pnlPct * 100).toFixed(0)}% (Fri ${etHour.toFixed(1)}h, ${why})`;
-      }
-    }
-
-    // ── Soft EOD from 3:00 — bank stalling winners before the final auction ──
-    if (!reason && etHour >= EOD_SOFT_HOUR && etHour < EOD_TIGHTEN_HOUR) {
-      if (pnlPct >= EOD_SOFT_MIN_PNL && (stalling || givingBack || nearTP)) {
-        const why = nearTP ? "near target" : givingBack ? `gave back from +${((pos.bestPnlPct || 0) * 100).toFixed(0)}% peak` : "move stalling";
-        reason = `EOD soft lock +${(pnlPct * 100).toFixed(0)}% (from 3:00, ${why})`;
-      }
-    }
-
-    // ── Hard EOD from 3:45 ──
-    if (!reason && etHour >= EOD_TIGHTEN_HOUR) {
-      if (pnlPct >= EOD_HARD_MIN_PNL && (pos.trimLevel || 0) === 0) {
-        reason = `EOD lock +${(pnlPct * 100).toFixed(0)}% (3:45 PM tighten, protecting overnight)`;
-      } else if (pnlPct >= EOD_HARD_MIN_PNL * 0.8 && (stalling || givingBack) && (pos.trimLevel || 0) <= 1) {
-        // Already trimmed but still green into the close with a stall — don't gift overnight theta.
-        reason = `EOD lock +${(pnlPct * 100).toFixed(0)}% (3:45 PM, post-trim stall)`;
-      }
-    }
-
-    if (!reason && pos.dteRemaining <= LOW_DTE_THRESHOLD && pnlPct >= 0.20) {
-      reason = `low DTE accelerated exit +${(pnlPct * 100).toFixed(0)}% (${pos.dteRemaining.toFixed(1)}d left, theta accelerating)`;
-    }
-
-    if (!reason) { remaining.push(pos); continue; }
-
-    const trade = closePosition(acct, pos, currentPremium, reason);
-    if (trade) {
-      closed.push(trade);
+    if (canFreezePlan) {
+      Object.assign(pos, decision.statePatch);
     } else {
-      remaining.push(pos);
+      const { managementPlan: _unverifiedPlan, ...safeStatePatch } = decision.statePatch;
+      Object.assign(pos, safeStatePatch);
     }
-  }
+    const recorded = recordPositionManagement(acct, pos, decision, now);
+    persistPosTrailMeta(acct, pos);
+    evaluations.push({
+      ticker: pos.ticker,
+      occ: pos.occSymbol || null,
+      action: decision.action,
+      qty: decision.qty,
+      reasonCode: decision.reasonCode,
+      reason: decision.reason,
+      executionPrice: decision.executionPrice,
+      markPrice: decision.markPrice,
+      metrics: decision.metrics,
+      plan: decision.plan,
+    });
 
-  state.positions = remaining;
-  state.history.push(...closed);
-  return closed;
-}
+    if (decision.action === "hold") {
+      pos._stopSuppressed = decision.reason;
+      remaining.push(pos);
+      continue;
+    }
 
-// ─── EMA Trailing Exits (trim 3 & 4 — SRxTrades 8/21 EMA trail) ───
+    if (recorded) {
+      log(acct, `POSITION MANAGER: ${decision.action.toUpperCase()} ${decision.qty}x ${pos.ticker} — ${decision.reason} [bid/exit $${decision.executionPrice.toFixed(2)}, mark $${decision.markPrice.toFixed(2)}, ${decision.metrics.dteRemaining.toFixed(1)}d]`);
+    }
 
-function tryEMATrailingExits(acct, quotes) {
-  const state = acct.state;
-  const closed = [];
-  const remaining = [];
+    const qtyToClose = decision.action === "trim" ? decision.qty : undefined;
+    // Paper closePosition applies the modeled sell spread itself; feed it the mark once so the
+    // evaluator and realized fill use the same modeled bid without charging the spread twice.
+    const closeReferencePrice = !isEquity && !liveOption ? currentMark : decision.executionPrice;
+    const trade = await closePosition(acct, pos, closeReferencePrice, decision.reason, qtyToClose, {
+      priceMode: decision.priceMode,
+      urgency: decision.urgency,
+      reasonCode: decision.reasonCode,
+    });
 
-  for (const pos of state.positions) {
-    if (pos._pending) { remaining.push(pos); continue; } // unfilled broker order, not a holding
-    if ((acct.config.broker === "tradier" || (acct.config.broker === "robinhood" && pos.type !== "equity")) && pos.liveMark == null) { remaining.push(pos); continue; } // no reliable mark — hold, never place live orders on model prices
-    if ((pos.trimLevel || 0) < 2) { remaining.push(pos); continue; }
-
-    const candles = acct.candleCache[pos.ticker];
-    if (!candles || candles.length < 22) { remaining.push(pos); continue; }
-
-    const closes = candles.map(d => d.c);
-    const ema8 = calcEMA(closes, 8);
-    const ema21 = calcEMA(closes, 21);
-    const L = closes.length - 1;
-    const price = closes[L];
-
-    const q = quotes[pos.ticker];
-    const spot = q ? q.c : pos.entrySpot;
-    const currentPremium = pos.liveMark ?? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type);
-    let reason = null;
-
-    const below8 = pos.type === "call" ? price < ema8[L] : price > ema8[L];
-    const below21 = pos.type === "call" ? price < ema21[L] : price > ema21[L];
-
-    if (pos.trimLevel === 2 && below8) {
-      const trimQty = Math.max(1, Math.floor((pos.originalQty || pos.qty) * 0.25));
-      if (trimQty > 0 && pos.qty > trimQty) {
-        const trade = closePosition(acct, pos, currentPremium, `8 EMA break (trim 3, trailing 21 EMA with remainder)`, trimQty);
-        if (trade) {
-          closed.push(trade);
-          pos.qty -= trimQty;
-          pos.trimLevel = 3;
-          log(acct, `EMA TRAIL: ${pos.ticker} broke 8 EMA — sold ${trimQty}, trailing 21 EMA with ${pos.qty} left`);
-        }
+    if (decision.action === "trim") {
+      if (trade) {
+        closed.push(trade);
+        pos.qty -= decision.qty;
+        if (decision.reasonCode === "TRIM_1") pos.trimLevel = 1;
+        else if (decision.reasonCode === "TRIM_2") pos.trimLevel = 2;
+        else if (decision.reasonCode === "EMA8_TRIM") pos.trimLevel = 3;
+        persistPosTrailMeta(acct, pos);
       }
       remaining.push(pos);
       continue;
     }
 
-    if (pos.trimLevel === 3 && below21) {
-      reason = "21 EMA break (final exit per SRxTrades trail)";
-    }
-
-    if (reason) {
-      const trade = closePosition(acct, pos, currentPremium, reason);
-      if (trade) {
-        closed.push(trade);
-      } else {
-        remaining.push(pos);
-      }
-    } else {
-      remaining.push(pos);
-    }
+    if (trade) closed.push(trade);
+    else remaining.push(pos); // live broker: keep until the fill is confirmed by sync
   }
 
   state.positions = remaining;
   state.history.push(...closed);
+  acct.dashboard.positionManagement = evaluations;
   return closed;
 }
 
@@ -5474,12 +5510,14 @@ function dashboardHTML(acct, { spectator = false } = {}) {
         : (pos.liveMark ?? (strikeKnown ? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
       const pnlPct = pos.entryPremium > 0 ? (curPremium - pos.entryPremium) / pos.entryPremium : 0;
       const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * (isEq ? 1 : 100);
-      const profitPrice = pos.entryPremium * (1 + PROFIT_TARGET);
-      const stopPrice = pos.entryPremium * (1 + STOP_LOSS);
+      const plan = managementPlanFor(pos, cfg, now);
+      const stopMult = isEq ? plan.stopLoss : plan.disasterFloor;
+      const profitPrice = pos.entryPremium * (1 + plan.profitTarget);
+      const stopPrice = pos.entryPremium * (1 + stopMult);
       return {
         ...pos, spot, dteLeft, curPremium, pnlPct, pnlDollar,
-        profitTarget: { pct: `+${(PROFIT_TARGET * 100).toFixed(0)}%`, premium: profitPrice.toFixed(2) },
-        stopLoss: { pct: `${(STOP_LOSS * 100).toFixed(0)}%`, premium: stopPrice.toFixed(2) },
+        profitTarget: { pct: `+${(plan.profitTarget * 100).toFixed(0)}%`, premium: profitPrice.toFixed(2) },
+        stopLoss: { pct: `${(stopMult * 100).toFixed(0)}%`, premium: stopPrice.toFixed(2) },
         pctToProfit: ((profitPrice - curPremium) / curPremium * 100).toFixed(1),
         pctToStop: ((stopPrice - curPremium) / curPremium * 100).toFixed(1),
         greeks: strikeKnown ? optGreeks(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : { delta: "?", theta: "?" },
@@ -5500,6 +5538,9 @@ function dashboardHTML(acct, { spectator = false } = {}) {
     const concerns = (p.claudeConcerns || []).join(" · ");
     const hasAI = !!(p.claudeReasoning || p.claudeSuggestion || sigs || concerns);
     const aiToggle = hasAI ? `<button type="button" class="ai-toggle" onclick="toggleRow('${rowId}')" title="Show AI thinking" style="background:none;border:1px solid #6a4df455;color:#6a4df4;border-radius:3px;padding:1px 6px;font-size:9px;cursor:pointer;margin-left:6px">🧠 AI</button>` : "";
+    const manager = p.lastManagementDecision;
+    const managerColor = manager?.action === "hold" ? "#138f86" : manager?.action === "trim" ? "#b07400" : "#e8473f";
+    const managerBadge = manager ? `<span title="${manager.reason}" style="display:inline-block;margin-left:5px;padding:1px 5px;border:1px solid ${managerColor}55;border-radius:3px;color:${managerColor};font-size:8px;white-space:nowrap">${manager.action.toUpperCase()} · ${manager.reasonCode}</span>` : "";
     const aiRow = hasAI ? `<tr id="${rowId}" style="display:none;background:#6a4df412">
       <td colspan="12" style="padding:10px 12px;font-size:11px;color:#4a4b52;line-height:1.6">
         <div style="color:#6a4df4;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">AI Thought Process at Entry ${p.claudeConfidence ? `(${p.claudeConfidence}% confidence)` : ''}</div>
@@ -5518,7 +5559,7 @@ function dashboardHTML(acct, { spectator = false } = {}) {
       </td>
     </tr>` : "";
     return `<tr>
-      <td><a href="/ticker/${p.ticker}"><b>${p.ticker}</b></a>${aiToggle}<a href="/media?a=${acct.id}&ticker=${p.ticker}" title="Compose a shareable post for ${p.ticker}" style="margin-left:6px;text-decoration:none;font-size:11px" onclick="event.stopPropagation()">📣</a></td><td>${p.type.toUpperCase()}</td><td>$${p.strike}</td>
+      <td><a href="/ticker/${p.ticker}"><b>${p.ticker}</b></a>${managerBadge}${aiToggle}<a href="/media?a=${acct.id}&ticker=${p.ticker}" title="Compose a shareable post for ${p.ticker}" style="margin-left:6px;text-decoration:none;font-size:11px" onclick="event.stopPropagation()">📣</a></td><td>${p.type.toUpperCase()}</td><td>$${p.strike}</td>
       <td style="white-space:nowrap">$${p.spot.toFixed(2)}<br><span style="color:${spotColor};font-size:10px">${spotChg >= 0 ? "+" : ""}${spotChg.toFixed(2)} (${spotChgPct >= 0 ? "+" : ""}${spotChgPct.toFixed(1)}%)</span><br><span style="color:${spotFromEntryColor};font-size:10px">from entry: ${spotFromEntry >= 0 ? "+" : ""}${spotFromEntry.toFixed(1)}%</span></td>
       <td>${p.dteLeft.toFixed(1)}d</td><td>${p.qty}</td>
       <td>$${p.entryPremium.toFixed(2)}${(p.intendedEntryPremium && Math.abs(p.intendedEntryPremium - p.entryPremium) >= 0.01) ? `<br><span style="font-size:9px;color:#9aa0aa" title="Bot's intended limit before the actual fill">intended $${(+p.intendedEntryPremium).toFixed(2)}</span>` : ''}</td><td>$${p.curPremium.toFixed(2)}</td>
@@ -5625,7 +5666,7 @@ function dashboardHTML(acct, { spectator = false } = {}) {
       <td style="font-size:10px;color:#6b7280">${d.ema8 ? `8:${d.ema8} 21:${d.ema21} 50:${d.ema50}` : "—"}</td>
       <td style="font-size:10px;color:#6b7280">${d.stEma3 ? `3:${d.stEma3} 5:${d.stEma5} 8:${d.stEma8}` : "—"}</td>
       <td style="font-size:10px;color:#6b7280">${d.rsi ? `RSI14:${d.rsi} RSI5:${d.stRsi ?? "—"} ATR:${d.atrPct}% VR:${d.vr}` : "—"}</td>
-      <td style="font-size:10px">${d.mom1d != null ? `<span style="color:${mc(+d.mom1d)}">1d:${d.mom1d}%</span> <span style="color:${mc(+d.mom3d)}">3d:${d.mom3d}%</span> <span style="color:${mc(+d.mom7d)}">7d:${d.mom7d}%</span>` : "—"}</td>
+      <td style="font-size:10px">${d.mom1d != null ? `<span style="color:${mc(+d.mom1d)}">1d:${d.mom1d}%</span> <span style="color:${mc(+d.mom3d)}">3d:${d.mom3d}%</span> <span style="color:${mc(+d.mom7d)}">7d:${d.mom7d}%</span>${d.entryPriority != null ? ` <span style="color:#6b7280">prio:${d.entryPriority}</span>` : ""}` : "—"}</td>
     </tr>`;
   }).join("") || '<tr><td colspan="9" style="opacity:.5">Waiting for first cycle...</td></tr>';
 
@@ -5679,13 +5720,29 @@ function dashboardHTML(acct, { spectator = false } = {}) {
     return `<span class="hint">${h.ticker} ${h.bias > 0 ? "+" : ""}${h.bias} (${h.direction}, ${mins}m watch) — ${h.reasoning}</span>`;
   }).join("") || '<span style="opacity:.5">None active. Write to hint.txt to add.</span>';
 
-  const logLines = dashboard.cycleLog.slice(-50).reverse().map(l =>
+  const logLines = dashboard.cycleLog.slice(-200).reverse().map(l =>
     l.replace(/\[(\d+:\d+:\d+)\]/, '<span style="color:#6b7280">[$1]</span>')
-      .replace(/(TRADE:|EXIT:|HINT RECEIVED:|CLAUDE SAYS:)/g, '<b style="color:#6a4df4">$1</b>')
+      .replace(/(TRADE:|EXIT:|HINT RECEIVED:|CLAUDE SAYS:|ENTRY RANK:|TRADE PACKAGE RANK:|POSITION MANAGER:|Momentum gate)/g, '<b style="color:#6a4df4">$1</b>')
 
       .replace(/(STRONG BUY)/g, '<span style="color:#00a843">$1</span>')
       .replace(/(AVOID)/g, '<span style="color:#e8473f">$1</span>')
   ).join("<br>");
+
+  const journal = dashboard.decisionJournal || [];
+  const rankStats = dashboard.rankTelemetry || summarizeRankOne(journal, "h1");
+  const rankStatsHtml = rankStats.n > 0
+    ? `<div style="font-size:10px;color:#6b7280;margin-bottom:6px">1h proof · n=${rankStats.n} · rank #1 hit ${(rankStats.hitRate * 100).toFixed(0)}% · lift ${rankStats.meanLift >= 0 ? "+" : ""}${rankStats.meanLift.toFixed(2)}% · regret ${rankStats.meanRegret.toFixed(2)}% <span title="Direction-adjusted underlying return; not option P&L">(signal)</span></div>`
+    : '<div style="font-size:10px;color:#6b7280;margin-bottom:6px">1h proof starts after two or more executable packages compete in the same cohort.</div>';
+  const journalHtml = journal.length ? journal.slice(-8).reverse().map(j => {
+    const when = j.at ? new Date(j.at).toLocaleString("en-US", { timeZone: "America/New_York", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "?";
+    const rows = (j.ranked || []).map(r => {
+      const oc = r.outcome === "entered" || r.outcome === "ordered" ? "#00a843" : /blocked|invalid/.test(r.outcome || "") ? "#b07400" : "#6b7280";
+      const fwd = r.forward?.h1?.pct ?? r.forward?.currentPct;
+      const fwdHtml = fwd != null ? ` <span style="color:${fwd >= 0 ? '#00a843' : '#e8473f'}">${r.forward?.h1 ? '1h' : 'now'} ${fwd >= 0 ? '+' : ''}${fwd.toFixed(2)}%</span>` : "";
+      return `<span style="margin-right:10px"><b>${r.rank ? `#${r.rank} ` : ""}${r.ticker}</b> ${r.score}→${r.priority ?? "—"} <span style="color:${oc}">${r.outcome}</span>${fwdHtml}${r.reason ? ` <span style="color:#8a909b;font-size:10px">(${String(r.reason).slice(0, 60)})</span>` : ""}</span>`;
+    }).join("");
+    return `<div style="margin-bottom:6px;font-size:11px"><span style="color:#6b7280">${when} ET</span> ${rows || "<span style='opacity:.5'>no BUY candidates</span>"}</div>`;
+  }).join("") : '<span style="opacity:.5;font-size:11px">No entry ranking history yet — fills after the next cycle with BUY candidates.</span>';
 
   return `<!DOCTYPE html><html><head><meta charset="utf-8">
 <title>Swing Trader Dashboard</title>
@@ -5840,8 +5897,12 @@ ${learningPanelHTML(acct, { spectator })}
     <span id="bot-thinking-caret" style="color:#6b7280;font-size:14px;font-weight:400">▾</span>
   </h2>
   <div id="bot-thinking-body" style="margin-top:12px">
-    <div style="font-size:10px;color:#8a909b;margin-bottom:8px">Score 50=neutral · ≥${BULL_ENTRY} buy calls · ≤${BEAR_ENTRY} buy puts · Risk: ${(RISK_PCT * 100)}%/trade · TP: +${(PROFIT_TARGET * 100)}% · SL: ${(STOP_LOSS * 100)}%</div>
-    <table><tr><th>Ticker</th><th>Price</th><th>Score (7d/90d→blend→final)</th><th>Decision</th><th>Reasoning</th><th>EMAs (8/21/50)</th><th>7d EMAs (3/5/8)</th><th>Indicators</th><th>Momentum</th></tr>${decisionRows}</table>
+    <div style="font-size:10px;color:#8a909b;margin-bottom:8px">Score 50=neutral · ≥${BULL_ENTRY} buy calls · ≤${BEAR_ENTRY} buy puts · Risk: ${(RISK_PCT * 100)}%/trade · TP: +${(PROFIT_TARGET * 100)}% · SL: ${(STOP_LOSS * 100)}% · Entries ranked by score+momentum; flat-tape names blocked under score 80</div>
+    <table><tr><th>Ticker</th><th>Price</th><th>Score (7d/90d→blend→final)</th><th>Decision</th><th>Reasoning</th><th>EMAs (8/21/50)</th><th>7d EMAs (3/5/8)</th><th>Indicators</th><th>Momentum / prio</th></tr>${decisionRows}</table>
+    <div style="margin-top:14px;padding-top:12px;border-top:1px solid #e8eaef">
+      <div style="font-size:10px;color:#8a909b;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Entry rank journal (last cycles)</div>
+      ${rankStatsHtml}${journalHtml}
+    </div>
   </div>
 </div>
 <script>
@@ -9078,7 +9139,7 @@ function startDashboard(defaultAcct, apiKey) {
     if (pathname === "/api/state") {
       await refreshBrokerBalances(activeAcct, { logErrors: true });
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-      res.end(JSON.stringify({ cash: state.cash, positions: state.positions, history: state.history.slice(-50), quotes: dashboard.quotes, analyses: Object.fromEntries(Object.entries(dashboard.analyses).map(([k, v]) => [k, { score: v.score, signal: v.signal, price: v.price, rsi: v.rsi }])), activeHints: activeAcct.activeHints, portfolioValue: portfolioValue(state, dashboard.quotes), marketOpen: dashboard.marketOpen, log: dashboard.cycleLog.slice(-50) }));
+      res.end(JSON.stringify({ cash: state.cash, positions: state.positions, history: state.history.slice(-50), quotes: dashboard.quotes, analyses: Object.fromEntries(Object.entries(dashboard.analyses).map(([k, v]) => [k, { score: v.score, signal: v.signal, price: v.price, rsi: v.rsi }])), activeHints: activeAcct.activeHints, portfolioValue: portfolioValue(state, dashboard.quotes), marketOpen: dashboard.marketOpen, log: dashboard.cycleLog.slice(-200), decisionJournal: (dashboard.decisionJournal || []).slice(-20), positionManagement: dashboard.positionManagement || [], managementJournal: (state.managementJournal || []).slice(-50) }));
       return;
     }
 
@@ -9979,8 +10040,8 @@ function effectivePositionCount(acct) {
 
 // Place a real buy_to_open on Tradier for a bot entry decision. Broker is the source of truth,
 // so we pre-seed side-metadata (entry context) keyed by OCC and let the next sync surface the fill.
-async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, dte, qty, premium, direction, bid = null, ask = null, setupQuality = 0, claudeConfidence = 0, aiThesis = null }) {
-  const expStr = new Date(expiryDate).toISOString().slice(0, 10);
+async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, expiryStr = null, dte, qty, premium, direction, bid = null, ask = null, setupQuality = 0, claudeConfidence = 0, aiThesis = null, maxBudget = null }) {
+  const expStr = expiryStr || new Date(expiryDate).toISOString().slice(0, 10);
   const occ = tradier.buildOCC(ticker, expStr, type, strike);
 
   // In-flight de-dupe: skip if a working order already exists for this underlying. The set is
@@ -9994,10 +10055,42 @@ async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, dte, q
     return { skipped: true, reason: `Tradier: autoExecute off — entry for ${ticker} not sent (enable on the account)` };
   }
 
+  // Commit-time exact-OCC re-quote. Ranking can take seconds across several candidates; never send
+  // an order using the earlier chain snapshot or a last/mid fallback without a two-sided market.
+  try {
+    const fresh = await tradier.getOptionQuote(occ);
+    if (!fresh || !fresh.twoSided || fresh.tradeable === false) {
+      return { skipped: true, reason: `Tradier: ${occ} has no current tradeable two-sided quote — ranked package is stale` };
+    }
+    bid = fresh.bid;
+    ask = fresh.ask;
+    premium = fresh.mid;
+  } catch (e) {
+    return { skipped: true, reason: `Tradier: exact-contract re-quote failed for ${occ}: ${e.message}` };
+  }
+
+  const frictionPct = ((ask - bid) + (2 * FEE_PER_CONTRACT / 100)) / ask;
+  const maxFrictionPct = Math.min(0.15, Math.max(0.06, 0.5 * (acct.config.profitTarget || 0.12)));
+  if (!Number.isFinite(frictionPct) || frictionPct > maxFrictionPct) {
+    return { skipped: true, reason: `Tradier: ${occ} executable friction ${(frictionPct * 100).toFixed(1)}% now exceeds ${(maxFrictionPct * 100).toFixed(1)}% — ranked edge disappeared` };
+  }
+
+  const conviction = Math.max(0, Math.min(1, (claudeConfidence || 0) / 100));
+  const limit = entryLimitPrice(bid, ask, premium, conviction);
+  const hardBudget = Math.min(
+    maxBudget != null ? maxBudget : Infinity,
+    acct.state.cash,
+    acct.config.maxTradeSize || 500,
+  );
+  qty = Math.min(qty, Math.floor(hardBudget / (limit * 100)));
+  if (qty < 1) {
+    return { skipped: true, reason: `Tradier: refreshed ${occ} limit $${limit.toFixed(2)} no longer fits $${hardBudget.toFixed(0)} budget` };
+  }
+
   // Seed metadata so the post-fill sync keeps entry context (stops/trails depend on it).
   if (!acct.state.meta) acct.state.meta = {};
   acct.state.meta[occ] = {
-    entryPremium: +premium.toFixed(2),
+    entryPremium: +limit.toFixed(2),
     entrySpot: acct.dashboard?.quotes?.[ticker]?.c ?? null,
     dte,
     originalQty: qty,
@@ -10005,6 +10098,8 @@ async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, dte, q
     openTime: Date.now(),
     trimLevel: 0,
     bestPnlPct: 0,
+    bestExitPnlPct: 0,
+    managementPlan: createManagementPlan(acct.config, { type, dte }),
     entryAtrPct: acct.dashboard?.analyses?.[ticker]?.atrPct ?? null,
     setupQuality,
     // Persist the full AI thought process so it survives the broker round-trip and shows up on the
@@ -10013,25 +10108,14 @@ async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, dte, q
   };
 
   try {
-    // Hard stop: reject if the spread at order time is too wide to get a fair fill
-    if (bid > 0 && ask > 0 && premium > 0) {
-      const liveSpreadPct = (ask - bid) / premium;
-      if (liveSpreadPct > MAX_ENTRY_SPREAD_PCT) {
-        delete acct.state.meta[occ];
-        return { skipped: true, reason: `Tradier: spread ${(liveSpreadPct * 100).toFixed(0)}% at order time exceeds ${(MAX_ENTRY_SPREAD_PCT * 100).toFixed(0)}% cap — refusing entry on ${ticker}` };
-      }
-    }
-
-    // Conviction-aware fill: high conviction → price toward the ask to fill;
-    // otherwise sit at the mid. Hard-capped at MAX_ENTRY_OVERPAY_PCT above mid.
-    const conviction = Math.max(0, Math.min(1, (claudeConfidence || 0) / 100));
-    const limit = entryLimitPrice(bid, ask, premium, conviction);
+    // Conviction-aware fill was computed from the fresh quote above.
     const aggrLabel = limit >= (ask || limit) ? "at ask" : limit > premium ? "toward ask" : "at mid";
     const res = await tradier.placeOptionOrder(ticker, expStr, type, strike, "buy_to_open", qty, "limit", limit);
     // Mark this underlying in-flight so the rest of THIS cycle counts it toward maxPositions
     // (via effectivePositionCount) and won't place a duplicate. The next sync reconciles fully.
     if (!acct._inflightTickers) acct._inflightTickers = new Set();
     acct._inflightTickers.add(ticker.toUpperCase());
+    reserveInflightExpiry(acct, ticker, expiryDate);
     log(acct, `TRADIER ENTRY: BUY ${qty}x ${occ} @ $${limit} (${aggrLabel}; conviction ${(conviction * 100).toFixed(0)}%; bid ${bid ?? "?"}/ask ${ask ?? "?"}/mid ${premium}) — order ${res?.id || JSON.stringify(res).slice(0, 80)}`);
 
     // Optimistic in-cycle cash decrement so additional entries this cycle size off remaining
@@ -10350,6 +10434,9 @@ async function syncBrokerAccount(acct, quotes) {
         openTime: meta.openTime ?? (p.date_acquired ? new Date(p.date_acquired).getTime() : now),
         trimLevel: meta.trimLevel ?? 0,
         bestPnlPct: meta.bestPnlPct ?? 0,
+        bestExitPnlPct: meta.bestExitPnlPct ?? 0,
+        managementPlan: meta.managementPlan || null,
+        lastManagementDecision: meta.lastManagementDecision || null,
         entryAtrPct: meta.entryAtrPct ?? null,
         iv,
         liveMark: mark != null ? +mark.toFixed(2) : null,   // tradeable two-sided mid only (exits gate on this)
@@ -10367,7 +10454,7 @@ async function syncBrokerAccount(acct, quotes) {
       if (pos.liveMark != null && pos.entryPremium > 0) {
         const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
         if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
-        recordMarkTrail(pos, pos.liveMark);
+        recordMarkTrail(pos, pos.liveMark, now, pos.liveBid);
       }
       persistPosTrailMeta(acct, pos);
 
@@ -10398,8 +10485,10 @@ async function syncBrokerAccount(acct, quotes) {
       state.meta[occ] = {
         entryPremium: pos.entryPremium, entrySpot: pos.entrySpot, dte: pos.dte,
         originalQty: pos.originalQty, openDate: pos.openDate, openTime: pos.openTime,
-        trimLevel: pos.trimLevel, bestPnlPct: pos.bestPnlPct, entryAtrPct: pos.entryAtrPct,
-        markTrail: Array.isArray(pos.markTrail) ? pos.markTrail.slice(-16) : undefined,
+        trimLevel: pos.trimLevel, bestPnlPct: pos.bestPnlPct, bestExitPnlPct: pos.bestExitPnlPct,
+        managementPlan: pos.managementPlan, lastManagementDecision: pos.lastManagementDecision,
+        entryAtrPct: pos.entryAtrPct,
+        markTrail: Array.isArray(pos.markTrail) ? pos.markTrail.slice(-240) : undefined,
         ai: aiData, // keep the captured (or backfilled) AI thought process across syncs
       };
       seen.add(occ);
@@ -10481,16 +10570,10 @@ async function syncBrokerAccount(acct, quotes) {
 
 // ─── Robinhood Entry-Order Working (active bidding) ───
 // A resting entry limit is a DECISION, not a fire-and-forget. Each sync we re-quote the contract
-// and choose one of three things, in the spirit of "a great stock at a fair price beats a fair
-// stock at a great price":
-//   1. Market came to us / hasn't run → leave the order resting (we ARE the fair price).
-//   2. It's moving up but still within a conviction-scaled ceiling → cancel/replace toward the
-//      new ask ("worth paying up a little for the good one").
-//   3. It ran past the ceiling (mooning) → cancel and WALK AWAY rather than pay a bad price,
-//      with a cooldown so the next cycle doesn't immediately chase it through the back door.
-const ENTRY_WORK_MIN_AGE_MS = 90_000;        // let each limit rest ~1.5 min before touching it
-const ENTRY_GIVEUP_MS = 20 * 60_000;         // total time we'll work one entry decision
-const ENTRY_MAX_CHASES = 3;                  // max cancel/replace rounds per entry
+// Initial Robinhood entry limits are never cancel/replaced. A cancel can race a partial fill; placing
+// the full quantity again before exact terminal reconciliation can overbuy the position. Let the
+// approved limit rest, cancel stale remainder once, and wait for the exact order snapshot.
+const ENTRY_GIVEUP_MS = 20 * 60_000;
 const ENTRY_WALKAWAY_COOLDOWN_MS = 15 * 60_000;
 
 async function workRobinhoodEntryOrders(acct, now) {
@@ -10500,100 +10583,138 @@ async function workRobinhoodEntryOrders(acct, now) {
   if (!acct._chaseCooldownUntil) acct._chaseCooldownUntil = {};
 
   for (const [occ, m] of Object.entries(state.meta)) {
-    if (!m || !m.entryOrderPlacedAt || !m.entryOrderCtx || !m.entryOrderId) continue;
+    if (!m || !m.entryOrderPlacedAt || !m.entryOrderCtx) continue;
     const ctx = m.entryOrderCtx;
     const tickerU = (ctx.ticker || "").toUpperCase();
-
-    if (!acct._inflightTickers.has(tickerU)) {
-      // No longer working at the broker — it filled (position appears this sync) or was
-      // canceled externally. Either way stop managing the order; keep the entry context.
-      delete m.entryOrderId; delete m.entryOrderPlacedAt; delete m.entryOrderCtx;
+    if (!m.entryOrderId) {
+      acct._inflightTickers.add(tickerU);
+      // Submission response was ambiguous. Retry the exact payload under the SAME broker idempotency
+      // key. Never mint a replacement ref: the first request may already have been accepted.
+      const refId = m.entryOrderRefId;
+      const qty = Number(ctx.qty);
+      const limit = Number(m.entryOrderLimit);
+      const completeCtx = refId && tickerU && ctx.expStr && Number(ctx.strike) > 0
+        && (ctx.optionType === "call" || ctx.optionType === "put") && qty > 0 && limit > 0;
+      if (!completeCtx) {
+        if (!m.entryRecoveryContextLoggedAt || now - m.entryRecoveryContextLoggedAt >= 15 * 60_000) {
+          m.entryRecoveryContextLoggedAt = now;
+          log(acct, `RH ENTRY RECOVERY BLOCKED ${tickerU || occ}: incomplete persisted order context; retaining quarantine`);
+        }
+        continue;
+      }
+      if (m.entryRecoveryAttemptAt && now - m.entryRecoveryAttemptAt < 30_000) continue;
+      m.entryRecoveryAttemptAt = now;
+      try {
+        const recovered = await robinhood.placeOptionOrder({
+          symbol: tickerU,
+          expirationDate: ctx.expStr,
+          strikePrice: ctx.strike,
+          optionType: ctx.optionType,
+          side: "buy_to_open",
+          quantity: qty,
+          type: "limit",
+          limitPrice: limit.toFixed(2),
+          refId,
+        });
+        const recoveredQty = optionOrderExecutedQuantity(recovered);
+        const recoveredFill = recoveredQty > 0 ? optionOrderAverageFillPrice(recovered) : null;
+        if (recoveredFill > 0) {
+          m.entryPremium = +recoveredFill.toFixed(2);
+          m.entryFillReconciled = true;
+          m.originalQty = recoveredQty;
+        }
+        const recoveredId = brokerOrderId(recovered);
+        if (recoveredId) {
+          m.entryOrderId = recoveredId;
+          delete m.entrySubmissionUnknownAt;
+          delete m.entryRecoveryContextLoggedAt;
+          log(acct, `RH ENTRY RECOVERY: recovered order ${recoveredId} for ${tickerU} using persisted ref ${refId}`);
+        } else {
+          m.entrySubmissionUnknownAt = now;
+          if (!m.entryRecoveryNoIdLoggedAt || now - m.entryRecoveryNoIdLoggedAt >= 15 * 60_000) {
+            m.entryRecoveryNoIdLoggedAt = now;
+            log(acct, `RH ENTRY RECOVERY: ${tickerU} still returned no order id; retaining persisted ref and quarantine`);
+          }
+        }
+      } catch (e) {
+        if (e.brokerRejected) {
+          delete state.meta[occ];
+          acct._inflightTickers.delete(tickerU);
+          acct._chaseCooldownUntil[tickerU] = now + ENTRY_WALKAWAY_COOLDOWN_MS;
+          log(acct, `RH ENTRY RECOVERY REJECTED ${tickerU}: ${e.message}; cleared rejected intent`);
+        } else {
+          m.entrySubmissionUnknownAt = now;
+          if (!m.entryRecoveryErrorLoggedAt || now - m.entryRecoveryErrorLoggedAt >= 15 * 60_000) {
+            m.entryRecoveryErrorLoggedAt = now;
+            log(acct, `RH ENTRY RECOVERY UNKNOWN ${tickerU}: ${e.message}; retaining persisted ref and quarantine`);
+          }
+        }
+      }
       continue;
     }
 
-    const age = now - m.entryOrderPlacedAt;
-    if (age < ENTRY_WORK_MIN_AGE_MS) continue;
-    const workedFor = now - (m.entryFirstPlacedAt || m.entryOrderPlacedAt);
+    let response = null;
+    try { response = await robinhood.getOptionsOrders({ order_id: m.entryOrderId }); } catch { }
+    const raw = response?.data ?? response;
+    const records = Array.isArray(raw) ? raw
+      : Array.isArray(raw?.orders) ? raw.orders
+        : Array.isArray(raw?.results) ? raw.results
+          : raw && typeof raw === "object" ? [raw] : [];
+    const order = findExactOptionOrder(records, {
+      orderId: m.entryOrderId,
+      occSymbol: occ,
+      side: "buy",
+      submittedAt: m.entryOrderPlacedAt,
+      now,
+    });
+    if (!order) {
+      acct._inflightTickers.add(tickerU);
+      continue;
+    }
 
-    const walkAway = async (why) => {
-      try { await robinhood.cancelOptionOrder(m.entryOrderId); } catch (e) {
-        log(acct, `RH ENTRY WORK: cancel failed for ${tickerU} — ${e.message}`);
+    const executedQty = optionOrderExecutedQuantity(order);
+    const terminal = optionOrderIsTerminal(order);
+    if (terminal) {
+      if (executedQty > 0) {
+        const fill = optionOrderAverageFillPrice(order);
+        if (fill > 0) {
+          m.entryPremium = +fill.toFixed(2);
+          m.entryFillReconciled = true;
+          m.originalQty = executedQty;
+        }
+        log(acct, `RH ENTRY WORK: terminal ${String(order.state || "order")} for ${tickerU}; ${executedQty}x filled${fill > 0 ? ` @ $${fill.toFixed(2)}` : ""}`);
+        delete m.entryOrderId; delete m.entryOrderRefId; delete m.entryOrderPlacedAt;
+        delete m.entryFirstPlacedAt; delete m.entryOrderCtx; delete m.entrySubmissionUnknownAt;
+        delete m.entryCancelRequestedAt; delete m.entryRecoveryAttemptAt;
+        delete m.entryRecoveryContextLoggedAt; delete m.entryRecoveryNoIdLoggedAt;
+        delete m.entryRecoveryErrorLoggedAt;
+      } else {
+        delete state.meta[occ];
+        acct._chaseCooldownUntil[tickerU] = now + ENTRY_WALKAWAY_COOLDOWN_MS;
+        log(acct, `RH ENTRY WORK: ${tickerU} order ended ${String(order.state || "without fill")} — no replacement sent`);
       }
       acct._inflightTickers.delete(tickerU);
-      acct._chaseCooldownUntil[tickerU] = now + ENTRY_WALKAWAY_COOLDOWN_MS;
-      log(acct, `RH ENTRY WORK: WALKED AWAY from ${tickerU} ${occ} — ${why}. Cooling down ${ENTRY_WALKAWAY_COOLDOWN_MS / 60000}m; a fresh signal can re-evaluate at the new price after that.`);
-      diag("entry_walkaway", acct, { ticker: tickerU, occ, why, chases: m.entryChaseCount || 0, lastLimit: m.entryOrderLimit ?? null, intendedMid: m.intendedEntryPremium ?? null });
-      delete state.meta[occ];
-    };
-
-    // Fresh two-sided quote (Tradier NBBO by OCC — our most reliable second source).
-    let q = null;
-    if (tradier.isConnected && robinhood.parseOCC(occ)) {
-      try { q = await tradier.getOptionQuote(occ); } catch { }
-    }
-    if (!q || !q.twoSided) {
-      if (workedFor >= ENTRY_GIVEUP_MS) await walkAway(`no fresh quote and order unfilled ${(workedFor / 60000).toFixed(0)}m`);
-      continue; // can't re-price blind — leave the order resting
-    }
-
-    const intended = m.intendedEntryPremium || m.entryPremium || q.mid;
-    const conviction = Math.max(0, Math.min(1, (m.ai?.claudeConfidence ?? 50) / 100));
-    // Conviction-scaled chase ceiling above the mid we originally decided was fair:
-    // 50% conviction → +10.5%, 90% → +14%. Beyond this the trade thesis is priced out.
-    const chaseCapPct = 0.06 + 0.09 * conviction;
-    const ceiling = intended * (1 + chaseCapPct);
-    const freshLimit = entryLimitPrice(q.bid, q.ask, q.mid, conviction);
-    const chases = m.entryChaseCount || 0;
-
-    if (workedFor >= ENTRY_GIVEUP_MS) {
-      await walkAway(`unfilled after ${(workedFor / 60000).toFixed(0)}m (bid ${q.bid}/ask ${q.ask}, our limit $${m.entryOrderLimit})`);
-      continue;
-    }
-    if (freshLimit <= (m.entryOrderLimit || 0) + 0.009) {
-      continue; // market hasn't moved past our price — stay patient, we're the fair bid
-    }
-    if (freshLimit > ceiling || chases >= ENTRY_MAX_CHASES) {
-      await walkAway(freshLimit > ceiling
-        ? `price ran away — re-fill needs $${freshLimit.toFixed(2)} vs ceiling $${ceiling.toFixed(2)} (intended mid $${(+intended).toFixed(2)} +${(chaseCapPct * 100).toFixed(0)}%)`
-        : `already chased ${chases}x without a fill`);
       continue;
     }
 
-    // Chase: cancel and re-place toward the new ask, still under the ceiling.
-    try {
-      await robinhood.cancelOptionOrder(m.entryOrderId);
-    } catch (e) {
-      log(acct, `RH ENTRY WORK: cancel-for-chase failed for ${tickerU} (${e.message}) — leaving original order`);
-      continue;
-    }
-    try {
-      const res = await robinhood.placeOptionOrder({
-        symbol: ctx.ticker,
-        expirationDate: ctx.expStr,
-        strikePrice: ctx.strike,
-        optionType: ctx.optionType,
-        side: "buy_to_open",
-        quantity: ctx.qty,
-        type: "limit",
-        limitPrice: freshLimit.toFixed(2),
-      });
-      m.entryOrderId = res?.id || res?.order_id || m.entryOrderId;
-      m.entryOrderPlacedAt = now;
-      m.entryOrderLimit = +freshLimit.toFixed(2);
-      m.entryChaseCount = chases + 1;
-      m.entryPremium = +freshLimit.toFixed(2); // what we're now willing to pay = working basis estimate
-      log(acct, `RH ENTRY WORK: CHASE ${m.entryChaseCount}/${ENTRY_MAX_CHASES} on ${tickerU} ${occ} → $${freshLimit.toFixed(2)} (bid ${q.bid}/ask ${q.ask}, ceiling $${ceiling.toFixed(2)}, conviction ${(conviction * 100).toFixed(0)}%)`);
-      diag("entry_chase", acct, { ticker: tickerU, occ, newLimit: +freshLimit.toFixed(2), ceiling: +ceiling.toFixed(2), chase: m.entryChaseCount, bid: q.bid, ask: q.ask });
-    } catch (e) {
-      // Canceled but couldn't re-place — release the slot so the next cycle can decide fresh.
-      acct._inflightTickers.delete(tickerU);
-      log(acct, `RH ENTRY WORK: re-place failed for ${tickerU} — ${e.message}. Order canceled; next cycle re-evaluates.`);
-      delete m.entryOrderId; delete m.entryOrderPlacedAt; delete m.entryOrderCtx;
+    acct._inflightTickers.add(tickerU);
+    const workedFor = now - (m.entryFirstPlacedAt || m.entryOrderPlacedAt);
+    // Cancel any partial remainder immediately; otherwise a held position and a live buy remainder
+    // coexist, making position size nondeterministic. Unfilled orders get the approved 20m window.
+    const shouldCancel = executedQty > 0 || workedFor >= ENTRY_GIVEUP_MS;
+    if (shouldCancel && !m.entryCancelRequestedAt) {
+      try {
+        await robinhood.cancelOptionOrder(m.entryOrderId);
+        m.entryCancelRequestedAt = now;
+        log(acct, `RH ENTRY WORK: cancel requested for ${tickerU} ${occ} (${executedQty > 0 ? `${executedQty}x partial fill` : "entry window expired"}); waiting for exact terminal state`);
+      } catch (e) {
+        log(acct, `RH ENTRY WORK: cancel failed for ${tickerU} — ${e.message}; original order remains locked`);
+      }
     }
   }
 }
 
-async function syncRobinhoodAccount(acct, quotes) {
+async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshBalance = true } = {}) {
   if (acct.config.broker !== "robinhood" || !robinhood.isConnected) return;
   const state = acct.state;
   if (!state.meta) state.meta = {};
@@ -10602,7 +10723,7 @@ async function syncRobinhoodAccount(acct, quotes) {
   // consecutive-loss breaker), which they previously never did.
   const prevPositions = Array.isArray(state.positions) ? state.positions.filter(p => !p._pending) : [];
 
-  try {
+  if (refreshBalance) try {
     const res = await robinhood.getPortfolio();
     const env = res && res.data ? res.data : res;
     // Robinhood's other MCP endpoints wrap their payload in a {results:[...]} envelope; the
@@ -10646,26 +10767,48 @@ async function syncRobinhoodAccount(acct, quotes) {
     const now = Date.now();
     const positions = [];
     const seen = new Set();
+    let optionOrdersSnapshot = null;
 
     // Fetch equity positions
     const res = await robinhood.getPositions();
     const raw = res && res.data && Array.isArray(res.data.positions) ? res.data.positions : (Array.isArray(res) ? res : []);
 
-    // Also fetch confirmed orders to count working orders (equity + options)
-    const workingRes = await robinhood.getOrders({ state: 'confirmed' }).catch(() => []);
-    const workingOrders = workingRes && workingRes.data && Array.isArray(workingRes.data.orders) ? workingRes.data.orders : (Array.isArray(workingRes) ? workingRes : []);
-    const freshInflight = new Set(workingOrders.map(o => o.symbol?.toUpperCase()).filter(Boolean));
+    // Also fetch confirmed orders to count working orders (equity + options). A failed endpoint
+    // is not evidence that all working orders vanished, so failures retain the previous local locks.
+    const brokerTickers = [];
+    let inflightSnapshotComplete = true;
+    try {
+      const workingRes = await robinhood.getOrders({ state: "confirmed" });
+      const workingOrders = workingRes && workingRes.data && Array.isArray(workingRes.data.orders)
+        ? workingRes.data.orders : (Array.isArray(workingRes) ? workingRes : []);
+      for (const order of workingOrders) {
+        const ticker = order.symbol?.toUpperCase();
+        if (ticker) brokerTickers.push(ticker);
+      }
+    } catch (e) {
+      inflightSnapshotComplete = false;
+      log(acct, `ROBINHOOD SYNC: equity working-orders fetch failed — preserving local order locks (${e.message})`);
+    }
 
-    // If options are enabled, also fetch options orders for inflight tracking
+    // If options are enabled, fetch every state. Confirmed-only misses queued, partially-filled,
+    // and pending-cancel orders and can release a duplicate-sell lock while a remainder is live.
     if (robinhood.optionsEnabled) {
       try {
-        const optWorkingRes = await robinhood.getOptionsOrders({ state: 'confirmed' }).catch(() => []);
-        const optWorkingOrders = optWorkingRes && optWorkingRes.data && Array.isArray(optWorkingRes.data.orders) ? optWorkingRes.data.orders : (Array.isArray(optWorkingRes) ? optWorkingRes : []);
+        const optWorkingRes = await robinhood.getOptionsOrders({});
+        const optWorkingRaw = optWorkingRes?.data ?? optWorkingRes;
+        optionOrdersSnapshot = Array.isArray(optWorkingRaw) ? optWorkingRaw
+          : Array.isArray(optWorkingRaw?.orders) ? optWorkingRaw.orders
+            : Array.isArray(optWorkingRaw?.results) ? optWorkingRaw.results : [];
+        const activeStates = new Set(["queued", "confirmed", "partially_filled", "pending_cancelled", "pending_canceled"]);
+        const optWorkingOrders = optionOrdersSnapshot.filter(order => activeStates.has(String(order.state || order.status || "").toLowerCase()));
         for (const o of optWorkingOrders) {
           const sym = (o.chain_symbol || o.symbol || "").toUpperCase();
-          if (sym) freshInflight.add(sym);
+          if (sym) brokerTickers.push(sym);
         }
-      } catch { }
+      } catch (e) {
+        inflightSnapshotComplete = false;
+        log(acct, `ROBINHOOD SYNC: option working-orders fetch failed — preserving local order locks (${e.message})`);
+      }
     }
     // Grace period: an order we just placed may not show up as "confirmed" at the broker for a
     // few seconds (or, previously, could be silently dropped entirely if it was rejected — see
@@ -10675,15 +10818,30 @@ async function syncRobinhoodAccount(acct, quotes) {
     // is how KO got three duplicate buy attempts within three minutes. Keep any ticker we placed
     // an entry order for in the last 2 minutes in the set regardless of what the broker reports.
     const ENTRY_INFLIGHT_GRACE_MS = 2 * 60_000;
-    if (state.meta) {
-      for (const meta of Object.values(state.meta)) {
-        if (meta?.entryOrderPlacedAt && now - meta.entryOrderPlacedAt < ENTRY_INFLIGHT_GRACE_MS && meta.entryOrderCtx?.ticker) {
-          freshInflight.add(meta.entryOrderCtx.ticker.toUpperCase());
-        }
+    const localIntents = [];
+    for (const meta of Object.values(state.meta || {})) {
+      if (meta?.entryOrderCtx?.ticker && meta.entryOrderPlacedAt) {
+        localIntents.push({
+          ticker: meta.entryOrderCtx.ticker,
+          placedAt: meta.entryOrderPlacedAt,
+          graceMs: ENTRY_INFLIGHT_GRACE_MS,
+        });
+      }
+      if (meta?.exitOrderTicker && exitIntentWithinGrace(meta, now)) {
+        localIntents.push({
+          ticker: meta.exitOrderTicker,
+          placedAt: meta.exitOrderPlacedAt,
+          graceMs: EXIT_INFLIGHT_GRACE_MS,
+        });
       }
     }
-    acct._inflightTickers = freshInflight;
-
+    acct._inflightTickers = mergeInflightTickers({
+      brokerTickers,
+      previousTickers: acct._inflightTickers || [],
+      brokerSnapshotComplete: inflightSnapshotComplete,
+      localIntents,
+      now,
+    });
     // Fetch quotes for equity positions
     const positionSymbols = raw.map(p => p.symbol).filter(Boolean);
     const rhQuotes = positionSymbols.length > 0 ? await robinhood.getQuotes(positionSymbols).catch(() => ({})) : {};
@@ -10714,6 +10872,9 @@ async function syncRobinhoodAccount(acct, quotes) {
         openTime: meta.openTime ?? (p.created_at ? new Date(p.created_at).getTime() : now),
         trimLevel: meta.trimLevel ?? 0,
         bestPnlPct: meta.bestPnlPct ?? 0,
+        bestExitPnlPct: meta.bestExitPnlPct ?? 0,
+        managementPlan: meta.managementPlan || null,
+        lastManagementDecision: meta.lastManagementDecision || null,
         entryAtrPct: meta.entryAtrPct ?? null,
         iv: 0,
         liveMark: spot,
@@ -10729,7 +10890,7 @@ async function syncRobinhoodAccount(acct, quotes) {
       if (pos.liveMark != null && pos.entryPremium > 0) {
         const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
         if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
-        recordMarkTrail(pos, pos.liveMark);
+        recordMarkTrail(pos, pos.liveMark, now, pos.liveBid);
       }
       persistPosTrailMeta(acct, pos);
 
@@ -10780,68 +10941,96 @@ async function syncRobinhoodAccount(acct, quotes) {
           const ticker = (op.chain_symbol || op.symbol || "").toUpperCase();
           if (!ticker) continue;
 
-          // Robinhood returns `type: "long"/"short"` (position side), not the option type.
-          // The actual call/put type lives in `option_type`. Normalize before using.
-          const rawSide = (op.type || "").toLowerCase();
-          const optType = (rawSide === "long" || rawSide === "short")
-            ? (op.option_type || op.legs?.[0]?.option_type || "call").toLowerCase()
-            : (rawSide || op.option_type || "call").toLowerCase();
-          const strike = parseFloat(
+          // The instrument UUID is the contract identity. Ticker/type/strike are not unique, and
+          // historical same-ticker orders must never be used to guess this holding's expiry.
+          const instrumentUrl = op.instrument || op.instrument_id || op.option_id || null;
+          const instrumentId = normalizeOptionId(instrumentUrl);
+          const rawOcc = op.occ_symbol || op.occSymbol || op.option_symbol || null;
+          const parsedOcc = parseOccSymbol(rawOcc);
+
+          // Robinhood returns `type: "long"/"short"` (position side), not call/put. Missing option
+          // type stays unknown; defaulting to call can turn a put into the wrong managed contract.
+          const rawSide = String(op.type || "").toLowerCase();
+          const rawOptionType = String(
+            (rawSide === "long" || rawSide === "short")
+              ? (op.option_type || op.legs?.[0]?.option_type || "")
+              : (op.option_type || rawSide || ""),
+          ).toLowerCase();
+          let optType = rawOptionType === "call" || rawOptionType === "put" ? rawOptionType : parsedOcc?.type || null;
+          let strike = parseFloat(
             op.strike_price || op.strike ||
             op.legs?.[0]?.strike_price || op.legs?.[0]?.strike ||
             op.instrument_data?.strike_price || op.option_data?.strike_price ||
             op.contract?.strike_price || op.details?.strike_price || 0
           );
-          const expDate = op.expiration_date || op.expiration || op.legs?.[0]?.expiration_date || null;
+          let expDate = op.expiration_date || op.expiration || op.legs?.[0]?.expiration_date || parsedOcc?.expiration || null;
+          if (!(strike > 0) && parsedOcc?.strike > 0) strike = parsedOcc.strike;
+
+          // Carry forward exact fields only from the same instrument UUID/OCC. Never match a prior
+          // position by ticker/type/strike: two contracts can share all three and differ in expiry.
+          const prevExact = prevPositions.find(previous => previous.type !== "equity" && (
+            (instrumentId && normalizeOptionId(previous.instrumentUrl) === instrumentId) ||
+            (rawOcc && previous.occSymbol === rawOcc)
+          ));
+          if (prevExact?.contractIdentityVerified) {
+            if (!optType && (prevExact.type === "call" || prevExact.type === "put")) optType = prevExact.type;
+            if (!(strike > 0) && prevExact.strike > 0) strike = prevExact.strike;
+            if (!expDate && prevExact.expiryDate > 0) expDate = new Date(prevExact.expiryDate).toISOString().slice(0, 10);
+          }
+
+          const expMs = expDate ? optionExpirationTimestamp(expDate) : 0;
+          const fieldsComplete = (optType === "call" || optType === "put") && strike > 0 && expMs > 0;
+          const candidateOcc = fieldsComplete ? robinhood.buildOCC(ticker, expDate, optType, strike) : null;
+          const rawOccMatches = !!(parsedOcc && candidateOcc && String(rawOcc).toUpperCase() === candidateOcc);
+          const previousIdentityMatches = !!(prevExact?.contractIdentityVerified && candidateOcc
+            && prevExact.occSymbol === candidateOcc
+            && (!instrumentId || normalizeOptionId(prevExact.instrumentUrl) === instrumentId));
+          const persistedIdentity = candidateOcc ? state.meta[candidateOcc] : null;
+          const persistedIdentityMatches = !!(persistedIdentity?.contractIdentityVerified
+            && (!instrumentId || normalizeOptionId(persistedIdentity.instrumentId) === instrumentId));
+          // UUID + free-standing fields are not proof they describe each other. First sight of a
+          // UUID-only position stays unverified until Step 1 resolves that exact UUID against the
+          // instrument/order record. Exact OCC, prior exact identity, or persisted UUID↔OCC proof is safe.
+          const identityProofMatches = instrumentId
+            ? (previousIdentityMatches || persistedIdentityMatches)
+            : rawOccMatches;
+          const contractIdentityVerified = !!(fieldsComplete && identityProofMatches);
+          const occ = contractIdentityVerified ? candidateOcc : null;
+          const optionMetaKey = occ || (instrumentId ? `rhopt:${instrumentId}` : null);
+          const meta = optionMetaKey ? (state.meta[optionMetaKey] || {}) : {};
+
           // Log raw structure once per ticker so we can identify which fields carry strike/type
-          if (strike === 0) console.log(`  [RH-OPT-DEBUG] ${ticker} raw keys:`, Object.keys(op).join(", "), "legs:", JSON.stringify(op.legs || []).slice(0, 300));
+          if (!contractIdentityVerified) console.log(`  [RH-OPT-DEBUG] ${ticker} unverified contract keys:`, Object.keys(op).join(", "), "legs:", JSON.stringify(op.legs || []).slice(0, 300));
           const avgPrice = parseFloat(op.average_price || op.average_buy_price || 0);
           const entryPremium = avgPrice > 1 ? avgPrice / 100 : avgPrice; // RH may return per-contract cost
-
-          const occ = expDate && strike ? robinhood.buildOCC(ticker, expDate, optType, strike) : `${ticker}_opt`;
-          const meta = state.meta[occ] || state.meta[ticker] || {};
-
-          const expMs = expDate ? new Date(expDate).getTime() : 0;
-          const dteRemaining = expMs > 0 ? Math.max(0, Math.ceil((expMs - now) / 86400000)) : 0;
+          const dteRemaining = contractIdentityVerified
+            ? Math.max(0, Math.ceil((expMs - now) / 86400000))
+            : null;
 
           const mark = parseFloat(op.mark_price || op.adjusted_mark_price || 0) || null;
           const bid = parseFloat(op.bid_price || 0) || null;
           const ask = parseFloat(op.ask_price || 0) || null;
 
-          // Robinhood's own option-position record carries the canonical instrument URL for this
-          // exact contract. This is the only fully unambiguous identifier we have — strike/expiry
-          // string matching against the market-data response can mismatch within a multi-strike
-          // chain, but the instrument URL cannot.
-          const instrumentUrl = op.instrument || op.instrument_id || op.option_id || null;
-
-          // Reject clearly impossible marks from the positions payload itself (same failure mode
-          // as market-data cross-contamination: SPY premium attached to PATH).
-          let safeMark = mark;
-          let safeBid = bid;
-          let safeAsk = ask;
-          if (safeMark != null) {
-            const basis = entryPremium > 0 ? entryPremium : (meta.entryPremium || 0);
-            if (basis > 0) {
-              const ratio = safeMark / basis;
-              if (ratio > 3.5 || ratio < 0.15) {
-                log(acct, `ROBINHOOD SYNC: ignoring position mark $${safeMark} for ${ticker} $${strike} (entry $${basis}, ratio ${ratio.toFixed(2)}x)`);
-                safeMark = null;
-                safeBid = null;
-                safeAsk = null;
-              }
-            }
-          }
+          // Quotes attached to an unverified contract cannot drive orders. For an exact contract,
+          // trust coherent broker quotes even above +250%; large legitimate winners must stay sellable.
+          const coherentSpread = bid == null || ask == null || ask >= bid;
+          const safeMark = contractIdentityVerified && coherentSpread ? mark : null;
+          const safeBid = contractIdentityVerified && coherentSpread ? bid : null;
+          const safeAsk = contractIdentityVerified && coherentSpread ? ask : null;
 
           const pos = {
             ...(meta.ai || {}),
             ticker,
-            type: optType,
+            type: optType || "unknown",
             strike,
-            dte: meta.dte ?? dteRemaining,
+            dte: contractIdentityVerified ? (meta.dte ?? dteRemaining) : null,
             dteRemaining,
-            expiryDate: expMs || meta.expiryDate || 0,
+            expiryDate: contractIdentityVerified ? expMs : null,
             occSymbol: occ,
-            instrumentUrl,
+            optionMetaKey,
+            instrumentUrl: instrumentId || null,
+            verifiedInstrumentId: contractIdentityVerified && instrumentId ? instrumentId : null,
+            contractIdentityVerified,
             // Prefer the actual Robinhood fill price over our pre-order limit estimate.
             // Fall back to meta only when RH hasn't reported an average_price yet (pending fill).
             entryPremium: entryPremium > 0 ? entryPremium : (meta.entryPremium ?? 0),
@@ -10850,34 +11039,42 @@ async function syncRobinhoodAccount(acct, quotes) {
             qty,
             originalQty: meta.originalQty ?? qty,
             cost: Math.abs(entryPremium * qty * 100),
-            openDate: meta.openDate ?? getETDateStr(),
-            openTime: meta.openTime ?? now,
+            openDate: meta.openDate ?? (op.created_at || op.updated_at ? String(op.created_at || op.updated_at).slice(0, 10) : getETDateStr()),
+            // Prefer persisted meta; else RH created_at. Never default to "now" every sync —
+            // that would zero held-days and corrupt DTE/lifecycle decisions (PATH Jul 7→13).
+            openTime: meta.openTime
+              ?? (op.created_at ? new Date(op.created_at).getTime() : null)
+              ?? (op.updated_at ? new Date(op.updated_at).getTime() : null)
+              ?? (meta.openDate ? new Date(meta.openDate + "T16:00:00-04:00").getTime() : now),
             trimLevel: meta.trimLevel ?? 0,
             bestPnlPct: meta.bestPnlPct ?? 0,
+            bestExitPnlPct: meta.bestExitPnlPct ?? 0,
+            managementPlan: meta.managementPlan || null,
+            lastManagementDecision: meta.lastManagementDecision || null,
             entryAtrPct: meta.entryAtrPct ?? null,
             iv: parseFloat(op.implied_volatility || 0) || null,
             liveMark: safeMark,
             liveBid: safeBid,
             liveAsk: safeAsk,
+            liveQuoteAt: safeBid > 0 ? now : null,
+            _pendingEntry: !!(meta.entryOrderPlacedAt && meta.entryOrderCtx),
             liveGreeks: op.greeks || null,
             optionsSource: "robinhood",
-            direction: optType === "call" ? "BULLISH" : "BEARISH",
+            direction: optType === "call" ? "BULLISH" : optType === "put" ? "BEARISH" : "UNKNOWN",
           };
 
-          const prevOpt = prevPositions.find(pp =>
-            (pp.occSymbol && pp.occSymbol === occ) ||
-            (pp.ticker === ticker && pp.type === optType && Math.abs((pp.strike || 0) - strike) < 0.01)
-          );
-          restorePosTrail(pos, meta, prevOpt);
+          restorePosTrail(pos, meta, prevExact);
 
           // Basis bookkeeping: when RH reports an actual average fill, persist it so stop/target
           // math and closure booking use the real basis even if the field is absent next cycle.
           // When it doesn't, mark the basis as an estimate so Step 1.2 reconciles it from the
-          // filled-orders feed (an unreconciled chase-limit basis caused a premature stop-out).
+          // filled-orders feed. A submitted limit is never interchangeable with the broker fill.
           if (entryPremium > 0) {
-            if (!state.meta[occ]) state.meta[occ] = {};
-            state.meta[occ].entryPremium = entryPremium;
-            state.meta[occ].entryFillReconciled = true;
+            if (optionMetaKey) {
+              if (!state.meta[optionMetaKey]) state.meta[optionMetaKey] = {};
+              state.meta[optionMetaKey].entryPremium = entryPremium;
+              state.meta[optionMetaKey].entryFillReconciled = true;
+            }
           } else {
             pos._basisEstimated = !meta.entryFillReconciled;
           }
@@ -10885,7 +11082,7 @@ async function syncRobinhoodAccount(acct, quotes) {
           if (pos.liveMark != null && pos.entryPremium > 0) {
             const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
             if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
-            recordMarkTrail(pos, pos.liveMark);
+            recordMarkTrail(pos, pos.liveMark, now, pos.liveBid);
           }
           persistPosTrailMeta(acct, pos);
 
@@ -10908,8 +11105,7 @@ async function syncRobinhoodAccount(acct, quotes) {
           if (aiData) Object.assign(pos, aiData);
 
           positions.push(pos);
-          seen.add(ticker);
-          seen.add(occ);
+          if (optionMetaKey) seen.add(optionMetaKey);
         }
       } catch (e) {
         log(acct, `ROBINHOOD SYNC: options positions error — ${e.message}`);
@@ -10917,56 +11113,42 @@ async function syncRobinhoodAccount(acct, quotes) {
     }
 
     // ── Broker-fill reconciliation helpers ──
-    // Our own limit prices are working estimates, not fills. Booking them as truth has already
-    // produced a phantom stop-out (basis recorded $4.69 vs actual fill ~$3.69 → a -12% dip read
-    // as -31% and was sold). Everything below prefers the fill Robinhood actually reports.
-    let _filledOptOrders = null; // lazy, fetched at most once per sync
-    const getFilledOptionOrders = async () => {
-      if (_filledOptOrders) return _filledOptOrders;
+    // Our own limit prices are working estimates, not fills. Everything below prefers the fill
+    // Robinhood actually reports; the broker activity record is authoritative for cost basis.
+    let _optionOrders = optionOrdersSnapshot; // reuse the all-state snapshot fetched for locks
+    const getOptionOrders = async () => {
+      if (_optionOrders) return _optionOrders;
       try {
-        const fRes = await robinhood.getOptionsOrders({ state: "filled" }).catch(() => null);
+        // No state filter: partial-then-cancelled orders contain real executions and must reconcile.
+        const fRes = await robinhood.getOptionsOrders({}).catch(() => null);
         const fRaw = fRes && fRes.data ? fRes.data : fRes;
-        _filledOptOrders = Array.isArray(fRaw) ? fRaw
+        _optionOrders = Array.isArray(fRaw) ? fRaw
           : (fRaw && Array.isArray(fRaw.orders)) ? fRaw.orders
           : (fRaw && Array.isArray(fRaw.results)) ? fRaw.results : [];
-      } catch { _filledOptOrders = []; }
-      return _filledOptOrders;
+      } catch { _optionOrders = []; }
+      return _optionOrders;
     };
-    // Extract a normalized per-share fill premium from a filled order. `refMark` (live mark/bid)
-    // disambiguates per-contract vs per-share units when available.
-    const orderFillPremium = (o, refMark = null) => {
-      const leg = (o.legs || [])[0] || {};
-      const exec = (leg.executions || o.executions || [])[0] || {};
-      const cands = [exec.price, o.average_price, leg.average_price, o.price, o.premium, o.processed_premium];
-      for (const c of cands) {
-        let v = parseFloat(c);
-        if (!(v > 0)) continue;
-        if (refMark > 0) {
-          if (v / refMark > 20) v /= 100;      // per-contract dollars reported
-          else if (refMark / v > 20) v *= 100; // cents/fractional form
-        } else if (v > 50) {
-          v /= 100; // no reference: >$50/share premium is almost surely per-contract dollars
-        }
-        return +v.toFixed(2);
+    const getOptionOrderById = async orderId => {
+      if (!orderId) return null;
+      const cached = (await getOptionOrders()).find(order => String(order.id || order.order_id || "") === String(orderId));
+      if (cached) return cached;
+      try {
+        const response = await robinhood.getOptionsOrders({ order_id: orderId });
+        const rawResponse = response?.data ?? response;
+        const records = Array.isArray(rawResponse) ? rawResponse
+          : Array.isArray(rawResponse?.orders) ? rawResponse.orders
+            : Array.isArray(rawResponse?.results) ? rawResponse.results
+              : rawResponse && typeof rawResponse === "object" ? [rawResponse] : [];
+        return records.find(order => String(order.id || order.order_id || "") === String(orderId)) || null;
+      } catch {
+        return null;
       }
-      return null;
     };
-    const matchFilledOrder = (orders, { ticker, strike, expDate, side }) => {
-      const tU = (ticker || "").toUpperCase();
-      return orders.find(o => {
-        const sym = (o.chain_symbol || o.symbol || "").toUpperCase();
-        if (sym !== tU) return false;
-        const leg = (o.legs || [])[0] || o;
-        const oSide = (leg.side || o.side || "").toLowerCase();
-        const effect = (leg.position_effect || o.position_effect || "").toLowerCase();
-        if (side === "buy" && !(oSide.includes("buy") || effect === "open")) return false;
-        if (side === "sell" && !(oSide.includes("sell") || effect === "close")) return false;
-        const oStrike = parseFloat(leg.strike_price || leg.strike || 0);
-        if (strike > 0 && oStrike > 0 && Math.abs(oStrike - strike) > 0.001) return false;
-        const oExp = leg.expiration_date || leg.expiration || o.expiration_date || null;
-        if (expDate && oExp && oExp !== expDate) return false;
-        return true;
-      });
+    // Executions/processed_premium are fills. Robinhood `price` and `premium` are submitted limits
+    // (SPY: 5.23 submitted vs 4.69 actual) and must never be booked as execution prices.
+    const orderFillPremium = order => {
+      const fill = optionOrderAverageFillPrice(order);
+      return fill > 0 ? +fill.toFixed(2) : null;
     };
 
     // Step 0.5: Detect positions that closed (or shrank) at the broker since last cycle and
@@ -10978,45 +11160,38 @@ async function syncRobinhoodAccount(acct, quotes) {
         ? positions.find(p => p.type === "equity" && p.ticker === prev.ticker)
         : positions.find(p => p.type !== "equity" && (
             (prev.occSymbol && p.occSymbol === prev.occSymbol) ||
-            (prev.instrumentUrl && p.instrumentUrl && p.instrumentUrl === prev.instrumentUrl)
+            (normalizeOptionId(prev.instrumentUrl) && normalizeOptionId(p.instrumentUrl) === normalizeOptionId(prev.instrumentUrl))
           ));
       for (const prev of prevPositions) {
         if (!(prev.qty > 0) || !(prev.entryPremium > 0)) continue;
         // If the options fetch failed this cycle, we can't tell "closed" from "API error" for
         // option positions — skip them entirely rather than book phantom exits.
-        if (prev.type !== "equity" && !optionsFetchOk) continue;
-        const metaKey = prev.type === "equity" ? prev.ticker : prev.occSymbol;
+        if (prev.type !== "equity" && !optionsFetchOk) {
+          positions.push({ ...prev, _syncMissing: true });
+          const priorMetaKey = prev.occSymbol || prev.optionMetaKey;
+          if (priorMetaKey) seen.add(priorMetaKey);
+          continue;
+        }
+        const metaKey = prev.type === "equity" ? prev.ticker : (prev.occSymbol || prev.optionMetaKey);
         const posMeta = metaKey ? state.meta[metaKey] : null;
         const cur = findCurrent(prev);
-        const closedQty = cur ? Math.max(0, prev.qty - cur.qty) : prev.qty;
+        let closedQty = cur ? Math.max(0, prev.qty - cur.qty) : prev.qty;
         if (closedQty <= 0) continue;
 
-        // Record closes WE initiated (an exit order was working), expiry lapses, AND — new —
-        // manual closes confirmed by the broker's own filled-orders feed. A user-entered stop
-        // on the Robinhood app fires while the bot's API link is down, the position vanishes,
-        // and previously we refused to book it: no trade record, and (worse) the sale proceeds
-        // never got credited to the unsettled bucket, so PV lost the position's entire value
-        // and the daily-loss breaker halted the account over a phantom -40% "loss" (7/7).
-        // The filled-order lookup doubles as proof a real sale occurred — an API hiccup that
-        // merely hides the position has no matching filled sell, and still gets skipped.
+        // Bot exits reconcile only against their persisted exact order identity. A historical
+        // same-contract manual trim cannot prove that a later missing position snapshot is a new
+        // close; reusing it would book phantom proceeds and drop a still-held broker position.
         const weExited = !!(posMeta && (posMeta.exitOrderPlacedAt || posMeta.exitOrderId));
         const expired = !cur && prev.expiryDate && prev.expiryDate < now;
-        let manualFill = null;
         if (!weExited && !expired) {
-          if (prev.type !== "equity") {
-            const orders = await getFilledOptionOrders();
-            const o = matchFilledOrder(orders, {
-              ticker: prev.ticker, strike: prev.strike,
-              expDate: prev.expiryDate ? new Date(prev.expiryDate).toISOString().slice(0, 10) : null,
-              side: "sell",
-            });
-            manualFill = o ? orderFillPremium(o, prev.liveMark ?? prev.liveBid ?? null) : null;
+          if (!cur) {
+            positions.push({ ...prev, _syncMissing: true });
+            if (metaKey) seen.add(metaKey);
+            if (!prev._syncMissing) {
+              log(acct, `ROBINHOOD SYNC: ${prev.ticker} ${prev.type} position gone without a bot exit order — retaining it as an API gap; manual activity requires explicit reconciliation`);
+            }
           }
-          if (manualFill == null) {
-            if (!cur) log(acct, `ROBINHOOD SYNC: ${prev.ticker} ${prev.type} position gone without a bot exit order or a matching broker fill — assuming API gap, not booking a trade`);
-            continue;
-          }
-          log(acct, `ROBINHOOD SYNC: ${prev.ticker} ${prev.type} closed manually at the broker (filled sell @ $${manualFill.toFixed(2)}) — booking it and crediting proceeds`);
+          continue;
         }
 
         const mult = prev.type === "equity" ? 1 : 100;
@@ -11024,26 +11199,73 @@ async function syncRobinhoodAccount(acct, quotes) {
         // worked (or last bid/mark) only when no matching fill is found.
         let closePremium = null;
         let fillConfirmed = false;
-        if (manualFill != null) {
-          closePremium = manualFill;
-          fillConfirmed = true;
-        } else if (expired && !weExited) {
+        let matchedExitOrder = null;
+        let fillGrossForDelta = null;
+        if (expired && !weExited) {
           closePremium = 0;
         } else if (prev.type !== "equity") {
-          const orders = await getFilledOptionOrders();
-          const o = matchFilledOrder(orders, {
-            ticker: prev.ticker, strike: prev.strike,
-            expDate: prev.expiryDate ? new Date(prev.expiryDate).toISOString().slice(0, 10) : null,
+          const orders = await getOptionOrders();
+          let o = findExactOptionOrder(orders, {
+            instrumentId: prev.instrumentUrl,
+            occSymbol: prev.occSymbol,
             side: "sell",
+            orderId: posMeta?.exitOrderId || null,
+            refId: posMeta?.exitOrderRefId || null,
+            submittedAt: posMeta?.exitOrderPlacedAt || prev.openTime || 0,
+            now,
           });
-          const fill = o ? orderFillPremium(o, prev.liveMark ?? prev.liveBid ?? null) : null;
-          if (fill != null) { closePremium = fill; fillConfirmed = true; }
+          if (!o && posMeta?.exitOrderId) {
+            const exactById = await getOptionOrderById(posMeta.exitOrderId);
+            o = findExactOptionOrder(exactById ? [exactById] : [], {
+              instrumentId: prev.instrumentUrl,
+              occSymbol: prev.occSymbol,
+              side: "sell",
+              orderId: posMeta.exitOrderId,
+              submittedAt: posMeta.exitOrderPlacedAt || prev.openTime || 0,
+              now,
+            });
+          }
+          matchedExitOrder = o;
+          if (o && optionOrderExecutedQuantity(o) > 0) {
+            const cumulativeQty = optionOrderExecutedQuantity(o);
+            const cumulativeGross = optionOrderExecutedGross(o);
+            const bookedQty = Number(posMeta?.exitBookedQty) || 0;
+            const bookedGross = Number(posMeta?.exitBookedGross) || 0;
+            const deltaQty = cumulativeQty - bookedQty;
+            const deltaGross = cumulativeGross - bookedGross;
+            // Broker position quantity and cumulative executions must agree exactly. If one API is
+            // ahead of the other, preserve the old position as pending and try again next sync.
+            if (deltaQty > 0 && Math.abs(deltaQty - closedQty) < 0.0001 && deltaGross > 0) {
+              closePremium = deltaGross / deltaQty;
+              fillGrossForDelta = deltaGross;
+              fillConfirmed = true;
+            }
+          }
         }
+        if (weExited && !expired && closePremium == null) {
+          // A quantity shrink (or one-cycle positions API gap) is not enough to advance trim state.
+          // Retain the pre-exit quantity as non-tradeable until the exact filled-order record confirms
+          // price and quantity. This preserves the diff for the next reconciliation pass.
+          if (cur) {
+            cur.qty = prev.qty;
+            cur._pendingExit = true;
+          } else {
+            positions.push({ ...prev, _pendingExit: true });
+            if (metaKey) seen.add(metaKey);
+          }
+          if (!posMeta?.exitReconcileWaitLoggedAt || now - posMeta.exitReconcileWaitLoggedAt >= 60_000) {
+            if (posMeta) posMeta.exitReconcileWaitLoggedAt = now;
+            log(acct, `ROBINHOOD SYNC: ${prev.ticker} changed while exit is pending but no exact matching fill is reported yet — deferring trim/P&L bookkeeping`);
+          }
+          continue;
+        }
+        // A resting limit is not an expiry fill. If the long contract disappears after expiry and
+        // no exact execution exists, book it worthless rather than crediting the old submitted limit.
+        if (expired && closePremium == null) closePremium = 0;
         if (closePremium == null) closePremium = posMeta?.exitOrderLimit ?? prev.liveBid ?? prev.liveMark ?? prev.entryPremium;
         const pnlDollar = (closePremium - prev.entryPremium) * closedQty * mult;
         const pnlPct = (closePremium - prev.entryPremium) / prev.entryPremium;
-        const reason = manualFill != null ? "manual close at broker (synced)"
-          : posMeta?.exitReason || (expired && !weExited ? "expired worthless" : "robinhood exit filled (synced)");
+        const reason = posMeta?.exitReason || (expired && !weExited ? "expired worthless" : "robinhood exit filled (synced)");
         const proceeds = +(closePremium * closedQty * mult).toFixed(2);
         const trade = {
           ...prev, qty: closedQty,
@@ -11066,94 +11288,137 @@ async function syncRobinhoodAccount(acct, quotes) {
         diag("exit_fill", acct, { ticker: prev.ticker, occ: prev.occSymbol || prev.ticker, qty: closedQty, estClose: +(+closePremium).toFixed(2), pnl: +pnlDollar.toFixed(2), pnlPct: +(pnlPct * 100).toFixed(1), reason, source: "rh-sync-diff" });
 
         if (cur && posMeta) {
-          // Partial close: if it was a planned trim, advance the trim level so the next trim
-          // tier arms (previously stuck at 0 forever on Robinhood — trims re-fired every cycle).
-          if (posMeta.exitIsTrim) {
-            posMeta.trimLevel = Math.min(4, (posMeta.trimLevel || 0) + 1);
-            cur.trimLevel = posMeta.trimLevel;
-            log(acct, `ROBINHOOD SYNC: ${prev.ticker} trim level → ${posMeta.trimLevel}`);
+          if (matchedExitOrder && fillConfirmed) {
+            posMeta.exitBookedQty = (Number(posMeta.exitBookedQty) || 0) + closedQty;
+            posMeta.exitBookedGross = (Number(posMeta.exitBookedGross) || 0) + (fillGrossForDelta || closePremium * closedQty);
+            if (posMeta.exitIsTrim) {
+              const targetLevel = posMeta.exitTrimTargetLevel
+                ?? posMeta.trimPendingLevel
+                ?? Math.min(4, (posMeta.trimLevel || 0) + 1);
+              if (!(posMeta.trimPendingTargetQty > 0)) posMeta.trimPendingTargetQty = posMeta.exitRequestedQty || closedQty;
+              posMeta.trimPendingLevel = targetLevel;
+              posMeta.trimPendingFilledQty = (Number(posMeta.trimPendingFilledQty) || 0) + closedQty;
+              if (posMeta.trimPendingFilledQty >= posMeta.trimPendingTargetQty) {
+                posMeta.trimLevel = targetLevel;
+                cur.trimLevel = targetLevel;
+                delete posMeta.trimPendingLevel;
+                delete posMeta.trimPendingTargetQty;
+                delete posMeta.trimPendingFilledQty;
+                log(acct, `ROBINHOOD SYNC: ${prev.ticker} trim tier ${targetLevel} fully filled`);
+              }
+            }
+
+            const requestedQty = Number(posMeta.exitRequestedQty) || closedQty;
+            const orderComplete = (Number(posMeta.exitBookedQty) || 0) >= requestedQty;
+            const terminal = optionOrderIsTerminal(matchedExitOrder);
+            const remainingOnOrder = optionOrderRemainingQuantity(matchedExitOrder);
+            if (orderComplete || terminal || remainingOnOrder === 0) {
+              clearExitOrderTracking(posMeta, { keepAttempts: false });
+              acct._inflightTickers.delete(prev.ticker.toUpperCase());
+            } else {
+              // A live partial remainder owns this contract; manager must not arm another tier.
+              cur._pendingExit = true;
+            }
+          } else {
+            clearExitOrderTracking(posMeta, { keepAttempts: false });
           }
-          delete posMeta.exitOrderId; delete posMeta.exitOrderPlacedAt; delete posMeta.exitOrderLimit;
-          delete posMeta.exitReason; delete posMeta.exitIsTrim; delete posMeta.exitAttempts;
         } else if (!cur && metaKey) {
           delete state.meta[metaKey]; // fully closed — retire the side-metadata
         }
       }
     }
 
-    // Step 1: Resolve strike/expiry for options positions where those fields are missing.
-    // The positions endpoint sometimes omits these. Filled orders always have them — scrape there.
+    // Step 1: Resolve incomplete option identity by exact instrument UUID only. Never scrape the
+    // first same-ticker/type order: multiple PATH/SPY calls can share ticker/type/strike while their
+    // expiries differ, and a borrowed old expiry can trigger a false DTE_CRITICAL liquidation.
     if (robinhood.optionsEnabled) {
-      const strikeUnknown = positions.filter(
-        p => p.optionsSource === "robinhood" && p.type !== "equity" && p.strike === 0
+      const identityUnknown = positions.filter(
+        p => p.optionsSource === "robinhood" && p.type !== "equity" && !isVerifiedRobinhoodContract(p)
       );
-      if (strikeUnknown.length > 0) {
-        try {
-          const filledRes = await robinhood.getOptionsOrders({ state: "filled" }).catch(() => null);
-          const filledRaw = filledRes && filledRes.data ? filledRes.data : filledRes;
-          const filledOrders = Array.isArray(filledRaw) ? filledRaw
-            : (filledRaw && Array.isArray(filledRaw.orders)) ? filledRaw.orders
-            : (filledRaw && Array.isArray(filledRaw.results)) ? filledRaw.results
-            : [];
+      if (identityUnknown.length > 0) {
+        const instrumentCache = new Map();
+        const extractRecords = response => {
+          const rawResponse = response?.data ?? response;
+          if (Array.isArray(rawResponse)) return rawResponse;
+          if (Array.isArray(rawResponse?.results)) return rawResponse.results;
+          if (Array.isArray(rawResponse?.instruments)) return rawResponse.instruments;
+          if (Array.isArray(rawResponse?.option_instruments)) return rawResponse.option_instruments;
+          return [];
+        };
+        for (const pos of identityUnknown) {
+          const instrumentId = normalizeOptionId(pos.instrumentUrl);
+          if (!instrumentId) continue;
+          try {
+            let records = instrumentCache.get(pos.ticker);
+            if (!records) {
+              records = extractRecords(await robinhood.getOptionInstruments(pos.ticker).catch(() => null));
+              instrumentCache.set(pos.ticker, records);
+            }
+            let identity = resolveExactOptionIdentity(instrumentId, records);
+            if (!identity) identity = resolveExactOptionIdentity(instrumentId, await getOptionOrders());
+            if (!identity || (identity.ticker && identity.ticker !== pos.ticker)) continue;
 
-          for (const pos of strikeUnknown) {
-            // Find a filled order that matches this ticker + option type
-            const order = filledOrders.find(o => {
-              const sym = (o.chain_symbol || o.symbol || "").toUpperCase();
-              if (sym !== pos.ticker) return false;
-              const oType = (o.legs?.[0]?.option_type || o.option_type || "").toLowerCase();
-              return !oType || oType === pos.type;
+            const expMs = optionExpirationTimestamp(identity.expiration);
+            if (!(expMs > 0)) continue;
+            const exactOcc = robinhood.buildOCC(pos.ticker, identity.expiration, identity.type, identity.strike);
+            const priorKey = pos.optionMetaKey;
+            const exactMeta = {
+              ...(priorKey ? state.meta[priorKey] : {}),
+              ...(state.meta[exactOcc] || {}),
+              resolvedStrike: identity.strike,
+              resolvedExpiry: identity.expiration,
+              contractIdentityVerified: true,
+              instrumentId,
+            };
+            state.meta[exactOcc] = exactMeta;
+            if (priorKey && priorKey !== exactOcc) delete state.meta[priorKey];
+
+            Object.assign(pos, {
+              type: identity.type,
+              direction: identity.type === "call" ? "BULLISH" : "BEARISH",
+              strike: identity.strike,
+              expiryDate: expMs,
+              dteRemaining: Math.max(0, Math.ceil((expMs - now) / 86400000)),
+              dte: exactMeta.dte ?? Math.max(0, Math.ceil((expMs - now) / 86400000)),
+              occSymbol: exactOcc,
+              optionMetaKey: exactOcc,
+              verifiedInstrumentId: instrumentId,
+              contractIdentityVerified: true,
             });
-            if (!order) continue;
-
-            const leg = (order.legs || [])[0] || order;
-            const resolvedStrike = parseFloat(leg.strike_price || leg.strike || 0);
-            const resolvedExp = leg.expiration_date || leg.expiration || null;
-
-            if (resolvedStrike > 0) {
-              pos.strike = resolvedStrike;
-              const occ = resolvedExp ? robinhood.buildOCC(pos.ticker, resolvedExp, pos.type, resolvedStrike) : pos.occSymbol;
-              // Persist into meta so it survives the next cycle
-              if (!state.meta[occ]) state.meta[occ] = { ...(state.meta[pos.occSymbol] || {}) };
-              state.meta[occ].resolvedStrike = resolvedStrike;
-              if (resolvedExp) state.meta[occ].resolvedExpiry = resolvedExp;
-              pos.occSymbol = occ;
-              seen.add(occ);
-              log(acct, `ROBINHOOD SYNC: resolved ${pos.ticker} ${pos.type} strike=$${resolvedStrike} exp=${resolvedExp || "?"} from filled order`);
-            }
-            if (resolvedExp && !pos.expiryDate) {
-              const expMs = new Date(resolvedExp).getTime();
-              if (expMs > 0) {
-                pos.expiryDate = expMs;
-                pos.dteRemaining = Math.max(0, Math.ceil((expMs - now) / 86400000));
-              }
-            }
+            seen.add(exactOcc);
+            log(acct, `ROBINHOOD SYNC: verified exact ${pos.ticker} ${identity.type} $${identity.strike} exp=${identity.expiration} from instrument ${instrumentId.slice(0, 8)}`);
+          } catch (e) {
+            log(acct, `ROBINHOOD SYNC: exact contract resolve error for ${pos.ticker} — ${e.message}`);
           }
-        } catch (e) {
-          log(acct, `ROBINHOOD SYNC: strike resolve error — ${e.message}`);
         }
       }
     }
 
     // Step 1.2: Reconcile entry cost basis against actual broker fills. The entry chase records
-    // "what we were willing to pay" as a working estimate; when the real fill was better, every
-    // stop/target computed off the estimate is wrong — a booked $4.69 basis on a ~$3.69 fill
-    // made a -12% dip read as -31% and triggered a premature stop-out.
+    // "what we were willing to pay" as a working estimate; when the real fill differs, every
+    // stop/target computed off that estimate is wrong. Reconcile before the manager acts.
     if (robinhood.optionsEnabled) {
-      const basisUnknown = positions.filter(p => p.optionsSource === "robinhood" && p.type !== "equity" && p._basisEstimated);
+      const basisUnknown = positions.filter(p => p.optionsSource === "robinhood" && p.type !== "equity"
+        && isVerifiedRobinhoodContract(p) && p._basisEstimated);
       for (const pos of basisUnknown) {
         try {
-          const orders = await getFilledOptionOrders();
-          const o = matchFilledOrder(orders, {
-            ticker: pos.ticker, strike: pos.strike,
-            expDate: pos.expiryDate ? new Date(pos.expiryDate).toISOString().slice(0, 10) : null,
+          const metaKey = pos.occSymbol || pos.optionMetaKey;
+          const basisMeta = metaKey ? state.meta[metaKey] : null;
+          if (!basisMeta) continue;
+          const orders = await getOptionOrders();
+          const o = findExactOptionOrder(orders, {
+            instrumentId: pos.instrumentUrl,
+            occSymbol: pos.occSymbol,
             side: "buy",
+            orderId: basisMeta.entryOrderId || null,
+            refId: basisMeta.entryOrderRefId || null,
+            submittedAt: basisMeta.entryOrderPlacedAt || pos.openTime || 0,
+            now,
           });
-          const fill = o ? orderFillPremium(o, pos.liveMark ?? pos.liveBid ?? null) : null;
+          const fill = o && optionOrderExecutedQuantity(o) > 0 ? orderFillPremium(o) : null;
           if (fill == null) continue;
-          if (!state.meta[pos.occSymbol]) state.meta[pos.occSymbol] = {};
-          state.meta[pos.occSymbol].entryPremium = fill;
-          state.meta[pos.occSymbol].entryFillReconciled = true;
+          basisMeta.entryPremium = fill;
+          basisMeta.entryFillReconciled = true;
           if (Math.abs(fill - pos.entryPremium) > 0.005) {
             log(acct, `ROBINHOOD SYNC: ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} cost basis reconciled $${pos.entryPremium.toFixed(2)} → $${fill.toFixed(2)} (actual broker fill)`);
             pos.entryPremium = fill;
@@ -11166,37 +11431,134 @@ async function syncRobinhoodAccount(acct, quotes) {
       }
     }
 
-    // Step 1.5: Stale exit-order watchdog. A sell_to_close limit order can sit unfilled forever
-    // if the market moves away from it (or it was mispriced) — there's no broker-side trailing/
-    // re-pricing. If an exit order we placed hasn't filled within a few minutes, cancel it so the
-    // next cycle's tryExits re-attempts at a fresh price (guaranteed-fill logic prices at the
-    // current bid for losing positions, so a retry should clear immediately).
+    // Step 1.5: Exact-order watchdog. Never release a lock merely because an order is absent from
+    // the `confirmed` feed: queued, partial, and pending-cancel orders can still sell the contract.
     if (robinhood.optionsEnabled && !(acct.paused && acct.pausedBy === "user")) {
-      const STALE_EXIT_ORDER_MS = 3 * 60_000;
       for (const pos of positions) {
         if (pos.type === "equity" || pos.optionsSource !== "robinhood") continue;
-        const posMeta = state.meta[pos.occSymbol];
+        const metaKey = pos.occSymbol || pos.optionMetaKey;
+        const posMeta = metaKey ? state.meta[metaKey] : null;
         if (!posMeta || !posMeta.exitOrderPlacedAt) continue;
         const age = now - posMeta.exitOrderPlacedAt;
-        const stillInflight = acct._inflightTickers && acct._inflightTickers.has(pos.ticker.toUpperCase());
-        if (!stillInflight) {
-          // No longer a working order on the broker — either it filled or was canceled
-          // externally. Either way, stop tracking it; the position list reflects current truth.
-          delete posMeta.exitOrderId;
-          delete posMeta.exitOrderPlacedAt;
-          delete posMeta.exitOrderLimit;
-        } else if (age >= STALE_EXIT_ORDER_MS && posMeta.exitOrderId) {
+        if (!posMeta.exitOrderId && posMeta.exitOrderRefId
+            && (!posMeta.exitRecoveryAttemptAt || now - posMeta.exitRecoveryAttemptAt >= 30_000)) {
+          // The first submission may have succeeded even though its response was lost. Replaying the
+          // exact payload with the SAME ref is the only safe recovery; a fresh ref could duplicate-sell.
+          const expStr = pos.expiryDate ? new Date(pos.expiryDate).toISOString().slice(0, 10) : null;
+          const requestedQty = Number(posMeta.exitRequestedQty);
+          const limit = Number(posMeta.exitOrderLimit);
+          const completeCtx = expStr && requestedQty > 0 && limit > 0
+            && (pos.type === "call" || pos.type === "put") && Number(pos.strike) > 0
+            && pos.instrumentUrl;
+          pos._pendingExit = true;
+          if (completeCtx) {
+            posMeta.exitRecoveryAttemptAt = now;
+            try {
+              const recovered = await robinhood.placeOptionOrder({
+                symbol: pos.ticker,
+                expirationDate: expStr,
+                strikePrice: pos.strike,
+                optionType: pos.type,
+                side: "sell_to_close",
+                quantity: requestedQty,
+                type: "limit",
+                limitPrice: limit.toFixed(2),
+                refId: posMeta.exitOrderRefId,
+                optionId: pos.instrumentUrl,
+              });
+              const recoveredId = brokerOrderId(recovered);
+              if (recoveredId) {
+                posMeta.exitOrderId = recoveredId;
+                delete posMeta.exitSubmissionUnknownAt;
+                log(acct, `ROBINHOOD EXIT RECOVERY: recovered order ${recoveredId} for ${pos.ticker} using persisted ref ${posMeta.exitOrderRefId}`);
+              } else {
+                posMeta.exitSubmissionUnknownAt = now;
+                if (!posMeta.exitRecoveryNoIdLoggedAt || now - posMeta.exitRecoveryNoIdLoggedAt >= 15 * 60_000) {
+                  posMeta.exitRecoveryNoIdLoggedAt = now;
+                  log(acct, `ROBINHOOD EXIT RECOVERY: ${pos.ticker} still returned no order id; retaining persisted ref and quarantine`);
+                }
+              }
+            } catch (e) {
+              if (e.brokerRejected) {
+                clearExitOrderTracking(posMeta);
+                acct._inflightTickers.delete(pos.ticker.toUpperCase());
+                delete pos._pendingExit;
+                log(acct, `ROBINHOOD EXIT RECOVERY REJECTED ${pos.ticker}: ${e.message}; cleared rejected intent`);
+                continue;
+              }
+              posMeta.exitSubmissionUnknownAt = now;
+              if (!posMeta.exitRecoveryErrorLoggedAt || now - posMeta.exitRecoveryErrorLoggedAt >= 15 * 60_000) {
+                posMeta.exitRecoveryErrorLoggedAt = now;
+                log(acct, `ROBINHOOD EXIT RECOVERY UNKNOWN ${pos.ticker}: ${e.message}; retaining persisted ref and quarantine`);
+              }
+            }
+          } else if (!posMeta.exitRecoveryContextLoggedAt || now - posMeta.exitRecoveryContextLoggedAt >= 15 * 60_000) {
+            posMeta.exitRecoveryContextLoggedAt = now;
+            log(acct, `ROBINHOOD EXIT RECOVERY BLOCKED ${pos.ticker}: incomplete persisted exact-contract context; retaining quarantine`);
+          }
+        }
+
+        let exactOrder = posMeta.exitOrderId ? await getOptionOrderById(posMeta.exitOrderId) : null;
+        if (exactOrder) {
+          exactOrder = findExactOptionOrder([exactOrder], {
+            instrumentId: pos.instrumentUrl,
+            occSymbol: pos.occSymbol,
+            side: "sell",
+            orderId: posMeta.exitOrderId,
+            submittedAt: posMeta.exitOrderPlacedAt,
+            now,
+          });
+        }
+
+        if (!exactOrder) {
+          // A transport timeout can happen after broker acceptance. With no exact order id/status,
+          // quarantine the position; clearing the intent here could submit a duplicate sell.
+          pos._pendingExit = true;
+          if (!posMeta.exitReconcileWaitLoggedAt || now - posMeta.exitReconcileWaitLoggedAt >= 60_000) {
+            posMeta.exitReconcileWaitLoggedAt = now;
+            log(acct, `ROBINHOOD SYNC: exit status unresolved for ${pos.ticker} — retaining duplicate-order lock and quarantining automated exits`);
+          }
+          continue;
+        }
+
+        const executedQty = optionOrderExecutedQuantity(exactOrder);
+        const bookedQty = Number(posMeta.exitBookedQty) || 0;
+        if (optionOrderIsTerminal(exactOrder)) {
+          if (executedQty > bookedQty + 0.0001) {
+            // Executions are ahead of the positions endpoint. Wait for quantity coherence so the
+            // fill is booked once at its exact cumulative delta before releasing anything.
+            pos._pendingExit = true;
+            continue;
+          }
+          clearExitOrderTracking(posMeta);
+          acct._inflightTickers.delete(pos.ticker.toUpperCase());
+          continue;
+        }
+
+        pos._pendingExit = true;
+        const staleAfterMs = Number(posMeta.exitStaleAfterMs) || 3 * 60_000;
+        const orderState = String(exactOrder.state || exactOrder.status || "").toLowerCase();
+        const pendingCancel = orderState === "pending_cancelled" || orderState === "pending_canceled";
+        const cancelRetryMs = pendingCancel ? 60_000 : 30_000;
+        const lastCancelAttemptAt = Math.max(
+          Number(posMeta.exitCancelAttemptedAt) || 0,
+          Number(posMeta.exitCancelRequestedAt) || 0,
+          Number(posMeta.exitCancelFailedAt) || 0,
+        );
+        const cancelRetryDue = !lastCancelAttemptAt || now - lastCancelAttemptAt >= cancelRetryMs;
+        if (age >= staleAfterMs && posMeta.exitOrderId && cancelRetryDue) {
+          const retrying = !!lastCancelAttemptAt;
+          posMeta.exitCancelAttemptedAt = now;
           try {
             await robinhood.cancelOptionOrder(posMeta.exitOrderId);
             posMeta.exitAttempts = (posMeta.exitAttempts || 0) + 1;
-            log(acct, `ROBINHOOD SYNC: canceled stale exit order for ${pos.ticker} (unfilled ${(age / 60000).toFixed(1)}m @ $${posMeta.exitOrderLimit}, attempt ${posMeta.exitAttempts}) — will re-price more aggressively next cycle`);
+            posMeta.exitCancelRequestedAt = now;
+            delete posMeta.exitCancelFailedAt;
+            log(acct, `ROBINHOOD SYNC: cancel ${retrying ? "retried" : "requested"} for stale ${posMeta.exitPriceMode || "exit"} order on ${pos.ticker} after ${(age / 1000).toFixed(0)}s @ $${posMeta.exitOrderLimit} (attempt ${posMeta.exitAttempts})`);
           } catch (e) {
+            posMeta.exitCancelFailedAt = now;
             log(acct, `ROBINHOOD SYNC: cancel stale exit order failed for ${pos.ticker} — ${e.message}`);
           }
-          delete posMeta.exitOrderId;
-          delete posMeta.exitOrderPlacedAt;
-          delete posMeta.exitOrderLimit;
-          acct._inflightTickers.delete(pos.ticker.toUpperCase());
         }
       }
     }
@@ -11209,7 +11571,10 @@ async function syncRobinhoodAccount(acct, quotes) {
     // premium (~$666 contract vs ~$85 real). Matching MUST be by instrument UUID or exact OCC.
     if (robinhood.optionsEnabled) {
       const needsMark = positions.filter(
-        p => p.optionsSource === "robinhood" && p.type !== "equity" && p.liveMark == null
+        p => p.optionsSource === "robinhood" && p.type !== "equity"
+          && isVerifiedRobinhoodContract(p)
+          && (p.liveMark == null || p.liveBid == null || !(p.liveQuoteAt > 0)
+            || now - p.liveQuoteAt > RH_OPTION_QUOTE_MAX_AGE_MS)
       );
       if (needsMark.length > 0) {
         const extractMdItems = (mdRes) => {
@@ -11221,6 +11586,11 @@ async function syncRobinhoodAccount(acct, quotes) {
           return [];
         };
         const applyQuoteToPos = (pos, match, sourceLabel) => {
+          if (!isVerifiedRobinhoodContract(pos) || !exactOptionQuoteMatches(pos, {
+            ...match,
+            ...(match.quote && typeof match.quote === "object" ? match.quote : {}),
+            ...(match.market_data && typeof match.market_data === "object" ? match.market_data : {}),
+          })) return false;
           const src = (match.quote && typeof match.quote === "object")
             ? { ...match, ...match.quote }
             : (match.market_data && typeof match.market_data === "object")
@@ -11237,45 +11607,31 @@ async function syncRobinhoodAccount(acct, quotes) {
           const ask = num("ask_price", "ask", "best_ask_price");
           const markRaw = num("mark_price", "adjusted_mark_price", "mark");
           const lastTrade = num("last_trade_price", "last_trade", "last_price", "previous_close_price");
+          if (bid != null && ask != null && ask < bid) {
+            log(acct, `ROBINHOOD SYNC: rejected crossed quote for ${pos.ticker} (${sourceLabel}) bid=${bid} ask=${ask}`);
+            return false;
+          }
           const mid = (bid != null && ask != null) ? +((bid + ask) / 2).toFixed(2) : null;
           const candidate = markRaw ?? mid ?? lastTrade ?? bid;
-          // Sanity: refuse marks that are clearly a different contract (e.g. SPY $6 onto PATH $0.85).
-          if (candidate != null && pos.entryPremium > 0) {
-            const ratio = candidate / pos.entryPremium;
-            if (ratio > 3.5 || ratio < 0.15) {
-              log(acct, `ROBINHOOD SYNC: REJECTED mark $${candidate} for ${pos.ticker} ${pos.type} $${pos.strike} (entry $${pos.entryPremium}, ratio ${ratio.toFixed(2)}x via ${sourceLabel}) — likely cross-contract contamination`);
-              return false;
-            }
-          }
           pos.liveBid = bid;
           pos.liveAsk = ask;
           pos.liveMark = candidate;
+          pos.liveQuoteAt = bid > 0 ? now : null;
           log(acct, `ROBINHOOD SYNC: ${pos.ticker} $${pos.strike} ${pos.type} live bid=${bid} ask=${ask} mark=${markRaw} mid=${mid} → liveMark=${pos.liveMark} (${sourceLabel})`);
           if (pos.liveMark != null && pos.entryPremium > 0) {
             const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
             if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
-            recordMarkTrail(pos, pos.liveMark);
+            recordMarkTrail(pos, pos.liveMark, now, pos.liveBid);
             persistPosTrailMeta(acct, pos);
           }
           return true;
         };
         const matchByHardId = (mdItems, pos) => {
-          if (pos.instrumentUrl) {
-            const hit = mdItems.find(item =>
-              (item.option_id && item.option_id === pos.instrumentUrl) ||
-              (item.instrument_id && item.instrument_id === pos.instrumentUrl) ||
-              (item.id && item.id === pos.instrumentUrl) ||
-              (item.instrument && (item.instrument === pos.instrumentUrl || String(item.instrument).includes(pos.instrumentUrl)))
-            );
-            if (hit) return hit;
-          }
-          if (pos.occSymbol && !String(pos.occSymbol).endsWith("_opt")) {
-            return mdItems.find(item => {
-              const rawSym = (item.symbol || item.occ_symbol || "").toUpperCase();
-              return rawSym && rawSym === pos.occSymbol.toUpperCase();
-            }) || null;
-          }
-          return null;
+          return mdItems.find(item => exactOptionQuoteMatches(pos, {
+            ...item,
+            ...(item.quote && typeof item.quote === "object" ? item.quote : {}),
+            ...(item.market_data && typeof item.market_data === "object" ? item.market_data : {}),
+          })) || null;
         };
 
         for (const pos of needsMark) {
@@ -11287,7 +11643,7 @@ async function syncRobinhoodAccount(acct, quotes) {
             if (pos.instrumentUrl) {
               const mdRes = await robinhood.getOptionMarketData([pos.instrumentUrl]);
               mdItems = extractMdItems(mdRes);
-              sourceLabel = `id:${pos.instrumentUrl.slice(0, 8)}`;
+              sourceLabel = `id:${normalizeOptionId(pos.instrumentUrl)?.slice(0, 8) || "?"}`;
             } else if (pos.occSymbol && !String(pos.occSymbol).endsWith("_opt")) {
               const mdRes = await robinhood.getOptionMarketData([pos.occSymbol]);
               mdItems = extractMdItems(mdRes);
@@ -11298,8 +11654,6 @@ async function syncRobinhoodAccount(acct, quotes) {
             }
 
             let match = matchByHardId(mdItems, pos);
-            // Only when we asked for ONE id/OCC and got back exactly ONE item is identity safe.
-            if (!match && mdItems.length === 1) match = mdItems[0];
 
             if (match) {
               applyQuoteToPos(pos, match, sourceLabel);
@@ -11312,45 +11666,23 @@ async function syncRobinhoodAccount(acct, quotes) {
         }
       }
 
-      // Step 2.5: Tradier NBBO fallback. If Robinhood's market data still didn't yield a mark
-      // (tool missing, shape drift, zero'd quotes), price the contract off Tradier by its OCC
-      // symbol — a real two-sided market from a second source beats holding blind. Positions
-      // with no reliable mark from EITHER source stay null and the exit logic holds them.
-      const stillUnmarked = positions.filter(
-        p => p.optionsSource === "robinhood" && p.type !== "equity" && p.liveMark == null
-          && p.occSymbol && robinhood.parseOCC(p.occSymbol)
-      );
-      if (stillUnmarked.length > 0 && tradier.isConnected) {
-        try {
-          const tq = await tradier.getOptionQuotes(stillUnmarked.map(p => p.occSymbol));
-          for (const pos of stillUnmarked) {
-            const q = tq[pos.occSymbol];
-            if (q && q.twoSided) {
-              pos.liveBid = q.bid;
-              pos.liveAsk = q.ask;
-              pos.liveMark = q.mid;
-              pos.markSource = "tradier";
-              log(acct, `ROBINHOOD SYNC: ${pos.ticker} ${pos.type} priced via Tradier fallback — bid=${q.bid} ask=${q.ask} mid=${q.mid}`);
-              if (pos.entryPremium > 0) {
-                const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
-                if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
-                recordMarkTrail(pos, pos.liveMark);
-                persistPosTrailMeta(acct, pos);
-              }
-            }
-          }
-        } catch (e) {
-          log(acct, `ROBINHOOD SYNC: Tradier mark fallback error — ${e.message}`);
-        }
-      }
     }
 
     // Step 3: Work unfilled ENTRY orders — the "chase or walk away" decision.
-    await workRobinhoodEntryOrders(acct, now);
+    if (workEntries) await workRobinhoodEntryOrders(acct, now);
 
     // Prune stale meta — but never prune fresh metadata for an order that hasn't produced a
     // broker position yet (unfilled entries). Pruning those (the old behavior) destroyed the
     // AI thesis + entry context between order placement and fill.
+    // Bare-ticker option metadata is ambiguous across expiries. It is never read above; retire it
+    // immediately when the same ticker is not also an equity holding so it cannot leak into a later
+    // contract's plan/trim state.
+    const optionTickers = new Set(positions.filter(pos => pos.type !== "equity").map(pos => pos.ticker));
+    for (const ticker of optionTickers) {
+      const hasEquity = positions.some(pos => pos.type === "equity" && pos.ticker === ticker);
+      if (!hasEquity && state.meta[ticker] && !seen.has(ticker)) delete state.meta[ticker];
+    }
+
     const META_GRACE_MS = 24 * 60 * 60_000;
     for (const k of Object.keys(state.meta)) {
       if (seen.has(k)) continue;
@@ -11362,6 +11694,160 @@ async function syncRobinhoodAccount(acct, quotes) {
 
     state.positions = positions;
   } catch (e) { log(acct, `ROBINHOOD SYNC: positions error — ${e.message}`); }
+}
+
+// ─── Robinhood held-position lane ───
+// Entry discovery may spend meaningful time on watchlists, news, AI validation, and contract
+// ranking. Held positions use a separate lightweight cadence and share this lane only for broker
+// sync/order mutations, so a manager tick can never overlap an entry commit.
+
+const brokerExecutionLanes = new Map();
+
+function executionLaneFor(acct) {
+  const key = acct.config.broker === "robinhood" ? "robinhood" : `${acct.config.broker}:${acct.id}`;
+  if (!brokerExecutionLanes.has(key)) brokerExecutionLanes.set(key, new ExecutionLane());
+  return brokerExecutionLanes.get(key);
+}
+
+function withBrokerExecutionLane(acct, work, options = {}) {
+  return executionLaneFor(acct).run(work, options);
+}
+
+function robinhoodQuoteRows(raw) {
+  const body = raw?.data ?? raw;
+  if (Array.isArray(body)) return body;
+  if (Array.isArray(body?.results)) return body.results;
+  if (Array.isArray(body?.quotes)) return body.quotes;
+  return [];
+}
+
+async function fetchHeldRobinhoodQuotes(acct) {
+  const tickers = [...new Set(
+    (acct.state.positions || []).filter(pos => !pos._pending).map(pos => pos.ticker).filter(Boolean),
+  )];
+  const quotes = {};
+  if (tickers.length > 0) {
+    try {
+      const rows = robinhoodQuoteRows(await robinhood.getQuotes(tickers));
+      const fetchedAt = Date.now();
+      for (const row of rows) {
+        const ticker = String(row.symbol || row.chain_symbol || "").toUpperCase();
+        if (!ticker || !tickers.includes(ticker)) continue;
+        const number = (...values) => {
+          for (const value of values) {
+            const parsed = Number(value);
+            if (Number.isFinite(parsed) && parsed > 0) return parsed;
+          }
+          return null;
+        };
+        const c = number(row.last_trade_price, row.last_extended_hours_trade_price, row.mark_price, row.adjusted_previous_close);
+        if (!(c > 0)) continue;
+        const pc = number(row.previous_close, row.adjusted_previous_close, row.previous_close_price) || c;
+        quotes[ticker] = {
+          c,
+          h: number(row.high_price, row.regular_market_day_high) || c,
+          l: number(row.low_price, row.regular_market_day_low) || c,
+          o: number(row.open_price, row.regular_market_open) || c,
+          pc,
+          d: c - pc,
+          dp: pc > 0 ? ((c - pc) / pc) * 100 : 0,
+          _underlyingQuoteFresh: true,
+          _underlyingQuoteAt: fetchedAt,
+        };
+      }
+    } catch (e) {
+      log(acct, `POSITION MANAGER: held-underlying quote refresh failed — ${e.message}`);
+    }
+  }
+
+  for (const ticker of tickers) {
+    if (!quotes[ticker] && acct.dashboard?.quotes?.[ticker]?.c > 0) {
+      // Clone the dashboard row: tagging a fallback stale must not mutate shared dashboard state.
+      quotes[ticker] = {
+        ...acct.dashboard.quotes[ticker],
+        _underlyingQuoteFresh: false,
+        _underlyingQuoteAt: null,
+      };
+    }
+  }
+  return quotes;
+}
+
+function analyzeHeldPositions(acct, quotes) {
+  const analyses = {};
+  const shortTermAnalyses = {};
+  for (const ticker of [...new Set((acct.state.positions || []).map(pos => pos.ticker).filter(Boolean))]) {
+    const candles = acct.candleCache[ticker];
+    const quote = quotes[ticker];
+    if (candles?.length && quote?.c > 0) {
+      const last = candles[candles.length - 1];
+      last.c = quote.c;
+      last.h = Math.max(last.h, quote.h ?? quote.c);
+      last.l = Math.min(last.l, quote.l ?? quote.c);
+    }
+    if (!candles) continue;
+    const analysis = runAnalysis(candles);
+    const shortTerm = runShortTermAnalysis(candles);
+    if (!analysis) continue;
+    if (shortTerm) shortTermAnalyses[ticker] = shortTerm;
+    const blended = blendScores(analysis, shortTerm);
+    const hintBias = getHintBias(acct, ticker);
+    analysis.score = Math.max(0, Math.min(100, blended.score + hintBias));
+    analysis.signal = signalLabel(analysis.score);
+    analyses[ticker] = analysis;
+  }
+  return { analyses, shortTermAnalyses };
+}
+
+async function runRobinhoodPositionManagement(acct) {
+  if (acct.config.broker !== "robinhood" || !robinhood.isConnected) return { skipped: true };
+  if (acct.paused && acct.pausedBy === "user") return { skipped: true };
+  const hasHolding = (acct.state.positions || []).some(pos => !pos._pending);
+  const hasExitIntent = Object.values(acct.state.meta || {}).some(meta => meta?.exitOrderPlacedAt);
+  if (!hasHolding && !hasExitIntent) {
+    acct._lastPositionManagerAt = Date.now();
+    return { skipped: true };
+  }
+
+  return withBrokerExecutionLane(acct, async () => {
+    const quotes = await fetchHeldRobinhoodQuotes(acct);
+    await syncRobinhoodAccount(acct, quotes, { workEntries: false, refreshBalance: false });
+    if (acct.paused && acct.pausedBy === "user") return { skipped: true };
+
+    const { analyses, shortTermAnalyses } = analyzeHeldPositions(acct, quotes);
+    await manageOpenPositions(acct, quotes, analyses, shortTermAnalyses);
+    acct.dashboard.quotes = { ...(acct.dashboard.quotes || {}), ...quotes };
+    acct.dashboard.analyses = { ...(acct.dashboard.analyses || {}), ...analyses };
+    acct.dashboard.shortTermAnalyses = { ...(acct.dashboard.shortTermAnalyses || {}), ...shortTermAnalyses };
+    acct.dashboard.positionDetails = buildPositionDetails(acct, quotes);
+    acct.dashboard.lastManagementCycle = Date.now();
+    acct._lastPositionManagerAt = Date.now();
+    saveAccounts();
+    return { skipped: false };
+  }, { skipIfBusy: true });
+}
+
+function startRobinhoodPositionManager() {
+  if (![...accounts.values()].some(acct => acct.config.broker === "robinhood")) return;
+  console.log(`  Robinhood position manager: independent ${POSITION_MANAGEMENT_MS / 1000}s held-position cadence`);
+  const tick = async () => {
+    const startedAt = Date.now();
+    const marketOpen = isMarketOpenLocal();
+    if (marketOpen) {
+      for (const acct of accounts.values()) {
+        if (acct.config.broker !== "robinhood") continue;
+        try {
+          await runRobinhoodPositionManagement(acct);
+        } catch (e) {
+          log(acct, `POSITION MANAGER LOOP ERROR: ${e.message}`);
+        }
+      }
+    }
+    const cadence = marketOpen ? POSITION_MANAGEMENT_MS : CYCLE_MS;
+    const nextIn = Math.max(5_000, cadence - (Date.now() - startedAt));
+    setTimeout(tick, nextIn);
+  };
+  setTimeout(tick, 0);
 }
 
 // ─── Main Trading Cycle ───
@@ -11481,6 +11967,11 @@ async function runCycle(acct, sharedQuotes, apiKey) {
 
   // Broker accounts: mirror real balance + positions before any exit/entry decisions.
   if (cfg.broker === "tradier") await syncBrokerAccount(acct, quotes);
+  if (acct._inflightExpiryReservations) {
+    for (const ticker of acct._inflightExpiryReservations.keys()) {
+      if (!acct._inflightTickers?.has(ticker)) acct._inflightExpiryReservations.delete(ticker);
+    }
+  }
 
   const regime = getMarketRegime(acct.candleCache);
   acct.currentRegime = regime;
@@ -11490,28 +11981,184 @@ async function runCycle(acct, sharedQuotes, apiKey) {
   // Daily loss halt fires off open-position drawdown too — check before entries, after sync.
   evaluateRiskHalts(acct, portfolioValue(state, quotes));
 
-  tryTimeBasedExits(acct, quotes, analyses, shortTermAnalyses);
-  tryExits(acct, quotes);
-  trySignalExits(acct, quotes, analyses);
-  tryEMATrailingExits(acct, quotes);
+  if (cfg.broker !== "robinhood") {
+    await manageOpenPositions(acct, quotes, analyses, shortTermAnalyses);
+  } else if (Date.now() - (acct._lastPositionManagerAt || 0) >= POSITION_MANAGER_STALE_MS) {
+    // Failsafe only: the independent Robinhood loop normally owns held positions.
+    log(acct, "POSITION MANAGER: fast loop stale — running entry-cycle fallback");
+    await runRobinhoodPositionManagement(acct);
+  }
 
-  for (const ticker of activeTickers) {
+  // Rank BUY candidates by score + aligned momentum so scarce slots/cash hit movers first
+  // (Jul 13: KO score 75 / +0.9% day beat out FIG/CRM on watchlist order alone).
+  const buyCandidates = rankEntryCandidates(decisions, shortTermAnalyses, quotes);
+  for (const candidate of buyCandidates) candidate.dec.entryPriority = +candidate.priority.toFixed(2);
+
+  if (buyCandidates.length > 1) {
+    log(acct, `ENTRY RANK: ${buyCandidates.map(c => `${c.ticker} ${c.priority.toFixed(1)}`).join(" > ")}`);
+  }
+
+  // Resolve prior ranking cohorts against current underlying prices before recording this cycle.
+  // These are explicitly signal returns, not option P&L; exact ask→future-bid tracking is separate.
+  dash.decisionJournal = applyUnderlyingSnapshots(dash.decisionJournal || [], quotes, Date.now());
+
+  const journalRow = {
+    at: Date.now(),
+    rankerVersion: "complete-trade-v1",
+    ranked: buyCandidates.map(c => ({
+      ticker: c.ticker,
+      action: c.dec.action,
+      score: c.dec.finalScore,
+      initialPriority: +c.priority.toFixed(2),
+      priority: null,
+      mom1d: shortTermAnalyses[c.ticker]?.mom1d ?? null,
+      entrySpot: quotes[c.ticker]?.c ?? null,
+      eligibility: "pending",
+      outcome: "pending",
+      reason: null,
+    })),
+  };
+
+  // Fully evaluate the strongest ticker-level setups first, then globally re-rank the executable
+  // trade packages using setup quality, AI confidence, contract friction/liquidity/delta/DTE, and
+  // aligned momentum. Preflight never places an order or changes cash/positions.
+  const preflightLimit = cfg.entryPreflightLimit > 0
+    ? Math.max(1, Math.floor(cfg.entryPreflightLimit))
+    : buyCandidates.length;
+  const prepared = [];
+  for (let i = 0; i < buyCandidates.length; i++) {
+    const candidate = buyCandidates[i];
+    const { ticker, dec } = candidate;
+    const jItem = journalRow.ranked.find(r => r.ticker === ticker);
+    if (i >= preflightLimit) {
+      if (jItem) {
+        jItem.eligibility = "not-preflighted";
+        jItem.outcome = "not-preflighted";
+        jItem.reason = `Ticker preflight cap ${preflightLimit}`;
+      }
+      continue;
+    }
+
+    const a = analyses[ticker];
+    const q = quotes[ticker];
+    if (!a || !q) continue;
+    const result = await tryEntry(acct, ticker, a, q, regime, apiKey, { preflightOnly: true });
+    if (result?.preflight) {
+      prepared.push({ ticker, dec, preflight: result });
+      if (jItem) {
+        jItem.eligibility = "executable";
+        jItem.outcome = "ready";
+        jItem.setupQuality = result.setupQuality;
+        jItem.claudeConfidence = result.claudeConfidence;
+        jItem.contract = result.contract;
+        jItem.plannedEntry = result.entryPremium;
+      }
+    } else if (result?.skipped) {
+      log(acct, `PREFLIGHT BLOCK ${ticker}: ${result.reason}`);
+      dec.action = "BLOCKED";
+      dec.reason = result.reason;
+      if (jItem) {
+        jItem.eligibility = "invalid";
+        jItem.outcome = "blocked";
+        jItem.reason = result.reason;
+      }
+    } else if (jItem) {
+      jItem.eligibility = "invalid";
+      jItem.outcome = "no-package";
+      jItem.reason = "Preflight produced no executable package";
+    }
+  }
+
+  const refreshedPrepared = [];
+  const rankSnapshotAt = Date.now();
+  for (const item of prepared) {
+    const pf = item.preflight;
+    if (!pf.contract || rankSnapshotAt - pf.preparedAt <= 10_000) {
+      refreshedPrepared.push(item);
+      continue;
+    }
+    const occ = pf.contract.occSymbol
+      || robinhood.buildOCC(item.ticker, pf.contract.expiryStr, pf.type, pf.contract.strike);
+    const fresh = await fetchExactOptionQuote(occ);
+    const jItem = journalRow.ranked.find(r => r.ticker === item.ticker);
+    if (!fresh?.twoSided || fresh.tradeable === false) {
+      if (jItem) { jItem.eligibility = "stale"; jItem.outcome = "blocked"; jItem.reason = "No fresh two-sided quote at global rank snapshot"; }
+      continue;
+    }
+    const frictionPct = ((fresh.ask - fresh.bid) + (2 * FEE_PER_CONTRACT / 100)) / fresh.ask;
+    const maxFrictionPct = Math.min(0.15, Math.max(0.06, 0.5 * (cfg.profitTarget || 0.12)));
+    if (!Number.isFinite(frictionPct) || frictionPct > maxFrictionPct) {
+      if (jItem) { jItem.eligibility = "stale"; jItem.outcome = "blocked"; jItem.reason = `Friction widened to ${(frictionPct * 100).toFixed(1)}%`; }
+      continue;
+    }
+    const conviction = Math.max(0, Math.min(1, (pf.claudeConfidence || 0) / 100));
+    const limit = entryLimitPrice(fresh.bid, fresh.ask, fresh.mid, conviction);
+    const qty = Math.min(pf.qty, Math.floor((pf.maxBudget || 0) / (limit * 100)));
+    if (qty < 1) {
+      if (jItem) { jItem.eligibility = "stale"; jItem.outcome = "blocked"; jItem.reason = "Fresh limit no longer affordable"; }
+      continue;
+    }
+    const contract = {
+      ...pf.contract,
+      bid: fresh.bid,
+      ask: fresh.ask,
+      mid: fresh.mid,
+      spread: +(fresh.ask - fresh.bid).toFixed(2),
+      spreadPct: +(((fresh.ask - fresh.bid) / fresh.mid) * 100).toFixed(1),
+      roundTripFrictionPct: +(frictionPct * 100).toFixed(1),
+    };
+    const nextPreflight = {
+      ...pf,
+      preparedAt: rankSnapshotAt,
+      qty,
+      entryPremium: limit,
+      cost: +(qty * limit * 100).toFixed(2),
+      contract,
+    };
+    if (jItem) { jItem.contract = contract; jItem.plannedEntry = limit; }
+    refreshedPrepared.push({ ...item, preflight: nextPreflight });
+  }
+
+  const packageCandidates = rankPreparedEntries(refreshedPrepared, shortTermAnalyses, quotes);
+  for (let i = 0; i < packageCandidates.length; i++) {
+    const candidate = packageCandidates[i];
+    candidate.dec.entryPriority = +candidate.packagePriority.toFixed(2);
+    const jItem = journalRow.ranked.find(r => r.ticker === candidate.ticker);
+    if (jItem) {
+      jItem.rank = i + 1;
+      jItem.priority = +candidate.packagePriority.toFixed(2);
+      jItem.components = Object.fromEntries(Object.entries(candidate.components).map(([k, v]) => [k, +v.toFixed(1)]));
+    }
+  }
+  if (packageCandidates.length > 1) {
+    log(acct, `TRADE PACKAGE RANK: ${packageCandidates.map(c => `${c.ticker} ${c.packagePriority.toFixed(1)} [tech ${c.components.technical.toFixed(0)} setup ${c.components.setup.toFixed(0)} contract ${c.components.contract.toFixed(0)} mom ${c.components.momentum.toFixed(0)}]`).join(" > ")}`);
+  }
+
+  for (const { ticker, preflight: rankedPackage } of packageCandidates) {
     const dec = decisions.find(d => d.ticker === ticker);
-    if (!dec || (dec.action !== "BUY CALL" && dec.action !== "BUY PUT")) continue;
+    if (!dec) continue;
 
     const a = analyses[ticker];
     const q = quotes[ticker];
     if (!a || !q) continue;
 
-    const result = await tryEntry(acct, ticker, a, q, regime, apiKey);
+    const jItem = journalRow.ranked.find(r => r.ticker === ticker);
+    const executeEntry = () => tryEntry(acct, ticker, a, q, regime, apiKey, { expectedPackage: rankedPackage });
+    const result = cfg.broker === "robinhood"
+      ? await withBrokerExecutionLane(acct, executeEntry)
+      : await executeEntry();
     if (result && result.skipped) {
       log(acct, `SKIP ${ticker}: ${result.reason}`);
-      const dec = decisions.find(d => d.ticker === ticker);
       if (dec && (dec.action === "BUY CALL" || dec.action === "BUY PUT")) {
         dec.action = "BLOCKED";
         dec.reason = result.reason;
       }
+      if (jItem) { jItem.outcome = "execution-blocked"; jItem.reason = result.reason; }
     } else if (result && result.ticker) {
+      if (jItem) {
+        jItem.outcome = result.brokerOrder ? "ordered" : "entered";
+        jItem.reason = `${result.type} $${result.strike} @ $${result.entryPremium.toFixed(2)}`;
+      }
       // Count every new entry (paper position or broker order) against the day-trade cap.
       ensureRiskState(acct).dayTrades += 1;
       log(acct, `TRADE: BUY ${result.qty}x ${result.ticker} $${result.strike} ${result.type.toUpperCase()} ${result.dte}d @ $${result.entryPremium.toFixed(2)} ($${result.cost.toFixed(0)}) [setup:${result.setupQuality}/100 claude:${result.claudeConfidence}%]`);
@@ -11535,8 +12182,17 @@ async function runCycle(acct, sharedQuotes, apiKey) {
 
       // Robinhood broker accounts already executed natively via placeBrokerEntry above.
       // No separate execution block needed — broker is per-account, same as Tradier.
+    } else if (jItem) {
+      jItem.outcome = "no-fill";
     }
   }
+
+  if (!dash.decisionJournal) dash.decisionJournal = [];
+  if (shouldRecordSelectionCohort(dash.decisionJournal, journalRow)) {
+    dash.decisionJournal.push(journalRow);
+    if (dash.decisionJournal.length > 500) dash.decisionJournal.splice(0, dash.decisionJournal.length - 500);
+  }
+  dash.rankTelemetry = summarizeRankOne(dash.decisionJournal, "h1");
 
   dash.positionDetails = buildPositionDetails(acct, quotes);
 
@@ -11621,11 +12277,11 @@ async function runPausedCycle(acct, sharedQuotes) {
   // pause to stop an imminent auto-exit must actually stop it. Only a breaker-initiated pause
   // ("risk") keeps the exit engines running so open positions aren't abandoned mid-halt.
   const manualPause = acct.pausedBy === "user";
-  if (!manualPause) {
-    tryTimeBasedExits(acct, quotes, analyses, shortTermAnalyses);
-    tryExits(acct, quotes);
-    trySignalExits(acct, quotes, analyses);
-    tryEMATrailingExits(acct, quotes);
+  if (!manualPause && cfg.broker !== "robinhood") {
+    await manageOpenPositions(acct, quotes, analyses, shortTermAnalyses);
+  } else if (!manualPause && Date.now() - (acct._lastPositionManagerAt || 0) >= POSITION_MANAGER_STALE_MS) {
+    log(acct, "POSITION MANAGER: fast loop stale during risk halt — running fallback");
+    await runRobinhoodPositionManagement(acct);
   }
 
   dash.positionDetails = buildPositionDetails(acct, quotes);
@@ -11673,11 +12329,12 @@ function buildPositionDetails(acct, quotes) {
       : (pos.liveMark ?? (strikeKnown ? optPrice(spot, pos.strike, dteLeft, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
     const pnlPct = (curPremium - pos.entryPremium) / pos.entryPremium;
     const pnlDollar = (curPremium - pos.entryPremium) * pos.qty * (isEq ? 1 : 100);
-    const profitPrice = pos.entryPremium * (1 + cfg.profitTarget);
+    const plan = managementPlanFor(pos, cfg, now);
+    const profitPrice = pos.entryPremium * (1 + plan.profitTarget);
     // Options don't exit on the configured premium stop anymore — their loss exits are the
     // structural spot stop and the 1.8× disaster floor. Show the disaster floor so the panel
     // reflects the price at which the bot would actually sell, not a line it will hold through.
-    const stopMult = isEq ? cfg.stopLoss : optionDisasterFloor(cfg);
+    const stopMult = isEq ? plan.stopLoss : plan.disasterFloor;
     const stopLossPrice = pos.entryPremium * (1 + stopMult);
 
     let effectiveStop;
@@ -11687,7 +12344,7 @@ function buildPositionDetails(acct, quotes) {
 
     return {
       ...pos, spot, dteLeft, curPremium, pnlPct, pnlDollar,
-      profitTarget: { pct: `+${(cfg.profitTarget * 100).toFixed(0)}%`, premium: profitPrice.toFixed(2) },
+      profitTarget: { pct: `+${(plan.profitTarget * 100).toFixed(0)}%`, premium: profitPrice.toFixed(2) },
       stopLoss: { pct: `${(stopMult * 100).toFixed(0)}%${isEq ? "" : " (disaster floor; structural stop leads)"}`, premium: effectiveStop.toFixed(2) },
       pctToProfit: ((profitPrice - curPremium) / curPremium * 100).toFixed(1),
       pctToStop: ((effectiveStop - curPremium) / curPremium * 100).toFixed(1),
@@ -11813,7 +12470,13 @@ async function simTick(sim) {
     if (sliced.length === 0) continue;
     acct.candleCache[ticker] = sliced;
     const latest = sliced[sliced.length - 1];
-    quotes[ticker] = { c: latest.c, h: latest.h, l: latest.l, o: latest.o, pc: sliced.length > 1 ? sliced[sliced.length - 2].c : latest.o };
+    const previousClose = sliced.length > 1 ? sliced[sliced.length - 2].c : latest.o;
+    const dayChange = latest.c - previousClose;
+    quotes[ticker] = {
+      c: latest.c, h: latest.h, l: latest.l, o: latest.o, pc: previousClose,
+      d: dayChange,
+      dp: previousClose > 0 ? (dayChange / previousClose) * 100 : 0,
+    };
   }
 
   // Run analyses
@@ -11831,6 +12494,8 @@ async function simTick(sim) {
     a.signal = signalLabel(blended.score);
     analyses[ticker] = a;
   }
+  acct.dashboard.shortTermAnalyses = shortTermAnalyses;
+  acct.dashboard.quotes = quotes;
 
   // Market regime
   const regime = getMarketRegime(acct.candleCache);
@@ -11838,12 +12503,20 @@ async function simTick(sim) {
   acct.riskPct = effectiveRiskPct(acct.config.baseRiskPct, regime);
 
   // Run exits
-  tryExits(acct, quotes);
-  trySignalExits(acct, quotes, analyses);
-  tryEMATrailingExits(acct, quotes);
+  await manageOpenPositions(acct, quotes, analyses, acct.dashboard?.shortTermAnalyses || null);
 
   // Run entries
-  for (const ticker of tickers) {
+  const simDecisions = tickers
+    .filter(ticker => analyses[ticker] && quotes[ticker])
+    .map(ticker => ({
+      ticker,
+      finalScore: analyses[ticker].score,
+      action: analyses[ticker].score >= acct.config.bullEntry
+        ? "BUY CALL"
+        : analyses[ticker].score <= acct.config.bearEntry ? "BUY PUT" : "WAIT",
+    }));
+  const rankedSimEntries = rankEntryCandidates(simDecisions, shortTermAnalyses, quotes);
+  for (const { ticker } of rankedSimEntries) {
     const a = analyses[ticker];
     const q = quotes[ticker];
     if (!a || !q) continue;
@@ -12194,7 +12867,9 @@ async function main() {
     // Force broker sync immediately so positions are never stale after a deploy
     for (const [, acct] of accounts) {
       if (acct.config.broker === "tradier") await syncBrokerAccount(acct, sharedQuotes);
-      if (acct.config.broker === "robinhood") await syncRobinhoodAccount(acct, sharedQuotes);
+      if (acct.config.broker === "robinhood") {
+        await withBrokerExecutionLane(acct, () => syncRobinhoodAccount(acct, sharedQuotes));
+      }
     }
     for (const [, acct] of accounts) {
       if (!acct.paused) await runAfterHoursScan(acct, sharedQuotes, apiKey);
@@ -12202,6 +12877,9 @@ async function main() {
   } catch (e) {
     console.log(`  WARN: Startup scan failed — ${e.message}`);
   }
+
+  // Held-position monitoring has its own cadence; entry discovery remains on the main loop below.
+  startRobinhoodPositionManager();
 
   // Main loop
   while (true) {
@@ -12245,7 +12923,10 @@ async function main() {
 
         for (const [, acct] of accounts) {
           try {
-            if (acct.config.broker === "robinhood") await syncRobinhoodAccount(acct, sharedQuotes).catch(e => log(acct, `ROBINHOOD SYNC: ${e.message}`));
+            if (acct.config.broker === "robinhood") {
+              await withBrokerExecutionLane(acct, () => syncRobinhoodAccount(acct, sharedQuotes))
+                .catch(e => log(acct, `ROBINHOOD SYNC: ${e.message}`));
+            }
             // Learning lab: keep shadow variants alive for live RH accounts (idempotent) so they
             // collect strategy data every cycle — including while the parent is paused/settling.
             if (acct.config.broker === "robinhood" && !acct.learning && acct.config.learningEnabled !== false) ensureLearningAccounts(acct);
@@ -12283,7 +12964,10 @@ async function main() {
         }
 
         for (const [, acct] of accounts) {
-          if (acct.config.broker === "robinhood") await syncRobinhoodAccount(acct, sharedQuotes).catch(e => log(acct, `ROBINHOOD SYNC: ${e.message}`));
+          if (acct.config.broker === "robinhood") {
+            await withBrokerExecutionLane(acct, () => syncRobinhoodAccount(acct, sharedQuotes))
+              .catch(e => log(acct, `ROBINHOOD SYNC: ${e.message}`));
+          }
           if (!acct.paused) await runAfterHoursScan(acct, sharedQuotes, apiKey);
           // paused accounts: candles already synced above, no further action needed after hours
         }

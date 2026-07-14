@@ -326,7 +326,9 @@ const tradier = {
         return { date, dte };
       })
       .filter(e => e.dte >= CHAIN_MIN_DTE && e.dte <= CHAIN_MAX_DTE)
-      .sort((a, b) => a.dte - b.dte)
+      // Daily/M-W-F expiration symbols can have many near dates; chronological slicing can omit
+      // the 21-30 DTE swing window entirely. Take expirations closest to the 28 DTE target.
+      .sort((a, b) => Math.abs(a.dte - 28) - Math.abs(b.dte - 28) || a.dte - b.dte)
       .slice(0, CHAIN_MAX_EXPIRIES);
 
     const out = [];
@@ -342,6 +344,7 @@ const tradier = {
       for (const c of contracts) {
         const g = c.greeks || {};
         const norm = {
+          occSymbol: c.symbol || c.option_symbol || null,
           strike: c.strike,
           bid: c.bid,
           ask: c.ask,

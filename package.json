@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node bot.js",
     "simulate": "node simulate.js",
-    "sim": "node simulate.js"
+    "sim": "node simulate.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@resvg/resvg-js": "^2.6.2",

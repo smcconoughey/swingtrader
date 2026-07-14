@@ -243,7 +243,9 @@ function extractContent(result) {
   // cash got decremented and a "trade placed" push notification fired for an order that never
   // reached Robinhood.
   if (result.isError) {
-    throw new Error(combined || "Robinhood MCP tool call failed (isError, no detail text)");
+    const error = new Error(combined || "Robinhood MCP tool call failed (isError, no detail text)");
+    error.brokerRejected = true;
+    throw error;
   }
   if (textParts.length === 0) return result;
   try { return JSON.parse(combined); } catch { return combined; }
@@ -687,7 +689,7 @@ const robinhood = {
       return (!want || Math.abs(s - want) < 0.01)
         && (!optionType || t === String(optionType).toLowerCase())
         && (!exp || e === exp);
-    }) || items[0] || null;
+    }) || null;
     return match ? (match.id || match.option_id || match.instrument_id || null) : null;
   },
 
