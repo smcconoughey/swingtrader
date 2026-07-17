@@ -30,6 +30,7 @@ import {
   EXIT_INFLIGHT_GRACE_MS,
   chooseOptionSellLimit,
   exitIntentWithinGrace,
+  exitLimitSanityCheck,
   mergeInflightTickers,
 } from "./exit-execution.js";
 import { ExecutionLane } from "./execution-lane.js";
@@ -4902,6 +4903,7 @@ async function closePosition(acct, pos, currentPremium, reason, qtyToClose, exec
         log(acct, `ROBINHOOD OPTION EXIT BLOCKED: ${pos.ticker} exact-contract quote is stale or missing`);
         return null;
       }
+
       acct._inflightTickers.add(pos.ticker.toUpperCase());
 
       const isTrimLocal = qty < pos.qty;
@@ -4943,6 +4945,30 @@ async function closePosition(acct, pos, currentPremium, reason, qtyToClose, exec
         if (!(pricing.limit > 0)) {
           acct._inflightTickers.delete(pos.ticker.toUpperCase());
           log(acct, `ROBINHOOD OPTION EXIT BLOCKED: ${pos.ticker} has no executable bid for ${priceMode} exit`);
+          return null;
+        }
+        const spotNow = acct.dashboard?.quotes?.[pos.ticker]?.c ?? pos._lastSpot ?? pos.entrySpot ?? null;
+        const liveDelta = Number(pos.liveGreeks?.delta);
+        const modeledDelta = (pos.strike > 0 && spotNow > 0 && (pos.type === "call" || pos.type === "put"))
+          ? Number(optGreeks(spotNow, pos.strike, pos.dteRemaining ?? pos.dte ?? 21, pos.iv || DEFAULT_IV, pos.type)?.delta)
+          : null;
+        const sanity = exitLimitSanityCheck({
+          limit: pricing.limit,
+          bid,
+          ask,
+          mark: pos.liveMark,
+          referencePrice: currentPremium,
+          spot: spotNow,
+          entrySpot: pos.entrySpot,
+          entryPremium: pos.entryPremium,
+          delta: Number.isFinite(liveDelta) ? liveDelta : modeledDelta,
+          optionType: pos.type,
+          atrPct: pos.entryAtrPct,
+          reason,
+        });
+        if (!sanity.ok) {
+          acct._inflightTickers.delete(pos.ticker.toUpperCase());
+          log(acct, `ROBINHOOD OPTION EXIT BLOCKED: ${pos.ticker} ${sanity.reason} — ${reason}`);
           return null;
         }
         const limit = pricing.limit;
