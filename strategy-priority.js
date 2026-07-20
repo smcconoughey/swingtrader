@@ -81,6 +81,22 @@ export function momentumEntryGate(cfg, analysis, shortTerm, quote, isBullish) {
   return null;
 }
 
+export function directionalSetupQuality(base = {}, momentum = {}, isBullish = true) {
+  const baseQuality = isBullish
+    ? finiteOr(base.bullishQuality, finiteOr(base.quality))
+    : finiteOr(base.bearishQuality, 0);
+  const expectedMomentumDirection = isBullish ? "up" : "down";
+  const momentumQuality = momentum.direction === expectedMomentumDirection
+    ? finiteOr(momentum.quality)
+    : 0;
+  return {
+    quality: Math.max(baseQuality, momentumQuality),
+    baseQuality,
+    momentumQuality,
+    directionMatched: momentum.direction === expectedMomentumDirection,
+  };
+}
+
 export function rankEntryCandidates(decisions, shortTermAnalyses, quotes) {
   return decisions
     .filter(decision => decision.action === "BUY CALL" || decision.action === "BUY PUT")

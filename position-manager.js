@@ -1,11 +1,101 @@
 const DAY_MS = 86_400_000;
+const MAX_OPTION_STOP_LOSS_PCT = -0.25;
 
 const finite = (value, fallback = 0) => Number.isFinite(value) ? value : fallback;
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
 export function optionDisasterFloorForStop(stopLoss = -0.35) {
   const configured = Number.isFinite(stopLoss) && stopLoss < 0 ? stopLoss : -0.35;
-  return Math.min(configured * 1.8, -0.60);
+  // A configured stop is a risk limit, not a suggestion that may be widened. Long-option
+  // automation is additionally capped at a 25% premium loss; Sean's published guidance treats
+  // ~30% including buffer as the outside limit, and live execution still needs room for spread.
+  return Math.max(configured, MAX_OPTION_STOP_LOSS_PCT);
+}
+
+export function confirmedPremiumStop({
+  trail = [],
+  entryPremium = 0,
+  stopLoss = MAX_OPTION_STOP_LOSS_PCT,
+  bid = 0,
+  ask = 0,
+  now = Date.now(),
+  requiredSamples = 3,
+  minSpanMs = 60_000,
+  maxAgeMs = 5 * 60_000,
+  maxSpreadPct = 0.20,
+  wideEscalationMs = 3 * 60_000,
+} = {}) {
+  const thresholdPrice = entryPremium > 0 ? entryPremium * (1 + stopLoss) : 0;
+  const mid = bid > 0 && ask >= bid ? (bid + ask) / 2 : 0;
+  const spreadPct = mid > 0 ? (ask - bid) / mid : Infinity;
+  const twoSidedBook = bid > 0 && ask >= bid;
+  const coherentBook = twoSidedBook && spreadPct <= maxSpreadPct;
+  const wideBook = twoSidedBook && spreadPct > maxSpreadPct;
+  const recentSamples = (Array.isArray(trail) ? trail : [])
+    .map(point => {
+      const exactBid = finite(point.bid, 0);
+      const exactAsk = finite(point.ask, 0);
+      const sampleMid = exactBid > 0 && exactAsk >= exactBid ? (exactBid + exactAsk) / 2 : 0;
+      const sampleSpreadPct = sampleMid > 0 ? (exactAsk - exactBid) / sampleMid : Infinity;
+      return {
+        // A display-mark refresh may update `sampledAt` without fetching a new executable bid.
+        // When a point carries a bid, only its bid-specific timestamp can extend confirmation.
+        ts: exactBid > 0
+          ? finite(point.bidSampledAt, finite(point.sampledAt, finite(point.ts, 0)))
+          : finite(point.sampledAt, finite(point.ts, 0)),
+        price: exactBid > 0 ? exactBid : finite(point.exitPrice, 0),
+        coherent: point.bookCoherent === true
+          || (sampleMid > 0 && sampleSpreadPct <= maxSpreadPct),
+        wide: point.bookWide === true
+          || (sampleMid > 0 && sampleSpreadPct > maxSpreadPct),
+      };
+    })
+    .filter(point => point.ts > 0 && now - point.ts <= maxAgeMs && point.price > 0)
+    .sort((a, b) => a.ts - b.ts);
+  // Confirmation provenance is continuous in both price and book quality. A prior one-sided or
+  // wide phantom bid cannot become a "coherent" sample merely because the latest NBBO tightened.
+  const trailingRun = predicate => {
+    let start = recentSamples.length;
+    for (let i = recentSamples.length - 1; i >= 0; i--) {
+      if (!predicate(recentSamples[i])) break;
+      start = i;
+    }
+    return recentSamples.slice(start);
+  };
+  const throughStop = point => thresholdPrice > 0 && point.price <= thresholdPrice;
+  const coherentSamples = trailingRun(point => throughStop(point) && point.coherent);
+  const wideSamples = trailingRun(point => throughStop(point) && point.wide);
+  const coherentSpanMs = coherentSamples.length > 1
+    ? coherentSamples[coherentSamples.length - 1].ts - coherentSamples[0].ts : 0;
+  const wideSpanMs = wideSamples.length > 1
+    ? wideSamples[wideSamples.length - 1].ts - wideSamples[0].ts : 0;
+  const currentBidThroughStop = thresholdPrice > 0 && bid > 0 && bid <= thresholdPrice;
+  const coherentBreach = currentBidThroughStop && coherentBook
+    && coherentSamples.length >= requiredSamples;
+  const wideBreach = currentBidThroughStop && wideBook
+    && wideSamples.length >= requiredSamples;
+  // A wide NBBO is not allowed to suppress a genuine stop indefinitely. It needs a much longer
+  // continuous run than a coherent-book stop, and execution starts with a patient limit rather
+  // than trusting the weak side of the book.
+  const wideEscalated = wideBook
+    && wideBreach
+    && wideSpanMs >= Math.max(minSpanMs, wideEscalationMs);
+  const activeSamples = coherentBook ? coherentSamples : wideBook ? wideSamples : [];
+  const activeSpanMs = coherentBook ? coherentSpanMs : wideBook ? wideSpanMs : 0;
+
+  return {
+    confirmed: coherentBreach && coherentSpanMs >= minSpanMs,
+    wideEscalated,
+    coherentBook,
+    wideBook,
+    thresholdPrice,
+    spreadPct,
+    sampleCount: activeSamples.length,
+    requiredSamples,
+    spanMs: activeSpanMs,
+    maxAgeMs,
+    wideEscalationMs,
+  };
 }
 
 /**
@@ -19,11 +109,16 @@ export function createManagementPlan(config = {}, position = {}, now = Date.now(
     ? config.trim1Pct : Math.min(0.25, profitTarget);
   const trim2Pct = Number.isFinite(config.trim2Pct) && config.trim2Pct > trim1Pct
     ? config.trim2Pct : Math.max(trim1Pct, profitTarget);
-  const stopLoss = Number.isFinite(config.stopLoss) && config.stopLoss < 0
+  const configuredStopLoss = Number.isFinite(config.stopLoss) && config.stopLoss < 0
     ? config.stopLoss : -0.35;
+  const stopLoss = position.type === "equity"
+    ? configuredStopLoss
+    : optionDisasterFloorForStop(configuredStopLoss);
   const inferredExitMode = profitTarget > trim2Pct ? "runner" : "quick_bank";
   const exitMode = config.exitMode === "runner" && profitTarget > trim2Pct
     ? "runner" : config.exitMode === "quick_bank" ? "quick_bank" : inferredExitMode;
+  const singleContractBankPct = Number.isFinite(config.singleContractBankPct) && config.singleContractBankPct > 0
+    ? config.singleContractBankPct : Math.min(profitTarget, trim1Pct);
   const brokerLifetimeDte = position.expiryDate > 0 && position.openTime > 0
     ? Math.max(0, (position.expiryDate - position.openTime) / DAY_MS)
     : 0;
@@ -32,16 +127,22 @@ export function createManagementPlan(config = {}, position = {}, now = Date.now(
     : Math.max(0, brokerLifetimeDte, finite(position.dte, finite(position.dteRemaining, 0)));
 
   return {
-    version: 1,
+    version: 2,
     createdAt: now,
     initialDte,
     profitTarget,
     trim1Pct,
     trim2Pct,
     exitMode,
-    singleContractBankPct: Math.min(profitTarget, trim1Pct),
+    singleContractBankPct,
     stopLoss,
-    disasterFloor: optionDisasterFloorForStop(stopLoss),
+    // Retained for old dashboard/API consumers. In v2 it is the actual stop, never a widened floor.
+    disasterFloor: stopLoss,
+    premiumStopSamples: 3,
+    premiumStopMinSpanMs: 60_000,
+    premiumStopMaxAgeMs: 5 * 60_000,
+    premiumStopMaxSpreadPct: 0.20,
+    premiumStopWideEscalationMs: 3 * 60_000,
     bullEntry: finite(config.bullEntry, 65),
     bearEntry: finite(config.bearEntry, 35),
     signalExitScoreMargin: 3,
@@ -72,7 +173,23 @@ export function createManagementPlan(config = {}, position = {}, now = Date.now(
 
 export function managementPlanFor(position = {}, config = {}, now = Date.now()) {
   const existing = position.managementPlan;
-  if (existing && existing.version === 1) return existing;
+  if (existing && existing.version === 2) return existing;
+  if (existing && existing.version === 1) {
+    const hardenedStop = position.type === "equity"
+      ? finite(existing.stopLoss, -0.35)
+      : optionDisasterFloorForStop(existing.stopLoss);
+    return {
+      ...existing,
+      version: 2,
+      stopLoss: hardenedStop,
+      disasterFloor: hardenedStop,
+      premiumStopSamples: 3,
+      premiumStopMinSpanMs: 60_000,
+      premiumStopMaxAgeMs: 5 * 60_000,
+      premiumStopMaxSpreadPct: 0.20,
+      premiumStopWideEscalationMs: 3 * 60_000,
+    };
+  }
   return createManagementPlan(config, position, now);
 }
 
@@ -190,6 +307,19 @@ export function evaluatePosition({
     || (underlyingQuoteFresh && !!signals.stalling);
   const etHour = finite(market.etHour, 0);
   const isFriday = !!market.isFriday;
+  const premiumStop = !isEquity ? confirmedPremiumStop({
+    trail: position.markTrail || [],
+    entryPremium,
+    stopLoss: plan.stopLoss,
+    bid,
+    ask: finite(market.ask, 0),
+    now,
+    requiredSamples: Math.max(1, finite(plan.premiumStopSamples, 3)),
+    minSpanMs: Math.max(0, finite(plan.premiumStopMinSpanMs, 60_000)),
+    maxAgeMs: Math.max(1, finite(plan.premiumStopMaxAgeMs, 5 * 60_000)),
+    maxSpreadPct: Math.max(0.01, finite(plan.premiumStopMaxSpreadPct, 0.20)),
+    wideEscalationMs: Math.max(60_000, finite(plan.premiumStopWideEscalationMs, 3 * 60_000)),
+  }) : null;
 
   const base = {
     action: "hold",
@@ -225,6 +355,13 @@ export function evaluatePosition({
       contractIdentityVerified,
       quoteAgeMs,
       underlyingQuoteFresh,
+      premiumStopConfirmed: premiumStop?.confirmed ?? false,
+      premiumStopWideEscalated: premiumStop?.wideEscalated ?? false,
+      premiumStopWideBook: premiumStop?.wideBook ?? false,
+      premiumStopSamples: premiumStop?.sampleCount ?? 0,
+      premiumStopRequiredSamples: premiumStop?.requiredSamples ?? 0,
+      premiumStopSpanMs: premiumStop?.spanMs ?? 0,
+      premiumStopSpreadPct: premiumStop?.spreadPct ?? null,
     },
   };
 
@@ -249,15 +386,42 @@ export function evaluatePosition({
   if (!isEquity && dteRemaining <= plan.criticalDte) {
     return makeDecision(base, "close", "DTE_CRITICAL", `DTE critical (${dteRemaining.toFixed(1)}d remaining)`, { urgency: "urgent", priceMode: "marketable" });
   }
+  // Once the exact-contract stop is confirmed, preserve that reason code even when the
+  // underlying also crossed its structural stop. The execution layer recognizes this explicit
+  // confirmation and will not let delta/IV attribution veto a coherent protective sale.
+  if (!isEquity && premiumStop.confirmed) {
+    return makeDecision(base, "close", "PREMIUM_STOP", `confirmed premium stop ${(exitPnlPct * 100).toFixed(0)}% (limit ${(plan.stopLoss * 100).toFixed(0)}%)`, { urgency: "protective", priceMode: "marketable" });
+  }
+  // Near expiry, theta/gamma risk is itself the invalidation. Do not let the longer premium-stop
+  // confirmation window shadow this explicit urgent exit; broker pricing sanity still rejects a
+  // one-off incoherent quote.
+  if (!isEquity && dteRemaining <= plan.lowDteThreshold && exitPnlPct <= plan.lowDteLoss) {
+    return makeDecision(base, "close", "LOW_DTE_LOSS", `low-DTE tight stop ${(exitPnlPct * 100).toFixed(0)}% (${dteRemaining.toFixed(1)}d left, theta accelerating)`, { urgency: "urgent", priceMode: "marketable" });
+  }
+  if (!isEquity && premiumStop.wideEscalated) {
+    return makeDecision(
+      base,
+      "close",
+      "PREMIUM_STOP_WIDE_BOOK",
+      `sustained wide-book premium stop ${(exitPnlPct * 100).toFixed(0)}% after ${(premiumStop.spanMs / 60_000).toFixed(1)}m (spread ${(premiumStop.spreadPct * 100).toFixed(0)}%; patient protective exit)`,
+      { urgency: "urgent", priceMode: "patient" },
+    );
+  }
   if (underlyingQuoteFresh && adverseSpotMove >= spotStopThreshold) {
     const moveLabel = isEquity ? "stock down" : `underlying ${position.type === "put" ? "up" : "down"}`;
     return makeDecision(base, "close", "STRUCTURAL_SPOT_STOP", `spot stop: ${moveLabel} ${(adverseSpotMove * 100).toFixed(1)}% from entry (DTE-aware threshold ${(spotStopThreshold * 100).toFixed(1)}%, ATR ${(atrPct * 100).toFixed(1)}%)`, { urgency: "protective", priceMode: "marketable" });
   }
-  if (!isEquity && dteRemaining <= plan.lowDteThreshold && exitPnlPct <= plan.lowDteLoss) {
-    return makeDecision(base, "close", "LOW_DTE_LOSS", `low-DTE tight stop ${(exitPnlPct * 100).toFixed(0)}% (${dteRemaining.toFixed(1)}d left, theta accelerating)`, { urgency: "urgent", priceMode: "marketable" });
-  }
-  if (!isEquity && exitPnlPct <= plan.disasterFloor) {
-    return makeDecision(base, "close", "PREMIUM_DISASTER", `disaster stop ${(exitPnlPct * 100).toFixed(0)}% (premium collapse past ${(plan.disasterFloor * 100).toFixed(0)}%)`, { urgency: "protective", priceMode: "marketable" });
+  if (!isEquity && exitPnlPct <= plan.stopLoss) {
+    // A single crossed/empty option quote must not liquidate a real position. Live options require
+    // repeated exact-contract bids over a bounded window and a coherent two-sided book. Paper
+    // replay has no broker book, so its modeled bid is acted on immediately.
+    if (!requireExecutableBid) {
+      return makeDecision(base, "close", "PREMIUM_STOP", `confirmed premium stop ${(exitPnlPct * 100).toFixed(0)}% (limit ${(plan.stopLoss * 100).toFixed(0)}%)`, { urgency: "protective", priceMode: "marketable" });
+    }
+    const spreadLabel = Number.isFinite(premiumStop.spreadPct)
+      ? `, spread ${(premiumStop.spreadPct * 100).toFixed(0)}%`
+      : ", no coherent two-sided book";
+    return makeDecision(base, "hold", "PREMIUM_STOP_CONFIRMING", `protective stop breached at ${(exitPnlPct * 100).toFixed(0)}%; confirming exact bids ${premiumStop.sampleCount}/${premiumStop.requiredSamples}${spreadLabel}`);
   }
 
   const underwater = exitPnlPct <= plan.signalExitMinLoss;

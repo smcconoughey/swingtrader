@@ -53,6 +53,17 @@ test("candidate builder requires meaningful OI or volume", () => {
   assert.deepEqual(new Set(out.map(x => x.occSymbol)), new Set(["OI", "FLOW"]));
 });
 
+test("candidate builder fails closed when delta is missing or below the live minimum", () => {
+  const out = buildCandidateContracts(chainWith([
+    contract({ occSymbol: "MISSING", delta: null }),
+    contract({ occSymbol: "NAN", delta: "not-a-number" }),
+    contract({ occSymbol: "LOW", delta: 0.20 }),
+    contract({ occSymbol: "VALID", delta: 0.45 }),
+  ]), "call", 100, 12, NOW);
+
+  assert.deepEqual(out.map(row => row.occSymbol), ["VALID"]);
+});
+
 test("entry limit remains between bid and ask and respects the overpay ceiling", () => {
   assert.equal(entryLimitPrice(1, 1.20, 1.10, 0), 1.10);
   assert.equal(entryLimitPrice(1, 1.20, 1.10, 1), 1.20);

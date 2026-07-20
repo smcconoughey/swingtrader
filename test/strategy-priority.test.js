@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   directionalConviction,
+  directionalSetupQuality,
   contractExecutionScore,
   completeTradeScore,
   entryPriority,
@@ -10,6 +11,25 @@ import {
   rankEntryCandidates,
   rankPreparedEntries,
 } from "../strategy-priority.js";
+
+test("setup quality cannot use an uptrend to qualify a bearish entry", () => {
+  const put = directionalSetupQuality(
+    { quality: 80, bullishQuality: 80, bearishQuality: 20 },
+    { quality: 90, direction: "up" },
+    false,
+  );
+  assert.deepEqual(put, {
+    quality: 20,
+    baseQuality: 20,
+    momentumQuality: 0,
+    directionMatched: false,
+  });
+});
+
+test("direction-matched momentum may qualify calls and puts symmetrically", () => {
+  assert.equal(directionalSetupQuality({}, { quality: 75, direction: "up" }, true).quality, 75);
+  assert.equal(directionalSetupQuality({}, { quality: 75, direction: "down" }, false).quality, 75);
+});
 
 test("directional conviction makes lower put scores stronger", () => {
   assert.equal(directionalConviction({ action: "BUY CALL", finalScore: 82 }), 82);

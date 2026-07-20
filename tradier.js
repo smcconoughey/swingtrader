@@ -416,6 +416,13 @@ const tradier = {
     return asArray(data?.orders?.order);
   },
 
+  async getOrder(orderId) {
+    if (!accountId) throw new Error("No Tradier account id (data-only token).");
+    if (orderId == null || orderId === "") throw new Error("Tradier order id is required.");
+    const data = await apiGet(`/accounts/${accountId}/orders/${encodeURIComponent(String(orderId))}`);
+    return data?.order || data?.orders?.order || data || null;
+  },
+
   // ─── Execution ───
 
   /**

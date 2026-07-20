@@ -16,7 +16,7 @@ export const EXIT_JUSTIFIED_CUSHION = 1.75; // allow IV/spread/gamma beyond pure
  * Those still use the same price physics — just a wider cushion — never a blind dump.
  */
 export function isEmergencyExitReason(reason = "") {
-  return /dte critical|disaster|expir(?:y|ing)|premium collapse/i.test(String(reason || ""));
+  return /dte critical|low-?dte|disaster|expir(?:y|ing)|premium collapse|confirmed premium stop|wide-book premium stop/i.test(String(reason || ""));
 }
 
 function absDelta(delta, fallback = 0.40) {
@@ -60,6 +60,7 @@ export function exitLimitSanityCheck({
   const d = absDelta(delta);
   const spotNow = positive(spot) ?? positive(entrySpot);
   const emergency = isEmergencyExitReason(reason);
+  const wideBookPremiumStop = /wide-book premium stop/i.test(String(reason || ""));
   const atrFrac = Number.isFinite(atrPct) && atrPct > 0 ? atrPct / 100 : 0.02;
   // Book noise allowance in premium-$: half-spread, ~δ×(2% spot), and a slice of ATR.
   const halfSpread = liveBid != null && liveAsk != null ? (liveAsk - liveBid) / 2 : 0;
@@ -68,6 +69,30 @@ export function exitLimitSanityCheck({
     : EXIT_PHANTOM_SPOT_FLOOR;
   const noiseAllow = Math.max(EXIT_PHANTOM_SPOT_FLOOR, halfSpread, spotNoise);
   const cushion = emergency ? EXIT_JUSTIFIED_CUSHION * 1.5 : EXIT_JUSTIFIED_CUSHION;
+
+  // A confirmed premium stop reaches here only after the lifecycle manager observed repeated
+  // exact-contract bids over time. Once the current NBBO is also coherent and reasonably tight,
+  // Greek attribution must not veto the protective exit: IV crush and theta can legitimately
+  // damage premium without a delta-sized underlying move.
+  const liveSpreadPct = mid > 0 && liveBid != null && liveAsk != null ? (liveAsk - liveBid) / mid : Infinity;
+  if (emergency && liveBid != null && liveAsk != null && liveAsk >= liveBid
+      && liveSpreadPct <= 0.20 && liveLimit <= liveBid + 0.01) {
+    return { ok: true, reason: null, fair: mid, gapVsFair: Math.max(0, mid - liveLimit), confirmedBook: true };
+  }
+
+  // The weak side of a deliberately wide book remains untrusted even after the lifecycle's
+  // three-minute escalation. The first patient limit can rest near fair value; a later retry at
+  // a raw phantom bid is rejected until the mark/mid converges enough to corroborate it.
+  if (wideBookPremiumStop && liveSpreadPct > 0.20 && liveBid != null
+      && liveLimit <= liveBid + 0.01 && gapVsFair > Math.max(0.05, fair * 0.15)) {
+    return {
+      ok: false,
+      reason: `raw wide-book bid $${liveLimit.toFixed(2)} is not corroborated by mark/mid $${fair.toFixed(2)} — keep patient protective limit`,
+      fair,
+      gapVsFair,
+      rawWideBookBid: true,
+    };
+  }
 
   // 1) Mark already embeds the current spot. A bid far below mark implies a phantom extra
   //    underlying move that is not in the quote — refuse unless that gap is just noise.
@@ -138,6 +163,9 @@ export function chooseOptionSellLimit({
 
   const spreadPct = liveBid != null && liveAsk != null ? (liveAsk - liveBid) / mid : 0;
   const executableNow = priceMode === "bank" || priceMode === "marketable";
+  const attempts = Math.max(0, Math.floor(Number(exitAttempts) || 0));
+  let operatorEscalation = false;
+  let escalationReason = null;
   let limit = mid;
 
   if (executableNow) {
@@ -145,21 +173,34 @@ export function chooseOptionSellLimit({
     // A protective limit at the displayed bid can miss in a falling market. The first retry crosses
     // one tick; a sell limit below the bid still fills at the best available price, never worse than
     // its limit. Profit-bank orders remain at the bid and do not donate the extra tick.
-    limit = priceMode === "marketable" && exitAttempts >= 1
+    limit = priceMode === "marketable" && attempts >= 1
       ? Math.max(0.01, liveBid - 0.01)
       : liveBid;
-  } else if (exitAttempts >= 2 && liveBid != null) {
-    // Patient orders get two attempts. After that, cross one tick to make the limit unambiguous.
-    limit = Math.max(0.01, liveBid - 0.01);
   } else if (protective) {
     if (spreadPct <= wideSpreadPct && liveBid != null) {
       limit = liveBid;
     } else {
-      limit = Math.max(liveBid ?? 0, mid * (1 - maxConcessionPct));
+      // A sustained wide book is specifically the case where the raw bid is untrusted. Escalate a
+      // patient protective order in bounded steps, but never let a retry jump to that quarantined
+      // bid (the prior attempt>=2 branch did exactly that and was then rejected forever by the
+      // sanity layer). Two cents above the displayed bid is the smallest cent-denominated guard
+      // that remains outside the raw-bid rejection band.
+      const guardedBid = liveBid != null ? liveBid + 0.02 : 0;
+      const concession = Math.min(0.36, maxConcessionPct * (1 + attempts * 0.5));
+      limit = Math.max(guardedBid, mid * (1 - concession));
+      const atGuardedFloor = liveBid != null && limit <= guardedBid + 0.005;
+      if (atGuardedFloor && attempts >= 2) {
+        operatorEscalation = true;
+        escalationReason = `wide-book protective exit reached guarded floor above bid after ${attempts + 1} attempts`;
+      }
     }
+  } else if (attempts >= 2 && liveBid != null) {
+    // Non-protective patient orders may eventually cross one tick. Protective wide-book orders are
+    // handled above and can never fall through to a quarantined raw bid.
+    limit = Math.max(0.01, liveBid - 0.01);
   }
 
-  return { limit: cents(limit), mid, spreadPct, executableNow };
+  return { limit: cents(limit), mid, spreadPct, executableNow, operatorEscalation, escalationReason };
 }
 
 export function exitIntentWithinGrace(meta = {}, now = Date.now(), graceMs = EXIT_INFLIGHT_GRACE_MS) {
