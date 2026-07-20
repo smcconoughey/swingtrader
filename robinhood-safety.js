@@ -288,3 +288,48 @@ export function optionOrderIsTerminal(order = {}) {
   const state = String(order.state || order.status || "").toLowerCase();
   return ["filled", "rejected", "cancelled", "canceled", "failed", "voided", "expired", "error"].includes(state);
 }
+
+/**
+ * Decide whether an exact broker holding proves a locally quarantined buy intent has settled.
+ * This is intentionally stricter than "a position exists": quantity, fill basis, and either the
+ * exact broker order or tight time/price provenance must agree.
+ */
+export function entryIntentSatisfiedByHolding(meta = {}, {
+  heldQuantity = 0,
+  averageFillPrice = 0,
+  positionCreatedAt = 0,
+  exactOrder = null,
+} = {}) {
+  const requested = positive(meta?.entryOrderCtx?.qty);
+  const held = positive(heldQuantity);
+  const fill = positive(averageFillPrice);
+  const placedAt = positive(meta.entryOrderPlacedAt);
+  if (requested == null || held == null || fill == null || placedAt == null || held + 1e-9 < requested) return false;
+
+  if (exactOrder && optionOrderExecutedQuantity(exactOrder) + 1e-9 >= requested) return true;
+
+  const createdAt = positive(positionCreatedAt);
+  const timeMatches = createdAt != null
+    && createdAt >= placedAt - 5 * 60_000
+    && createdAt <= placedAt + 30 * 60_000;
+  const submittedLimit = positive(meta.entryOrderLimit);
+  const priceMatches = submittedLimit != null && fill <= submittedLimit * 1.05 && fill >= submittedLimit * 0.95;
+  return timeMatches && priceMatches;
+}
+
+export function clearEntryOrderTracking(meta = {}) {
+  const fields = [
+    "entryOrderId", "entryOrderRefId", "entryOrderPlacedAt", "entryFirstPlacedAt",
+    "entryOrderCtx", "entrySubmissionUnknownAt", "entryCancelRequestedAt",
+    "entryRecoveryAttemptAt", "entryRecoveryContextLoggedAt", "entryRecoveryNoIdLoggedAt",
+    "entryRecoveryErrorLoggedAt", "entryHaltReplayBlockedLoggedAt",
+    "entryAwaitingHolding", "entryExecutedQty", "entryOrderTerminalAt",
+    "entryAwaitingHoldingLoggedAt",
+  ];
+  let changed = false;
+  for (const field of fields) {
+    if (Object.prototype.hasOwnProperty.call(meta, field)) changed = true;
+    delete meta[field];
+  }
+  return changed;
+}

@@ -9,7 +9,7 @@ import { Resvg } from "@resvg/resvg-js";
 import webpush from "web-push";
 import { robinhood } from "./robinhood.js";
 import { tradier } from "./tradier.js";
-import { entryPriority, momentumEntryGate, rankEntryCandidates, rankPreparedEntries } from "./strategy-priority.js";
+import { directionalSetupQuality, entryPriority, momentumEntryGate, rankEntryCandidates, rankPreparedEntries } from "./strategy-priority.js";
 import { applyUnderlyingSnapshots, shouldRecordSelectionCohort, summarizeRankOne } from "./decision-telemetry.js";
 import {
   createManagementPlan,
@@ -34,7 +34,30 @@ import {
   mergeInflightTickers,
 } from "./exit-execution.js";
 import { ExecutionLane } from "./execution-lane.js";
+import { applyLiveRiskPolicy, CAPITAL_PRESERVATION_POLICY } from "./live-risk-policy.js";
+import { sizeLongOptionEntry } from "./risk-governor.js";
+import { portfolioEntryBlock, recordPortfolioOutcome, rollPortfolioRiskState } from "./portfolio-risk.js";
+import { validateEntryDecision } from "./llm-validation.js";
+import { computeLongOptionOpenRisk } from "./open-risk.js";
 import {
+  classifyLongOptionHolding,
+  isCanonicalLiveAccount,
+  sanitizeRuntimeBrokerConfig,
+} from "./live-broker-safety.js";
+import {
+  ambiguousBuyReplayAllowed,
+  entryBuyHaltReason,
+  shouldCancelWorkingBuysOnHalt,
+} from "./entry-order-halt.js";
+import {
+  applyTradierTrimFill,
+  isConfirmedTradeOutcome,
+  matchTradierExitOrder,
+  tradierFillDelta,
+} from "./tradier-fill-accounting.js";
+import {
+  clearEntryOrderTracking,
+  entryIntentSatisfiedByHolding,
   exactOptionQuoteMatches,
   findExactOptionOrder,
   isVerifiedRobinhoodContract,
@@ -828,7 +851,7 @@ const MWF_EXPIRY_TICKERS = new Set([
 ]);
 
 const CLAUDE_API_KEY = (process.env.CLAUDE_API_KEY || "").trim();
-const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || "AIzaSyB1agSJoX1rImf5gYGm6Jh9uZXSHg2AOIE").trim();
+const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || "").trim();
 
 // LLM_PROVIDER: "gemini" | "claude" — defaults to Claude (Haiku)
 // Mutable at runtime via dashboard toggle or POST /api/llm-provider
@@ -836,8 +859,8 @@ let LLM_PROVIDER = (process.env.LLM_PROVIDER || "claude").toLowerCase();
 
 // Robinhood execution is per-account (config.broker = "robinhood"), just like Tradier.
 
-// RH_REQUIRE_APPROVAL: when true, Robinhood orders are queued for manual approval instead of auto-executing.
-// Default false — full autonomous execution. Set RH_REQUIRE_APPROVAL=true in env to require manual approval.
+// The old in-memory Robinhood "approval queue" was not durable or broker-backed. Keep the env
+// flag only as a fail-closed compatibility switch: when enabled, all new live entries are blocked.
 let RH_REQUIRE_APPROVAL = process.env.RH_REQUIRE_APPROVAL === "true";
 
 // RH_OPTIONS_ONLY: when true (default), Robinhood trades options only — no equity share fallback.
@@ -964,6 +987,9 @@ const DEFAULT_CONFIG = {
   // strategy toggle, if any. Purely a UI label — the actual behavior lives in the fields above,
   // which the toggle sets directly. null = never used the toggle / since manually edited.
   strategyPreset: null,
+  // Synthetic option pricing is not admissible performance evidence. Historical simulations may
+  // opt in explicitly for UI experiments, but default/shadow/live ledgers never use it.
+  allowSyntheticSimulation: false,
 };
 
 // ─── Multi-Account Runtime ───
@@ -973,14 +999,15 @@ const simulations = new Map();
 let simIdCounter = 0;
 
 function createAccountRuntime(id, name, config, state) {
-  return {
+  const brokerBinding = sanitizeRuntimeBrokerConfig(id, { ...DEFAULT_CONFIG, ...config });
+  const runtime = {
     id,
     name: name || id,
     createdAt: Date.now(),
     paused: false,
-    config: { ...DEFAULT_CONFIG, ...config },
+    config: brokerBinding.config,
     state: state || {
-      cash: (config && config.startingCash) || DEFAULT_CONFIG.startingCash,
+      cash: brokerBinding.config.startingCash || DEFAULT_CONFIG.startingCash,
       positions: [],
       history: [],
 
@@ -1006,13 +1033,17 @@ function createAccountRuntime(id, name, config, state) {
     chatHistory: [],
     lastHintContent: "",
     currentRegime: { mode: "unknown", riskScale: 1.0, label: "UNKNOWN" },
-    riskPct: (config && config.baseRiskPct) || DEFAULT_CONFIG.baseRiskPct,
+    riskPct: brokerBinding.config.baseRiskPct || DEFAULT_CONFIG.baseRiskPct,
     dynamicWatchlist: [],
     tickers: ["SPY", "QQQ"],
     lastWatchlistRefresh: 0,
     lastNewsScan: 0,
     latestNewsBrief: "",
   };
+  runtime._brokerBindingChanges = brokerBinding.changes;
+  runtime._riskPolicyChanges = applyLiveRiskPolicy(runtime);
+  runtime.riskPct = runtime.config.baseRiskPct;
+  return runtime;
 }
 
 // ─── Learning Lab ───
@@ -1023,11 +1054,11 @@ function createAccountRuntime(id, name, config, state) {
 // variants trade deterministically on the numeric gates (which ARE the experiment variables).
 const LEARNING_VARIANTS = [
   { key: "baseline", name: "Baseline", desc: "parent config, unchanged", tweak: {} },
-  { key: "selective", name: "High conviction", desc: "quality ≥75, half size", tweak: { minSetupQuality: 75, baseRiskPct: 0.5 } },
+  { key: "selective", name: "High conviction", desc: "quality ≥75, 4% allocation cap", tweak: { minSetupQuality: 75, baseRiskPct: 0.04 } },
   { key: "loose", name: "Looser filter", desc: "quality ≥45 — more shots", tweak: { minSetupQuality: 45 } },
   { key: "quicktp", name: "Quick profits", desc: "TP +20% / SL -20%", tweak: { profitTarget: 0.20, stopLoss: -0.20 } },
   { key: "runner", name: "Let it run", desc: "TP +80%, later trims", tweak: { profitTarget: 0.80, trim1Pct: 0.30, trim2Pct: 0.60 } },
-  { key: "smallsize", name: "Quarter size", desc: "25% risk, up to 4 positions", tweak: { baseRiskPct: 0.25, maxPositions: 4 } },
+  { key: "smallsize", name: "Small size", desc: "2% allocation cap, up to 3 positions", tweak: { baseRiskPct: 0.02, maxPositions: 3 } },
 ];
 
 // The Learning Lab's "baseline" tweak is intentionally empty (it means "mirror whatever the
@@ -1044,35 +1075,41 @@ const BASELINE_STRATEGY_TWEAK = {
   maxConsecutiveLosses: DEFAULT_CONFIG.maxConsecutiveLosses,
 };
 
-// Live-only track: $1M by March 1 2027. Fat settled sleeve + bank fast so a +10–15% option
-// print moves the *account* several percent. Not added to LEARNING_VARIANTS (no shadow clone).
+// Historical deadline target retained only to render old telemetry. It is never offered as a live
+// preset: a deadline cannot justify changing portfolio risk.
 const MARCH_1M_DEADLINE = "2027-03-01";
-const MARCH_1M_TRACK = {
-  key: "march1m",
-  name: "March $1M",
-  desc: "Fat sleeve, bank +12–15%, goal $1M by Mar 2027",
+const CAPITAL_PRESERVATION_TRACK = {
+  key: "capital",
+  name: "Capital Preservation",
+  desc: "≤0.5% planned loss, ≤10% allocation, 1.5R minimum",
   tweak: {
-    goal: 1_000_000,
-    baseRiskPct: 1.0,       // full cash sleeve (skips regime size-down)
-    maxPositions: 2,        // concentrate — account % ≈ trade %
-    useCashReserve: false,
-    profitTarget: 0.12,     // bank quick winners (minutes–hours, not days)
-    stopLoss: -0.25,
-    trim1Pct: 0.10,
-    trim2Pct: 0.18,
-    minSetupQuality: 55,
-    bullEntry: 64,
-    bearEntry: 36,
-    maxDayTrades: 3,
-    dailyLossLimitPct: 0.22,
-    maxConsecutiveLosses: 4,
+    baseRiskPct: CAPITAL_PRESERVATION_POLICY.maxPositionPct,
+    riskPerTradePct: CAPITAL_PRESERVATION_POLICY.riskPerTradePct,
+    maxPortfolioRiskPct: CAPITAL_PRESERVATION_POLICY.maxPortfolioRiskPct,
+    maxPositionPct: CAPITAL_PRESERVATION_POLICY.maxPositionPct,
+    maxPositions: CAPITAL_PRESERVATION_POLICY.maxPositions,
+    useCashReserve: true,
+    profitTarget: CAPITAL_PRESERVATION_POLICY.profitTarget,
+    stopLoss: CAPITAL_PRESERVATION_POLICY.stopLoss,
+    trim1Pct: CAPITAL_PRESERVATION_POLICY.trim1Pct,
+    trim2Pct: CAPITAL_PRESERVATION_POLICY.trim2Pct,
+    singleContractBankPct: CAPITAL_PRESERVATION_POLICY.singleContractBankPct,
+    minimumRewardRisk: CAPITAL_PRESERVATION_POLICY.minimumRewardRisk,
+    minSetupQuality: 65,
+    bullEntry: 68,
+    bearEntry: 32,
+    maxDayTrades: CAPITAL_PRESERVATION_POLICY.maxDayTrades,
+    dailyLossLimitPct: CAPITAL_PRESERVATION_POLICY.dailyLossLimitPct,
+    weeklyLossLimitPct: CAPITAL_PRESERVATION_POLICY.weeklyLossLimitPct,
+    highWaterDrawdownLimitPct: CAPITAL_PRESERVATION_POLICY.highWaterDrawdownLimitPct,
+    maxConsecutiveLosses: CAPITAL_PRESERVATION_POLICY.maxConsecutiveLosses,
   },
 };
 
 function liveStrategyPresets() {
   return [
     ...LEARNING_VARIANTS,
-    MARCH_1M_TRACK,
+    CAPITAL_PRESERVATION_TRACK,
   ];
 }
 
@@ -1092,7 +1129,7 @@ function tradingDaysBetween(isoStart, isoEnd) {
 
 function march1mPace(acct, pv) {
   const cfg = acct.config;
-  if (cfg.strategyPreset !== "march1m" && cfg.goal !== 1_000_000) return null;
+  if (cfg.strategyPreset !== "march1m") return null;
   const today = getETDateStr();
   const daysLeft = Math.max(1, tradingDaysBetween(today, MARCH_1M_DEADLINE));
   const goal = cfg.goal || 1_000_000;
@@ -1130,27 +1167,21 @@ function applyStrategyPreset(acct, key) {
     acct.config[k] = v;
   }
   acct.config.strategyPreset = key;
-  if (key === "march1m") {
-    acct.state.marchTrack = acct.state.marchTrack || {};
-    acct.state.marchTrack.enabledAt = Date.now();
-    acct.state.marchTrack.deadline = MARCH_1M_DEADLINE;
-    acct.state.marchTrack.startPv = portfolioValue(acct.state, acct.dashboard?.quotes || {});
-  }
+  const policyChanges = applyLiveRiskPolicy(acct);
+  if (policyChanges.length) changes.push(...policyChanges.map(change => `${change.key} ${change.before} → ${change.after}`));
   log(acct, `STRATEGY: switched to "${variant.name}" (${variant.desc})${changes.length ? " — " + changes.join(", ") : " — already matched, no fields changed"}`);
   saveAccounts();
   return { ok: true, variant, changes };
 }
 
-function ensureMarch1MTrack(acct) {
+function ensureCapitalPreservationTrack(acct) {
   if (!acct || acct.learning || acct.config.broker !== "robinhood") return false;
-  // Live leverage/risk presets require an explicit dashboard selection. Startup may resume a
-  // previously selected March track, but must never arm 100%-sleeve mode just because code deployed.
-  if (acct.config.strategyPreset !== "march1m") return false;
-  if (acct.state._march1mApplied) return false;
-  acct.state.marchTrack = acct.state.marchTrack || {};
-  acct.state.marchTrack.deadline = MARCH_1M_DEADLINE;
-  acct.state._march1mApplied = true;
-  log(acct, `MARCH $1M TRACK: resumed — bank +12%, goal $1,000,000 by ${MARCH_1M_DEADLINE}.`);
+  const pendingChanges = Array.isArray(acct._riskPolicyChanges) ? acct._riskPolicyChanges : [];
+  const changes = [...pendingChanges, ...applyLiveRiskPolicy(acct)];
+  acct._riskPolicyChanges = [];
+  if (!changes.length && acct.state._capitalPolicyVersion === 1) return false;
+  acct.state._capitalPolicyVersion = 1;
+  log(acct, `CAPITAL POLICY: live risk bounded to ${(acct.config.riskPerTradePct * 100).toFixed(2)}% planned loss/trade, ${(acct.config.maxPositionPct * 100).toFixed(0)}% allocation, ${(acct.config.dailyLossLimitPct * 100).toFixed(1)}% daily halt; new live entries are observation-only pending forward validation; protective exits remain active; live self-learning disabled.`);
   return true;
 }
 
@@ -1190,7 +1221,7 @@ function ensureLearningAccounts(parent, baseCash = null) {
 }
 
 function learningStats(v) {
-  const closed = (v.state.history || []).filter(t => t && typeof t.pnlDollar === "number");
+  const closed = (v.state.history || []).filter(t => isAdmissiblePerformanceTrade(t) && typeof t.pnlDollar === "number");
   const wins = closed.filter(t => t.pnlDollar > 0).length;
   const pv = portfolioValue(v.state, v.dashboard?.quotes || {});
   const realized = closed.reduce((s, t) => s + t.pnlDollar, 0);
@@ -1342,8 +1373,13 @@ function loadAccounts() {
     if (fs.existsSync(ACCOUNTS_FILE)) {
       const data = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, "utf-8"));
       if (data.meta && data.accounts) {
+        let brokerBindingSanitized = false;
         for (const [id, acctData] of Object.entries(data.accounts)) {
           const acct = createAccountRuntime(id, acctData.name, acctData.config, acctData.state);
+          if (acct._brokerBindingChanges?.length) {
+            brokerBindingSanitized = true;
+            console.warn(`  [${id}] BROKER BINDING SANITIZED: ${acct._brokerBindingChanges.map(change => `${change.key} ${change.before} → ${change.after}`).join(", ")}`);
+          }
           acct.paused = acctData.paused || false;
           acct.pausedBy = acctData.pausedBy || (acctData.paused ? "user" : null);
           acct.learning = acctData.learning || false;
@@ -1364,6 +1400,7 @@ function loadAccounts() {
           if (Array.isArray(acctData.decisionJournal)) acct.dashboard.decisionJournal = acctData.decisionJournal.slice(-500);
           accounts.set(id, acct);
         }
+        if (brokerBindingSanitized) saveAccounts();
         return true;
       }
     }
@@ -1404,7 +1441,7 @@ function loadAccounts() {
   return false;
 }
 
-function saveAccounts() {
+function saveAccounts({ strict = false } = {}) {
   const data = { meta: { version: 1 }, accounts: {} };
   for (const [id, acct] of accounts) {
     data.accounts[id] = {
@@ -1434,11 +1471,23 @@ function saveAccounts() {
       decisionJournal: (acct.dashboard?.decisionJournal || []).slice(-500),
     };
   }
+  const tmpFile = `${ACCOUNTS_FILE}.tmp`;
   try {
-    fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(data, null, 2));
+    fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2));
+    const fd = fs.openSync(tmpFile, "r");
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.renameSync(tmpFile, ACCOUNTS_FILE);
+    return true;
   } catch (e) {
+    try { fs.unlinkSync(tmpFile); } catch { }
     console.error(`WARN: Failed to save accounts — ${e.message}`);
+    if (strict) throw new Error(`durable account-state write failed: ${e.message}`);
+    return false;
   }
+}
+
+function saveAccountsStrict() {
+  return saveAccounts({ strict: true });
 }
 
 // ─── Logging ───
@@ -2017,7 +2066,8 @@ function closedTradeKey(t) {
   return [t.ticker, t.strike, t.type, t.openDate || "", t.closeDate || "", Math.round(t.pnlDollar || 0)].join("|");
 }
 function gatherClosedTrades(acct, max = 12) {
-  const hist = (acct.state.history || []).filter(t => !t._pendingFill && t.pnlDollar != null && t.closePremium != null && t.entryPremium != null);
+  const hist = (acct.state.history || []).filter(t => isAdmissiblePerformanceTrade(t)
+    && !t._pendingFill && t.pnlDollar != null && t.closePremium != null && t.entryPremium != null);
   return hist.slice(-max).reverse(); // newest first
 }
 function findClosedTrade(acct, key) {
@@ -2087,7 +2137,7 @@ function buildAccountStats(acct) {
   const weekPct = weekStartVal ? (weekPnl / weekStartVal) * 100 : null;
 
   // Closed trades, win rate, averages.
-  const closed = (state.history || []).filter(t => !t._pendingFill && t.pnlDollar != null);
+  const closed = (state.history || []).filter(t => isAdmissiblePerformanceTrade(t) && !t._pendingFill && t.pnlDollar != null);
   const wins = closed.filter(t => t.pnlDollar > 0);
   const losses = closed.filter(t => t.pnlDollar <= 0);
   const winRate = closed.length ? (wins.length / closed.length) * 100 : 0;
@@ -2331,20 +2381,25 @@ async function checkEarnings(ticker, apiKey) {
   try {
     const now = getETDate();
     const from = now.toISOString().slice(0, 10);
-    const futureDate = new Date(now.getTime() + 8 * 86400_000); // 8 days out
+    const futureDate = new Date(now.getTime() + (MAX_DTE + 2) * 86400_000);
     const to = futureDate.toISOString().slice(0, 10);
     const r = await fetch(`https://finnhub.io/api/v1/calendar/earnings?from=${from}&to=${to}&symbol=${ticker}&token=${apiKey}`);
-    if (!r.ok) return { hasEarnings: false, daysUntil: null };
+    if (!r.ok) return { available: false, hasEarnings: false, daysUntil: null, error: `calendar HTTP ${r.status}` };
     const data = await r.json();
     const earnings = data.earningsCalendar || [];
-    if (earnings.length === 0) return { hasEarnings: false, daysUntil: null };
+    if (earnings.length === 0) return { available: true, hasEarnings: false, daysUntil: null };
     const nextEarning = earnings[0];
     const earningDate = new Date(nextEarning.date);
     const daysUntil = Math.ceil((earningDate - now) / 86400_000);
-    return { hasEarnings: daysUntil <= 7, daysUntil, date: nextEarning.date };
-  } catch {
-    return { hasEarnings: false, daysUntil: null };
+    return { available: true, hasEarnings: true, daysUntil, date: nextEarning.date };
+  } catch (error) {
+    return { available: false, hasEarnings: false, daysUntil: null, error: error.message };
   }
+}
+
+function removeEarningsCrossingContracts(candidates, earningsInfo) {
+  if (!earningsInfo?.hasEarnings || !earningsInfo.date) return candidates;
+  return (candidates || []).filter(candidate => candidate.expiryStr < earningsInfo.date);
 }
 
 async function checkEarningsCached(ticker, apiKey) {
@@ -2389,7 +2444,7 @@ function detectConsolidation(candles) {
     else if (volRatio < 1.0) volDeclineScore = 8;    // Slight decline
   }
 
-  // 3. Price above moving averages during base
+  // 3. Directional EMA structure during the base
   const allCandles = candles;
   const allCloses = allCandles.map(d => d.c);
   const ema8 = calcEMA(allCloses, 8);
@@ -2397,30 +2452,45 @@ function detectConsolidation(candles) {
   const ema50 = calcEMA(allCloses, 50);
   const L = allCloses.length - 1;
   const price = allCloses[L];
-  let emaScore = 0;
-  if (price > ema8[L] && price > ema21[L] && price > ema50[L]) emaScore = 25;
-  else if (price > ema21[L] && price > ema50[L]) emaScore = 15;
-  else if (price > ema50[L]) emaScore = 8;
+  let bullishEmaScore = 0;
+  let bearishEmaScore = 0;
+  if (price > ema8[L] && price > ema21[L] && price > ema50[L]) bullishEmaScore = 25;
+  else if (price > ema21[L] && price > ema50[L]) bullishEmaScore = 15;
+  else if (price > ema50[L]) bullishEmaScore = 8;
+  if (price < ema8[L] && price < ema21[L] && price < ema50[L]) bearishEmaScore = 25;
+  else if (price < ema21[L] && price < ema50[L]) bearishEmaScore = 15;
+  else if (price < ema50[L]) bearishEmaScore = 8;
 
   // 4. Breakout detection: latest close near/above range high with volume expansion
   const latestVol = volumes[volumes.length - 1];
   const avgVol = volumes.slice(0, -1).reduce((a, b) => a + b, 0) / Math.max(1, volumes.length - 1);
   let breakoutScore = 0;
+  let breakdownScore = 0;
   if (price >= rangeHigh * 0.995 && latestVol > avgVol * 1.3) {
     breakoutScore = 20; // Breaking out of consolidation on volume!
   } else if (price >= rangeHigh * 0.99) {
     breakoutScore = 10; // Near breakout level
   }
+  if (price <= rangeLow * 1.005 && latestVol > avgVol * 1.3) {
+    breakdownScore = 20;
+  } else if (price <= rangeLow * 1.01) {
+    breakdownScore = 10;
+  }
 
-  const quality = Math.min(100, tightnessScore + volDeclineScore + emaScore + breakoutScore);
+  const bullishQuality = Math.min(100, tightnessScore + volDeclineScore + bullishEmaScore + breakoutScore);
+  const bearishQuality = Math.min(100, tightnessScore + volDeclineScore + bearishEmaScore + breakdownScore);
   return {
-    quality,
+    quality: bullishQuality,
+    bullishQuality,
+    bearishQuality,
     tight: rangePct < 8,
     rangePct: rangePct.toFixed(1),
     volDeclining: secondHalfVol < firstHalfVol * 0.85,
-    aboveEMAs: emaScore >= 15,
+    aboveEMAs: bullishEmaScore >= 15,
+    belowEMAs: bearishEmaScore >= 15,
     breakingOut: breakoutScore >= 15,
-    components: { tightnessScore, volDeclineScore, emaScore, breakoutScore },
+    breakingDown: breakdownScore >= 15,
+    components: { tightnessScore, volDeclineScore, bullishEmaScore, bearishEmaScore, breakoutScore, breakdownScore },
   };
 }
 
@@ -3004,12 +3074,29 @@ function reliableOptionMark(oq) {
 
 // ─── Portfolio Helpers ───
 
+// Historical paper runs were allowed to invent option contracts and prices when no real chain
+// was available. Those observations are not executable market evidence, so keep them out of
+// performance reporting and learning. Invalid open simulations are carried at cost (zero P&L)
+// and invalid realized P&L is backed out of brokerless portfolio values.
+function isAdmissiblePerformanceTrade(trade) {
+  if (!trade || trade.optionsSource === "synthetic") return false;
+  // An order intent is not a trade. Pending, rejected, canceled-with-zero-fill, and unresolved
+  // broker submissions must remain outside every performance/learning/social metric permanently.
+  if (!isConfirmedTradeOutcome(trade)) return false;
+  if (trade.type !== "equity" && !(Number(trade.strike) > 0)) return false;
+  return true;
+}
+
 function portfolioValue(state, quotes) {
   // Broker accounts: trust Tradier's own total_equity. It already nets settled cash, filled
   // positions, AND capital reserved by working (unfilled) orders — so nothing appears to "vanish"
   // into pending orders the way cash+positions alone would.
   if (typeof state.brokerEquity === "number" && state.brokerEquity > 0) return state.brokerEquity;
-  let val = state.cash;
+  const inadmissibleRealizedPnl = (state.history || [])
+    .filter(t => (t?.optionsSource === "synthetic" || (t?.type !== "equity" && !(Number(t?.strike) > 0)))
+      && typeof t?.pnlDollar === "number")
+    .reduce((sum, t) => sum + t.pnlDollar, 0);
+  let val = state.cash - inadmissibleRealizedPnl;
   // Robinhood fallback: state.cash is buying power, which excludes today's sale proceeds until
   // T+1 settlement. Without this credit every exit looks like the proceeds evaporated (a real
   // ~-10% day once read as -77.8% and falsely tripped the daily-loss breaker).
@@ -3018,12 +3105,42 @@ function portfolioValue(state, quotes) {
     const q = quotes[pos.ticker];
     const spot = q ? q.c : pos.entrySpot;
     const isEquity = pos.type === "equity";
-    const currentPremium = isEquity
+    const invalidSimulation = !isEquity && !isAdmissiblePerformanceTrade(pos);
+    const currentPremium = invalidSimulation
+      ? pos.entryPremium
+      : isEquity
       ? (pos.liveMark ?? spot)
       : (pos.liveMark ?? (pos.strike > 0 ? optPrice(spot, pos.strike, pos.dteRemaining, pos.iv || DEFAULT_IV, pos.type) : pos.entryPremium));
     val += currentPremium * pos.qty * (isEquity ? 1 : 100);
   }
   return val;
+}
+
+function estimatedOpenRiskDollars(acct) {
+  const state = acct.state || {};
+  const result = computeLongOptionOpenRisk({
+    positions: state.positions || [],
+    pendingOrders: state.pendingEntryOrders || [],
+    metadata: state.meta || {},
+    stopLossPct: acct.config.stopLoss || -0.20,
+    entryFeePerContract: FEE_PER_CONTRACT,
+    exitFeePerContract: FEE_PER_CONTRACT,
+  });
+  state.openRiskSnapshot = {
+    at: Date.now(),
+    totalRiskDollars: result.totalRiskDollars,
+    knownRiskDollars: result.knownRiskDollars,
+    complete: result.complete,
+    quantities: result.quantities,
+    unresolved: result.unresolved.map(row => ({
+      contractKey: row.contractKey,
+      source: row.source,
+      quantity: row.quantity,
+    })),
+  };
+  // The governor requires a finite number. Null deliberately fails its input validation, so an
+  // unknown open exposure can never be treated as zero heat.
+  return result.complete ? result.totalRiskDollars : null;
 }
 
 /**
@@ -3178,18 +3295,24 @@ function signalLabel(score) {
 function ensureRiskState(acct, pv = null) {
   const state = acct.state;
   const today = getETDateStr();
+  state.portfolioRisk = rollPortfolioRiskState(state.portfolioRisk || {}, {
+    pv,
+    dateKey: today,
+    now: Date.now(),
+  });
   if (!state.risk || state.risk.date !== today) {
     state.risk = {
       date: today,
       // Baseline for the daily loss limit. Falls back to the first PV we see today.
       dayStartPV: (typeof pv === "number" && pv > 0) ? pv : null,
       dayTrades: 0,
-      consecLosses: 0,
+      consecLosses: state.portfolioRisk.consecutiveLosses || 0,
       haltNotified: null,
     };
   } else if (state.risk.dayStartPV == null && typeof pv === "number" && pv > 0) {
     state.risk.dayStartPV = pv;
   }
+  state.risk.consecLosses = state.portfolioRisk.consecutiveLosses || 0;
   return state.risk;
 }
 
@@ -3199,12 +3322,16 @@ function ensureRiskState(acct, pv = null) {
 function recordTradeOutcome(acct, pnlDollar) {
   if (acct._simMode) return;
   const r = ensureRiskState(acct);
-  if (pnlDollar < 0) r.consecLosses += 1;
-  else if (pnlDollar > 0) r.consecLosses = 0;
+  acct.state.portfolioRisk = recordPortfolioOutcome(acct.state.portfolioRisk || {}, {
+    pnlDollar,
+    now: Date.now(),
+    lossCooldownMs: 60 * 60_000,
+  });
+  r.consecLosses = acct.state.portfolioRisk.consecutiveLosses || 0;
   const max = acct.config.maxConsecutiveLosses;
   if (max && r.consecLosses >= max && r.haltNotified !== "consec") {
     r.haltNotified = "consec";
-    const msg = `${r.consecLosses} consecutive losing closes — new entries blocked until tomorrow (exits keep running).`;
+    const msg = `${r.consecLosses} consecutive losing closes — new entries blocked pending manual review (exits keep running).`;
     log(acct, `🛑 CIRCUIT BREAKER: ${msg}`);
     diag("risk_halt", acct, { kind: "consecutive_losses", consecLosses: r.consecLosses, max });
     sendPush(`🛑 Loss streak halt [${acct.name}]`, msg, true).catch(() => {});
@@ -3220,8 +3347,18 @@ function riskBreakerStatus(acct) {
   if (cfg.maxDayTrades && r.dayTrades >= cfg.maxDayTrades) {
     return `Circuit breaker: day-trade cap reached (${r.dayTrades}/${cfg.maxDayTrades} entries today)`;
   }
-  if (cfg.maxConsecutiveLosses && r.consecLosses >= cfg.maxConsecutiveLosses) {
-    return `Circuit breaker: ${r.consecLosses} consecutive losses (max ${cfg.maxConsecutiveLosses}) — no new entries until tomorrow`;
+  const portfolioBlock = portfolioEntryBlock({ risk: acct.state.portfolioRisk, pv, config: cfg, now: Date.now() });
+  if (portfolioBlock?.kind === "loss_cooldown") {
+    return `Circuit breaker: portfolio cooling down ${Math.max(1, Math.ceil((portfolioBlock.until - Date.now()) / 60_000))}m after a loss`;
+  }
+  if (portfolioBlock?.kind === "consecutive_losses") {
+    return `Circuit breaker: ${portfolioBlock.losses} consecutive losses (max ${portfolioBlock.limit}) — manual review required`;
+  }
+  if (portfolioBlock?.kind === "weekly_loss") {
+    return `Circuit breaker: weekly loss ${(portfolioBlock.drawdownPct * 100).toFixed(1)}% breaches -${(cfg.weeklyLossLimitPct * 100).toFixed(1)}% limit`;
+  }
+  if (portfolioBlock?.kind === "high_water_drawdown") {
+    return `Circuit breaker: drawdown ${(portfolioBlock.drawdownPct * 100).toFixed(1)}% from high water breaches -${(cfg.highWaterDrawdownLimitPct * 100).toFixed(1)}% limit`;
   }
   if (cfg.dailyLossLimitPct > 0 && r.dayStartPV > 0 && pv > 0) {
     const dayPnlPct = (pv - r.dayStartPV) / r.dayStartPV;
@@ -3232,26 +3369,74 @@ function riskBreakerStatus(acct) {
   return null;
 }
 
+const LIVE_BALANCE_MAX_AGE_MS = 90_000;
+
+function liveEntryCommitBlock(acct, entryEpoch = null) {
+  const broker = acct?.config?.broker;
+  if (broker !== "tradier" && broker !== "robinhood") return null;
+  if (acct.config.liveEntriesEnabled !== true) {
+    return "Live entries are observation-only pending forward validation; protective exits remain active";
+  }
+  if (acct.paused) return `Account is paused (${acct.pausedBy || "manual"})`;
+  if (entryEpoch != null && entryEpoch !== (acct._entryEpoch || 0)) {
+    return "Entry authorization changed while the setup was being prepared";
+  }
+  const balanceAt = Number(acct.state?.brokerBalanceAt);
+  if (!(balanceAt > 0) || Date.now() - balanceAt > LIVE_BALANCE_MAX_AGE_MS) {
+    return "Authoritative broker cash/equity is stale; refusing a live entry";
+  }
+  if (broker === "robinhood" && acct.state?.brokerHealth?.status === "disconnected") {
+    return "Robinhood health probe is failing";
+  }
+  if (broker === "robinhood" && RH_REQUIRE_APPROVAL) {
+    return "Robinhood manual-approval mode has no durable broker queue; use observation mode instead";
+  }
+  return null;
+}
+
 // Cycle-level halt check (runs even when no entry is attempted, so a drawdown on OPEN positions
 // still trips it). Live broker accounts are paused outright — the paused cycle keeps managing
 // exits but nothing new opens until manually resumed.
 function evaluateRiskHalts(acct, pv) {
   const cfg = acct.config;
   const r = ensureRiskState(acct, pv);
-  if (!(cfg.dailyLossLimitPct > 0) || !(r.dayStartPV > 0) || !(pv > 0)) return;
-  const dayPnlPct = (pv - r.dayStartPV) / r.dayStartPV;
-  if (dayPnlPct > -cfg.dailyLossLimitPct) return;
-  if (r.haltNotified === "daily") return;
-  r.haltNotified = "daily";
+  if (!(pv > 0)) return;
+  const dayPnlPct = r.dayStartPV > 0 ? (pv - r.dayStartPV) / r.dayStartPV : 0;
+  const portfolioBlock = portfolioEntryBlock({ risk: acct.state.portfolioRisk, pv, config: cfg, now: Date.now() });
+  let kind = null;
+  let msg = null;
+  let baseline = r.dayStartPV;
+  let drawdownPct = dayPnlPct;
+  if (cfg.dailyLossLimitPct > 0 && r.dayStartPV > 0 && dayPnlPct <= -cfg.dailyLossLimitPct) {
+    kind = "daily";
+    msg = `Portfolio ${(dayPnlPct * 100).toFixed(1)}% on the day (start $${r.dayStartPV.toFixed(0)} → $${pv.toFixed(0)}), limit -${(cfg.dailyLossLimitPct * 100).toFixed(1)}%.`;
+  } else if (portfolioBlock?.kind === "weekly_loss") {
+    kind = "weekly";
+    baseline = portfolioBlock.baseline;
+    drawdownPct = portfolioBlock.drawdownPct;
+    msg = `Portfolio ${(drawdownPct * 100).toFixed(1)}% this week (start $${baseline.toFixed(0)} → $${pv.toFixed(0)}), limit -${(cfg.weeklyLossLimitPct * 100).toFixed(1)}%.`;
+  } else if (portfolioBlock?.kind === "high_water_drawdown") {
+    kind = "high_water";
+    baseline = portfolioBlock.baseline;
+    drawdownPct = portfolioBlock.drawdownPct;
+    msg = `Portfolio drawdown ${(drawdownPct * 100).toFixed(1)}% from high water $${baseline.toFixed(0)} → $${pv.toFixed(0)}, limit -${(cfg.highWaterDrawdownLimitPct * 100).toFixed(1)}%.`;
+  }
+  if (!kind) return;
+  if (r.haltNotified === kind || (kind !== "daily" && acct.state.portfolioRisk?.haltNotified === kind)) return;
+  r.haltNotified = kind;
+  if (kind !== "daily") acct.state.portfolioRisk.haltNotified = kind;
   const isLive = cfg.broker === "tradier" || cfg.broker === "robinhood";
-  const msg = `Portfolio ${(dayPnlPct * 100).toFixed(1)}% on the day (start $${r.dayStartPV.toFixed(0)} → $${pv.toFixed(0)}), limit -${(cfg.dailyLossLimitPct * 100).toFixed(0)}%.${isLive ? " Account PAUSED — exits keep running; resume manually from the dashboard." : " New entries blocked for the day."}`;
-  log(acct, `🚨 DAILY LOSS HALT: ${msg}`);
-  diag("risk_halt", acct, { kind: "daily_loss", dayPnlPct: +(dayPnlPct * 100).toFixed(1), dayStartPV: +r.dayStartPV.toFixed(2), pv: +pv.toFixed(2), paused: isLive });
-  if (!acct.learning) sendPush(`🚨 Daily loss halt [${acct.name}]`, msg, true).catch(() => {});
+  msg += isLive ? " Account PAUSED — exits keep running; resume manually from the dashboard." : " New entries blocked.";
+  log(acct, `🚨 ${kind.toUpperCase()} RISK HALT: ${msg}`);
+  diag("risk_halt", acct, { kind, drawdownPct: +(drawdownPct * 100).toFixed(1), baseline: +baseline.toFixed(2), pv: +pv.toFixed(2), paused: isLive });
+  if (!acct.learning) sendPush(`🚨 Portfolio risk halt [${acct.name}]`, msg, true).catch(() => {});
   if (isLive) {
     acct.paused = true;
     acct.pausedBy = "risk"; // breaker pause: exits keep managing open positions
+    acct._entryEpoch = (acct._entryEpoch || 0) + 1;
     saveAccounts();
+    // Risk halt must not leave yesterday's working buys live on the broker.
+    scheduleWorkingEntryCancellation(acct, `${kind} risk halt`);
   }
 }
 
@@ -3464,10 +3649,10 @@ async function processHint(hintText, acct) {
     const plan = managementPlanFor(p, cfg);
     const cur = p.liveMark ?? null;
     const pnlStr = cur != null && p.entryPremium > 0 ? `${(((cur - p.entryPremium) / p.entryPremium) * 100).toFixed(1)}%` : "?";
-    const stopMult = isEq ? plan.stopLoss : plan.disasterFloor; // options: disaster floor (structural spot stop is the primary loss exit)
+    const stopMult = plan.stopLoss;
     const stopP = p.entryPremium > 0 ? (p.entryPremium * (1 + stopMult)).toFixed(2) : "?";
     const tpP = p.entryPremium > 0 ? (p.entryPremium * (1 + plan.profitTarget)).toFixed(2) : "?";
-    return `${p.ticker} ${isEq ? "shares" : `$${p.strike} ${p.type.toUpperCase()}`} x${p.qty}: entry $${p.entryPremium?.toFixed(2)}, now $${cur != null ? cur.toFixed(2) : "?"} (${pnlStr}), ${isEq ? "stop" : "disaster stop"} $${stopP} (${(stopMult * 100).toFixed(0)}%${isEq ? "" : "; primary loss exit is a structural break in the underlying"}), frozen target $${tpP} (+${(plan.profitTarget * 100).toFixed(0)}%)${isEq ? "" : `, ${(p.dteRemaining ?? p.dte ?? 0).toFixed(0)} DTE`}`;
+    return `${p.ticker} ${isEq ? "shares" : `$${p.strike} ${p.type.toUpperCase()}`} x${p.qty}: entry $${p.entryPremium?.toFixed(2)}, now $${cur != null ? cur.toFixed(2) : "?"} (${pnlStr}), confirmed stop $${stopP} (${(stopMult * 100).toFixed(0)}%${isEq ? "" : "; repeated coherent exact bids required"}), frozen target $${tpP} (+${(plan.profitTarget * 100).toFixed(0)}%)${isEq ? "" : `, ${(p.dteRemaining ?? p.dte ?? 0).toFixed(0)} DTE`}`;
   });
   const portfolioContext = `Portfolio: $${state.cash.toFixed(0)} cash, ${state.positions.length} positions open${positionLines.length ? `:\n${positionLines.join("\n")}` : " (none)"}. Watchlist: ${acct.tickers.join(", ")}. Active hints: ${acct.activeHints.map(h => `${h.ticker} ${h.bias > 0 ? '+' : ''}${h.bias}`).join(", ") || "none"}.`;
 
@@ -3634,6 +3819,7 @@ async function applyHintResult(acct, result, userMessage) {
 }
 
 function getHintBias(acct, ticker) {
+  if (acct.learning) return 0;
   const now = Date.now();
   acct.activeHints = acct.activeHints.filter(h => h.expiresAt > now);
   const hint = acct.activeHints.find(h => h.ticker === ticker);
@@ -3836,7 +4022,7 @@ async function validateEntryWithClaude(acct, ticker, quote, analysis, setupQuali
   } else if (isEquity) {
     contractSection = '\nThis is an EQUITY (shares) trade — no options contracts. Evaluate whether buying shares at the current price is a good swing entry.';
   } else {
-    contractSection = '\nNo real chain data available — synthetic pricing will be used.';
+    contractSection = '\nNo real listed contract with an executable market is available — you must reject the trade.';
   }
 
   const tradeType = isEquity ? 'equity (shares) trade' : 'options trade';
@@ -3861,7 +4047,7 @@ RSI: ${analysis.rsi?.toFixed(1) || 'N/A'}
 EMA Stack: ${analysis.aligned ? 'Aligned bullish (8>21>50)' : analysis.bearish ? 'Aligned bearish (50>21>8)' : 'Mixed/transitioning'}
 Setup Quality: ${effectiveQuality}/100 (${effectiveQuality > setupQuality.quality ? 'momentum-runner quality exceeds base quality' : setupQuality.tight ? 'tight base' : 'wide range'}, ${setupQuality.breakingOut ? 'breaking out' : 'no base breakout'}, vol ${setupQuality.volDeclining ? 'declining in base' : 'normal'})
 Market Regime: ${regime.label}
-${earningsInfo.hasEarnings ? `⚠ EARNINGS in ${earningsInfo.daysUntil} days (${earningsInfo.date})` : 'No earnings risk in next 3 days'}
+${earningsInfo.hasEarnings ? `⚠ EARNINGS in ${earningsInfo.daysUntil} days (${earningsInfo.date}); eligible contracts expire before it` : 'No reported earnings inside the option horizon'}
 ${cfg.customPromptSuffix ? `Additional context: ${cfg.customPromptSuffix}` : ''}
 ${contractSection}
 
@@ -3874,23 +4060,12 @@ covering the setup read, the main risk, and why you approve/reject the ${isEquit
 
   try {
     const raw = await callClaude(promptText, 3, 512);
-    const result = extractLLMJSON(raw);
-    // Validate contractIdx is in range
-    if (candidates?.length > 0) {
-      const idx = parseInt(result.contractIdx);
-      result.contractIdx = (idx >= 1 && idx <= candidates.length) ? idx - 1 : 0; // convert to 0-based
-    }
-    return result;
+    return validateEntryDecision(extractLLMJSON(raw), { candidateCount: candidates?.length || 0 });
   } catch (e) {
-    // Live-broker accounts FAIL CLOSED: an unreadable/unavailable risk check must never turn
-    // into an auto-approval with real money (this exact fail-open produced a run of junk
-    // synthetic entries in the trade log). Paper accounts keep the old permissive behavior.
-    const live = cfg.broker === "tradier" || cfg.broker === "robinhood";
-    log(acct, `CLAUDE VALIDATE WARN: Parse failed — ${e.message}. ${live ? "Live account → failing CLOSED (skip trade)." : "Paper account → defaulting to approve."}`);
-    if (live) {
-      return { approve: false, confidence: 0, concerns: ["validation parse failed"], reasoning: "AI validation unreadable — refusing to risk live capital without a completed risk check.", suggestion: "validation failed, trade skipped", contractIdx: 0 };
-    }
-    return { approve: true, confidence: 50, concerns: ["validation parse failed"], reasoning: "AI response could not be parsed; proceeding with caution on technicals alone.", suggestion: "proceeding with caution", contractIdx: 0 };
+    // Fail closed for live, paper, and shadow ledgers. A permissive paper fallback fabricated an
+    // all-approved training set, which is just as dangerous once those statistics inform policy.
+    log(acct, `CLAUDE VALIDATE WARN: Parse/schema failed — ${e.message}. Failing CLOSED (skip trade).`);
+    return { approve: false, confidence: 0, concerns: ["validation parse failed"], reasoning: "AI validation unreadable — refusing the trade without a completed risk check.", suggestion: "validation failed, trade skipped", contractIdx: 0 };
   }
 }
 
@@ -4035,6 +4210,13 @@ function buildEntryPreflight({
 async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflightOnly = false, expectedPackage = null } = {}) {
   const state = acct.state;
   const cfg = acct.config;
+  const entryEpoch = acct._entryEpoch || 0;
+  const liveCommitBlock = liveEntryCommitBlock(acct, entryEpoch);
+  const observationPreflight = preflightOnly
+    && (cfg.broker === "tradier" || cfg.broker === "robinhood")
+    && cfg.liveEntriesEnabled !== true
+    && !acct.paused;
+  if (liveCommitBlock && !observationPreflight) return { skipped: true, reason: liveCommitBlock };
   if (state.positions.some(p => p.ticker === ticker)) return null;
   // Broker accounts: also skip names with a working (unfilled) order this cycle so we don't
   // stack duplicate orders while an earlier one is still resting.
@@ -4098,17 +4280,29 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
 
   // Use the better of consolidation quality (tight base) or momentum quality (trending runner).
   // SRxTrades buys both: tight-base breakouts AND 8 EMA taps on leaders in motion.
+  const isBullish = analysis.score >= cfg.bullEntry;
+  const isBearish = analysis.score <= cfg.bearEntry;
   const setupQuality = detectConsolidation(acct.candleCache[ticker]);
   const momentumQuality = detectMomentumQuality(acct.candleCache[ticker]);
-  const effectiveQuality = Math.max(setupQuality.quality, momentumQuality.quality);
+  const directionalQuality = directionalSetupQuality(setupQuality, momentumQuality, isBullish);
+  const effectiveQuality = directionalQuality.quality;
   const minQuality = acct.config.minSetupQuality ?? 50;
   if (effectiveQuality < minQuality) {
-    return { skipped: true, reason: `Low setup quality ${effectiveQuality}/100 (base:${setupQuality.quality} mom:${momentumQuality.quality}, need >=${minQuality}, range ${setupQuality.rangePct}%)` };
+    return { skipped: true, reason: `Low direction-matched setup quality ${effectiveQuality}/100 (base:${directionalQuality.baseQuality} mom:${directionalQuality.momentumQuality}, need >=${minQuality}, range ${setupQuality.rangePct}%)` };
   }
 
   // ─── Local pre-filters (catch what Claude would reject without API call) ───
-  const isBullish = analysis.score >= cfg.bullEntry;
-  const isBearish = analysis.score <= cfg.bearEntry;
+
+  // Sean treats U&R and Uppercut as opposite-direction setups, not weights that can be washed out
+  // by a composite score. A detected counter-pattern is therefore a deterministic veto.
+  const undercutReclaim = detectUndercutReclaim(acct.candleCache[ticker]);
+  const uppercut = detectUppercut(acct.candleCache[ticker]);
+  if (isBullish && uppercut.detected) {
+    return { skipped: true, reason: `Direction veto — bullish call conflicts with ${uppercut.pattern || "Uppercut"} (${uppercut.quality}/100)` };
+  }
+  if (isBearish && undercutReclaim.detected) {
+    return { skipped: true, reason: `Direction veto — bearish put conflicts with ${undercutReclaim.pattern || "Undercut & Reclaim"} (${undercutReclaim.quality}/100)` };
+  }
 
   const shortTerm = acct.dashboard?.shortTermAnalyses?.[ticker] || null;
   const momGate = momentumEntryGate(cfg, analysis, shortTerm, quote, isBullish);
@@ -4149,17 +4343,24 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
     return { skipped: true, reason: `Range ${setupQuality.rangePct}% too wide (max ${maxRange}%) — extended move, not consolidation setup` };
   }
 
-  let earningsInfo = { hasEarnings: false, daysUntil: null };
+  let earningsInfo = { available: false, hasEarnings: false, daysUntil: null };
   try {
     earningsInfo = await checkEarningsCached(ticker, apiKey);
     await delay(apiDelay());
-  } catch { }
-  if (earningsInfo.hasEarnings) {
-    return { skipped: true, reason: `Earnings in ${earningsInfo.daysUntil} days (${earningsInfo.date}) — too risky${rhTradeMode(cfg) === "equity" ? "" : " for 7DTE options"}` };
+  } catch (error) {
+    earningsInfo = { available: false, hasEarnings: false, daysUntil: null, error: error.message };
+  }
+  if (earningsInfo.available === false && (cfg.broker === "tradier" || cfg.broker === "robinhood")) {
+    return { skipped: true, reason: `Earnings calendar unavailable (${earningsInfo.error || "unknown error"}) — live long-premium entry fails closed` };
+  }
+  if (earningsInfo.hasEarnings && earningsInfo.daysUntil <= 14) {
+    return { skipped: true, reason: `Earnings in ${earningsInfo.daysUntil} days (${earningsInfo.date}) — every eligible swing contract would cross the event` };
   }
 
   const spot = quote.c;
-  const maxRisk = state.cash * acct.riskPct;
+  // Legacy `riskPct` is an allocation fraction, not risk. Keep it only as a regime-scaled
+  // affordability ceiling; the risk governor below sizes from loss at the stop.
+  const maxAllocationBudget = state.cash * acct.riskPct;
   const direction = isBullish ? "BULLISH" : "BEARISH";
   let type = isBullish ? "call" : "put";
 
@@ -4187,7 +4388,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
           if (chain) setCachedChain(ticker, chain);
         }
         if (chain) {
-          candidates = buildCandidateContracts(chain, type, spot, 15);
+          candidates = removeEarningsCrossingContracts(buildCandidateContracts(chain, type, spot, 15), earningsInfo);
           // Validation may stay cached for 30 minutes, but its contract quote must not. Remap the
           // approved strike/expiry onto the freshly built chain so bid/ask/mid are current.
           if (selectedCandidate) {
@@ -4213,7 +4414,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
           if (chain) setCachedChain(ticker, chain);
         }
         if (chain) {
-          candidates = buildCandidateContracts(chain, type, spot, 15);
+          candidates = removeEarningsCrossingContracts(buildCandidateContracts(chain, type, spot, 15), earningsInfo);
           log(acct, `OPTIONS ${ticker}: ${candidates.length} viable ${type} contracts (${chain.length} expiries)`);
         }
       } catch (e) {
@@ -4297,7 +4498,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
     ({ deployable, reservePct } = deployableCash(state, pv, trust));
   }
   const maxSize = cfg.maxTradeSize || 500;
-  const maxContractCost = Math.min(maxRisk, deployable, maxSize);
+  const maxContractCost = Math.min(maxAllocationBudget, deployable, maxSize);
 
   let strike = 0, dte = 0, expiryDate = 0, premium = 0, posIv = 0, optionsSource = "robinhood";
   let costPer = 0;
@@ -4339,8 +4540,8 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
       // When a tight budget forces a downgrade, the substitute is often a cheap far-OTM lottery with
       // a huge %-spread. Reject those so we never buy a contract we can't exit near fair value.
       const chosenDelta = selectedCandidate.delta != null ? Math.abs(selectedCandidate.delta) : null;
-      if (chosenDelta != null && chosenDelta < MIN_OPTION_DELTA) {
-        return { skipped: true, reason: `Contract delta ${chosenDelta.toFixed(2)} below min ${MIN_OPTION_DELTA} — lottery ticket, not a swing trade${contractDowngraded ? " (only sub-budget junk was affordable)" : ""}` };
+      if (!Number.isFinite(chosenDelta) || chosenDelta < MIN_OPTION_DELTA) {
+        return { skipped: true, reason: `Contract delta ${Number.isFinite(chosenDelta) ? chosenDelta.toFixed(2) : "missing"} below min ${MIN_OPTION_DELTA} — unmeasurable/lottery risk, not a swing trade${contractDowngraded ? " (only sub-budget junk was affordable)" : ""}` };
       }
       const chosenSpreadPct = selectedCandidate.spreadPct != null ? selectedCandidate.spreadPct / 100 : null;
       if (chosenSpreadPct != null && chosenSpreadPct > MAX_ENTRY_SPREAD_PCT) {
@@ -4368,22 +4569,10 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
       const cheapest = candidates.reduce((a, b) => (b.mid < a.mid ? b : a));
       return { skipped: true, reason: `No quality contract within budget: cheapest near-the-money ${type} is $${(cheapest.mid * 100).toFixed(0)} (δ${cheapest.delta != null ? Math.abs(cheapest.delta).toFixed(2) : "?"}) but only $${maxContractCost.toFixed(0)} is deployable — skipping rather than buying a cheap OTM lottery ticket` };
     } else {
-      // Learning variants never trade invented contracts — synthetic pricing is exactly the
-      // fantasy that inflated past sims (δ0.01 lottery tickets, currency-code "options").
-      if (acct.learning) {
-        return { skipped: true, reason: "Learning variant: no real chain data — synthetic entries disabled" };
-      }
-      // Synthetic fallback: 1 strike OTM, expiry chosen from the ticker's cadence near TARGET_DTE
-      // and staggered away from over-concentrated expirations.
-      const atm = Math.round(spot / 5) * 5;
-      strike = isBullish ? atm + 5 : atm - 5;
-      const expiry = nextExpiry(ticker, { targetDTE: TARGET_DTE, state });
-      dte = expiry.dte;
-      expiryDate = expiry.date.getTime();
-      posIv = DEFAULT_IV;
-      premium = optPrice(spot, strike, dte, DEFAULT_IV, type);
-      optionsSource = "synthetic";
-      log(acct, `OPTIONS ${ticker}: using synthetic pricing — $${strike} ${type} ${dte}d @ $${premium.toFixed(2)}`);
+      // Never invent a contract for a portfolio or learning ledger. Historical synthetic puts
+      // included strike $0 and could gain value when the stock moved against them, fabricating
+      // wins and NAV. No listed, executable contract means no trade.
+      return { skipped: true, reason: `${acct.learning ? "Learning variant" : "Account"}: no real listed option chain — synthetic entries disabled` };
     }
     costPer = premium * 100;
   }
@@ -4410,9 +4599,43 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
     return { skipped: true, reason: `Cash reserve: ${(reservePct * 100).toFixed(0)}% buffer required (trust ${(trust * 100).toFixed(0)}%) — only $${deployable.toFixed(0)} of $${state.cash.toFixed(0)} cash deployable, need $${sizingCostPer.toFixed(0)}/${unitName}` };
   }
 
-  const budget = Math.min(maxRisk, deployable, maxSize);
+  const budget = Math.min(maxAllocationBudget, deployable, maxSize);
   let qty = Math.max(1, Math.floor(budget / sizingCostPer));
   let totalCost = qty * sizingCostPer;
+
+  const governedOptionSizing = !isRhEquityOnly && type !== "equity"
+    && (["tradier", "robinhood"].includes(cfg.broker) || Number.isFinite(cfg.riskPerTradePct));
+  const optionRiskDecisionFor = (entryPrice, bid, ask) => {
+    const spread = bid > 0 && ask >= bid ? ask - bid : 0;
+    const dollarCap = cfg.broker === "robinhood"
+      ? Math.min(maxSize, RH_MAX_POSITION_DOLLARS)
+      : maxSize;
+    return sizeLongOptionEntry({
+      accountEquity: pv,
+      cash: Math.max(0, Math.min(state.cash, deployable)),
+      entryPrice,
+      stopLossPct: cfg.stopLoss,
+      profitTargetPct: Math.min(cfg.profitTarget, cfg.singleContractBankPct ?? cfg.profitTarget),
+      minimumRewardRisk: cfg.minimumRewardRisk ?? 1.5,
+      riskPerTradePct: cfg.riskPerTradePct ?? 0.005,
+      maxPositionPct: cfg.maxPositionPct ?? Math.min(cfg.baseRiskPct || 0.10, 0.10),
+      maxPositionDollars: dollarCap,
+      aggregateRiskBudgetDollars: pv * (cfg.maxPortfolioRiskPct ?? 0.02),
+      openRiskDollars: estimatedOpenRiskDollars(acct),
+      exitFrictionDollarsPerContract: spread * 50,
+      entryFeePerContract: FEE_PER_CONTRACT,
+      exitFeePerContract: FEE_PER_CONTRACT,
+    });
+  };
+  let optionRiskDecision = null;
+  if (governedOptionSizing) {
+    optionRiskDecision = optionRiskDecisionFor(expectedEntryPremium, selectedCandidate?.bid, selectedCandidate?.ask);
+    if (!optionRiskDecision.approved) {
+      return { skipped: true, reason: `Risk governor ${optionRiskDecision.reasonCode}: ${optionRiskDecision.reason}` };
+    }
+    qty = Math.min(qty, optionRiskDecision.quantity);
+    totalCost = qty * sizingCostPer;
+  }
   
   if (isRhEquityOnly) {
     // Robinhood supports fractional shares (equity-only mode)
@@ -4430,7 +4653,9 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
     if (!preflightOnly && (cfg.broker === "tradier" || cfg.broker === "robinhood")) {
       acct.paused = true; // Hard stop for real money
       acct.pausedBy = "risk"; // breaker pause: exits keep managing open positions
+      acct._entryEpoch = (acct._entryEpoch || 0) + 1;
       saveAccounts();
+      scheduleWorkingEntryCancellation(acct, "circuit-breaker size halt");
       const msg = `🚨 CIRCUIT BREAKER TRIPPED: Trade for ${ticker} costs $${totalCost.toFixed(2)} (exceeds $${maxSize} max). Account is now PAUSED.`;
       log(acct, msg);
       sendPush(`🚨 Circuit Breaker [${acct.name}]`, msg, true).catch(()=>{});
@@ -4443,7 +4668,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
   // readable thesis from the technical signals so every trade still documents WHY it was opened.
   const topSignals = (analysis.sigs || []).slice(0, 5).map(s => s.text);
   let claudeReasoning = (claudeResult.reasoning || "").trim()
-    || `No LLM prose for this entry. Opened on technicals: ${direction} setup, score ${analysis.score}/100, setup quality ${setupQuality.quality}/100, regime ${regime.label}. Signals: ${topSignals.join("; ") || "n/a"}.`;
+    || `No LLM prose for this entry. Opened on technicals: ${direction} setup, score ${analysis.score}/100, direction-matched setup quality ${effectiveQuality}/100, regime ${regime.label}. Signals: ${topSignals.join("; ") || "n/a"}.`;
   // As-ordered footer so the displayed thesis can never silently describe a different contract than
   // the one we actually traded. If the budget forced a downgrade off Claude's pick, say so plainly.
   const deltaStr = selectedCandidate?.delta != null ? `δ${Math.abs(selectedCandidate.delta).toFixed(2)}` : "δ?";
@@ -4459,7 +4684,10 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
     claudeReasoning,
     claudeSuggestion: claudeResult.suggestion || "",
     claudeConcerns: claudeResult.concerns || [],
-    setupQuality: setupQuality.quality,
+    setupQuality: effectiveQuality,
+    baseSetupQuality: directionalQuality.baseQuality,
+    momentumSetupQuality: directionalQuality.momentumQuality,
+    setupDirectionMatched: directionalQuality.directionMatched,
     technicalScore: analysis.score,
     direction,
     regimeAtEntry: regime.label,
@@ -4482,7 +4710,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
     if (optionsSource === "synthetic" || !selectedCandidate || !(premium > 0)) {
       return { skipped: true, reason: `Tradier: no real option market for ${ticker} (source ${optionsSource}) — refusing to trade on synthetic pricing` };
     }
-    if (!acct.config.autoExecute) {
+    if (!acct.config.autoExecute && !preflightOnly) {
       return { skipped: true, reason: `Tradier: autoExecute off — entry for ${ticker} not sent (enable on the account)` };
     }
     if (preflightOnly) {
@@ -4499,7 +4727,12 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
       const conviction = Math.max(0, Math.min(1, (claudeResult.confidence || 0) / 100));
       const maxOverpayPct = Math.min(MAX_ENTRY_OVERPAY_PCT, Math.max(0.03, (cfg.profitTarget || 0.40) * 0.4));
       const liveLimit = entryLimitPrice(fresh.bid, fresh.ask, fresh.mid, conviction, { maxOverpayPct });
-      const liveQty = Math.min(qty, Math.floor(budget / (liveLimit * 100)));
+      const freshRiskDecision = governedOptionSizing ? optionRiskDecisionFor(liveLimit, fresh.bid, fresh.ask) : null;
+      if (freshRiskDecision && !freshRiskDecision.approved) {
+        return { skipped: true, reason: `Tradier refreshed risk ${freshRiskDecision.reasonCode}: ${freshRiskDecision.reason}` };
+      }
+      if (freshRiskDecision) optionRiskDecision = freshRiskDecision;
+      const liveQty = Math.min(qty, freshRiskDecision?.quantity ?? qty, Math.floor(budget / (liveLimit * 100)));
       if (liveQty < 1) return { skipped: true, reason: `Tradier: ${occ} no longer fits $${budget.toFixed(0)} budget` };
       selectedCandidate = {
         ...selectedCandidate,
@@ -4522,10 +4755,10 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
       expiryStr: selectedCandidate.expiryStr,
       bid: selectedCandidate.bid, ask: selectedCandidate.ask,
       setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence,
-      aiThesis, maxBudget: budget,
+      aiThesis, maxBudget: budget, entryEpoch,
     });
   } else if (cfg.broker === "robinhood") {
-    if (!acct.config.autoExecute) {
+    if (!acct.config.autoExecute && !preflightOnly) {
       return { skipped: true, reason: `Robinhood: autoExecute off — entry for ${ticker} not sent (enable on the account)` };
     }
 
@@ -4563,7 +4796,12 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
 
         const maxOverpayPct = Math.min(MAX_ENTRY_OVERPAY_PCT, Math.max(0.03, (cfg.profitTarget || 0.40) * 0.4));
         const limit = entryLimitPrice(bid, ask, premium, conviction, { maxOverpayPct });
-        qty = Math.min(qty, Math.floor(budget / (limit * 100)));
+        const freshRiskDecision = governedOptionSizing ? optionRiskDecisionFor(limit, bid, ask) : null;
+        if (freshRiskDecision && !freshRiskDecision.approved) {
+          return { skipped: true, reason: `Robinhood refreshed risk ${freshRiskDecision.reasonCode}: ${freshRiskDecision.reason}` };
+        }
+        if (freshRiskDecision) optionRiskDecision = freshRiskDecision;
+        qty = Math.min(qty, freshRiskDecision?.quantity ?? qty, Math.floor(budget / (limit * 100)));
         if (qty < 1) {
           return { skipped: true, reason: `Robinhood: refreshed ${occ} limit $${limit.toFixed(2)} no longer fits $${budget.toFixed(0)} budget` };
         }
@@ -4596,6 +4834,18 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
           entryAtrPct: analysis.atrPct ?? null,
           setupQuality: effectiveQuality,
           ai: aiThesis || null,
+          plannedRiskDollars: optionRiskDecision?.metrics
+            ? +(optionRiskDecision.metrics.maxLossPerContract * qty).toFixed(2)
+            : null,
+          riskGovernor: optionRiskDecision ? {
+            version: 1,
+            reasonCode: optionRiskDecision.reasonCode,
+            rewardRiskRatio: optionRiskDecision.metrics?.rewardRiskRatio ?? null,
+            maxLossPerContract: optionRiskDecision.metrics?.maxLossPerContract ?? null,
+            tradeRiskBudgetDollars: optionRiskDecision.metrics?.tradeRiskBudgetDollars ?? null,
+            aggregateRiskRemainingDollars: optionRiskDecision.metrics?.aggregateRiskRemainingDollars ?? null,
+          } : null,
+          entryAuthorizationEpoch: entryEpoch,
         };
 
         const entryRefId = crypto.randomUUID();
@@ -4613,6 +4863,15 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
         acct._inflightTickers.add(ticker.toUpperCase());
         reserveInflightExpiry(acct, ticker, expiryDate);
 
+        const commitBlock = liveEntryCommitBlock(acct, entryEpoch);
+        if (commitBlock) {
+          clearEntryOrderTracking(acct.state.meta[occ]);
+          acct._inflightTickers.delete(ticker.toUpperCase());
+          return { skipped: true, reason: `Robinhood commit blocked: ${commitBlock}` };
+        }
+        // The intent/ref must survive a process restart before the network request can reach the
+        // broker. A failed durable write aborts placement; an in-memory lock is not sufficient.
+        saveAccountsStrict();
         const res = await robinhood.placeOptionOrder({
           symbol: ticker,
           expirationDate: expStr,
@@ -4634,6 +4893,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
         // cancel and walk away if the price runs — instead of sitting stale all day.
         acct.state.meta[occ].entryOrderId = brokerOrderId(res);
         if (!acct.state.meta[occ].entryOrderId) acct.state.meta[occ].entrySubmissionUnknownAt = Date.now();
+        saveAccountsStrict();
         log(acct, `ROBINHOOD OPTION ENTRY: BUY ${qty}x ${occ} @ $${limit.toFixed(2)} (${aggrLabel}; conviction ${(conviction * 100).toFixed(0)}%; bid ${bid ?? "?"}/ask ${ask ?? "?"}/mid ${premium}) — order ${res?.id || JSON.stringify(res).slice(0, 80)}`);
 
         acct.state.cash = Math.max(0, acct.state.cash - qty * limit * 100);
@@ -4722,6 +4982,9 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
 async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) {
   const state = acct.state;
   const cfg = acct.config;
+  if (cfg.allowSyntheticSimulation !== true) {
+    return { skipped: true, reason: "Simulation entry disabled: no historical executable option NBBO; synthetic P&L is not valid strategy evidence" };
+  }
   if (state.positions.some(p => p.ticker === ticker)) return null;
   // In sim mode, allow trading as long as we have enough for at least 1 contract
   if (state.cash < 10) return null;
@@ -4736,7 +4999,8 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
   const candles = acct.candleCache[ticker];
   const sq = detectConsolidation(candles);
   const mq = detectMomentumQuality(candles);
-  const effectiveQuality = Math.max(sq.quality, mq.quality);
+  const simDirectionalQuality = directionalSetupQuality(sq, mq, isBullish);
+  const effectiveQuality = simDirectionalQuality.quality;
   const minQuality = cfg.minSetupQuality ?? 50;
   if (effectiveQuality < minQuality) return { skipped: true, reason: `Low setup quality ${effectiveQuality}/100 (base:${sq.quality} mom:${mq.quality})` };
 
@@ -4874,7 +5138,7 @@ async function closePosition(acct, pos, currentPremium, reason, qtyToClose, exec
   // Returns null so the exit loop keeps the position until the fill is confirmed by the broker.
   if (!acct._simMode) {
     if (acct.config.broker === "tradier") {
-      return placeBrokerExit(acct, pos, currentPremium, reason, qty, pnlPct, pnlDollar);
+      return placeBrokerExit(acct, pos, currentPremium, reason, qty, pnlPct, pnlDollar, execution);
     } else if (acct.config.broker === "robinhood") {
       if (isEquity) {
         if (!state.meta[pos.ticker]) state.meta[pos.ticker] = {};
@@ -4973,6 +5237,28 @@ async function closePosition(acct, pos, currentPremium, reason, qtyToClose, exec
         }
         const limit = pricing.limit;
 
+        if (pricing.operatorEscalation && occKey) {
+          if (!acct.state.meta[occKey]) acct.state.meta[occKey] = {};
+          const escalationMeta = acct.state.meta[occKey];
+          const escalationAt = Date.now();
+          if (!escalationMeta.exitOperatorEscalatedAt
+              || escalationAt - escalationMeta.exitOperatorEscalatedAt >= 15 * 60_000) {
+            escalationMeta.exitOperatorEscalatedAt = escalationAt;
+            const escalationMessage = `${pos.ticker} ${occKey} protective exit cannot safely concede below $${limit.toFixed(2)} while the exact book remains wide (bid $${bid ?? "?"}/ask $${ask ?? "?"}); manual broker review required`;
+            log(acct, `🚨 ROBINHOOD EXIT ESCALATION: ${escalationMessage}`);
+            diag("risk_halt", acct, {
+              kind: "wide_book_exit_escalation",
+              ticker: pos.ticker,
+              occ: occKey,
+              bid,
+              ask,
+              guardedLimit: limit,
+              attempts: exitAttempts,
+            });
+            sendPush(`🚨 Protective exit needs review [${acct.name}]`, escalationMessage, true).catch(() => {});
+          }
+        }
+
         const expStr = pos.expiryDate ? new Date(pos.expiryDate).toISOString().slice(0, 10) : null;
         if (expStr) {
           if (!acct.state.meta[occKey]) acct.state.meta[occKey] = {};
@@ -5014,6 +5300,8 @@ async function closePosition(acct, pos, currentPremium, reason, qtyToClose, exec
             exitStaleAfterMs: execution.urgency === "urgent" ? 15_000
               : execution.urgency === "protective" ? 20_000 : 3 * 60_000,
           });
+          // Intent/ref must survive a process restart before the network request can reach the broker.
+          saveAccountsStrict();
           // Log synchronously, before the async call, so the cycle log always shows what was
           // attempted (and at what price) even if the network call hangs or the process restarts.
           log(acct, `ROBINHOOD OPTION EXIT: attempting SELL ${qty}x ${pos.ticker} $${pos.strike} ${pos.type.toUpperCase()} @ $${limit} limit (bid=${bid ?? "?"} ask=${ask ?? "?"} mid=${mid != null ? mid.toFixed(2) : "?"} spread=${(spreadPct * 100).toFixed(0)}% mode=${priceMode} attempt=${exitAttempts + 1}) — ${isTrimLocal ? "TRIM" : "EXIT"}: ${reason}`);
@@ -5092,17 +5380,47 @@ async function closePosition(acct, pos, currentPremium, reason, qtyToClose, exec
 
 // ─── Position-management telemetry helpers ───
 
-function recordMarkTrail(pos, mark, now = Date.now(), bid = null) {
+function recordMarkTrail(pos, mark, now = Date.now(), bid = null, ask = null) {
   if (!(mark > 0)) return;
   if (!pos.markTrail) pos.markTrail = [];
   const last = pos.markTrail[pos.markTrail.length - 1];
   // Coalesce sub-minute duplicates so the trail spans real time, not sync spam.
   if (last && now - last.ts < 45_000) {
+    // Preserve when the executable bid was actually sampled. Position/display endpoints may
+    // refresh `mark` without a fresh exact-contract NBBO; that must not make an old bid appear new.
+    if (last.bid > 0 && !(last.bidSampledAt > 0)) {
+      last.bidSampledAt = last.sampledAt || last.ts;
+    }
     last.mark = mark;
-    if (bid > 0) last.bid = bid;
+    if (bid > 0) {
+      last.bid = bid;
+      last.bidSampledAt = now;
+      if (ask > 0 && ask >= bid) {
+        last.ask = ask;
+        const mid = (bid + ask) / 2;
+        const spreadPct = mid > 0 ? (ask - bid) / mid : Infinity;
+        last.bookCoherent = spreadPct <= WIDE_SPREAD_EXIT_PCT;
+        last.bookWide = spreadPct > WIDE_SPREAD_EXIT_PCT;
+      } else {
+        delete last.ask;
+        last.bookCoherent = false;
+        last.bookWide = false;
+      }
+    }
     last.sampledAt = now;
   } else {
-    pos.markTrail.push({ ts: now, mark, ...(bid > 0 ? { bid } : {}) });
+    const exactBook = bid > 0 && ask > 0 && ask >= bid;
+    const mid = exactBook ? (bid + ask) / 2 : 0;
+    const spreadPct = mid > 0 ? (ask - bid) / mid : Infinity;
+    pos.markTrail.push({
+      ts: now,
+      mark,
+      ...(bid > 0 ? {
+        bid,
+        bidSampledAt: now,
+        ...(exactBook ? { ask, bookCoherent: spreadPct <= WIDE_SPREAD_EXIT_PCT, bookWide: spreadPct > WIDE_SPREAD_EXIT_PCT } : { bookCoherent: false, bookWide: false }),
+      } : {}),
+    });
   }
   if (pos.markTrail.length > 240) pos.markTrail.splice(0, pos.markTrail.length - 240);
 }
@@ -5115,6 +5433,30 @@ function persistPosTrailMeta(acct, pos) {
   if (!key) return;
   if (!acct.state.meta[key]) acct.state.meta[key] = {};
   const m = acct.state.meta[key];
+  // Preserve the lifecycle baseline across broker rebuilds and deploys. Reconstructing these from
+  // `updated_at` (or `now`) resets held time and can attach a new plan to an old position.
+  const baseline = {
+    entryPremium: pos.entryPremium,
+    intendedEntryPremium: pos.intendedEntryPremium,
+    entrySpot: pos.entrySpot,
+    openDate: pos.openDate,
+    openTime: pos.openTime,
+    originalQty: pos.originalQty,
+    dte: pos.dte,
+    expiryDate: pos.expiryDate,
+    entryAtrPct: pos.entryAtrPct,
+    setupQuality: pos.setupQuality,
+    technicalScore: pos.technicalScore,
+    direction: pos.direction,
+    plannedRiskDollars: pos.plannedRiskDollars,
+    riskGovernor: pos.riskGovernor,
+    contractIdentityVerified: pos.contractIdentityVerified,
+    instrumentId: normalizeOptionId(pos.instrumentUrl),
+    occSymbol: pos.occSymbol,
+  };
+  for (const [field, value] of Object.entries(baseline)) {
+    if (m[field] == null && value != null) m[field] = value;
+  }
   if (typeof pos.bestPnlPct === "number") m.bestPnlPct = Math.max(m.bestPnlPct || 0, pos.bestPnlPct);
   if (typeof pos.bestExitPnlPct === "number") m.bestExitPnlPct = Math.max(m.bestExitPnlPct || 0, pos.bestExitPnlPct);
   if (typeof pos.trimLevel === "number") m.trimLevel = pos.trimLevel;
@@ -5263,7 +5605,9 @@ async function manageOpenPositions(acct, quotes, analyses = null, shortTermAnaly
   const evaluations = [];
 
   for (const pos of state.positions) {
-    if (pos._pending || pos._pendingEntry || pos._pendingExit || pos._syncMissing) { remaining.push(pos); continue; }
+    // A partial buy is already real exposure. Keep managing the held quantity while the entry
+    // worker cancels/reconciles its remainder; `_pendingEntry` must never quarantine its stop.
+    if (pos._pending || pos._pendingExit || pos._syncMissing) { remaining.push(pos); continue; }
     const quote = quotes[pos.ticker];
     if (!quote) { remaining.push(pos); continue; }
 
@@ -5286,7 +5630,7 @@ async function manageOpenPositions(acct, quotes, analyses = null, shortTermAnaly
       : null;
     const executableBid = isEquity ? currentMark : (pos.liveBid ?? (liveOption ? null : modeledPaperBid));
     const trailMark = currentMark > 0 ? currentMark : executableBid;
-    if (trailMark > 0) recordMarkTrail(pos, trailMark, now, executableBid);
+    if (trailMark > 0) recordMarkTrail(pos, trailMark, now, executableBid, pos.liveAsk);
 
     // A broker holding with no frozen plan predates this lifecycle manager (or was opened manually).
     // Freeze a modest quick-bank policy once; do not let today's account preset silently turn PATH
@@ -5513,10 +5857,9 @@ function dashboardHTML(acct, { spectator = false } = {}) {
         <b>March $1M track</b> · ${pace.daysLeft} sessions left · need ~<b>${pace.needDailyPct.toFixed(1)}%/day</b>
         · this week target ~$${pace.weekTarget.toFixed(0)}
         · sleeve ${((cfg.baseRiskPct || 0) * 100).toFixed(0)}% · bank +${((cfg.profitTarget || 0) * 100).toFixed(0)}%
-        ${cfg.strategyPreset === "march1m" ? "" : " · click <b>March $1M</b> strategy pill to arm"}
       </div>`
     : (cfg.broker === "robinhood"
-      ? `<div style="margin:10px 0 14px;padding:10px 12px;border-radius:8px;border:1px solid #d4d8e0;background:#f6f7f9;color:#3a3b42;font-size:12px">Hit the <b>March $1M</b> strategy pill to arm fat-sleeve + quick-bank mode.</div>`
+      ? `<div style="margin:10px 0 14px;padding:10px 12px;border-radius:8px;border:1px solid #99f6e4;background:#ecfdf5;color:#134e4a;font-size:12px"><b>Capital-preservation rails</b> · planned loss ≤${((cfg.riskPerTradePct || 0) * 100).toFixed(2)}%/trade · allocation ≤${((cfg.maxPositionPct || 0) * 100).toFixed(0)}% · daily halt ${((cfg.dailyLossLimitPct || 0) * 100).toFixed(1)}% · no live self-promotion</div>`
       : "");
 
   const llmBadge = spectator
@@ -5544,7 +5887,7 @@ function dashboardHTML(acct, { spectator = false } = {}) {
       const pnlDollar = (curPremium != null && pos.entryPremium > 0)
         ? (curPremium - pos.entryPremium) * pos.qty * (isEq ? 1 : 100) : 0;
       const plan = managementPlanFor(pos, cfg, now);
-      const stopMult = isEq ? plan.stopLoss : plan.disasterFloor;
+      const stopMult = plan.stopLoss;
       const profitPrice = pos.entryPremium * (1 + plan.profitTarget);
       const stopPrice = pos.entryPremium * (1 + stopMult);
       return {
@@ -6775,7 +7118,6 @@ window.__CHARTS__ = ${JSON.stringify({ short: shortChartData, barrier: barrierCh
 
 function robinhoodPageHTML({ spectator = false } = {}) {
   const connected = robinhood.isConnected;
-  const pending = robinhood.pendingOrders || [];
 
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -6919,23 +7261,10 @@ function robinhoodPageHTML({ spectator = false } = {}) {
       <div id="watchlist-data" class="rh-loading">Loading watchlist...</div>
     </div>
 
-    <!-- Pending Orders -->
+    <!-- Entry posture -->
     <div class="rh-card">
-      <h2>⏳ Pending Orders <span style="color:#6b7280;font-weight:400;font-size:11px">(${pending.length})</span></h2>
-      <div id="pending-list">
-        ${pending.length === 0 ? '<div class="rh-empty">No pending orders</div>' : pending.map(o => `
-          <div class="rh-pending-item">
-            <div>
-              <div class="sym">${o.side?.toUpperCase()} ${o.quantity} ${o.symbol}</div>
-              <div class="detail">${o.conversionNote || ''} · ${new Date(o.createdAt).toLocaleTimeString()}</div>
-            </div>
-            ${spectator ? '' : `<div style="display:flex;gap:6px">
-              <button class="rh-btn primary small" onclick="approveOrder('${o.id}')">✓</button>
-              <button class="rh-btn danger small" onclick="rejectOrder('${o.id}')">✕</button>
-            </div>`}
-          </div>
-        `).join('')}
-      </div>
+      <h2>🛡️ Entry Posture</h2>
+      <div class="rh-empty">Observation-only: no new live entries until forward validation establishes an executable edge. Protective exits remain active.</div>
     </div>
 
     <!-- Trading Controls -->
@@ -6947,9 +7276,8 @@ function robinhoodPageHTML({ spectator = false } = {}) {
         <span style="font-size:11px;color:${connected ? '#00a843' : '#6b7280'};min-width:80px">${connected ? 'ACTIVE' : 'DISCONNECTED'}</span>
       </div>
       <div class="rh-toggle">
-        <label>Require Approval</label>
-        <div class="switch ${RH_REQUIRE_APPROVAL ? 'on' : ''}" onclick="toggleApproval()" title="${RH_REQUIRE_APPROVAL ? 'Manual approval ON' : 'Auto-execution ON'}"></div>
-        <span style="font-size:11px;color:${RH_REQUIRE_APPROVAL ? '#00a843' : '#b07400'};min-width:80px">${RH_REQUIRE_APPROVAL ? 'MANUAL' : 'AUTO'}</span>
+        <label>New Entries</label>
+        <span style="font-size:11px;color:#b07400;min-width:80px">OBSERVE</span>
       </div>
       <div class="rh-toggle">
         <label>Options Only</label>
@@ -6965,7 +7293,7 @@ function robinhoodPageHTML({ spectator = false } = {}) {
       <div class="rh-stat"><span class="label">Watchlist</span><span class="value" style="font-size:11px">${RH_WATCHLIST_NAME}</span></div>
       <div class="rh-stat"><span class="label">Max Position</span><span class="value">$${RH_MAX_POSITION_DOLLARS}</span></div>
       <div style="margin-top:12px">
-        <button class="rh-btn danger" onclick="killSwitch()" style="width:100%">🛑 Cancel All Pending</button>
+        <button class="rh-btn danger" onclick="killSwitch()" style="width:100%">🛑 Cancel Working Buys</button>
       </div>
       `}
     </div>
@@ -7104,11 +7432,6 @@ function disconnectRH() {
   fetch('/api/rh-token', { method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'}, body: 'token=' }).then(()=>location.reload());
 }
 
-async function toggleApproval() {
-  await fetch('/api/rh-approval', { method: 'POST' });
-  location.reload();
-}
-
 async function toggleOptionsOnly() {
   await fetch('/api/rh-options-only', { method: 'POST' });
   location.reload();
@@ -7163,22 +7486,11 @@ async function addWatchlistOption() {
   } catch(e) { alert('Error: '+e.message); }
 }
 
-async function approveOrder(id) {
-  await fetch('/api/rh-approve/'+id, { method: 'POST' });
-  location.reload();
-}
-
-async function rejectOrder(id) {
-  await fetch('/api/rh-reject/'+id, { method: 'POST' });
-  location.reload();
-}
-
 async function killSwitch() {
-  if (!confirm('Cancel ALL pending orders?')) return;
-  const status = await fetch('/api/rh-status').then(r=>r.json());
-  for (const o of (status.pendingOrders || [])) {
-    await fetch('/api/rh-reject/'+o.id, { method: 'POST' });
-  }
+  if (!confirm('Cancel every tracked working Robinhood BUY order? Protective sell orders will remain active.')) return;
+  const response = await fetch('/api/rh-cancel-entry-orders', { method: 'POST' });
+  const result = await response.json();
+  alert(result.error || ('Cancel requested for '+result.canceled+' buy order(s)'));
   location.reload();
 }
 
@@ -7307,7 +7619,7 @@ ${spectator ? "" : `<div id="acct-modal" style="display:none;position:fixed;top:
       <input name="name" value="Strategy 2" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
       <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Starting Cash ($)</label>
       <input name="startingCash" type="number" value="200" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
-      <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Risk per Trade (%)</label>
+      <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Max Premium Allocation (%)</label>
       <input name="baseRiskPct" type="number" step="0.01" value="15" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
       <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Profit Target (%)</label>
       <input name="profitTarget" type="number" step="1" value="40" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
@@ -7319,13 +7631,9 @@ ${spectator ? "" : `<div id="acct-modal" style="display:none;position:fixed;top:
       <input name="minSetupQuality" type="number" value="50" min="0" max="100" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
       <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Custom Prompt Suffix (optional)</label>
       <input name="customPromptSuffix" value="" placeholder="e.g. Focus on tech sector only" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:16px;box-sizing:border-box">
-      <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Broker (execution)</label>
-      <select name="broker" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
-        <option value="paper">Paper (simulated)</option>
-        <option value="tradier">Tradier (LIVE — real money)</option>
-      </select>
+      <input type="hidden" name="broker" value="paper">
+      <div style="font-size:12px;color:#6b7280;margin-bottom:12px">Broker: <strong>PAPER</strong> · live brokers use their protected canonical account tabs.</div>
       <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="useCashReserve" checked> Use cash reserve (50%→25% buffer)</label>
-      <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="autoExecute"> Auto-execute broker orders (full autonomy)</label>
       <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="tradeWhenClosed"> Trade when market closed (testing/sandbox)</label>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px">
         <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">0-cash spend limit ($)</label><input name="marginZeroCashSpendLimit" type="number" value="200" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
@@ -7386,7 +7694,7 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
       <button type="submit" class="acct-btn resume" title="${activeHalt}">🟢 Clear risk halt</button>
     </form>` : ""}
     <button type="button" class="acct-btn" id="push-btn" onclick="togglePush()" title="Toggle push notifications on this device">🔔 Notify</button>
-    ${acctId !== "default" ? `<form method="POST" action="/api/accounts/${acctId}/delete" style="display:inline" onsubmit="return confirm('Delete account ${acct.name}? This cannot be undone.')">
+    ${acctId !== "default" && !isCanonicalLiveAccount(acctId) ? `<form method="POST" action="/api/accounts/${acctId}/delete" style="display:inline" onsubmit="return confirm('Delete account ${acct.name}? This cannot be undone.')">
       <button type="submit" class="acct-btn delete">🗑 Delete</button>
     </form>` : ""}
   </div>
@@ -7394,7 +7702,7 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
     <div style="background:#ffffff;border:1px solid #d4d8e0;border-radius:12px;padding:24px;max-width:420px;width:90%;max-height:calc(100vh - 40px);overflow-y:auto;box-sizing:border-box">
       <h2 style="margin:0 0 16px;color:#1c1d22">Settings: ${acct.name}</h2>
       <form method="POST" action="/api/accounts/${acctId}/config">
-        <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Risk per Trade (%)</label>
+        <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Max Premium Allocation (%)</label>
         <input name="baseRiskPct" type="number" step="0.01" value="${(cfg.baseRiskPct * 100).toFixed(1)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Profit Target (%)</label>
         <input name="profitTarget" type="number" step="1" value="${(cfg.profitTarget * 100).toFixed(0)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
@@ -7868,7 +8176,7 @@ function simulatorPageHTML(simId) {
     <label>Starting Cash ($)</label>
     <input type="number" name="startingCash" value="${v.startingCash}">
     <div class="row">
-      <div><label>Risk per Trade (%)</label><input type="number" name="baseRiskPct" value="${v.baseRiskPct}" step="1"></div>
+      <div><label>Max Premium Allocation (%)</label><input type="number" name="baseRiskPct" value="${v.baseRiskPct}" step="1"></div>
       <div><label>Min Setup Quality (0-100)</label><input type="number" name="minSetupQuality" value="${v.minSetupQuality}" min="0" max="100"></div>
     </div>
     <div class="row">
@@ -8189,7 +8497,10 @@ function startDashboard(defaultAcct, apiKey) {
       req.on("end", () => {
         const params = new URLSearchParams(body);
         const name = params.get("name") || `Account ${accounts.size + 1}`;
-        const id = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || `acct-${Date.now()}`;
+        const requestedId = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || `acct-${Date.now()}`;
+        // Reserved ids are authorization principals for the two process-global live clients. A
+        // user-created account with the same display name still receives a distinct paper id.
+        const id = isCanonicalLiveAccount(requestedId) ? `${requestedId}-paper` : requestedId;
         if (accounts.has(id)) { res.writeHead(302, { Location: `/?a=${id}` }); res.end(); return; }
         const config = {
           startingCash: parseFloat(params.get("startingCash")) || 200,
@@ -8200,9 +8511,11 @@ function startDashboard(defaultAcct, apiKey) {
           bullEntry: 65, bearEntry: 35, trim1Pct: 0.25, trim2Pct: 0.50,
           minSetupQuality: parseInt(params.get("minSetupQuality")) || 50,
           customPromptSuffix: params.get("customPromptSuffix") || "",
-          broker: ["paper", "tradier", "robinhood"].includes(params.get("broker")) ? params.get("broker") : "paper",
+          // User-created runtimes are always simulations. Process-global live credentials are owned
+          // exclusively by the protected `robinhood` and `tradier` canonical accounts.
+          broker: "paper",
           useCashReserve: params.get("useCashReserve") === "on" || params.get("useCashReserve") === "true",
-          autoExecute: params.get("autoExecute") === "on" || params.get("autoExecute") === "true",
+          autoExecute: false,
           tradeWhenClosed: params.get("tradeWhenClosed") === "on" || params.get("tradeWhenClosed") === "true",
           marginZeroCashSpendLimit: Math.max(0, parseFloat(params.get("marginZeroCashSpendLimit")) || DEFAULT_CONFIG.marginZeroCashSpendLimit),
           marginMaxDebt: Math.max(0, parseFloat(params.get("marginMaxDebt")) || DEFAULT_CONFIG.marginMaxDebt),
@@ -8224,11 +8537,15 @@ function startDashboard(defaultAcct, apiKey) {
       const target = accounts.get(id);
       if (target) {
         target.paused = !target.paused;
-        // Manual pause = hands off entirely (no entries, no automated exits). A breaker pause
-        // ("risk") keeps exits alive; the user hitting the button means "stop touching my account".
+        target._entryEpoch = (target._entryEpoch || 0) + 1;
+        // Pause is an entry kill switch. Protective management remains active; otherwise pressing
+        // Pause during a drawdown would silently strand stops and profit-taking orders.
         target.pausedBy = target.paused ? "user" : null;
+        if (target.paused) {
+          scheduleWorkingEntryCancellation(target, "manual pause");
+        }
         saveAccounts();
-        console.log(`  [${id}] ${target.paused ? "Paused (manual — all automated trading halted)" : "Resumed"}`);
+        console.log(`  [${id}] ${target.paused ? "Paused (new entries/candidates halted; protective exits active)" : "Resumed"}`);
       }
       res.writeHead(302, { Location: `/?a=${id}` });
       res.end();
@@ -8236,10 +8553,8 @@ function startDashboard(defaultAcct, apiKey) {
     }
 
     // ─── Risk-halt manual reset ───
-    // Re-baselines today's daily-loss reference to the CURRENT portfolio value and clears the
-    // halt flag. For when the breaker tripped on bad accounting (e.g. a manual broker-side sale
-    // whose proceeds were invisible to PV) rather than a real loss — the user can see the real
-    // account and knows better than the stale baseline does.
+    // Explicit manual risk review: re-baseline daily/weekly/high-water references and clear the
+    // rolling loss streak/cooldown. This is the only way to override a persistent risk halt.
     const riskResetMatch = pathname.match(/^\/api\/accounts\/([^/]+)\/risk-reset$/);
     if (req.method === "POST" && riskResetMatch) {
       const target = accounts.get(riskResetMatch[1]);
@@ -8249,11 +8564,21 @@ function startDashboard(defaultAcct, apiKey) {
         const oldBase = r.dayStartPV;
         if (pv > 0) r.dayStartPV = pv;
         r.haltNotified = null;
+        target.state.portfolioRisk = {
+          ...(target.state.portfolioRisk || {}),
+          weekStartPV: pv > 0 ? pv : target.state.portfolioRisk?.weekStartPV,
+          highWaterPV: pv > 0 ? pv : target.state.portfolioRisk?.highWaterPV,
+          consecutiveLosses: 0,
+          cooldownUntil: 0,
+          haltNotified: null,
+          manuallyReviewedAt: Date.now(),
+        };
+        r.consecLosses = 0;
         if (target.paused && target.pausedBy === "risk") {
           target.paused = false;
           target.pausedBy = null;
         }
-        log(target, `RISK: daily-loss baseline manually reset $${(oldBase ?? 0).toFixed(0)} → $${pv.toFixed(0)} — halt cleared, trading resumes (consecutive-loss and day-trade counters untouched)`);
+        log(target, `RISK REVIEW: baselines reset $${(oldBase ?? 0).toFixed(0)} → $${pv.toFixed(0)}, rolling loss streak/cooldown cleared; trading may resume within hard live limits`);
         saveAccounts();
       }
       res.writeHead(302, { Location: `/?a=${riskResetMatch[1]}` });
@@ -8321,7 +8646,7 @@ function startDashboard(defaultAcct, apiKey) {
     const delMatch = pathname.match(/^\/api\/accounts\/([^/]+)\/delete$/);
     if (req.method === "POST" && delMatch) {
       const id = delMatch[1];
-      if (id !== "default" && accounts.has(id)) {
+      if (id !== "default" && !isCanonicalLiveAccount(id) && accounts.has(id)) {
         for (const v of learningVariantsFor(id)) accounts.delete(v.id); // cascade shadow variants
         accounts.delete(id); saveAccounts(); console.log(`  [${id}] Deleted`);
       }
@@ -8369,16 +8694,22 @@ function startDashboard(defaultAcct, apiKey) {
         if (params.has("bullEntry")) cfg.bullEntry = Math.min(100, Math.max(50, parseInt(params.get("bullEntry")) || 68));
         if (params.has("bearEntry")) cfg.bearEntry = Math.min(50, Math.max(0, parseInt(params.get("bearEntry")) || 32));
         cfg.customPromptSuffix = params.get("customPromptSuffix") || "";
-        // Broker binding + live-trading toggles. Checkboxes only POST when checked.
-        if (params.has("broker") && ["paper", "tradier", "robinhood"].includes(params.get("broker"))) cfg.broker = params.get("broker");
+        // Broker binding is immutable. Only canonical runtime ids can own process-global live
+        // credentials; an API-crafted config request cannot rebind a paper account or vice versa.
         if (params.has("configForm")) {
           cfg.useCashReserve = params.get("useCashReserve") === "on" || params.get("useCashReserve") === "true";
           cfg.autoExecute = params.get("autoExecute") === "on" || params.get("autoExecute") === "true";
           cfg.tradeWhenClosed = params.get("tradeWhenClosed") === "on" || params.get("tradeWhenClosed") === "true";
         }
-        target.riskPct = effectiveRiskPct(cfg.baseRiskPct, target.currentRegime);
+        Object.assign(cfg, sanitizeRuntimeBrokerConfig(id, cfg).config);
+        const policyChanges = applyLiveRiskPolicy(target);
+        const liveCfg = target.config;
+        target.riskPct = effectiveRiskPct(liveCfg.baseRiskPct, target.currentRegime);
+        if (policyChanges.length) {
+          log(target, `CAPITAL POLICY: settings tightened to hard live bounds (${policyChanges.map(change => `${change.key} ${change.before}→${change.after}`).join(", ")})`);
+        }
         saveAccounts();
-        console.log(`  [${id}] Config updated: risk=${(cfg.baseRiskPct * 100).toFixed(1)}% target=${(cfg.profitTarget * 100)}% stop=${(cfg.stopLoss * 100)}% minQuality=${cfg.minSetupQuality} bullEntry=${cfg.bullEntry} bearEntry=${cfg.bearEntry}`);
+        console.log(`  [${id}] Config updated: allocation=${(liveCfg.baseRiskPct * 100).toFixed(1)}% plannedRisk=${((liveCfg.riskPerTradePct || 0) * 100).toFixed(2)}% target=${(liveCfg.profitTarget * 100)}% stop=${(liveCfg.stopLoss * 100)}% minQuality=${liveCfg.minSetupQuality} bullEntry=${liveCfg.bullEntry} bearEntry=${liveCfg.bearEntry}`);
         res.writeHead(302, { Location: `/?a=${id}` });
         res.end();
       });
@@ -8427,12 +8758,11 @@ function startDashboard(defaultAcct, apiKey) {
 
     // (TRADING_MODE toggle removed — broker is per-account via config.broker)
 
-    // ─── Robinhood: Toggle Approval Mode ───
+    // The old in-process approval queue was never broker-backed and could not survive a restart.
+    // Fail closed instead of advertising controls that do not exist.
     if (req.method === "POST" && pathname === "/api/rh-approval") {
-      RH_REQUIRE_APPROVAL = !RH_REQUIRE_APPROVAL;
-      console.log(`  RH Approval Mode: ${RH_REQUIRE_APPROVAL ? "ON (manual)" : "OFF (auto)"}`);
-      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-      res.end(JSON.stringify({ requireApproval: RH_REQUIRE_APPROVAL }));
+      res.writeHead(410, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ error: "Manual approval queue retired; live entries are observation-only" }));
       return;
     }
 
@@ -8965,39 +9295,38 @@ function startDashboard(defaultAcct, apiKey) {
         tradeMode: rhTradeMode({ broker: "robinhood" }),
         availableTools: robinhood.availableTools,
         requireApproval: RH_REQUIRE_APPROVAL,
+        approvalSupported: false,
         maxPositionDollars: RH_MAX_POSITION_DOLLARS,
-        pendingOrders: robinhood.pendingOrders || [],
+        pendingOrders: [],
       }));
       return;
     }
 
-    // ─── Robinhood: Approve Pending Order ───
-    if (req.method === "POST" && pathname.startsWith("/api/rh-approve/")) {
-      const orderId = pathname.split("/api/rh-approve/")[1];
+    if (req.method === "POST" && pathname === "/api/rh-cancel-entry-orders") {
+      const acct = accounts.get("robinhood");
       try {
-        const result = await robinhood.approveOrder(orderId);
-        console.log(`  RH Order ${orderId.slice(0, 8)} APPROVED → ${result.status}`);
+        const canceled = acct
+          ? await withBrokerExecutionLane(acct, () => cancelWorkingEntryOrders(acct, "dashboard kill switch"))
+          : 0;
         res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-        res.end(JSON.stringify(result));
-      } catch (e) {
-        res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-        res.end(JSON.stringify({ error: e.message }));
+        res.end(JSON.stringify({ canceled }));
+      } catch (error) {
+        res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: error.message }));
       }
       return;
     }
 
-    // ─── Robinhood: Reject Pending Order ───
+    // Retired non-durable approval endpoints remain explicit errors for old clients.
+    if (req.method === "POST" && pathname.startsWith("/api/rh-approve/")) {
+      res.writeHead(410, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ error: "Approval queue retired; no order was submitted" }));
+      return;
+    }
+
     if (req.method === "POST" && pathname.startsWith("/api/rh-reject/")) {
-      const orderId = pathname.split("/api/rh-reject/")[1];
-      try {
-        const result = robinhood.rejectOrder(orderId);
-        console.log(`  RH Order ${orderId.slice(0, 8)} REJECTED`);
-        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-        res.end(JSON.stringify(result));
-      } catch (e) {
-        res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-        res.end(JSON.stringify({ error: e.message }));
-      }
+      res.writeHead(410, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ error: "Approval queue retired; use cancel-working-buys for broker-backed orders" }));
       return;
     }
 
@@ -9885,7 +10214,7 @@ async function ensureTradierAccount() {
   if (accounts.has("tradier")) {
     const acct = accounts.get("tradier");
     acct.config.broker = "tradier";
-    if (acct.config.autoExecute === undefined) acct.config.autoExecute = true;
+    if (acct.config.autoExecute === undefined) acct.config.autoExecute = false;
     if (acct.config.tradeWhenClosed === undefined) acct.config.tradeWhenClosed = tradier.environment === "sandbox";
     if (acct.config.marginZeroCashSpendLimit === undefined) acct.config.marginZeroCashSpendLimit = DEFAULT_CONFIG.marginZeroCashSpendLimit;
     if (acct.config.marginMaxDebt === undefined) acct.config.marginMaxDebt = DEFAULT_CONFIG.marginMaxDebt;
@@ -9928,7 +10257,7 @@ async function ensureTradierAccount() {
     ...DEFAULT_CONFIG,
     broker: "tradier",
     useCashReserve: false, // off by default for the live account; toggle on from settings
-    autoExecute: true,     // full autonomy (Pause remains the kill switch)
+    autoExecute: false,    // live execution must be explicitly armed after controls are verified
     // Sandbox accounts trade when closed by default so you can test execution outside market hours.
     tradeWhenClosed: tradier.environment === "sandbox",
     startingCash: typeof seedCash === "number" ? seedCash : DEFAULT_CONFIG.startingCash,
@@ -9945,7 +10274,7 @@ async function ensureTradierAccount() {
   const acct = createAccountRuntime("tradier", `Tradier Live (${tradier.environment})`, config, state);
   accounts.set("tradier", acct);
   saveAccounts();
-  console.log(`  Tradier: provisioned LIVE account ✓ — seeded cash $${state.cash.toFixed(2)} (${tradier.environment}), autoExecute ON`);
+  console.log(`  Tradier: provisioned LIVE account ✓ — seeded cash $${state.cash.toFixed(2)} (${tradier.environment}), autoExecute OFF`);
 }
 
 // Ensure a first-class live account bound to Robinhood MCP exists.
@@ -9971,7 +10300,7 @@ async function ensureRobinhoodAccount() {
   if (accounts.has("robinhood")) {
     const acct = accounts.get("robinhood");
     acct.config.broker = "robinhood";
-    if (acct.config.autoExecute === undefined) acct.config.autoExecute = true;
+    if (acct.config.autoExecute === undefined) acct.config.autoExecute = false;
 
     if (typeof seedCash === "number") {
       // seedCash here is equity (preferred) or buying power — never overwrite spendable cash with
@@ -9998,7 +10327,7 @@ async function ensureRobinhoodAccount() {
 
     // Guard: startingCash must be > 0 to avoid +Infinity% P&L
     if (!(acct.config.startingCash > 0)) acct.config.startingCash = DEFAULT_CONFIG.startingCash;
-    ensureMarch1MTrack(acct);
+    ensureCapitalPreservationTrack(acct);
     console.log(`  Robinhood: live account present — cash $${(acct.state.cash || 0).toFixed(2)} (capital base $${acct.config.startingCash})`);
     return;
   }
@@ -10008,7 +10337,7 @@ async function ensureRobinhoodAccount() {
     ...DEFAULT_CONFIG,
     broker: "robinhood",
     useCashReserve: false,
-    autoExecute: true,
+    autoExecute: false,
     startingCash: safeSeed,
   };
   const state = {
@@ -10019,9 +10348,9 @@ async function ensureRobinhoodAccount() {
   };
   const acct = createAccountRuntime("robinhood", `Robinhood Live`, config, state);
   accounts.set("robinhood", acct);
-  ensureMarch1MTrack(acct);
+  ensureCapitalPreservationTrack(acct);
   saveAccounts();
-  console.log(`  Robinhood: provisioned LIVE account ✓ — seeded cash $${state.cash.toFixed(2)}, autoExecute ON`);
+  console.log(`  Robinhood: provisioned LIVE account ✓ — seeded cash $${state.cash.toFixed(2)}, autoExecute OFF (arm explicitly after verification)`);
 }
 
 const ORDER_DONE_STATUSES = ["filled", "canceled", "cancelled", "rejected", "expired", "error"];
@@ -10036,7 +10365,12 @@ async function brokerWorkingOrders(acct) {
       .map(o => {
         const occ = o.option_symbol || o.symbol || "";
         const parsed = tradier.parseOCC(occ);
-        const qty = Math.round(Math.abs(o.quantity || o.remaining_quantity || 0));
+        const requestedQty = Math.round(Math.abs(Number(o.quantity) || 0));
+        const executedQty = Math.round(Math.abs(Number(o.exec_quantity ?? o.executed_quantity) || 0));
+        const explicitRemaining = Number(o.remaining_quantity ?? o.pending_quantity);
+        const qty = Number.isFinite(explicitRemaining)
+          ? Math.round(Math.max(0, Math.abs(explicitRemaining)))
+          : Math.max(0, requestedQty - executedQty);
         const price = o.price ?? o.avg_fill_price ?? null;
         return {
           id: o.id,
@@ -10046,6 +10380,9 @@ async function brokerWorkingOrders(acct) {
           ticker: parsed ? parsed.ticker : occ.toUpperCase(),
           parsed,
           qty,
+          requestedQty,
+          executedQty,
+          remainingQuantity: qty,
           price,
           createDate: o.create_date ? new Date(o.create_date).getTime() : null,
           reserved: parsed && price ? qty * price * 100 : 0,
@@ -10073,7 +10410,7 @@ function effectivePositionCount(acct) {
 
 // Place a real buy_to_open on Tradier for a bot entry decision. Broker is the source of truth,
 // so we pre-seed side-metadata (entry context) keyed by OCC and let the next sync surface the fill.
-async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, expiryStr = null, dte, qty, premium, direction, bid = null, ask = null, setupQuality = 0, claudeConfidence = 0, aiThesis = null, maxBudget = null }) {
+async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, expiryStr = null, dte, qty, premium, direction, bid = null, ask = null, setupQuality = 0, claudeConfidence = 0, aiThesis = null, maxBudget = null, entryEpoch = null }) {
   const expStr = expiryStr || new Date(expiryDate).toISOString().slice(0, 10);
   const occ = tradier.buildOCC(ticker, expStr, type, strike);
 
@@ -10087,6 +10424,8 @@ async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, expiry
   if (!acct.config.autoExecute) {
     return { skipped: true, reason: `Tradier: autoExecute off — entry for ${ticker} not sent (enable on the account)` };
   }
+  const initialCommitBlock = liveEntryCommitBlock(acct, entryEpoch);
+  if (initialCommitBlock) return { skipped: true, reason: `Tradier commit blocked: ${initialCommitBlock}` };
 
   // Commit-time exact-OCC re-quote. Ranking can take seconds across several candidates; never send
   // an order using the earlier chain snapshot or a last/mid fallback without a two-sided market.
@@ -10116,7 +10455,30 @@ async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, expiry
     acct.state.cash,
     acct.config.maxTradeSize || 500,
   );
-  qty = Math.min(qty, Math.floor(hardBudget / (limit * 100)));
+  const livePv = portfolioValue(acct.state, acct.dashboard?.quotes || {});
+  const liveRiskDecision = sizeLongOptionEntry({
+    accountEquity: livePv,
+    cash: Math.min(acct.state.cash, hardBudget),
+    entryPrice: limit,
+    stopLossPct: acct.config.stopLoss,
+    profitTargetPct: Math.min(
+      acct.config.profitTarget,
+      acct.config.singleContractBankPct ?? acct.config.profitTarget,
+    ),
+    minimumRewardRisk: acct.config.minimumRewardRisk ?? 1.5,
+    riskPerTradePct: acct.config.riskPerTradePct ?? 0.005,
+    maxPositionPct: acct.config.maxPositionPct ?? 0.10,
+    maxPositionDollars: acct.config.maxTradeSize || 500,
+    aggregateRiskBudgetDollars: livePv * (acct.config.maxPortfolioRiskPct ?? 0.02),
+    openRiskDollars: estimatedOpenRiskDollars(acct),
+    exitFrictionDollarsPerContract: Math.max(0, ask - bid) * 50,
+    entryFeePerContract: FEE_PER_CONTRACT,
+    exitFeePerContract: FEE_PER_CONTRACT,
+  });
+  if (!liveRiskDecision.approved) {
+    return { skipped: true, reason: `Tradier commit risk ${liveRiskDecision.reasonCode}: ${liveRiskDecision.reason}` };
+  }
+  qty = Math.min(qty, liveRiskDecision.quantity, Math.floor(hardBudget / (limit * 100)));
   if (qty < 1) {
     return { skipped: true, reason: `Tradier: refreshed ${occ} limit $${limit.toFixed(2)} no longer fits $${hardBudget.toFixed(0)} budget` };
   }
@@ -10136,11 +10498,27 @@ async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, expiry
     managementPlan: createManagementPlan(acct.config, { type, dte }),
     entryAtrPct: acct.dashboard?.analyses?.[ticker]?.atrPct ?? null,
     setupQuality,
+    plannedRiskDollars: +(liveRiskDecision.metrics.maxLossPerContract * qty).toFixed(2),
+    riskGovernor: {
+      version: 1,
+      reasonCode: liveRiskDecision.reasonCode,
+      rewardRiskRatio: liveRiskDecision.metrics.rewardRiskRatio,
+      maxLossPerContract: liveRiskDecision.metrics.maxLossPerContract,
+      tradeRiskBudgetDollars: liveRiskDecision.metrics.tradeRiskBudgetDollars,
+      aggregateRiskRemainingDollars: liveRiskDecision.metrics.aggregateRiskRemainingDollars,
+    },
     // Persist the full AI thought process so it survives the broker round-trip and shows up on the
     // live position (and later in trade history) exactly like paper trades.
     ai: aiThesis || null,
   };
 
+  const finalCommitBlock = liveEntryCommitBlock(acct, entryEpoch);
+  if (finalCommitBlock) {
+    delete acct.state.meta[occ];
+    return { skipped: true, reason: `Tradier commit blocked: ${finalCommitBlock}` };
+  }
+  // Intent must survive a process restart before the broker call can accept the order.
+  saveAccountsStrict();
   try {
     // Conviction-aware fill was computed from the fresh quote above.
     const aggrLabel = limit >= (ask || limit) ? "at ask" : limit > premium ? "toward ask" : "at mid";
@@ -10179,7 +10557,7 @@ async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, expiry
 // Place a real sell_to_close on Tradier. Broker is the source of truth: we record the trade to
 // history and log it, but DO NOT mutate state.cash/state.positions — the next
 // sync reconciles. Returns null so exit-loop callers keep the position until the fill is confirmed.
-function placeBrokerExit(acct, pos, currentPremium, reason, qty, pnlPct, pnlDollar) {
+function placeBrokerExit(acct, pos, currentPremium, reason, qty, pnlPct, pnlDollar, execution = {}) {
   const state = acct.state;
   const ticker = pos.ticker;
 
@@ -10197,56 +10575,74 @@ function placeBrokerExit(acct, pos, currentPremium, reason, qty, pnlPct, pnlDoll
 
   acct._inflightTickers.add(ticker.toUpperCase());
 
-  // Exit pricing must FILL without donating the spread. The old behavior dumped every protective
-  // exit at the raw bid — on a wide market (e.g. b$0.25/a$0.82) that gives away ~half the value.
-  // New model:
-  //   • profit-taking            → post at mid (patient; re-prices each cycle)
-  //   • urgent protective        → at the bid (must get out: critical/expiry/hard stop)
-  //   • tight-market protective  → at the bid (spread is small, marketable is fine)
-  //   • wide-market protective   → mid minus a capped concession; re-prices down over cycles
+  // Honor the lifecycle manager's explicit price mandate. In particular, a profit-bank decision
+  // was evaluated on the executable bid and must submit at that bid; replacing it with a midpoint
+  // order turns a reached target into an unfilled wish while the gain can reverse.
   const bid = typeof pos.liveBid === "number" && pos.liveBid > 0 ? pos.liveBid : null;
   const ask = typeof pos.liveAsk === "number" && pos.liveAsk > 0 ? pos.liveAsk : null;
   const mid = (bid != null && ask != null && ask >= bid) ? (bid + ask) / 2
             : (typeof pos.liveMark === "number" && pos.liveMark > 0 ? pos.liveMark : currentPremium);
   const spreadPct = (bid != null && ask != null && mid > 0) ? (ask - bid) / mid : 0;
-  const protective = pnlPct <= 0 || /stop|critical|expir|reversed|breakeven|low-dte|theta/i.test(reason);
-  const urgent = /critical|expir|low-dte/i.test(reason);
-
-  let limit = +mid.toFixed(2);
-  if (protective) {
-    if (urgent && bid != null) {
-      limit = +bid.toFixed(2); // must exit now — take the bid
-    } else if (spreadPct <= WIDE_SPREAD_EXIT_PCT && bid != null) {
-      limit = +bid.toFixed(2); // tight market — marketable at the bid is fine
-    } else if (mid > 0) {
-      // Wide market: don't dump at the bid. Concede at most MAX_EXIT_CONCESSION_PCT below mid,
-      // but never below the bid. If unfilled, the next cycle re-prices off the new mid.
-      const floor = bid != null ? bid : 0;
-      limit = +Math.max(floor, mid * (1 - MAX_EXIT_CONCESSION_PCT)).toFixed(2);
-      log(acct, `TRADIER EXIT ${ticker}: wide market (${(spreadPct * 100).toFixed(0)}% spread) — working limit $${limit} near mid $${mid.toFixed(2)} instead of dumping at bid $${bid ?? "?"}`);
-    } else {
-      log(acct, `TRADIER EXIT WARN ${ticker}: no live market for protective exit — using $${limit} (fill not guaranteed)`);
-    }
+  const protective = execution.urgency === "protective" || execution.urgency === "urgent"
+    || pnlPct <= 0 || /stop|critical|expir|reversed|breakeven|low-dte|theta/i.test(reason);
+  const urgent = execution.urgency === "urgent" || /critical|expir|low-dte/i.test(reason);
+  const priceMode = execution.priceMode || (urgent ? "marketable" : protective ? "patient" : "patient");
+  const pricing = chooseOptionSellLimit({
+    bid,
+    ask,
+    mark: pos.liveMark,
+    referencePrice: currentPremium,
+    priceMode,
+    protective,
+    exitAttempts: 0,
+    wideSpreadPct: WIDE_SPREAD_EXIT_PCT,
+    maxConcessionPct: MAX_EXIT_CONCESSION_PCT,
+  });
+  if (!(pricing.limit > 0)) {
+    acct._inflightTickers.delete(ticker.toUpperCase());
+    log(acct, `TRADIER EXIT BLOCKED ${ticker}: no executable bid for ${priceMode} exit — ${reason}`);
+    return null;
+  }
+  const limit = pricing.limit;
+  if (protective && pricing.spreadPct > WIDE_SPREAD_EXIT_PCT && priceMode === "patient") {
+    log(acct, `TRADIER EXIT ${ticker}: wide market (${(spreadPct * 100).toFixed(0)}% spread) — working guarded protective limit $${limit} vs bid $${bid ?? "?"}`);
   }
 
+  // Record an unresolved intent only. Realized P&L, streak/cooldown state, notifications, and the
+  // durable trade log are updated exclusively from an authoritative broker fill below.
   // Use the EXACT held OCC symbol so we can never target the wrong contract via reconstruction.
   const occForExit = pos.occSymbol || tradier.buildOCC(ticker, new Date(pos.expiryDate).toISOString().slice(0, 10), pos.type, pos.strike);
-  tradier.placeOptionOrderByOCC(occForExit, "sell_to_close", qty, "limit", limit)
-    .then(res => log(acct, `TRADIER EXIT: SELL ${qty}x ${occForExit} @ $${limit}${protective ? " (marketable)" : ""} — order ${res?.id || "ok"} (${reason})`))
-    .catch(e => {
+  const occForTrade = occForExit;
+  if (!state.meta) state.meta = {};
+  if (!state.meta[occForExit]) state.meta[occForExit] = {};
+  const exitMeta = state.meta[occForExit];
+  const requestedTrimLevel = execution.reasonCode === "TRIM_1" ? 1
+    : execution.reasonCode === "TRIM_2" ? 2
+      : execution.reasonCode === "EMA8_TRIM" ? 3 : null;
+  if (qty < pos.qty && requestedTrimLevel != null) {
+    if ((Number(exitMeta.trimLevel) || 0) >= requestedTrimLevel) {
       acct._inflightTickers.delete(ticker.toUpperCase());
-      log(acct, `TRADIER EXIT FAILED ${ticker}: ${e.message}`);
-    });
-
-  // Bookkeeping (no balance/position mutation — sync is authoritative). The P&L recorded here is an
-  // ESTIMATE based on the limit we sent; the actual fill is reconciled by reconcileBrokerFills() on a
-  // later cycle (which corrects closePremium/proceeds/pnl and folds in commissions). We tag the trade
-  // with the exact OCC + submit time so the reconciler can find the real fill.
-  if (!state.lastClosed) state.lastClosed = {};
-  state.lastClosed[ticker] = getETDateStr();
-  state.realizedPnl = (state.realizedPnl || 0) + pnlDollar;
-
-  const occForTrade = pos.occSymbol || occForExit;
+      log(acct, `TRADIER EXIT BLOCKED ${ticker}: trim tier ${requestedTrimLevel} is already complete`);
+      return null;
+    }
+    if (exitMeta.trimPendingLevel === requestedTrimLevel && exitMeta.trimPendingTargetQty > 0) {
+      const remainingTrimQty = Math.max(
+        0,
+        Number(exitMeta.trimPendingTargetQty) - (Number(exitMeta.trimPendingFilledQty) || 0),
+      );
+      qty = Math.min(qty, remainingTrimQty);
+      if (!(qty > 0)) {
+        acct._inflightTickers.delete(ticker.toUpperCase());
+        log(acct, `TRADIER EXIT BLOCKED ${ticker}: trim tier ${requestedTrimLevel} has no unfilled target quantity`);
+        return null;
+      }
+    } else {
+      exitMeta.trimPendingLevel = requestedTrimLevel;
+      exitMeta.trimPendingTargetQty = qty;
+      exitMeta.trimPendingFilledQty = 0;
+    }
+    pnlDollar = (currentPremium - pos.entryPremium) * qty * 100;
+  }
   const trade = {
     ...pos, qty,
     closePremium: +limit.toFixed(2),   // estimate (submitted limit) until the fill is reconciled
@@ -10254,12 +10650,35 @@ function placeBrokerExit(acct, pos, currentPremium, reason, qty, pnlPct, pnlDoll
     pnlDollar, pnlPct, reason, closeDate: getETDateStr(), closeTime: Date.now(),
     _occ: occForTrade,
     _exitSubmittedAt: Date.now(),
+    _exitOrderId: null,
+    _submittedLimit: +limit.toFixed(2),
+    _requestedQty: qty,
+    _positionQtyAtSubmit: pos.qty,
     _pendingFill: true,
-    _estPnlDollar: pnlDollar,           // remember the estimate so reconciliation can net it out
+    _estPnlDollar: pnlDollar,
+    _campaignKey: occForTrade,
+    _campaignComplete: qty >= pos.qty - 1e-9,
+    _trimTargetLevel: requestedTrimLevel,
+    _trimTargetQty: requestedTrimLevel != null ? Number(exitMeta.trimPendingTargetQty) || qty : null,
+    _entryCostPerContract: pos.cost > 0 && pos.qty > 0
+      ? pos.cost / pos.qty
+      : (pos.entryPremium || 0) * 100,
   };
-  logTrade(trade);
   state.history.push(trade);
-  recordTradeOutcome(acct, pnlDollar); // consecutive-loss circuit breaker (estimate; reconciled later)
+
+  tradier.placeOptionOrderByOCC(occForExit, "sell_to_close", qty, "limit", limit)
+    .then(res => {
+      trade._exitOrderId = brokerOrderId(res);
+      trade._orderAcceptedAt = Date.now();
+      log(acct, `TRADIER EXIT: SELL ${qty}x ${occForExit} @ $${limit}${protective ? " (marketable)" : ""} — order ${trade._exitOrderId || "ok"} (${reason})`);
+      saveAccounts();
+    })
+    .catch(e => {
+      trade._submissionFailedAt = Date.now();
+      acct._inflightTickers.delete(ticker.toUpperCase());
+      log(acct, `TRADIER EXIT FAILED ${ticker}: ${e.message}`);
+      saveAccounts();
+    });
   diag("exit_submit", acct, {
     ticker, occ: occForTrade, reason,
     intendedLimit: +limit.toFixed(2), mid: +mid.toFixed(2), bid, ask,
@@ -10271,15 +10690,6 @@ function placeBrokerExit(acct, pos, currentPremium, reason, qty, pnlPct, pnlDoll
 
   const trimLabel = qty < pos.qty ? `TRIM ${qty}/${pos.qty}` : "EXIT";
   log(acct, `${trimLabel} (LIVE): ${ticker} $${pos.strike} ${pos.type.toUpperCase()} ${pnlDollar >= 0 ? "+" : ""}$${pnlDollar.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${(pnlPct * 100).toFixed(0)}%) — ${reason}`);
-
-  const emoji = pnlDollar >= 0 ? "✅" : "🛑";
-  const label = qty < pos.qty ? "TRIM" : (pnlDollar >= 0 ? "EXIT TP" : "EXIT SL");
-  sendPush(
-    `${emoji} ${label} (LIVE): ${ticker} ${pos.type.toUpperCase()} $${pos.strike} [${acct.name}]`,
-    `P&L: ${pnlDollar >= 0 ? "+" : ""}$${pnlDollar.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${(pnlPct * 100).toFixed(0)}%)\n${reason}`,
-    pnlDollar < 0
-  ).catch(() => {});
-  tweetTradeExit(acct, pos, trade).catch(e => console.log(`  [X] Exit tweet error: ${e.message}`));
 
   return null; // keep position locally; sync reconciles after fill
 }
@@ -10296,61 +10706,205 @@ async function reconcileBrokerFills(acct) {
 
   let orders;
   try { orders = await tradier.getOrders(); } catch { return; }
-  const filled = orders.filter(o => (o.status || "").toLowerCase() === "filled" && (o.avg_fill_price > 0 || o.last_fill_price > 0));
+  const claimedOrderIds = new Set(
+    (state.history || [])
+      .filter(trade => !trade._pendingFill)
+      .map(trade => trade._matchedOrderId || trade._exitOrderId)
+      .filter(id => id != null)
+      .map(String),
+  );
 
   for (const trade of pending) {
-    const occ = trade._occ;
     const submittedAt = trade._exitSubmittedAt || 0;
-    // Match the filled sell order for this exact contract, dated at/after we submitted (60s slack).
-    const match = filled.find(o => {
-      const oOcc = o.option_symbol || o.symbol || "";
-      const side = (o.side || "").toLowerCase();
-      if (oOcc !== occ) return false;
-      if (side !== "sell_to_close" && side !== "sell") return false;
-      const t = o.transaction_date || o.create_date;
-      const filledAt = t ? new Date(t).getTime() : 0;
-      return filledAt >= submittedAt - 60_000;
-    });
+    let match = matchTradierExitOrder(orders, trade, claimedOrderIds);
+    // The account-orders collection is current-session only. After a deploy/restart, yesterday's
+    // exact-ID fill may no longer appear there, so retrieve that durable order directly before
+    // classifying the intent as unresolved/non-fill. Never use this fallback without an exact id.
+    if (!match && trade._exitOrderId != null) {
+      try {
+        const exactOrder = await tradier.getOrder(trade._exitOrderId);
+        match = matchTradierExitOrder(exactOrder ? [exactOrder] : [], trade, claimedOrderIds);
+      } catch { }
+    }
     if (!match) {
-      // Give up reconciling after 24h (order canceled/expired or history pruned) so it stops retrying.
-      if (Date.now() - submittedAt > 86_400_000) { trade._pendingFill = false; trade._fillUnresolved = true; }
+      // Give up after 24h, but never promote an estimate into performance. If a prior snapshot
+      // proved a partial fill, preserve only that confirmed quantity; otherwise classify non-fill.
+      if (Date.now() - submittedAt > 86_400_000) {
+        trade._pendingFill = false;
+        if (trade._bookedFillQty > 0) {
+          // The terminal order record disappeared, but prior snapshots already proved these fills.
+          // Keep the confirmed partial outcome and only mark terminal-state provenance unresolved.
+          trade._reconciled = true;
+          trade._terminalStateUnresolved = true;
+          trade._campaignComplete = false;
+          logTrade(trade);
+        } else {
+          trade._fillUnresolved = true;
+          trade._nonFill = true;
+          trade._nonFillReason = "no authoritative Tradier execution found within 24h";
+          trade.qty = 0;
+          trade.closePremium = 0;
+          trade.proceeds = 0;
+          trade.pnlDollar = 0;
+          trade.pnlPct = 0;
+        }
+      }
       continue;
     }
 
-    const actualClose = +(match.avg_fill_price || match.last_fill_price);
-    const filledQty = Math.round(Math.abs(match.exec_quantity || match.quantity || trade.qty));
-    const exitFees = +(FEE_PER_CONTRACT * filledQty).toFixed(2);
-    const grossProceeds = +(actualClose * filledQty * 100).toFixed(2);
-    const netProceeds = +(grossProceeds - exitFees).toFixed(2);
-    // Prefer the all-in entry cost basis (already includes entry commission) for a true net number.
-    const costBasis = trade.cost && trade.cost > 0 ? trade.cost : (trade.entryPremium || 0) * filledQty * 100;
-    const realPnl = +(netProceeds - costBasis).toFixed(2);
-    const realPnlPct = costBasis > 0 ? realPnl / costBasis : 0;
+    const matchId = brokerOrderId(match);
+    if (matchId != null) {
+      trade._matchedOrderId = matchId;
+      if (trade._exitOrderId == null) trade._exitOrderId = matchId;
+      claimedOrderIds.add(String(matchId));
+    }
+    const fill = tradierFillDelta(trade, match, FEE_PER_CONTRACT);
+    if (!fill.ok) {
+      log(acct, `FILL RECONCILE BLOCKED ${trade.ticker} ${trade._occ}: ${fill.reason}`);
+      if (Date.now() - submittedAt > 86_400_000 && !(trade._bookedFillQty > 0)) {
+        trade._pendingFill = false;
+        trade._fillUnresolved = true;
+        trade._nonFill = true;
+        trade._nonFillReason = `Tradier execution could not be verified: ${fill.reason}`;
+        trade.qty = 0;
+        trade.closePremium = 0;
+        trade.proceeds = 0;
+        trade.pnlDollar = 0;
+        trade.pnlPct = 0;
+      }
+      continue;
+    }
 
-    // Net the estimate out of realized P&L, fold in the actual.
-    state.realizedPnl = (state.realizedPnl || 0) - (trade._estPnlDollar || 0) + realPnl;
+    if (!(fill.cumulativeQty > 0)) {
+      if (fill.terminal) {
+        trade._pendingFill = false;
+        trade._nonFill = true;
+        trade._nonFillReason = `Tradier order ended ${(match.status || match.state || "terminal")} with zero execution`;
+        trade.qty = 0;
+        trade.closePremium = 0;
+        trade.proceeds = 0;
+        trade.pnlDollar = 0;
+        trade.pnlPct = 0;
+      } else if (Date.now() - submittedAt > 86_400_000) {
+        trade._pendingFill = false;
+        trade._fillUnresolved = true;
+        trade._nonFill = true;
+        trade._nonFillReason = "Tradier order remained nonterminal with zero verified execution after 24h";
+        trade.qty = 0;
+        trade.closePremium = 0;
+        trade.proceeds = 0;
+        trade.pnlDollar = 0;
+        trade.pnlPct = 0;
+      }
+      continue;
+    }
 
-    const est = trade.closePremium;
-    trade.closePremium = +actualClose.toFixed(2);
-    trade.proceeds = netProceeds;
-    trade.exitFees = exitFees;
-    trade.costBasis = +costBasis.toFixed(2);
-    trade.pnlDollar = realPnl;
-    trade.pnlPct = realPnlPct;
-    trade.filledQty = filledQty;
+    const est = trade._submittedLimit ?? trade.closePremium;
+    if (!state.realizedCampaignPnl) state.realizedCampaignPnl = {};
+    if (Math.abs(fill.deltaRealPnl) > 1e-9) {
+      state.realizedPnl = (state.realizedPnl || 0) + fill.deltaRealPnl;
+      const campaignKey = trade._campaignKey || trade._occ;
+      state.realizedCampaignPnl[campaignKey] = (state.realizedCampaignPnl[campaignKey] || 0) + fill.deltaRealPnl;
+    }
+
+    // A trim tier advances only from newly executed contracts on this exact OCC/order. A submitted
+    // limit, a working remainder, or a terminal partial cancel is not enough. Persist the target
+    // across retries so a partially-filled 2-contract trim asks only for its remaining contract
+    // instead of repeatedly issuing the full tier or resetting to TRIM_1 forever.
+    const trimTargetLevel = Number(trade._trimTargetLevel);
+    if (trimTargetLevel > 0 && fill.deltaQty > 0) {
+      if (!state.meta) state.meta = {};
+      const trimResult = applyTradierTrimFill(state.meta[trade._occ] || {}, trade, fill);
+      state.meta[trade._occ] = trimResult.meta;
+      if (trimResult.completed) {
+        log(acct, `TRADIER SYNC: ${trade.ticker} trim tier ${trimTargetLevel} fully filled from authoritative ${trade._occ} execution`);
+      }
+    }
+
+    trade.closePremium = +fill.averageFillPrice.toFixed(2);
+    trade.proceeds = +fill.netProceeds.toFixed(2);
+    trade.exitFees = +fill.exitFees.toFixed(2);
+    trade.costBasis = +fill.costBasis.toFixed(2);
+    trade.pnlDollar = +fill.cumulativeRealPnl.toFixed(2);
+    trade.pnlPct = fill.costBasis > 0 ? fill.cumulativeRealPnl / fill.costBasis : 0;
+    trade.filledQty = fill.cumulativeQty;
+    trade.qty = fill.cumulativeQty;
+    trade._bookedFillQty = fill.cumulativeQty;
+    trade._bookedRealPnl = fill.cumulativeRealPnl;
+
+    const fullyExecuted = fill.cumulativeQty >= fill.requestedQty - 1e-9;
+    if (!fill.terminal && !fullyExecuted) continue;
+
     trade._pendingFill = false;
     trade._reconciled = true;
+    trade._partialTerminal = fill.terminal && !fullyExecuted;
+    const positionQtyAtSubmit = Number(trade._positionQtyAtSubmit)
+      || (trade._campaignComplete ? fill.requestedQty : Infinity);
+    trade._campaignComplete = fill.cumulativeQty >= positionQtyAtSubmit - 1e-9;
+    const campaignKey = trade._campaignKey || trade._occ;
+    if (trade._campaignComplete) {
+      const campaignPnl = state.realizedCampaignPnl?.[campaignKey] || 0;
+      delete state.realizedCampaignPnl[campaignKey];
+      if (!state.lastClosed) state.lastClosed = {};
+      state.lastClosed[trade.ticker] = getETDateStr();
+      recordTradeOutcome(acct, campaignPnl);
+    }
+    logTrade(trade);
 
-    const slip = est ? ((actualClose - est) / est) * 100 : 0;
-    log(acct, `FILL RECONCILED ${trade.ticker} ${occ}: actual close $${actualClose.toFixed(2)} (est $${est}, ${slip >= 0 ? "+" : ""}${slip.toFixed(0)}% slip) · net proceeds $${netProceeds} − fees $${exitFees} · P&L ${realPnl >= 0 ? "+" : ""}$${realPnl.toFixed(0)} (${(realPnlPct * 100).toFixed(0)}%)`);
+    const slip = est ? ((fill.averageFillPrice - est) / est) * 100 : 0;
+    log(acct, `FILL RECONCILED ${trade.ticker} ${trade._occ}: ${fill.cumulativeQty}/${fill.requestedQty} executed @ $${fill.averageFillPrice.toFixed(2)} (est $${est}, ${slip >= 0 ? "+" : ""}${slip.toFixed(0)}% slip) · net proceeds $${fill.netProceeds.toFixed(2)} − fees $${fill.exitFees.toFixed(2)} · P&L ${fill.cumulativeRealPnl >= 0 ? "+" : ""}$${fill.cumulativeRealPnl.toFixed(0)} (${(trade.pnlPct * 100).toFixed(0)}%)`);
     diag("exit_fill", acct, {
-      ticker: trade.ticker, occ,
+      ticker: trade.ticker, occ: trade._occ,
       reason: trade.exitReason || trade.reason || null,
-      estClose: est ?? null, actualClose: +actualClose.toFixed(2), slipPct: +slip.toFixed(1),
+      estClose: est ?? null, actualClose: +fill.averageFillPrice.toFixed(2), slipPct: +slip.toFixed(1),
       entryPremium: trade.entryPremium ?? null, intendedEntryPremium: trade.intendedEntryPremium ?? null,
-      qty: filledQty, costBasis: +costBasis.toFixed(2), proceeds: netProceeds, fees: exitFees,
-      pnl: realPnl, pnlPct: +(realPnlPct * 100).toFixed(1),
+      qty: fill.cumulativeQty, requestedQty: fill.requestedQty,
+      costBasis: +fill.costBasis.toFixed(2), proceeds: +fill.netProceeds.toFixed(2), fees: +fill.exitFees.toFixed(2),
+      pnl: +fill.cumulativeRealPnl.toFixed(2), pnlPct: +(trade.pnlPct * 100).toFixed(1),
     });
+    const emoji = fill.cumulativeRealPnl >= 0 ? "✅" : "🛑";
+    const label = trade._campaignComplete ? (fill.cumulativeRealPnl >= 0 ? "EXIT TP" : "EXIT SL") : "TRIM";
+    sendPush(
+      `${emoji} ${label} FILLED: ${trade.ticker} ${String(trade.type || "option").toUpperCase()} $${trade.strike} [${acct.name}]`,
+      `P&L: ${fill.cumulativeRealPnl >= 0 ? "+" : ""}$${fill.cumulativeRealPnl.toFixed(0)} (${trade.pnlPct >= 0 ? "+" : ""}${(trade.pnlPct * 100).toFixed(0)}%)\n${trade.reason || "broker fill"}`,
+      fill.cumulativeRealPnl < 0,
+    ).catch(() => {});
+    tweetTradeExit(acct, trade, trade).catch(e => console.log(`  [X] Exit tweet error: ${e.message}`));
+  }
+}
+
+function quarantineNonLongBrokerOption(acct, { broker, symbol, quantity, positionSide, reason }) {
+  const state = acct.state;
+  if (!state.nonLongOptionQuarantine || typeof state.nonLongOptionQuarantine !== "object") {
+    state.nonLongOptionQuarantine = {};
+  }
+  const key = `${broker}:${String(symbol || "unknown").toUpperCase()}`;
+  const previous = state.nonLongOptionQuarantine[key] || {};
+  const row = {
+    broker,
+    symbol: String(symbol || "unknown").toUpperCase(),
+    quantity: Number(quantity),
+    positionSide: positionSide || null,
+    reason,
+    firstSeenAt: previous.firstSeenAt || Date.now(),
+    lastSeenAt: Date.now(),
+    status: "quarantined_non_long",
+    notifiedAt: previous.notifiedAt || null,
+  };
+  state.nonLongOptionQuarantine[key] = row;
+  if (!row.notifiedAt) {
+    row.notifiedAt = Date.now();
+    const message = `${broker.toUpperCase()} ${row.symbol} has non-long option exposure (${reason}, qty ${quantity}). It is quarantined: the long-option lifecycle will not submit sell_to_close.`;
+    log(acct, `🚨 BROKER POSITION QUARANTINE: ${message}`);
+    diag("risk_halt", acct, {
+      kind: "non_long_option_holding",
+      broker,
+      symbol: row.symbol,
+      quantity: row.quantity,
+      positionSide: row.positionSide,
+      reason,
+    });
+    sendPush(`🚨 Non-long option quarantined [${acct.name}]`, message, true).catch(() => {});
   }
 }
 
@@ -10375,6 +10929,7 @@ async function syncBrokerAccount(acct, quotes) {
     applyBrokerBalanceInfo(acct, info, { warn: true });
     acct._brokerBalanceInfo = info;
     acct._brokerBalanceRefreshedAt = Date.now();
+    state.brokerBalanceAt = Date.now();
   } catch (e) { log(acct, `TRADIER SYNC: balance error — ${e.message}`); }
 
   try {
@@ -10386,9 +10941,29 @@ async function syncBrokerAccount(acct, quotes) {
     // Batch ALL option quotes in one (chunked) request rather than one serial call per position.
     // This is faster, far less rate-limit prone, and gives a single point-in-time snapshot — the
     // most reliable way to get consistent live marks while the market is open.
-    const optionOccs = raw
-      .filter(p => tradier.parseOCC(p.symbol) && Math.round(Math.abs(p.quantity)) >= 1)
-      .map(p => p.symbol);
+    const longOptionRows = [];
+    for (const brokerPosition of raw) {
+      const parsed = tradier.parseOCC(brokerPosition.symbol);
+      if (!parsed) continue;
+      const holding = classifyLongOptionHolding({
+        quantity: brokerPosition.quantity,
+        positionSide: brokerPosition.position_side ?? brokerPosition.side ?? brokerPosition.type,
+      });
+      if (holding.quarantine) {
+        quarantineNonLongBrokerOption(acct, {
+          broker: "tradier",
+          symbol: brokerPosition.symbol,
+          quantity: brokerPosition.quantity,
+          positionSide: brokerPosition.position_side ?? brokerPosition.side ?? brokerPosition.type,
+          reason: holding.reason,
+        });
+        continue;
+      }
+      if (holding.manageable && Math.round(holding.quantity) >= 1) {
+        longOptionRows.push({ brokerPosition, quantity: Math.round(holding.quantity) });
+      }
+    }
+    const optionOccs = longOptionRows.map(row => row.brokerPosition.symbol);
     let optionQuotes = {};
     try {
       optionQuotes = await tradier.getOptionQuotes(optionOccs);
@@ -10397,12 +10972,10 @@ async function syncBrokerAccount(acct, quotes) {
     }
     const mktOpenNow = isMarketOpen();
 
-    for (const p of raw) {
+    for (const { brokerPosition: p, quantity: qtyContracts } of longOptionRows) {
       const occ = p.symbol;
       const parsed = tradier.parseOCC(occ);
       if (!parsed) continue;                       // skip equity / non-option holdings
-      const qtyContracts = Math.round(Math.abs(p.quantity));
-      if (qtyContracts < 1) continue;
       // Tradier's cost_basis is the REAL all-in fill (premium × qty × 100, incl. commissions). This
       // is authoritative for what we actually paid — the bot's pre-fill limit estimate (meta.entryPremium)
       // is only a guess and must never override the broker's reported fill.
@@ -10472,6 +11045,8 @@ async function syncBrokerAccount(acct, quotes) {
         managementPlan: meta.managementPlan || null,
         lastManagementDecision: meta.lastManagementDecision || null,
         entryAtrPct: meta.entryAtrPct ?? null,
+        plannedRiskDollars: meta.plannedRiskDollars ?? null,
+        riskGovernor: meta.riskGovernor ?? null,
         iv,
         liveMark: mark != null ? +mark.toFixed(2) : null,   // tradeable two-sided mid only (exits gate on this)
         displayMark: displayMark != null ? +displayMark.toFixed(2) : null, // continuous mark for UI/P&L
@@ -10488,7 +11063,7 @@ async function syncBrokerAccount(acct, quotes) {
       if (pos.liveMark != null && pos.entryPremium > 0) {
         const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
         if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
-        recordMarkTrail(pos, pos.liveMark, now, pos.liveBid);
+        recordMarkTrail(pos, pos.liveMark, now, pos.liveBid, pos.liveAsk);
       }
       persistPosTrailMeta(acct, pos);
 
@@ -10517,11 +11092,16 @@ async function syncBrokerAccount(acct, quotes) {
 
       positions.push(pos);
       state.meta[occ] = {
+        // Keep exact-OCC lifecycle state that is not reconstructed from the broker holding itself,
+        // especially an incompletely-filled trim target spanning multiple orders.
+        ...meta,
         entryPremium: pos.entryPremium, entrySpot: pos.entrySpot, dte: pos.dte,
         originalQty: pos.originalQty, openDate: pos.openDate, openTime: pos.openTime,
         trimLevel: pos.trimLevel, bestPnlPct: pos.bestPnlPct, bestExitPnlPct: pos.bestExitPnlPct,
         managementPlan: pos.managementPlan, lastManagementDecision: pos.lastManagementDecision,
         entryAtrPct: pos.entryAtrPct,
+        plannedRiskDollars: pos.plannedRiskDollars,
+        riskGovernor: pos.riskGovernor,
         markTrail: Array.isArray(pos.markTrail) ? pos.markTrail.slice(-240) : undefined,
         ai: aiData, // keep the captured (or backfilled) AI thought process across syncs
       };
@@ -10533,7 +11113,6 @@ async function syncBrokerAccount(acct, quotes) {
     for (const o of workingOrders) {
       if (o.side !== "buy_to_open" && o.side !== "buy") continue;
       if (!o.parsed || o.qty < 1) continue;
-      if (seen.has(o.occ)) continue; // already a filled position
       reserved += o.reserved;
       const expiryDate = new Date(`${o.parsed.expiration}T16:00:00`).getTime();
       positions.push({
@@ -10547,7 +11126,12 @@ async function syncBrokerAccount(acct, quotes) {
         entryPremium: o.price || 0,
         entrySpot: quotes[o.parsed.ticker]?.c ?? null,
         qty: o.qty,
-        originalQty: o.qty,
+        originalQty: o.requestedQty || o.qty,
+        remainingQuantity: o.remainingQuantity,
+        requestedQty: o.requestedQty,
+        executedQty: o.executedQty,
+        orderId: o.id,
+        side: o.side,
         cost: o.reserved,
         openDate: getETDateStr(),
         openTime: o.createDate || now,
@@ -10560,7 +11144,22 @@ async function syncBrokerAccount(acct, quotes) {
         _pending: true,
         orderStatus: o.status,
       });
+      seen.add(o.occ);
     }
+
+    state.pendingEntryOrders = workingOrders
+      .filter(o => (o.side === "buy_to_open" || o.side === "buy") && o.parsed && o.qty > 0)
+      .map(o => ({
+        occ: o.occ,
+        option_symbol: o.occ,
+        side: o.side,
+        status: o.status,
+        orderId: o.id,
+        quantity: o.requestedQty || o.qty,
+        remaining_quantity: o.remainingQuantity,
+        executed_quantity: o.executedQty,
+        price: o.price,
+      }));
 
     // Prune metadata for positions that no longer exist at the broker.
     for (const k of Object.keys(state.meta)) if (!seen.has(k)) delete state.meta[k];
@@ -10609,12 +11208,67 @@ async function syncBrokerAccount(acct, quotes) {
 // approved limit rest, cancel stale remainder once, and wait for the exact order snapshot.
 const ENTRY_GIVEUP_MS = 20 * 60_000;
 const ENTRY_WALKAWAY_COOLDOWN_MS = 15 * 60_000;
+const ENTRY_HALT_CANCEL_COOLDOWN_MS = 60_000;
+
+/**
+ * Fire-and-forget cancel of broker-visible working buys. Safe to call from risk/pause paths that
+ * may already hold (or sit outside) the broker execution lane — Robinhood work is queued on the lane.
+ */
+function scheduleWorkingEntryCancellation(acct, reason) {
+  const cancelTask = () => cancelWorkingEntryOrders(acct, reason);
+  const cancellation = acct.config?.broker === "robinhood"
+    ? withBrokerExecutionLane(acct, cancelTask)
+    : cancelTask();
+  cancellation.catch(error => {
+    log(acct, `ENTRY HALT: working-entry cancellation failed — ${error.message}`);
+  });
+  return cancellation;
+}
+
+async function cancelWorkingEntryOrders(acct, reason = "entry halt") {
+  if (acct.config.broker === "tradier") {
+    const working = await brokerWorkingOrders(acct);
+    let requested = 0;
+    for (const order of working) {
+      if (order.side !== "buy_to_open" && order.side !== "buy") continue;
+      await tradier.cancelOrder(order.id);
+      requested++;
+    }
+    if (requested) log(acct, `ENTRY HALT: cancel requested for ${requested} Tradier buy order(s) — ${reason}`);
+    return requested;
+  }
+  if (acct.config.broker !== "robinhood") return 0;
+  let requested = 0;
+  for (const [occ, meta] of Object.entries(acct.state.meta || {})) {
+    if (!meta?.entryOrderPlacedAt || !meta.entryOrderCtx) continue;
+    if (!meta.entryOrderId) {
+      log(acct, `ENTRY HALT: ${occ} has ambiguous submission status; retaining quarantine (no buy replay) — ${reason}`);
+      continue;
+    }
+    if (meta.entryCancelRequestedAt) continue;
+    await robinhood.cancelOptionOrder(meta.entryOrderId);
+    meta.entryCancelRequestedAt = Date.now();
+    requested++;
+  }
+  if (requested) log(acct, `ENTRY HALT: cancel requested for ${requested} Robinhood buy order(s) — ${reason}`);
+  return requested;
+}
 
 async function workRobinhoodEntryOrders(acct, now) {
   const state = acct.state;
   if (!state.meta) return;
   if (!acct._inflightTickers) acct._inflightTickers = new Set();
   if (!acct._chaseCooldownUntil) acct._chaseCooldownUntil = {};
+
+  const haltReason = entryBuyHaltReason(acct);
+  if (haltReason && shouldCancelWorkingBuysOnHalt(acct)) {
+    // Observation / pause / risk: cancel broker-visible buys every minute until gone. Never leave
+    // an armed buy resting after the lock that forbids new entries.
+    if (!acct._entryHaltCancelAt || now - acct._entryHaltCancelAt >= ENTRY_HALT_CANCEL_COOLDOWN_MS) {
+      acct._entryHaltCancelAt = now;
+      await cancelWorkingEntryOrders(acct, haltReason);
+    }
+  }
 
   for (const [occ, m] of Object.entries(state.meta)) {
     if (!m || !m.entryOrderPlacedAt || !m.entryOrderCtx) continue;
@@ -10623,7 +11277,14 @@ async function workRobinhoodEntryOrders(acct, now) {
     if (!m.entryOrderId) {
       acct._inflightTickers.add(tickerU);
       // Submission response was ambiguous. Retry the exact payload under the SAME broker idempotency
-      // key. Never mint a replacement ref: the first request may already have been accepted.
+      // key — but NEVER while paused/observation-locked. An old in-flight buy must not outlive the halt.
+      if (!ambiguousBuyReplayAllowed(acct)) {
+        if (!m.entryHaltReplayBlockedLoggedAt || now - m.entryHaltReplayBlockedLoggedAt >= 15 * 60_000) {
+          m.entryHaltReplayBlockedLoggedAt = now;
+          log(acct, `RH ENTRY RECOVERY BLOCKED ${tickerU || occ}: ${haltReason || "entry halt"} — refusing ambiguous buy replay`);
+        }
+        continue;
+      }
       const refId = m.entryOrderRefId;
       const qty = Number(ctx.qty);
       const limit = Number(m.entryOrderLimit);
@@ -10638,6 +11299,8 @@ async function workRobinhoodEntryOrders(acct, now) {
       }
       if (m.entryRecoveryAttemptAt && now - m.entryRecoveryAttemptAt < 30_000) continue;
       m.entryRecoveryAttemptAt = now;
+      // Durable intent already exists (same ref). Re-assert it before the broker call.
+      saveAccountsStrict();
       try {
         const recovered = await robinhood.placeOptionOrder({
           symbol: tickerU,
@@ -10716,18 +11379,24 @@ async function workRobinhoodEntryOrders(acct, now) {
           m.entryFillReconciled = true;
           m.originalQty = executedQty;
         }
-        log(acct, `RH ENTRY WORK: terminal ${String(order.state || "order")} for ${tickerU}; ${executedQty}x filled${fill > 0 ? ` @ $${fill.toFixed(2)}` : ""}`);
-        delete m.entryOrderId; delete m.entryOrderRefId; delete m.entryOrderPlacedAt;
-        delete m.entryFirstPlacedAt; delete m.entryOrderCtx; delete m.entrySubmissionUnknownAt;
-        delete m.entryCancelRequestedAt; delete m.entryRecoveryAttemptAt;
-        delete m.entryRecoveryContextLoggedAt; delete m.entryRecoveryNoIdLoggedAt;
-        delete m.entryRecoveryErrorLoggedAt;
+        // Orders can report a terminal fill one snapshot before the holdings endpoint reflects it.
+        // Retain the exact-OCC lock until that holding proves quantity/basis; otherwise the next
+        // still-empty positions snapshot can submit a duplicate full buy.
+        m.entryAwaitingHolding = true;
+        m.entryExecutedQty = executedQty;
+        m.entryOrderTerminalAt = now;
+        m.entryOrderCtx.qty = executedQty;
+        acct._inflightTickers.add(tickerU);
+        if (!m.entryAwaitingHoldingLoggedAt) {
+          m.entryAwaitingHoldingLoggedAt = now;
+          log(acct, `RH ENTRY WORK: terminal ${String(order.state || "order")} for ${tickerU}; ${executedQty}x filled${fill > 0 ? ` @ $${fill.toFixed(2)}` : ""}; retaining lock until holdings confirms`);
+        }
       } else {
         delete state.meta[occ];
         acct._chaseCooldownUntil[tickerU] = now + ENTRY_WALKAWAY_COOLDOWN_MS;
         log(acct, `RH ENTRY WORK: ${tickerU} order ended ${String(order.state || "without fill")} — no replacement sent`);
+        acct._inflightTickers.delete(tickerU);
       }
-      acct._inflightTickers.delete(tickerU);
       continue;
     }
 
@@ -10788,6 +11457,9 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
       } else {
         delete state.brokerEquity; // never let a stale equity reading override the live fallback math
       }
+      if ((!isNaN(bpNum) && bpNum >= 0) || (!isNaN(eqNum) && eqNum >= 0)) {
+        state.brokerBalanceAt = Date.now();
+      }
     }
     // Sale proceeds settle T+1: anything booked on a prior day is assumed absorbed into buying
     // power by now, so drop it from the unsettled credit (portfolioValue adds what remains).
@@ -10833,8 +11505,9 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
         optionOrdersSnapshot = Array.isArray(optWorkingRaw) ? optWorkingRaw
           : Array.isArray(optWorkingRaw?.orders) ? optWorkingRaw.orders
             : Array.isArray(optWorkingRaw?.results) ? optWorkingRaw.results : [];
-        const activeStates = new Set(["queued", "confirmed", "partially_filled", "pending_cancelled", "pending_canceled"]);
-        const optWorkingOrders = optionOrdersSnapshot.filter(order => activeStates.has(String(order.state || order.status || "").toLowerCase()));
+        // Treat every unknown/nonterminal state as active. A new broker state must retain locks,
+        // never silently release them and permit a duplicate order.
+        const optWorkingOrders = optionOrdersSnapshot.filter(order => !optionOrderIsTerminal(order));
         for (const o of optWorkingOrders) {
           const sym = (o.chain_symbol || o.symbol || "").toUpperCase();
           if (sym) brokerTickers.push(sym);
@@ -10924,7 +11597,7 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
       if (pos.liveMark != null && pos.entryPremium > 0) {
         const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
         if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
-        recordMarkTrail(pos, pos.liveMark, now, pos.liveBid);
+        recordMarkTrail(pos, pos.liveMark, now, pos.liveBid, pos.liveAsk);
       }
       persistPosTrailMeta(acct, pos);
 
@@ -10970,11 +11643,24 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
 
         for (const op of optRaw) {
           try {
-          const qty = parseFloat(op.quantity || op.pending_buy_quantity || 0);
-          if (qty <= 0) continue;
-
           const ticker = String(op.chain_symbol || op.symbol || "").toUpperCase();
           if (!ticker) continue;
+
+          const rawSide = String(op.position_side || op.side || op.type || "").toLowerCase();
+          const rawQuantity = parseFloat(op.quantity || op.pending_buy_quantity || 0);
+          const holding = classifyLongOptionHolding({ quantity: rawQuantity, positionSide: rawSide });
+          if (holding.quarantine) {
+            quarantineNonLongBrokerOption(acct, {
+              broker: "robinhood",
+              symbol: op.occ_symbol || op.occSymbol || op.option_symbol || ticker,
+              quantity: rawQuantity,
+              positionSide: rawSide,
+              reason: holding.reason,
+            });
+            continue;
+          }
+          if (!holding.manageable) continue;
+          const qty = holding.quantity;
 
           // The instrument UUID is the contract identity. Ticker/type/strike are not unique, and
           // historical same-ticker orders must never be used to guess this holding's expiry.
@@ -10985,7 +11671,6 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
 
           // Robinhood returns `type: "long"/"short"` (position side), not call/put. Missing option
           // type stays unknown; defaulting to call can turn a put into the wrong managed contract.
-          const rawSide = String(op.type || "").toLowerCase();
           const rawOptionType = String(
             (rawSide === "long" || rawSide === "short")
               ? (op.option_type || op.legs?.[0]?.option_type || "")
@@ -11049,9 +11734,40 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
           // Quotes attached to an unverified contract cannot drive orders. For an exact contract,
           // trust coherent broker quotes even above +250%; large legitimate winners must stay sellable.
           const coherentSpread = bid == null || ask == null || ask >= bid;
+          // Embedded position quote fields can be stale while the positions endpoint is polled.
+          // Keep a coherent mark for display, but never stamp its bid/ask as fresh execution data.
+          // Step 2 performs a new exact-instrument market-data request every manager tick; only
+          // that response may populate executable bids or protective-stop samples.
           const safeMark = contractIdentityVerified && coherentSpread ? mark : null;
-          const safeBid = contractIdentityVerified && coherentSpread ? bid : null;
-          const safeAsk = contractIdentityVerified && coherentSpread ? ask : null;
+          const safeBid = null;
+          const safeAsk = null;
+
+          // A fully established exact holding is stronger fill evidence than a stale local flag.
+          // Without this reconciliation a missing terminal-order snapshot quarantined KO for four
+          // days, so the manager skipped its executable +10% bank and subsequent giveback lock.
+          const exactEntryOrder = meta.entryOrderPlacedAt && optionOrdersSnapshot ? findExactOptionOrder(optionOrdersSnapshot, {
+            orderId: meta.entryOrderId,
+            refId: meta.entryOrderRefId,
+            instrumentId,
+            occSymbol: occ,
+            side: "buy",
+            submittedAt: meta.entryOrderPlacedAt,
+            now,
+          }) : null;
+          // Only immutable broker creation time may prove that a holding came from this intent.
+          // `updated_at` changes with quotes/position activity and local openTime is circular.
+          const brokerPositionCreatedAt = op.created_at ? new Date(op.created_at).getTime() : 0;
+          const entryIntentSettled = contractIdentityVerified && entryIntentSatisfiedByHolding(meta, {
+            heldQuantity: qty,
+            averageFillPrice: entryPremium,
+            positionCreatedAt: brokerPositionCreatedAt,
+            exactOrder: exactEntryOrder,
+          });
+          if (entryIntentSettled) {
+            clearEntryOrderTracking(meta);
+            if (!brokerTickers.includes(ticker)) acct._inflightTickers.delete(ticker);
+            log(acct, `RH ENTRY RECONCILED ${ticker}: exact ${occ} holding ${qty}x @ $${entryPremium.toFixed(2)} satisfies the local buy intent; management unlocked`);
+          }
 
           const pos = {
             ...(meta.ai || {}),
@@ -11070,28 +11786,31 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
             // Fall back to meta only when RH hasn't reported an average_price yet (pending fill).
             entryPremium: entryPremium > 0 ? entryPremium : (meta.entryPremium ?? 0),
             intendedEntryPremium: meta.intendedEntryPremium ?? null,
-            entrySpot: meta.entrySpot ?? (quotes[ticker]?.c ?? null),
+            entrySpot: meta.entrySpot ?? prevExact?.entrySpot ?? (quotes[ticker]?.c ?? null),
             qty,
-            originalQty: meta.originalQty ?? qty,
+            originalQty: meta.originalQty ?? prevExact?.originalQty ?? qty,
             cost: Math.abs(entryPremium * qty * 100),
-            openDate: meta.openDate ?? (op.created_at || op.updated_at ? String(op.created_at || op.updated_at).slice(0, 10) : getETDateStr()),
+            openDate: meta.openDate ?? prevExact?.openDate ?? (op.created_at || op.updated_at ? String(op.created_at || op.updated_at).slice(0, 10) : getETDateStr()),
             // Prefer persisted meta; else RH created_at. Never default to "now" every sync —
             // that would zero held-days and corrupt DTE/lifecycle decisions (PATH Jul 7→13).
             openTime: meta.openTime
+              ?? prevExact?.openTime
               ?? (op.created_at ? new Date(op.created_at).getTime() : null)
               ?? (op.updated_at ? new Date(op.updated_at).getTime() : null)
               ?? (meta.openDate ? new Date(meta.openDate + "T16:00:00-04:00").getTime() : now),
             trimLevel: meta.trimLevel ?? 0,
             bestPnlPct: meta.bestPnlPct ?? 0,
             bestExitPnlPct: meta.bestExitPnlPct ?? 0,
-            managementPlan: meta.managementPlan || null,
-            lastManagementDecision: meta.lastManagementDecision || null,
-            entryAtrPct: meta.entryAtrPct ?? null,
+            managementPlan: meta.managementPlan || prevExact?.managementPlan || null,
+            lastManagementDecision: meta.lastManagementDecision || prevExact?.lastManagementDecision || null,
+            entryAtrPct: meta.entryAtrPct ?? prevExact?.entryAtrPct ?? null,
+            plannedRiskDollars: meta.plannedRiskDollars ?? prevExact?.plannedRiskDollars ?? null,
+            riskGovernor: meta.riskGovernor ?? prevExact?.riskGovernor ?? null,
             iv: parseFloat(op.implied_volatility || 0) || null,
             liveMark: safeMark,
             liveBid: safeBid,
             liveAsk: safeAsk,
-            liveQuoteAt: safeBid > 0 ? now : null,
+            liveQuoteAt: null,
             _pendingEntry: !!(meta.entryOrderPlacedAt && meta.entryOrderCtx),
             liveGreeks: op.greeks || null,
             optionsSource: "robinhood",
@@ -11117,7 +11836,7 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
           if (pos.liveMark != null && pos.entryPremium > 0) {
             const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
             if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
-            recordMarkTrail(pos, pos.liveMark, now, pos.liveBid);
+            recordMarkTrail(pos, pos.liveMark, now, pos.liveBid, pos.liveAsk);
           }
           persistPosTrailMeta(acct, pos);
 
@@ -11478,7 +12197,7 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
 
     // Step 1.5: Exact-order watchdog. Never release a lock merely because an order is absent from
     // the `confirmed` feed: queued, partial, and pending-cancel orders can still sell the contract.
-    if (robinhood.optionsEnabled && !(acct.paused && acct.pausedBy === "user")) {
+    if (robinhood.optionsEnabled) {
       for (const pos of positions) {
         if (pos.type === "equity" || pos.optionsSource !== "robinhood") continue;
         const metaKey = pos.occSymbol || pos.optionMetaKey;
@@ -11666,7 +12385,7 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
           if (pos.liveMark != null && pos.entryPremium > 0) {
             const pnl = (pos.liveMark - pos.entryPremium) / pos.entryPremium;
             if (pnl > pos.bestPnlPct) pos.bestPnlPct = pnl;
-            recordMarkTrail(pos, pos.liveMark, now, pos.liveBid);
+            recordMarkTrail(pos, pos.liveMark, now, pos.liveBid, pos.liveAsk);
             persistPosTrailMeta(acct, pos);
           }
           return true;
@@ -11747,6 +12466,104 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
 // sync/order mutations, so a manager tick can never overlap an entry commit.
 
 const brokerExecutionLanes = new Map();
+const RH_RECONNECT_BACKOFF_MS = 60_000;
+const RH_HEALTH_PROBE_INTERVAL_MS = 30_000;
+let rhReconnectAttemptAt = 0;
+let rhReconnectPromise = null;
+let rhLastHealthProbeAt = 0;
+let rhHealthProbePromise = null;
+
+async function ensureRobinhoodConnectionHealth() {
+  const liveAccounts = [...accounts.values()].filter(acct => acct.config.broker === "robinhood" && !acct.learning);
+  if (!liveAccounts.length) return robinhood.isConnected;
+
+  const now = Date.now();
+  let changed = false;
+
+  // `isConnected` only proves that an MCP handshake once succeeded. Exercise a real, read-only
+  // broker call on a short cadence so a dead session cannot look healthy indefinitely. Coalesce
+  // concurrent manager/main-loop checks into one probe.
+  if (rhHealthProbePromise) {
+    await rhHealthProbePromise;
+  } else if (robinhood.isAuthenticated && now - rhLastHealthProbeAt >= RH_HEALTH_PROBE_INTERVAL_MS) {
+    rhLastHealthProbeAt = now;
+    const probe = withBrokerExecutionLane(liveAccounts[0], () => robinhood.healthCheck())
+      .catch(() => false);
+    rhHealthProbePromise = probe;
+    try { await probe; }
+    finally { if (rhHealthProbePromise === probe) rhHealthProbePromise = null; }
+  }
+
+  if (!robinhood.isConnected) {
+    for (const acct of liveAccounts) {
+      const health = acct.state.brokerHealth || {};
+      if (!health.disconnectedAt) health.disconnectedAt = now;
+      health.status = "disconnected";
+      health.lastCheckedAt = robinhood.lastHealthCheckAt || now;
+      health.lastProbeFailureAt = robinhood.lastHealthFailureAt || health.lastProbeFailureAt || null;
+      health.lastError = robinhood.lastHealthError || robinhood.lastInitError || "Robinhood transport unavailable";
+      acct.state.brokerHealth = health;
+      // A broker outage disables new entries immediately. Preserve a deliberate user pause, but
+      // otherwise require manual resume after recovery; open-position exits keep their own lane.
+      if (!(acct.paused && acct.pausedBy === "user") && !(acct.paused && acct.pausedBy === "broker")) {
+        acct.paused = true;
+        acct.pausedBy = "broker";
+        acct._entryEpoch = (acct._entryEpoch || 0) + 1;
+        changed = true;
+      }
+      if (!health.notifiedAt) {
+        health.notifiedAt = now;
+        const msg = "Robinhood connection is down. New entries are PAUSED; position management cannot execute until reconnection. Recovery will leave entries paused for manual review.";
+        log(acct, `🚨 BROKER HEALTH: ${msg}`);
+        diag("risk_halt", acct, { kind: "broker_disconnected", disconnectedAt: health.disconnectedAt });
+        sendPush(`🚨 Broker disconnected [${acct.name}]`, msg, true).catch(() => {});
+        changed = true;
+      }
+    }
+
+    if (robinhood.isAuthenticated && !rhReconnectPromise && now - rhReconnectAttemptAt >= RH_RECONNECT_BACKOFF_MS) {
+      rhReconnectAttemptAt = now;
+      rhReconnectPromise = withBrokerExecutionLane(liveAccounts[0], async () => {
+        try {
+          const initialized = await robinhood.init();
+          if (initialized) {
+            rhLastHealthProbeAt = Date.now();
+            await robinhood.healthCheck();
+          }
+        }
+        catch (error) { console.log(`  [RH] Reconnect failed: ${error.message}`); }
+      });
+      rhReconnectPromise.finally(() => { rhReconnectPromise = null; });
+      await rhReconnectPromise;
+    }
+  }
+
+  if (robinhood.isConnected) {
+    for (const acct of liveAccounts) {
+      const health = acct.state.brokerHealth || {};
+      if (health.status === "disconnected") {
+        health.status = "reconnected_paused";
+        health.lastDisconnectedAt = health.disconnectedAt || now;
+        health.lastReconnectedAt = Date.now();
+        delete health.disconnectedAt;
+        delete health.notifiedAt;
+        acct.state.brokerHealth = health;
+        log(acct, "BROKER HEALTH: Robinhood reconnected — protective management is active; new entries remain paused until manual review/resume.");
+        diag("data", acct, { kind: "broker_reconnected", paused: acct.paused, pausedBy: acct.pausedBy });
+        changed = true;
+      } else if (!health.status || health.status === "unknown") {
+        health.status = "healthy";
+        changed = true;
+      }
+      health.lastCheckedAt = robinhood.lastHealthCheckAt || Date.now();
+      health.lastProbeSuccessAt = robinhood.lastHealthSuccessAt || health.lastProbeSuccessAt || null;
+      delete health.lastError;
+      acct.state.brokerHealth = health;
+    }
+  }
+  if (changed) saveAccounts();
+  return robinhood.isConnected;
+}
 
 function executionLaneFor(acct) {
   const key = acct.config.broker === "robinhood" ? "robinhood" : `${acct.config.broker}:${acct.id}`;
@@ -11846,7 +12663,6 @@ function analyzeHeldPositions(acct, quotes) {
 
 async function runRobinhoodPositionManagement(acct) {
   if (acct.config.broker !== "robinhood" || !robinhood.isConnected) return { skipped: true };
-  if (acct.paused && acct.pausedBy === "user") return { skipped: true };
   const hasHolding = (acct.state.positions || []).some(pos => !pos._pending);
   const hasExitIntent = Object.values(acct.state.meta || {}).some(meta => meta?.exitOrderPlacedAt);
   if (!hasHolding && !hasExitIntent) {
@@ -11856,8 +12672,7 @@ async function runRobinhoodPositionManagement(acct) {
 
   return withBrokerExecutionLane(acct, async () => {
     const quotes = await fetchHeldRobinhoodQuotes(acct);
-    await syncRobinhoodAccount(acct, quotes, { workEntries: false, refreshBalance: false });
-    if (acct.paused && acct.pausedBy === "user") return { skipped: true };
+    await syncRobinhoodAccount(acct, quotes, { workEntries: true, refreshBalance: false });
 
     const { analyses, shortTermAnalyses } = analyzeHeldPositions(acct, quotes);
     await manageOpenPositions(acct, quotes, analyses, shortTermAnalyses);
@@ -11878,6 +12693,8 @@ function startRobinhoodPositionManager() {
   const tick = async () => {
     const startedAt = Date.now();
     const marketOpen = isMarketOpenLocal();
+    try { await ensureRobinhoodConnectionHealth(); }
+    catch (e) { console.log(`  [RH] Health watchdog error: ${e.message}`); }
     if (marketOpen) {
       for (const acct of accounts.values()) {
         if (acct.config.broker !== "robinhood") continue;
@@ -12021,7 +12838,7 @@ async function runCycle(acct, sharedQuotes, apiKey) {
   const regime = getMarketRegime(acct.candleCache);
   acct.currentRegime = regime;
   acct.riskPct = effectiveRiskPct(cfg.baseRiskPct, regime);
-  log(acct, `REGIME: ${regime.label} | Risk: ${(acct.riskPct * 100).toFixed(1)}% per trade (${cfg.baseRiskPct >= 1.0 ? "max risk override, regime scale skipped" : `${regime.riskScale}x base`})`);
+  log(acct, `REGIME: ${regime.label} | Allocation cap: ${(acct.riskPct * 100).toFixed(1)}% (${regime.riskScale}x base) | Planned loss cap: ${((cfg.riskPerTradePct || 0) * 100).toFixed(2)}% equity`);
 
   // Daily loss halt fires off open-position drawdown too — check before entries, after sync.
   evaluateRiskHalts(acct, portfolioValue(state, quotes));
@@ -12319,14 +13136,13 @@ async function runPausedCycle(acct, sharedQuotes) {
   // paused (a hard risk-halt pauses entries but must not abandon open positions).
   if (cfg.broker === "tradier") await syncBrokerAccount(acct, quotes);
 
-  // Manual pause means hands off ENTIRELY: no entries AND no automated exits. The user hitting
-  // pause to stop an imminent auto-exit must actually stop it. Only a breaker-initiated pause
-  // ("risk") keeps the exit engines running so open positions aren't abandoned mid-halt.
+  // Every pause is entry-only. Risk controls and the manual kill switch must never abandon an
+  // already-open position; protective exits continue on their normal broker lane.
   const manualPause = acct.pausedBy === "user";
-  if (!manualPause && cfg.broker !== "robinhood") {
+  if (cfg.broker !== "robinhood") {
     await manageOpenPositions(acct, quotes, analyses, shortTermAnalyses);
-  } else if (!manualPause && Date.now() - (acct._lastPositionManagerAt || 0) >= POSITION_MANAGER_STALE_MS) {
-    log(acct, "POSITION MANAGER: fast loop stale during risk halt — running fallback");
+  } else if (Date.now() - (acct._lastPositionManagerAt || 0) >= POSITION_MANAGER_STALE_MS) {
+    log(acct, "POSITION MANAGER: fast loop stale during pause — running protective fallback");
     await runRobinhoodPositionManagement(acct);
   }
 
@@ -12335,7 +13151,7 @@ async function runPausedCycle(acct, sharedQuotes) {
 
   const pv = portfolioValue(state, quotes);
   const pnlPct = ((pv - cfg.startingCash) / cfg.startingCash * 100).toFixed(1);
-  log(acct, `[PAUSED${manualPause ? " — MANUAL" : " — RISK HALT"}] Portfolio: $${pv.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%) | Cash: $${state.cash.toFixed(0)} | ${state.positions.length} open | ${manualPause ? "ALL automated trading halted (positions are yours to manage)" : "exits active, no new entries"}`);
+  log(acct, `[PAUSED${manualPause ? " — MANUAL" : " — RISK HALT"}] Portfolio: $${pv.toFixed(0)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%) | Cash: $${state.cash.toFixed(0)} | ${state.positions.length} open | exits active, no new entries`);
 
   dash.portfolioHistory = dash.portfolioHistory || [];
   appendPortfolioPoint(dash.portfolioHistory, Date.now(), pv);
@@ -12381,10 +13197,10 @@ function buildPositionDetails(acct, quotes) {
       ? (curPremium - pos.entryPremium) * pos.qty * (isEq ? 1 : 100) : 0;
     const plan = managementPlanFor(pos, cfg, now);
     const profitPrice = pos.entryPremium * (1 + plan.profitTarget);
-    // Options don't exit on the configured premium stop anymore — their loss exits are the
-    // structural spot stop and the 1.8× disaster floor. Show the disaster floor so the panel
-    // reflects the price at which the bot would actually sell, not a line it will hold through.
-    const stopMult = isEq ? plan.stopLoss : plan.disasterFloor;
+    // Options use the frozen premium stop plus structural invalidation. Live premium stops need
+    // repeated exact-contract bids from a coherent book, so the displayed line is the real risk
+    // limit while execution remains protected from one-off bad prints.
+    const stopMult = plan.stopLoss;
     const stopLossPrice = pos.entryPremium * (1 + stopMult);
 
     let effectiveStop;
@@ -12395,7 +13211,7 @@ function buildPositionDetails(acct, quotes) {
     return {
       ...pos, spot, dteLeft, curPremium, pnlPct, pnlDollar,
       profitTarget: { pct: `+${(plan.profitTarget * 100).toFixed(0)}%`, premium: profitPrice.toFixed(2) },
-      stopLoss: { pct: `${(stopMult * 100).toFixed(0)}%${isEq ? "" : " (disaster floor; structural stop leads)"}`, premium: effectiveStop.toFixed(2) },
+      stopLoss: { pct: `${(stopMult * 100).toFixed(0)}%${isEq ? "" : " (confirmed exact bids)"}`, premium: effectiveStop.toFixed(2) },
       pctToProfit: curPremium > 0 ? ((profitPrice - curPremium) / curPremium * 100).toFixed(1) : "—",
       pctToStop: curPremium > 0 ? ((effectiveStop - curPremium) / curPremium * 100).toFixed(1) : "—",
       greeks: pos.liveGreeks
@@ -12837,10 +13653,11 @@ async function main() {
     const optLabel = robinhood.optionsEnabled ? "equity + options" : "equity only";
     console.log(`  Robinhood: CONNECTED ✓ (agentic account: ${robinhood.accountNumber}, ${optLabel})`);
   } else {
-    console.log("  Robinhood: MCP not connected — account will run in paper mode until token is set");
+    console.log("  Robinhood: MCP not connected — live account entries will be paused until broker recovery");
   }
   // Always provision the account so it appears in the dashboard
   await ensureRobinhoodAccount();
+  await ensureRobinhoodConnectionHealth();
   if (rhOk) {
     await ensureRhWatchlist();
     const modeLabel = rhTradeMode({ broker: "robinhood" });

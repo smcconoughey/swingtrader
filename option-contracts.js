@@ -40,9 +40,12 @@ export function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 
       const roundTripFrictionPct = ((c.ask - c.bid) + (2 * FEE_PER_CONTRACT / 100)) / c.ask;
 
       const iv = c.impliedVolatility > 0 ? c.impliedVolatility : null;
-      const delta = c.delta != null ? c.delta : null;
+      const deltaValue = Number(c.delta);
+      const delta = Number.isFinite(deltaValue) ? deltaValue : null;
       if (iv != null && iv > MAX_ENTRY_IV) continue;
-      if (delta != null && Math.abs(delta) < MIN_OPTION_DELTA) continue;
+      // Missing Greeks are not evidence of acceptable risk. Live selection must fail closed rather
+      // than admit an unmeasurable far-OTM lottery contract.
+      if (delta == null || Math.abs(delta) < MIN_OPTION_DELTA) continue;
 
       const feeDragPct = mid > 0 ? (2 * FEE_PER_CONTRACT) / (mid * 100) : 0;
       const smallCapPenalty = spotPrice < 10 ? 0.6 : spotPrice < 20 ? 0.3 : 0;

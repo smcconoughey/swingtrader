@@ -65,7 +65,7 @@ function evaluate(positionOverrides = {}, marketOverrides = {}, signalOverrides 
   });
 }
 
-test("SPY regression: intended limit is ignored and a shallow long-DTE premium loss is not a stop", () => {
+test("SPY regression: intended limit is ignored and one long-DTE loss quote waits for confirmation", () => {
   const decision = evaluate(
     {
       ticker: "SPY",
@@ -82,9 +82,206 @@ test("SPY regression: intended limit is ignored and a shallow long-DTE premium l
   );
 
   assert.equal(decision.action, "hold");
-  assert.equal(decision.reasonCode, "HOLD_THESIS");
+  assert.equal(decision.reasonCode, "PREMIUM_STOP_CONFIRMING");
   assert.ok(decision.metrics.exitPnlPct < -0.30);
-  assert.ok(decision.metrics.exitPnlPct > decision.plan.disasterFloor);
+  assert.equal(decision.plan.stopLoss, -0.25);
+  assert.equal(decision.metrics.premiumStopConfirmed, false);
+});
+
+test("three coherent exact bids through the configured stop close a live option", () => {
+  const decision = evaluate(
+    {
+      markTrail: [
+        { ts: NOW - 120_000, mark: 0.76, bid: 0.74, bookCoherent: true },
+        { ts: NOW - 60_000, mark: 0.75, bid: 0.73, bookCoherent: true },
+        { ts: NOW, mark: 0.74, bid: 0.72, bookCoherent: true },
+      ],
+    },
+    { mark: 0.74, bid: 0.72, ask: 0.76 },
+  );
+
+  assert.equal(decision.action, "close");
+  assert.equal(decision.reasonCode, "PREMIUM_STOP");
+  assert.equal(decision.metrics.premiumStopConfirmed, true);
+});
+
+test("a newly coherent quote cannot promote earlier wide bids into stop confirmation", () => {
+  const decision = evaluate(
+    {
+      markTrail: [
+        { ts: NOW - 120_000, bid: 0.70, ask: 1.10, bookWide: true },
+        { ts: NOW - 60_000, bid: 0.71, ask: 1.09, bookWide: true },
+        { ts: NOW, bid: 0.72, ask: 0.76, bookCoherent: true },
+      ],
+    },
+    { mark: 0.74, bid: 0.72, ask: 0.76 },
+  );
+
+  assert.equal(decision.action, "hold");
+  assert.equal(decision.reasonCode, "PREMIUM_STOP_CONFIRMING");
+  assert.equal(decision.metrics.premiumStopSamples, 1);
+  assert.equal(decision.metrics.premiumStopConfirmed, false);
+});
+
+test("a display refresh cannot make a stale executable bid satisfy the stop window", () => {
+  const decision = evaluate(
+    {
+      markTrail: [
+        { ts: NOW - 120_000, sampledAt: NOW - 10_000, bidSampledAt: NOW - 120_000, bid: 0.74, bookCoherent: true },
+        { ts: NOW - 60_000, sampledAt: NOW - 5_000, bidSampledAt: NOW - 60_000, bid: 0.73, bookCoherent: true },
+        { ts: NOW, bidSampledAt: NOW, bid: 0.72, bookCoherent: true },
+      ],
+    },
+    { mark: 0.74, bid: 0.72, ask: 0.76 },
+    {},
+    { premiumStopMaxAgeMs: 90_000 },
+  );
+
+  assert.equal(decision.action, "hold");
+  assert.equal(decision.reasonCode, "PREMIUM_STOP_CONFIRMING");
+  assert.equal(decision.metrics.premiumStopSamples, 2);
+});
+
+test("confirmed premium stop keeps hard-stop priority when the structural spot stop also fires", () => {
+  const decision = evaluate(
+    {
+      markTrail: [
+        { ts: NOW - 120_000, bid: 0.74, bookCoherent: true },
+        { ts: NOW - 60_000, bid: 0.73, bookCoherent: true },
+        { ts: NOW, bid: 0.72, bookCoherent: true },
+      ],
+    },
+    { spot: 94, mark: 0.74, bid: 0.72, ask: 0.76 },
+  );
+
+  assert.equal(decision.action, "close");
+  assert.equal(decision.reasonCode, "PREMIUM_STOP");
+  assert.equal(decision.metrics.premiumStopConfirmed, true);
+  assert.ok(decision.metrics.adverseSpotMove >= decision.metrics.spotStopThreshold);
+});
+
+test("low-DTE loss is urgent instead of waiting behind premium-stop confirmation", () => {
+  const decision = evaluate(
+    { dte: 4, dteRemaining: 4, markTrail: [{ ts: NOW, bid: 0.74 }] },
+    { mark: 0.90, bid: 0.74, ask: 1.06, dteRemaining: 4 },
+  );
+
+  assert.equal(decision.action, "close");
+  assert.equal(decision.reasonCode, "LOW_DTE_LOSS");
+  assert.equal(decision.urgency, "urgent");
+  assert.equal(decision.metrics.premiumStopConfirmed, false);
+});
+
+test("15-second manager cadence can confirm a stop after a continuous minute", () => {
+  const decision = evaluate(
+    {
+      markTrail: [
+        { ts: NOW - 60_000, bid: 0.74, bookCoherent: true },
+        { ts: NOW - 45_000, bid: 0.73, bookCoherent: true },
+        { ts: NOW - 30_000, bid: 0.72, bookCoherent: true },
+        { ts: NOW - 15_000, bid: 0.71, bookCoherent: true },
+        { ts: NOW, bid: 0.70, bookCoherent: true },
+      ],
+    },
+    { mark: 0.72, bid: 0.70, ask: 0.74 },
+  );
+
+  assert.equal(decision.action, "close");
+  assert.equal(decision.reasonCode, "PREMIUM_STOP");
+  assert.equal(decision.metrics.premiumStopConfirmed, true);
+  assert.equal(decision.metrics.premiumStopSpanMs, 60_000);
+});
+
+test("a recovery above the stop resets the continuous confirmation window", () => {
+  const decision = evaluate(
+    {
+      markTrail: [
+        { ts: NOW - 75_000, bid: 0.74, bookCoherent: true },
+        { ts: NOW - 60_000, bid: 0.76, bookCoherent: true },
+        { ts: NOW - 45_000, bid: 0.73, bookCoherent: true },
+        { ts: NOW - 30_000, bid: 0.72, bookCoherent: true },
+        { ts: NOW - 15_000, bid: 0.71, bookCoherent: true },
+        { ts: NOW, bid: 0.70, bookCoherent: true },
+      ],
+    },
+    { mark: 0.72, bid: 0.70, ask: 0.74 },
+  );
+
+  assert.equal(decision.action, "hold");
+  assert.equal(decision.reasonCode, "PREMIUM_STOP_CONFIRMING");
+  assert.equal(decision.metrics.premiumStopConfirmed, false);
+  assert.equal(decision.metrics.premiumStopSpanMs, 45_000);
+});
+
+test("one dislocated bid cannot trigger a live premium stop", () => {
+  const decision = evaluate(
+    { markTrail: [{ ts: NOW, mark: 0.85, bid: 0.25 }] },
+    { mark: 0.85, bid: 0.25, ask: 1.45 },
+  );
+
+  assert.equal(decision.action, "hold");
+  assert.equal(decision.reasonCode, "PREMIUM_STOP_CONFIRMING");
+  assert.equal(decision.metrics.premiumStopConfirmed, false);
+});
+
+test("a wide book remains quarantined before the bounded escalation interval", () => {
+  const decision = evaluate(
+    {
+      markTrail: [
+        { ts: NOW - 120_000, bid: 0.70, bookWide: true },
+        { ts: NOW - 60_000, bid: 0.69, bookWide: true },
+        { ts: NOW, bid: 0.68, bookWide: true },
+      ],
+    },
+    { mark: 0.90, bid: 0.68, ask: 1.12 },
+  );
+
+  assert.equal(decision.action, "hold");
+  assert.equal(decision.reasonCode, "PREMIUM_STOP_CONFIRMING");
+  assert.equal(decision.metrics.premiumStopConfirmed, false);
+  assert.equal(decision.metrics.premiumStopWideEscalated, false);
+});
+
+test("a sustained wide-book stop escalates after three minutes with patient pricing", () => {
+  const decision = evaluate(
+    {
+      markTrail: [
+        { ts: NOW - 180_000, bid: 0.71, bookWide: true },
+        { ts: NOW - 120_000, bid: 0.70, bookWide: true },
+        { ts: NOW - 60_000, bid: 0.69, bookWide: true },
+        { ts: NOW, bid: 0.68, bookWide: true },
+      ],
+    },
+    { mark: 0.90, bid: 0.68, ask: 1.12 },
+  );
+
+  assert.equal(decision.action, "close");
+  assert.equal(decision.reasonCode, "PREMIUM_STOP_WIDE_BOOK");
+  assert.equal(decision.urgency, "urgent");
+  assert.equal(decision.priceMode, "patient");
+  assert.equal(decision.metrics.premiumStopConfirmed, false);
+  assert.equal(decision.metrics.premiumStopWideEscalated, true);
+  assert.equal(decision.metrics.premiumStopSpanMs, 180_000);
+});
+
+test("a recovery above the stop resets the wide-book escalation clock", () => {
+  const decision = evaluate(
+    {
+      markTrail: [
+        { ts: NOW - 240_000, bid: 0.70, bookWide: true },
+        { ts: NOW - 180_000, bid: 0.76, bookWide: true },
+        { ts: NOW - 120_000, bid: 0.71, bookWide: true },
+        { ts: NOW - 60_000, bid: 0.70, bookWide: true },
+        { ts: NOW, bid: 0.69, bookWide: true },
+      ],
+    },
+    { mark: 0.90, bid: 0.69, ask: 1.11 },
+  );
+
+  assert.equal(decision.action, "hold");
+  assert.equal(decision.reasonCode, "PREMIUM_STOP_CONFIRMING");
+  assert.equal(decision.metrics.premiumStopWideEscalated, false);
+  assert.equal(decision.metrics.premiumStopSpanMs, 120_000);
 });
 
 test("one-contract position banks at trim-one threshold instead of entering a no-op dead zone", () => {
@@ -295,6 +492,23 @@ test("an existing position keeps its frozen plan after account preset changes", 
   assert.equal(restored.trim1Pct, 0.10);
 });
 
+test("a legacy widened-stop plan is migrated without changing its frozen profit mandate", () => {
+  const position = basePosition({
+    managementPlan: {
+      ...createManagementPlan({ profitTarget: 0.80, trim1Pct: 0.30, trim2Pct: 0.60 }, basePosition(), NOW),
+      version: 1,
+      stopLoss: -0.35,
+      disasterFloor: -0.63,
+    },
+  });
+  const migrated = managementPlanFor(position, { profitTarget: 0.12 }, NOW + DAY);
+
+  assert.equal(migrated.version, 2);
+  assert.equal(migrated.stopLoss, -0.25);
+  assert.equal(migrated.disasterFloor, -0.25);
+  assert.equal(migrated.profitTarget, 0.80);
+});
+
 test("an imported broker position reconstructs its original option lifetime", () => {
   const position = basePosition({
     dte: 0,
@@ -363,15 +577,23 @@ test("stale underlying quote suppresses thesis invalidation", () => {
   assert.equal(staleDecision.metrics.thesisState, "unknown");
 });
 
-test("stale underlying quote does not suppress an exact-bid premium disaster exit", () => {
+test("stale underlying quote does not suppress a confirmed exact-bid premium stop", () => {
   const decision = evaluate(
-    { type: "call", entrySpot: 100 },
-    { spot: 95, mark: 0.40, bid: 0.39, underlyingQuoteFresh: false },
+    {
+      type: "call",
+      entrySpot: 100,
+      markTrail: [
+        { ts: NOW - 120_000, bid: 0.44, bookCoherent: true },
+        { ts: NOW - 60_000, bid: 0.42, bookCoherent: true },
+        { ts: NOW, bid: 0.39, bookCoherent: true },
+      ],
+    },
+    { spot: 95, mark: 0.40, bid: 0.39, ask: 0.42, underlyingQuoteFresh: false },
     { score: 20, break8: true, stalling: true },
   );
 
   assert.equal(decision.action, "close");
-  assert.equal(decision.reasonCode, "PREMIUM_DISASTER");
+  assert.equal(decision.reasonCode, "PREMIUM_STOP");
 });
 
 test("stale underlying quote suppresses EMA and analysis-derived stall exits", () => {

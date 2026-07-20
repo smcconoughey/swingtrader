@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  clearEntryOrderTracking,
+  entryIntentSatisfiedByHolding,
   exactOptionQuoteMatches,
   findExactOptionOrder,
   isVerifiedRobinhoodContract,
@@ -196,4 +198,46 @@ test("expired and error orders are terminal while replaced remains unresolved", 
   assert.equal(optionOrderIsTerminal({ status: "ERROR" }), true);
   assert.equal(optionOrderIsTerminal({ state: "replaced" }), false);
   assert.equal(optionOrderIsTerminal({ state: "confirmed" }), false);
+});
+
+test("an exact fully established holding releases stale entry quarantine", () => {
+  const placedAt = Date.parse("2026-07-13T15:00:00Z");
+  const meta = {
+    entryOrderId: "entry-1",
+    entryOrderRefId: "ref-1",
+    entryOrderPlacedAt: placedAt,
+    entryFirstPlacedAt: placedAt,
+    entryOrderLimit: 2.18,
+    entryOrderCtx: { ticker: "KO", qty: 1 },
+  };
+
+  assert.equal(entryIntentSatisfiedByHolding(meta, {
+    heldQuantity: 1,
+    averageFillPrice: 2.24,
+    positionCreatedAt: placedAt + 30_000,
+  }), true);
+  assert.equal(clearEntryOrderTracking(meta), true);
+  assert.equal(meta.entryOrderPlacedAt, undefined);
+  assert.equal(meta.entryOrderCtx, undefined);
+  assert.equal(meta.entryOrderLimit, 2.18);
+});
+
+test("partial or unrelated holdings cannot release an entry quarantine", () => {
+  const placedAt = Date.parse("2026-07-13T15:00:00Z");
+  const meta = {
+    entryOrderPlacedAt: placedAt,
+    entryOrderLimit: 2,
+    entryOrderCtx: { ticker: "KO", qty: 2 },
+  };
+
+  assert.equal(entryIntentSatisfiedByHolding(meta, {
+    heldQuantity: 1,
+    averageFillPrice: 2,
+    positionCreatedAt: placedAt + 30_000,
+  }), false);
+  assert.equal(entryIntentSatisfiedByHolding(meta, {
+    heldQuantity: 2,
+    averageFillPrice: 2,
+    positionCreatedAt: placedAt + 2 * 60 * 60_000,
+  }), false);
 });

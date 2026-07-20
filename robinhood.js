@@ -16,6 +16,10 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import os from "os";
+import {
+  robinhoodAccountAllowlistFromEnv,
+  selectRobinhoodTradingAccount,
+} from "./live-broker-safety.js";
 
 // ─── Configuration ───
 
@@ -44,6 +48,31 @@ let discoveredTools = new Set();
 let discoveredToolSchemas = new Map();
 let optionsSupported = false;
 let lastInitError = null;
+
+// `mcpInitialized` only records that the initialize handshake once succeeded; it does not prove
+// the session or broker authorization is still usable. Keep explicit probe state so callers can
+// distinguish a fresh read-only broker check from that cached transport flag.
+let healthStatus = "unknown";
+let lastHealthCheckAt = null;
+let lastHealthSuccessAt = null;
+let lastHealthFailureAt = null;
+let lastHealthError = null;
+let healthCheckInProgress = null;
+
+function robinhoodAccountRows(raw) {
+  const body = raw?.data ?? raw;
+  if (Array.isArray(body)) return body;
+  if (Array.isArray(body?.accounts)) return body.accounts;
+  if (Array.isArray(body?.results)) return body.results;
+  if (body && typeof body === "object" && (body.account_number || body.account_id)) return [body];
+  return [];
+}
+
+function selectedRobinhoodAccount(raw) {
+  return selectRobinhoodTradingAccount(robinhoodAccountRows(raw), {
+    allowlist: robinhoodAccountAllowlistFromEnv(process.env),
+  });
+}
 
 // ─── Token Refresh ───
 
@@ -219,6 +248,16 @@ function buildSchemaArgs(toolName, candidateArgs) {
   return filtered;
 }
 
+function idempotencySchemaError(toolName) {
+  const error = new Error(
+    `Robinhood safety block: discovered ${toolName} schema does not accept ref_id; `
+    + "refusing to place an option order whose idempotency key would be discarded",
+  );
+  error.code = "RH_IDEMPOTENCY_UNSUPPORTED";
+  error.idempotencyUnsupported = true;
+  return error;
+}
+
 // Find the first discovered tool whose name matches any of the given regexes, tried in order.
 // Lets us bind to whatever the MCP server actually named a tool instead of hardcoding guesses.
 function findTool(...patterns) {
@@ -376,6 +415,25 @@ const robinhood = {
     return info;
   },
   get lastInitError() { return lastInitError; },
+  get healthStatus() { return healthStatus; },
+  get lastHealthCheckAt() { return lastHealthCheckAt; },
+  get lastHealthSuccessAt() { return lastHealthSuccessAt; },
+  get lastHealthFailureAt() { return lastHealthFailureAt; },
+  get lastHealthError() { return lastHealthError; },
+  get health() {
+    return {
+      status: healthStatus,
+      checking: !!healthCheckInProgress,
+      lastCheckAt: lastHealthCheckAt,
+      lastSuccessAt: lastHealthSuccessAt,
+      lastFailureAt: lastHealthFailureAt,
+      error: lastHealthError,
+      authenticated: !!accessToken,
+      initialized: mcpInitialized,
+      connected: !!accessToken && mcpInitialized,
+      probe: "get_accounts",
+    };
+  },
 
   buildOCC,
   parseOCC,
@@ -390,6 +448,10 @@ const robinhood = {
     }
 
     lastInitError = null;
+    // Never carry an account choice across a new MCP initialization. A stale account number from a
+    // previous token/session is more dangerous than temporarily reporting disconnected.
+    discoveredAccountNumber = null;
+    mcpInitialized = false;
 
     try {
       const initResult = await mcpCall("initialize", {
@@ -447,31 +509,15 @@ const robinhood = {
         console.log(`  [RH] tools/list unavailable (${e.message}) — assuming equity only`);
       }
 
-      // Auto-discover the agentic account
-      try {
-        let accounts = await robinhood.getAccounts();
-        if (accounts && accounts.data && Array.isArray(accounts.data.accounts)) {
-          accounts = accounts.data.accounts;
-        } else if (accounts && Array.isArray(accounts.accounts)) {
-          accounts = accounts.accounts;
-        }
-
-        if (Array.isArray(accounts)) {
-          const agentic = accounts.find(a => a.agentic_allowed || a.is_agentic || a.nickname === "Agentic");
-          if (agentic) {
-            discoveredAccountNumber = agentic.account_number || agentic.account_id;
-            console.log(`  [RH] Agentic account discovered: ${discoveredAccountNumber}`);
-          } else if (accounts.length > 0) {
-            discoveredAccountNumber = accounts[0].account_number || accounts[0].account_id;
-            console.log(`  [RH] Using first account: ${discoveredAccountNumber} (no explicit agentic flag found)`);
-          }
-        } else if (typeof accounts === "object" && accounts.account_number) {
-          discoveredAccountNumber = accounts.account_number;
-          console.log(`  [RH] Account discovered: ${discoveredAccountNumber}`);
-        }
-      } catch (e) {
-        console.log(`  [RH] Account discovery failed: ${e.message}`);
+      // A process-global execution client must resolve to one explicitly authorized account. Never
+      // fall back to "the first" account: profile ordering is not an authorization boundary.
+      const accounts = await robinhood.getAccounts();
+      const selection = selectedRobinhoodAccount(accounts);
+      if (!selection.accountNumber) {
+        throw new Error(`Robinhood account safety block: ${selection.reason}`);
       }
+      discoveredAccountNumber = selection.accountNumber;
+      console.log(`  [RH] Trading account selected (${selection.mode}): ${discoveredAccountNumber}`);
 
       console.log(`  [RH] Robinhood Agentic Trading connected ✓${optionsSupported ? " (equity + options)" : " (equity only)"}`);
       return true;
@@ -481,6 +527,61 @@ const robinhood = {
       mcpInitialized = false;
       return false;
     }
+  },
+
+  // Exercise a real, read-only broker tool call. A successful initialize handshake can outlive
+  // the underlying MCP session, so consumers should use this probe for watchdog decisions instead
+  // of treating `isConnected` as a perpetual health signal. Failures deliberately invalidate the
+  // cached session and force a full init before trading resumes.
+  async healthCheck() {
+    if (healthCheckInProgress) return healthCheckInProgress;
+
+    healthStatus = "checking";
+    const checkPromise = (async () => {
+      try {
+        if (!accessToken) throw new Error("Robinhood not authenticated");
+        const result = await callTool("get_accounts", {});
+        const accounts = extractContent(result);
+        if (!discoveredAccountNumber) {
+          throw new Error("Robinhood trading account was not safely selected during initialization");
+        }
+        const selection = selectedRobinhoodAccount(accounts);
+        if (!selection.accountNumber) throw new Error(`Robinhood account safety block: ${selection.reason}`);
+        if (selection.accountNumber !== discoveredAccountNumber) {
+          throw new Error(
+            `Robinhood account safety block: probe selected ${selection.accountNumber}, expected ${discoveredAccountNumber}`,
+          );
+        }
+
+        const checkedAt = Date.now();
+        mcpInitialized = true;
+        healthStatus = "healthy";
+        lastHealthCheckAt = checkedAt;
+        lastHealthSuccessAt = checkedAt;
+        lastHealthError = null;
+        return true;
+      } catch (error) {
+        const checkedAt = Date.now();
+        mcpInitialized = false;
+        sessionId = null;
+        healthStatus = "unhealthy";
+        lastHealthCheckAt = checkedAt;
+        lastHealthFailureAt = checkedAt;
+        lastHealthError = error?.message || String(error);
+        return false;
+      }
+    })();
+    healthCheckInProgress = checkPromise;
+    try {
+      return await checkPromise;
+    } finally {
+      if (healthCheckInProgress === checkPromise) healthCheckInProgress = null;
+    }
+  },
+
+  // Alias for callers that use probe-oriented naming. Retains the same boolean contract.
+  async probe() {
+    return this.healthCheck();
   },
 
   // ─── Account & Portfolio ───
@@ -769,13 +870,25 @@ const robinhood = {
     if (!acctNum) throw new Error("No account number");
     const toolName = discoveredTools.has("place_option_order") ? "place_option_order"
       : findTool(/place_options?_order/i) || "place_option_order";
+    const callerSuppliedRefId = Object.prototype.hasOwnProperty.call(params, "refId")
+      && params.refId !== undefined && params.refId !== null;
+    if (callerSuppliedRefId && !schemaAccepts(toolName, "ref_id")) {
+      throw idempotencySchemaError(toolName);
+    }
     const { args, optionId, legSide, posEffect } = await this._buildOptionOrderArgs({ ...params, acctNum });
+    const wireArgs = buildSchemaArgs(toolName, args);
+    // A caller-supplied ref is persisted specifically so an ambiguous submission can be replayed
+    // under the same broker idempotency key. Silently schema-filtering it creates duplicate-order
+    // risk, so stop before the placement RPC whenever the discovered schema would drop it.
+    if (callerSuppliedRefId && !Object.prototype.hasOwnProperty.call(wireArgs, "ref_id")) {
+      throw idempotencySchemaError(toolName);
+    }
     const label = params.symbol
       ? buildOCC(params.symbol, params.expirationDate, params.optionType || "call", parseFloat(params.strikePrice) || 0)
       : optionId;
     console.log(`  [RH] Placing OPTION ${legSide}/${posEffect} ${args.quantity}x ${label} (${args.type}${args.price ? ` @ $${args.price}` : ""})`);
 
-    const result = await callTool(toolName, buildSchemaArgs(toolName, args));
+    const result = await callTool(toolName, wireArgs);
     const parsed = extractContent(result);
     console.log(`  [RH] Option order result:`, typeof parsed === "string" ? parsed.slice(0, 200) : JSON.stringify(parsed).slice(0, 200));
     return parsed;
@@ -887,6 +1000,9 @@ const robinhood = {
   // (from dynamic client registration). Required for refresh_token grants to succeed later.
   setToken(token, refresh = null, meta = {}) {
     accessToken = (token || "").trim() || null;
+    discoveredAccountNumber = null;
+    mcpInitialized = false;
+    sessionId = null;
     refreshToken = refresh != null ? String(refresh).trim() || null : refreshToken;
     if (meta.clientId) oauthClientId = meta.clientId;
     if (meta.tokenEndpoint) oauthTokenEndpoint = meta.tokenEndpoint;
@@ -894,11 +1010,13 @@ const robinhood = {
       refreshToken = null;
       oauthClientId = null;
       oauthTokenEndpoint = null;
-      mcpInitialized = false;
-      sessionId = null;
+      healthStatus = "unknown";
+      lastHealthError = null;
       try { fs.unlinkSync(TOKEN_FILE); } catch { }
       return;
     }
+    healthStatus = "unknown";
+    lastHealthError = null;
     saveTokens();
   },
 
