@@ -59,10 +59,12 @@ import {
   clearEntryOrderTracking,
   entryIntentSatisfiedByHolding,
   exactOptionQuoteMatches,
+  findBrokerCloseFillForPosition,
   findExactOptionOrder,
   isVerifiedRobinhoodContract,
   normalizeOptionId,
   optionOrderAverageFillPrice,
+  optionOrderId,
   optionOrderExecutedGross,
   optionOrderExecutedQuantity,
   optionOrderIsTerminal,
@@ -5189,9 +5191,9 @@ async function closePosition(acct, pos, currentPremium, reason, qtyToClose, exec
         const priceMode = execution.priceMode || (guaranteedFill ? "marketable" : "patient");
 
         // How many exit attempts on this contract have already gone stale (canceled by the
-        // watchdog). Each retry escalates: attempt 0 negotiates, later attempts hit the bid,
-        // and from the 3rd attempt price one tick UNDER the bid so the order is unambiguously
-        // marketable (a sell limit below the bid still fills at the bid or better).
+        // watchdog). Marketable exits cross after the first stale attempt. A protective exit in
+        // a wide book instead concedes in bounded steps toward a guarded floor above the raw bid;
+        // it must never turn a quarantined book dislocation into the next executable limit.
         const occKey = pos.occSymbol || (pos.expiryDate ? robinhood.buildOCC(pos.ticker, new Date(pos.expiryDate).toISOString().slice(0, 10), pos.type, pos.strike) : null);
         const exitAttempts = (occKey && acct.state.meta[occKey]?.exitAttempts) || 0;
 
@@ -10666,11 +10668,17 @@ function placeBrokerExit(acct, pos, currentPremium, reason, qty, pnlPct, pnlDoll
   };
   state.history.push(trade);
 
+  // Persist the unresolved exact-OCC intent before the broker request. This remains best-effort:
+  // a sell_to_close reduces exposure, so a local disk failure must not suppress a protective exit.
+  // When the write succeeds, a restart can still reconcile a fast fill even if the process dies
+  // before the broker response supplies its order id.
+  saveAccounts();
+
   tradier.placeOptionOrderByOCC(occForExit, "sell_to_close", qty, "limit", limit)
     .then(res => {
       trade._exitOrderId = brokerOrderId(res);
       trade._orderAcceptedAt = Date.now();
-      log(acct, `TRADIER EXIT: SELL ${qty}x ${occForExit} @ $${limit}${protective ? " (marketable)" : ""} — order ${trade._exitOrderId || "ok"} (${reason})`);
+      log(acct, `TRADIER EXIT: SELL ${qty}x ${occForExit} @ $${limit} (${priceMode}) — order ${trade._exitOrderId || "ok"} (${reason})`);
       saveAccounts();
     })
     .catch(e => {
@@ -11473,6 +11481,10 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
     const now = Date.now();
     const positions = [];
     const seen = new Set();
+    // If Robinhood reports any short/non-long leg for a ticker, quarantine every option leg for
+    // that ticker from this long-only runtime. Mixed-leg/spread exposure cannot be safely managed
+    // one leg at a time, and a stale prior long must not reach exit-intent recovery.
+    const nonLongOptionTickers = new Set();
     let optionOrdersSnapshot = null;
 
     // Fetch equity positions
@@ -11650,6 +11662,7 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
           const rawQuantity = parseFloat(op.quantity || op.pending_buy_quantity || 0);
           const holding = classifyLongOptionHolding({ quantity: rawQuantity, positionSide: rawSide });
           if (holding.quarantine) {
+            nonLongOptionTickers.add(ticker);
             quarantineNonLongBrokerOption(acct, {
               broker: "robinhood",
               symbol: op.occ_symbol || op.occSymbol || op.option_symbol || ticker,
@@ -11871,6 +11884,16 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
       }
     }
 
+    if (nonLongOptionTickers.size > 0) {
+      for (let i = positions.length - 1; i >= 0; i--) {
+        const pos = positions[i];
+        if (pos.type === "equity" || !nonLongOptionTickers.has(String(pos.ticker || "").toUpperCase())) continue;
+        if (pos.occSymbol) seen.delete(pos.occSymbol);
+        if (pos.optionMetaKey) seen.delete(pos.optionMetaKey);
+        positions.splice(i, 1);
+      }
+    }
+
     // ── Broker-fill reconciliation helpers ──
     // Our own limit prices are working estimates, not fills. Everything below prefers the fill
     // Robinhood actually reports; the broker activity record is authoritative for cost basis.
@@ -11923,6 +11946,9 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
           ));
       for (const prev of prevPositions) {
         if (!(prev.qty > 0) || !(prev.entryPremium > 0)) continue;
+        // A broker-reported short/mixed exposure owns this ticker now. Do not resurrect the prior
+        // long into the positions list: downstream recovery can otherwise replay sell_to_close.
+        if (prev.type !== "equity" && nonLongOptionTickers.has(String(prev.ticker || "").toUpperCase())) continue;
         // If the options fetch failed this cycle, we can't tell "closed" from "API error" for
         // option positions — skip them entirely rather than book phantom exits.
         if (prev.type !== "equity" && !optionsFetchOk) {
@@ -11937,29 +11963,20 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
         let closedQty = cur ? Math.max(0, prev.qty - cur.qty) : prev.qty;
         if (closedQty <= 0) continue;
 
-        // Bot exits reconcile only against their persisted exact order identity. A historical
-        // same-contract manual trim cannot prove that a later missing position snapshot is a new
-        // close; reusing it would book phantom proceeds and drop a still-held broker position.
         const weExited = !!(posMeta && (posMeta.exitOrderPlacedAt || posMeta.exitOrderId));
         const expired = !cur && prev.expiryDate && prev.expiryDate < now;
-        if (!weExited && !expired) {
-          if (!cur) {
-            positions.push({ ...prev, _syncMissing: true });
-            if (metaKey) seen.add(metaKey);
-            if (!prev._syncMissing) {
-              log(acct, `ROBINHOOD SYNC: ${prev.ticker} ${prev.type} position gone without a bot exit order — retaining it as an API gap; manual activity requires explicit reconciliation`);
-            }
-          }
-          continue;
-        }
-
         const mult = prev.type === "equity" ? 1 : 100;
-        // Prefer the actual broker fill from the filled-orders feed; fall back to the limit we
-        // worked (or last bid/mark) only when no matching fill is found.
         let closePremium = null;
         let fillConfirmed = false;
         let matchedExitOrder = null;
         let fillGrossForDelta = null;
+        let reconciledFromBrokerHistory = false;
+        const bookedExitOrderIds = new Set(
+          (state.history || [])
+            .flatMap(t => [t._exitOrderId, t._matchedOrderId].filter(Boolean))
+            .map(String),
+        );
+
         if (expired && !weExited) {
           closePremium = 0;
         } else if (prev.type !== "equity") {
@@ -11992,39 +12009,67 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
             const bookedGross = Number(posMeta?.exitBookedGross) || 0;
             const deltaQty = cumulativeQty - bookedQty;
             const deltaGross = cumulativeGross - bookedGross;
-            // Broker position quantity and cumulative executions must agree exactly. If one API is
-            // ahead of the other, preserve the old position as pending and try again next sync.
             if (deltaQty > 0 && Math.abs(deltaQty - closedQty) < 0.0001 && deltaGross > 0) {
               closePremium = deltaGross / deltaQty;
               fillGrossForDelta = deltaGross;
               fillConfirmed = true;
             }
           }
-        }
-        if (weExited && !expired && closePremium == null) {
-          // A quantity shrink (or one-cycle positions API gap) is not enough to advance trim state.
-          // Retain the pre-exit quantity as non-tradeable until the exact filled-order record confirms
-          // price and quantity. This preserves the diff for the next reconciliation pass.
-          if (cur) {
-            cur.qty = prev.qty;
-            cur._pendingExit = true;
-          } else {
-            positions.push({ ...prev, _pendingExit: true });
-            if (metaKey) seen.add(metaKey);
+
+          // Holdings can disappear before local exit metadata is durable, or after an agentic fill
+          // whose order id never made it back to disk. Trust the broker's sell history for the
+          // exact contract once the positions feed confirms the long is gone.
+          if (closePremium == null && !cur) {
+            const brokerClose = findBrokerCloseFillForPosition(orders, {
+              instrumentId: prev.instrumentUrl,
+              occSymbol: prev.occSymbol,
+              openTime: prev.openTime || 0,
+              expectedQty: closedQty,
+              excludeOrderIds: [...bookedExitOrderIds],
+              now,
+            });
+            if (brokerClose) {
+              matchedExitOrder = brokerClose.order;
+              closePremium = brokerClose.fillPrice;
+              fillGrossForDelta = brokerClose.gross;
+              fillConfirmed = true;
+              reconciledFromBrokerHistory = true;
+              log(acct, `ROBINHOOD SYNC: ${prev.ticker} ${prev.occSymbol || ""} closed at broker — reconciled from order ${optionOrderId(brokerClose.order) || "?"}`);
+            }
           }
-          if (!posMeta?.exitReconcileWaitLoggedAt || now - posMeta.exitReconcileWaitLoggedAt >= 60_000) {
-            if (posMeta) posMeta.exitReconcileWaitLoggedAt = now;
-            log(acct, `ROBINHOOD SYNC: ${prev.ticker} changed while exit is pending but no exact matching fill is reported yet — deferring trim/P&L bookkeeping`);
+        }
+
+        if (closePremium == null) {
+          if (weExited && !expired) {
+            if (cur) {
+              cur.qty = prev.qty;
+              cur._pendingExit = true;
+            } else {
+              positions.push({ ...prev, _pendingExit: true });
+              if (metaKey) seen.add(metaKey);
+            }
+            if (!posMeta?.exitReconcileWaitLoggedAt || now - posMeta.exitReconcileWaitLoggedAt >= 60_000) {
+              if (posMeta) posMeta.exitReconcileWaitLoggedAt = now;
+              log(acct, `ROBINHOOD SYNC: ${prev.ticker} changed while exit is pending but no exact matching fill is reported yet — deferring trim/P&L bookkeeping`);
+            }
+            continue;
+          }
+          if (!cur) {
+            positions.push({ ...prev, _syncMissing: true });
+            if (metaKey) seen.add(metaKey);
+            if (!prev._syncMissing) {
+              log(acct, `ROBINHOOD SYNC: ${prev.ticker} ${prev.type} position gone with no matching broker close fill — retaining until reconciliation`);
+            }
           }
           continue;
         }
-        // A resting limit is not an expiry fill. If the long contract disappears after expiry and
-        // no exact execution exists, book it worthless rather than crediting the old submitted limit.
+
         if (expired && closePremium == null) closePremium = 0;
-        if (closePremium == null) closePremium = posMeta?.exitOrderLimit ?? prev.liveBid ?? prev.liveMark ?? prev.entryPremium;
         const pnlDollar = (closePremium - prev.entryPremium) * closedQty * mult;
         const pnlPct = (closePremium - prev.entryPremium) / prev.entryPremium;
-        const reason = posMeta?.exitReason || (expired && !weExited ? "expired worthless" : "robinhood exit filled (synced)");
+        const reason = posMeta?.exitReason
+          || (reconciledFromBrokerHistory ? "robinhood close reconciled from broker fill" : null)
+          || (expired && !weExited ? "expired worthless" : "robinhood exit filled (synced)");
         const proceeds = +(closePremium * closedQty * mult).toFixed(2);
         const trade = {
           ...prev, qty: closedQty,
@@ -12032,7 +12077,8 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
           proceeds,
           pnlDollar: +pnlDollar.toFixed(2), pnlPct,
           reason, closeDate: getETDateStr(), closeTime: now,
-          _estimated: !fillConfirmed, // true = booked from our worked limit, not a broker fill
+          _estimated: !fillConfirmed,
+          _exitOrderId: matchedExitOrder ? optionOrderId(matchedExitOrder) : null,
         };
         // Sale proceeds are invisible to buying power until T+1 — credit them to PV until then.
         if (proceeds > 0) {
@@ -12082,7 +12128,9 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
             clearExitOrderTracking(posMeta, { keepAttempts: false });
           }
         } else if (!cur && metaKey) {
+          clearExitOrderTracking(posMeta || {}, { keepAttempts: false });
           delete state.meta[metaKey]; // fully closed — retire the side-metadata
+          acct._inflightTickers?.delete(prev.ticker.toUpperCase());
         }
       }
     }

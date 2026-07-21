@@ -131,6 +131,7 @@ async function tryRefreshToken() {
         saveTokens();
         sessionId = null;
         mcpInitialized = false;
+        discoveredAccountNumber = null;
         console.log("  [RH] Token refreshed successfully");
         return true;
       }
@@ -185,9 +186,15 @@ async function mcpCall(method, params = {}, _retried = false) {
     if ((res.status === 401 || res.status === 403) && !_retried && refreshToken) {
       const refreshed = await tryRefreshToken();
       if (refreshed) {
-        // Re-init the MCP session with the new token
+        // Re-init and re-authorize the account with the refreshed in-memory token. Never retry a
+        // broker call when strict account discovery failed, and do not reload a stale env token.
         if (method !== "initialize") {
-          try { await robinhood.init(); } catch { }
+          let reinitialized = false;
+          try { reinitialized = await robinhood.init({ reload: false }); } catch { }
+          if (!reinitialized) {
+            throw new Error(`Robinhood token refreshed but account re-authorization failed: ${lastInitError || "unknown error"}`);
+          }
+          assertSelectedAccountArgs(params?.arguments || {});
         }
         return mcpCall(method, params, true);
       }
@@ -225,7 +232,18 @@ async function mcpCall(method, params = {}, _retried = false) {
 
 // ─── MCP Tool Calls ───
 
+function assertSelectedAccountArgs(args = {}) {
+  if (!Object.prototype.hasOwnProperty.call(args, "account_number")) return;
+  const requested = args.account_number == null ? "" : String(args.account_number);
+  if (!discoveredAccountNumber || requested !== String(discoveredAccountNumber)) {
+    throw new Error(
+      `Robinhood account safety block: tool requested ${requested || "no account"}, selected ${discoveredAccountNumber || "none"}`,
+    );
+  }
+}
+
 async function callTool(toolName, args = {}) {
+  assertSelectedAccountArgs(args);
   return mcpCall("tools/call", {
     name: toolName,
     arguments: args,
@@ -439,6 +457,15 @@ const robinhood = {
   parseOCC,
 
   async init({ reload = true } = {}) {
+    lastInitError = null;
+    // Invalidate execution state before any token/account discovery work. Even a token-loading
+    // failure must leave the client disconnected instead of retaining a prior account binding.
+    discoveredAccountNumber = null;
+    mcpInitialized = false;
+    if (reload) {
+      accessToken = null;
+      sessionId = null;
+    }
     if (reload || !accessToken) {
       if (!loadTokens()) {
         lastInitError = "No Robinhood token found";
@@ -446,12 +473,6 @@ const robinhood = {
         return false;
       }
     }
-
-    lastInitError = null;
-    // Never carry an account choice across a new MCP initialization. A stale account number from a
-    // previous token/session is more dangerous than temporarily reporting disconnected.
-    discoveredAccountNumber = null;
-    mcpInitialized = false;
 
     try {
       const initResult = await mcpCall("initialize", {
@@ -564,6 +585,7 @@ const robinhood = {
         const checkedAt = Date.now();
         mcpInitialized = false;
         sessionId = null;
+        discoveredAccountNumber = null;
         healthStatus = "unhealthy";
         lastHealthCheckAt = checkedAt;
         lastHealthFailureAt = checkedAt;
@@ -696,7 +718,8 @@ const robinhood = {
     const toolName = discoveredTools.has("get_options_positions") ? "get_options_positions"
       : discoveredTools.has("get_option_positions") ? "get_option_positions"
       : "get_options_positions";
-    const result = await callTool(toolName, { account_number: acctNum });
+    const args = buildSchemaArgs(toolName, { account_number: acctNum, nonzero: true });
+    const result = await callTool(toolName, args);
     return extractContent(result);
   },
 

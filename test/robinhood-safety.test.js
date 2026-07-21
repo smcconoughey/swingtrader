@@ -5,6 +5,7 @@ import {
   clearEntryOrderTracking,
   entryIntentSatisfiedByHolding,
   exactOptionQuoteMatches,
+  findBrokerCloseFillForPosition,
   findExactOptionOrder,
   isVerifiedRobinhoodContract,
   normalizeOptionId,
@@ -240,4 +241,88 @@ test("partial or unrelated holdings cannot release an entry quarantine", () => {
     averageFillPrice: 2,
     positionCreatedAt: placedAt + 2 * 60 * 60_000,
   }), false);
+});
+
+test("broker close fill is found for a flat account when holdings disappear", () => {
+  const HPE_ID = "22df30c2-c1ef-4278-a87f-54bdc10f3686";
+  const openTime = Date.parse("2026-07-14T13:59:01Z");
+  const closeOrder = {
+    id: "6a5e2351-c90c-4a9a-b8dc-9256ce79ce2c",
+    chain_symbol: "HPE",
+    state: "filled",
+    updated_at: "2026-07-20T13:32:01.699055Z",
+    processed_quantity: "1.00000",
+    processed_premium: "241",
+    legs: [{
+      option_id: HPE_ID,
+      side: "sell",
+      position_effect: "close",
+      expiration_date: "2026-08-21",
+      strike_price: "50.0000",
+      option_type: "call",
+      executions: [{
+        price: "2.41000000",
+        quantity: "1.00000",
+        timestamp: "2026-07-20T13:32:01.388000Z",
+      }],
+    }],
+  };
+  const oldKoClose = {
+    id: "old-ko-close",
+    chain_symbol: "KO",
+    state: "filled",
+    updated_at: "2026-07-06T13:42:37Z",
+    processed_quantity: "1.00000",
+    processed_premium: "260",
+    legs: [{
+      option_id: "84569651-cb1b-442c-a403-261b0ed50a0e",
+      side: "sell",
+      position_effect: "close",
+      expiration_date: "2026-08-21",
+      strike_price: "85.0000",
+      option_type: "call",
+      executions: [{ price: "2.60000000", quantity: "1.00000", timestamp: "2026-07-06T13:42:37Z" }],
+    }],
+  };
+
+  const match = findBrokerCloseFillForPosition([oldKoClose, closeOrder], {
+    instrumentId: HPE_ID,
+    occSymbol: "HPE260821C00050000",
+    openTime,
+    expectedQty: 1,
+    now: Date.parse("2026-07-21T12:00:00Z"),
+  });
+
+  assert.equal(match?.fillPrice, 2.41);
+  assert.equal(match?.executedQty, 1);
+  assert.equal(match?.order?.id, closeOrder.id);
+});
+
+test("broker close fill ignores sells before the position opened or already booked", () => {
+  const HPE_ID = "22df30c2-c1ef-4278-a87f-54bdc10f3686";
+  const openTime = Date.parse("2026-07-14T13:59:01Z");
+  const closeOrder = {
+    id: "booked-close",
+    state: "filled",
+    updated_at: "2026-07-20T13:32:01Z",
+    processed_quantity: "1.00000",
+    processed_premium: "241",
+    legs: [{
+      option_id: HPE_ID,
+      side: "sell",
+      position_effect: "close",
+      expiration_date: "2026-08-21",
+      strike_price: "50.0000",
+      option_type: "call",
+      executions: [{ price: "2.41000000", quantity: "1.00000", timestamp: "2026-07-20T13:32:01Z" }],
+    }],
+  };
+
+  assert.equal(findBrokerCloseFillForPosition([closeOrder], {
+    instrumentId: HPE_ID,
+    openTime: openTime - 86400000,
+    expectedQty: 1,
+    excludeOrderIds: ["booked-close"],
+    now: Date.parse("2026-07-21T12:00:00Z"),
+  }), null);
 });

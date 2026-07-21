@@ -144,6 +144,11 @@ test("read-only probe state and caller idempotency fail closed against discovere
     assert.equal(robinhood.isConnected, true);
 
     await assert.rejects(
+      robinhood.getPortfolio("UNSELECTED-ACCOUNT"),
+      /account safety block/i,
+    );
+
+    await assert.rejects(
       robinhood.placeOptionOrder({
         symbol: "SPY",
         expirationDate: "2026-08-21",

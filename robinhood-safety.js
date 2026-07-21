@@ -225,6 +225,67 @@ export function findExactOptionOrder(orders = [], {
   return candidates[0] || null;
 }
 
+/**
+ * When a long option vanishes from the holdings feed, locate the broker's sell/close fill for that
+ * exact contract. Requires instrument id or OCC — never ticker alone.
+ */
+export function findBrokerCloseFillForPosition(orders = [], {
+  instrumentId = null,
+  occSymbol = null,
+  openTime = 0,
+  expectedQty = null,
+  excludeOrderIds = [],
+  now = Date.now(),
+} = {}) {
+  const expectedInstrumentId = normalizeOptionId(instrumentId);
+  const expectedOcc = parseOccSymbol(occSymbol);
+  if (!expectedInstrumentId && !expectedOcc) return null;
+
+  const excluded = new Set((excludeOrderIds || []).map(String));
+  const candidates = (orders || []).filter(order => {
+    if (orderLegs(order).length !== 1) return false;
+    if (!sideMatches(order, "sell")) return false;
+    if (optionOrderExecutedQuantity(order) <= 0) return false;
+    const oid = optionOrderId(order);
+    if (oid && excluded.has(oid)) return false;
+
+    const timestamp = optionOrderTime(order);
+    if (openTime > 0 && (!(timestamp > 0) || timestamp < openTime - 60_000)) return false;
+    if (timestamp > now + 60_000) return false;
+
+    if (expectedInstrumentId) {
+      const exactLeg = orderLegs(order).some(leg => optionIds(leg).includes(expectedInstrumentId));
+      if (!exactLeg) return false;
+    } else {
+      const exactLeg = orderLegs(order).some(leg => {
+        const identity = legIdentity(leg, order);
+        return identity.ticker === expectedOcc.ticker
+          && identity.type === expectedOcc.type
+          && identity.expiration === expectedOcc.expiration
+          && identity.strike != null
+          && Math.abs(identity.strike - expectedOcc.strike) < 0.001;
+      });
+      if (!exactLeg) return false;
+    }
+    return true;
+  });
+
+  candidates.sort((a, b) => optionOrderTime(b) - optionOrderTime(a));
+  for (const order of candidates) {
+    const executedQty = optionOrderExecutedQuantity(order);
+    if (expectedQty != null && Math.abs(executedQty - expectedQty) >= 0.0001) continue;
+    const fillPrice = optionOrderAverageFillPrice(order);
+    if (!(fillPrice > 0)) continue;
+    return {
+      order,
+      fillPrice: +fillPrice.toFixed(2),
+      executedQty,
+      gross: optionOrderExecutedGross(order),
+    };
+  }
+  return null;
+}
+
 export function optionOrderExecutions(order = {}) {
   const executions = [];
   for (const leg of orderLegs(order)) {
