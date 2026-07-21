@@ -1062,7 +1062,7 @@ const LEARNING_VARIANTS = [
   { key: "baseline", name: "Baseline", desc: "parent config, unchanged", tweak: {} },
   { key: "selective", name: "High conviction", desc: "quality ≥75, 4% allocation cap", tweak: { minSetupQuality: 75, baseRiskPct: 0.04 } },
   { key: "loose", name: "Looser filter", desc: "quality ≥45 — more shots", tweak: { minSetupQuality: 45 } },
-  { key: "quicktp", name: "Quick profits", desc: "TP +20% / SL -20%", tweak: { profitTarget: 0.20, stopLoss: -0.20 } },
+  { key: "quicktp", name: "Quick profits", desc: "TP +20% / SL -20%, no cash reserve", tweak: { profitTarget: 0.20, stopLoss: -0.20, useCashReserve: false, liveEntriesEnabled: true, singleContractBankPct: 0.20 } },
   { key: "runner", name: "Let it run", desc: "TP +80%, later trims", tweak: { profitTarget: 0.80, trim1Pct: 0.30, trim2Pct: 0.60 } },
   { key: "smallsize", name: "Small size", desc: "2% allocation cap, up to 3 positions", tweak: { baseRiskPct: 0.02, maxPositions: 3 } },
 ];
@@ -1183,12 +1183,15 @@ function applyStrategyPreset(acct, key) {
 function ensureCapitalPreservationTrack(acct) {
   if (!acct || acct.learning || acct.config.broker !== "robinhood") return false;
   const pendingChanges = Array.isArray(acct._riskPolicyChanges) ? acct._riskPolicyChanges : [];
+  // Sanity + retired-preset migration only. Do NOT re-impose capital rails over user settings.
   const changes = [...pendingChanges, ...applyLiveRiskPolicy(acct)];
   acct._riskPolicyChanges = [];
-  if (!changes.length && acct.state._capitalPolicyVersion === 1) return false;
-  acct.state._capitalPolicyVersion = 1;
-  log(acct, `CAPITAL POLICY: live risk bounded to ${(acct.config.riskPerTradePct * 100).toFixed(2)}% planned loss/trade, ${(acct.config.maxPositionPct * 100).toFixed(0)}% allocation, ${(acct.config.dailyLossLimitPct * 100).toFixed(1)}% daily halt; new live entries are observation-only pending forward validation; protective exits remain active; live self-learning disabled.`);
-  return true;
+  if (!changes.length && acct.state._capitalPolicyVersion === 2) return false;
+  acct.state._capitalPolicyVersion = 2;
+  if (changes.length) {
+    log(acct, `LIVE CONFIG: normalized (${changes.map(c => `${c.key} ${c.before}→${c.after}`).join(", ")})`);
+  }
+  return changes.length > 0;
 }
 
 function learningVariantsFor(parentId) {
@@ -4624,7 +4627,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
       profitTargetPct: Math.min(cfg.profitTarget, cfg.singleContractBankPct ?? cfg.profitTarget),
       minimumRewardRisk: cfg.minimumRewardRisk ?? 1.5,
       riskPerTradePct: cfg.riskPerTradePct ?? 0.005,
-      maxPositionPct: cfg.maxPositionPct ?? Math.min(cfg.baseRiskPct || 0.10, 0.10),
+      maxPositionPct: cfg.maxPositionPct ?? cfg.baseRiskPct ?? 0.10,
       maxPositionDollars: dollarCap,
       aggregateRiskBudgetDollars: pv * (cfg.maxPortfolioRiskPct ?? 0.02),
       openRiskDollars: estimatedOpenRiskDollars(acct),
@@ -5865,7 +5868,9 @@ function dashboardHTML(acct, { spectator = false } = {}) {
         · sleeve ${((cfg.baseRiskPct || 0) * 100).toFixed(0)}% · bank +${((cfg.profitTarget || 0) * 100).toFixed(0)}%
       </div>`
     : (cfg.broker === "robinhood"
-      ? `<div style="margin:10px 0 14px;padding:10px 12px;border-radius:8px;border:1px solid #99f6e4;background:#ecfdf5;color:#134e4a;font-size:12px"><b>Capital-preservation rails</b> · planned loss ≤${((cfg.riskPerTradePct || 0) * 100).toFixed(2)}%/trade · allocation ≤${((cfg.maxPositionPct || 0) * 100).toFixed(0)}% · daily halt ${((cfg.dailyLossLimitPct || 0) * 100).toFixed(1)}% · no live self-promotion</div>`
+      ? (cfg.strategyPreset === "capital"
+        ? `<div style="margin:10px 0 14px;padding:10px 12px;border-radius:8px;border:1px solid #99f6e4;background:#ecfdf5;color:#134e4a;font-size:12px"><b>Capital-preservation preset</b> · planned loss ≤${((cfg.riskPerTradePct || 0) * 100).toFixed(2)}%/trade · allocation ≤${((cfg.maxPositionPct || 0) * 100).toFixed(0)}% · daily halt ${((cfg.dailyLossLimitPct || 0) * 100).toFixed(1)}% · entries ${cfg.liveEntriesEnabled ? "ON" : "OFF"}</div>`
+        : `<div style="margin:10px 0 14px;padding:10px 12px;border-radius:8px;border:1px solid #d4d8e0;background:#f6f7f9;color:#3a3b42;font-size:12px"><b>Live settings</b> · allocation ${((cfg.baseRiskPct || 0) * 100).toFixed(0)}% · reserve ${cfg.useCashReserve ? "ON" : "OFF"} · entries ${cfg.liveEntriesEnabled ? "ON" : "OFF"} · TP +${((cfg.profitTarget || 0) * 100).toFixed(0)}% / SL ${((cfg.stopLoss || 0) * 100).toFixed(0)}%</div>`)
       : "");
 
   const llmBadge = spectator
@@ -7739,6 +7744,7 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
         <div style="border-top:1px solid #e3e6ea;margin:4px 0 14px;padding-top:14px">
           <div style="font-size:12px;color:#6b7280;margin-bottom:10px">Broker: <strong style="color:${cfg.broker === "tradier" ? "#00a843" : "#6b7280"}">${(cfg.broker || "paper").toUpperCase()}${cfg.broker === "tradier" ? " · LIVE" : ""}</strong></div>
           <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="useCashReserve" ${cfg.useCashReserve ? "checked" : ""}> Use cash reserve (50%→25% buffer)</label>
+          <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="liveEntriesEnabled" ${cfg.liveEntriesEnabled ? "checked" : ""}> Allow new live entries</label>
           <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="autoExecute" ${cfg.autoExecute ? "checked" : ""}> Auto-execute broker orders (full autonomy)</label>
           <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#3a3b42"><input type="checkbox" name="tradeWhenClosed" ${cfg.tradeWhenClosed ? "checked" : ""}> Trade when market closed (testing/sandbox)</label>
           ${cfg.broker === "tradier" ? `<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px">
@@ -8671,7 +8677,14 @@ function startDashboard(defaultAcct, apiKey) {
       req.on("end", () => {
         const params = new URLSearchParams(body);
         const cfg = target.config;
-        if (params.has("baseRiskPct")) cfg.baseRiskPct = parseFloat(params.get("baseRiskPct")) / 100;
+        if (params.has("baseRiskPct")) {
+          cfg.baseRiskPct = parseFloat(params.get("baseRiskPct")) / 100;
+          // Settings UI only exposes allocation (%). Keep the governor ceiling aligned so a higher
+          // spend is not ignored by a stale maxPositionPct leftover from the old 10% hard rail.
+          if (Number.isFinite(cfg.baseRiskPct) && cfg.baseRiskPct > 0) {
+            cfg.maxPositionPct = Math.max(Number(cfg.maxPositionPct) || 0, cfg.baseRiskPct);
+          }
+        }
         if (params.has("profitTarget")) cfg.profitTarget = parseFloat(params.get("profitTarget")) / 100;
         if (params.has("stopLoss")) cfg.stopLoss = parseFloat(params.get("stopLoss")) / 100;
         if (params.has("goal")) cfg.goal = parseFloat(params.get("goal")) || cfg.goal;
@@ -8706,16 +8719,17 @@ function startDashboard(defaultAcct, apiKey) {
           cfg.useCashReserve = params.get("useCashReserve") === "on" || params.get("useCashReserve") === "true";
           cfg.autoExecute = params.get("autoExecute") === "on" || params.get("autoExecute") === "true";
           cfg.tradeWhenClosed = params.get("tradeWhenClosed") === "on" || params.get("tradeWhenClosed") === "true";
+          cfg.liveEntriesEnabled = params.get("liveEntriesEnabled") === "on" || params.get("liveEntriesEnabled") === "true";
         }
         Object.assign(cfg, sanitizeRuntimeBrokerConfig(id, cfg).config);
         const policyChanges = applyLiveRiskPolicy(target);
         const liveCfg = target.config;
         target.riskPct = effectiveRiskPct(liveCfg.baseRiskPct, target.currentRegime);
         if (policyChanges.length) {
-          log(target, `CAPITAL POLICY: settings tightened to hard live bounds (${policyChanges.map(change => `${change.key} ${change.before}→${change.after}`).join(", ")})`);
+          log(target, `LIVE CONFIG: settings normalized (${policyChanges.map(change => `${change.key} ${change.before}→${change.after}`).join(", ")})`);
         }
         saveAccounts();
-        console.log(`  [${id}] Config updated: allocation=${(liveCfg.baseRiskPct * 100).toFixed(1)}% plannedRisk=${((liveCfg.riskPerTradePct || 0) * 100).toFixed(2)}% target=${(liveCfg.profitTarget * 100)}% stop=${(liveCfg.stopLoss * 100)}% minQuality=${liveCfg.minSetupQuality} bullEntry=${liveCfg.bullEntry} bearEntry=${liveCfg.bearEntry}`);
+        console.log(`  [${id}] Config updated: allocation=${(liveCfg.baseRiskPct * 100).toFixed(1)}% reserve=${liveCfg.useCashReserve} entries=${liveCfg.liveEntriesEnabled} plannedRisk=${((liveCfg.riskPerTradePct || 0) * 100).toFixed(2)}% target=${(liveCfg.profitTarget * 100)}% stop=${(liveCfg.stopLoss * 100)}% minQuality=${liveCfg.minSetupQuality} bullEntry=${liveCfg.bullEntry} bearEntry=${liveCfg.bearEntry}`);
         res.writeHead(302, { Location: `/?a=${id}` });
         res.end();
       });
