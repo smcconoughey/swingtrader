@@ -2430,13 +2430,11 @@ function getMarketRegime(candleCache) {
   return { mode, riskScale, label, spyAbove: spy, qqqAbove: qqq };
 }
 
-// At max risk-per-trade (100%), the user has explicitly opted to deploy the full configured
-// budget on a trade — treat that as an override and skip the regime-based scale-down (which
-// otherwise quietly caps a "100%" setting to e.g. 35% of cash in a CHOPPY regime). Any other
-// risk level still scales with the regime as before.
-function effectiveRiskPct(baseRiskPct, regime) {
-  if (baseRiskPct >= 1.0) return baseRiskPct;
-  return baseRiskPct * (regime?.riskScale ?? 0.5);
+// Compatibility name: this is the configured premium-spend fraction, not planned loss. Regime
+// information is visible and goes into entry validation, but it must not silently rewrite an
+// explicit dollar ceiling behind the dashboard's back.
+function effectiveRiskPct(baseRiskPct) {
+  return Number.isFinite(Number(baseRiskPct)) ? Number(baseRiskPct) : 0;
 }
 
 // ─── Earnings Calendar Check (Finnhub) ───
@@ -3452,6 +3450,33 @@ function riskBreakerStatus(acct) {
 }
 
 const LIVE_BALANCE_MAX_AGE_MS = 90_000;
+const LIVE_BALANCE_REFRESH_AGE_MS = 30_000;
+
+function brokerBalanceAgeMs(acct, now = Date.now()) {
+  const at = Number(acct?.state?.brokerBalanceAt);
+  return at > 0 ? Math.max(0, now - at) : Infinity;
+}
+
+async function ensureFreshBrokerBalance(acct, { maxAgeMs = LIVE_BALANCE_REFRESH_AGE_MS } = {}) {
+  if (!acct || !["tradier", "robinhood"].includes(acct.config?.broker)) return false;
+  if (brokerBalanceAgeMs(acct) <= maxAgeMs) return true;
+  acct.state.brokerBalanceRefreshAttemptAt = Date.now();
+  try {
+    if (acct.config.broker === "tradier") {
+      await refreshBrokerBalances(acct, { maxAgeMs: 0, logErrors: true });
+    } else {
+      await refreshRobinhoodBalance(acct);
+    }
+    const fresh = brokerBalanceAgeMs(acct) <= LIVE_BALANCE_MAX_AGE_MS;
+    if (fresh) delete acct.state.brokerBalanceError;
+    else acct.state.brokerBalanceError = "Broker returned no usable buying-power or account-value field";
+    return fresh;
+  } catch (error) {
+    acct.state.brokerBalanceError = error.message;
+    log(acct, `BROKER BALANCE REFRESH: ${error.message}`);
+    return false;
+  }
+}
 
 function liveEntryCommitBlock(acct, entryEpoch = null) {
   const broker = acct?.config?.broker;
@@ -3463,8 +3488,7 @@ function liveEntryCommitBlock(acct, entryEpoch = null) {
   if (entryEpoch != null && entryEpoch !== (acct._entryEpoch || 0)) {
     return "Entry authorization changed while the setup was being prepared";
   }
-  const balanceAt = Number(acct.state?.brokerBalanceAt);
-  if (!(balanceAt > 0) || Date.now() - balanceAt > LIVE_BALANCE_MAX_AGE_MS) {
+  if (brokerBalanceAgeMs(acct) > LIVE_BALANCE_MAX_AGE_MS) {
     return "Authoritative broker cash/equity is stale; refusing a live entry";
   }
   if (broker === "robinhood" && acct.state?.brokerHealth?.status === "disconnected") {
@@ -4437,6 +4461,9 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
   const state = acct.state;
   const cfg = acct.config;
   const entryEpoch = acct._entryEpoch || 0;
+  if (["tradier", "robinhood"].includes(cfg.broker)) {
+    await ensureFreshBrokerBalance(acct);
+  }
   const liveCommitBlock = liveEntryCommitBlock(acct, entryEpoch);
   const observationPreflight = preflightOnly
     && (cfg.broker === "tradier" || cfg.broker === "robinhood")
@@ -5093,6 +5120,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
         acct._inflightTickers.add(ticker.toUpperCase());
         reserveInflightExpiry(acct, ticker, expiryDate);
 
+        await ensureFreshBrokerBalance(acct);
         const commitBlock = liveEntryCommitBlock(acct, entryEpoch);
         if (commitBlock) {
           clearEntryOrderTracking(acct.state.meta[occ]);
@@ -6070,8 +6098,16 @@ function liveControlSummaryHTML(acct) {
   const breaker = riskBreakerStatus(acct);
   if (breaker) blockers.push(breaker);
   const balanceAt = Number(acct.state?.brokerBalanceAt);
-  if (!(balanceAt > 0) || Date.now() - balanceAt > LIVE_BALANCE_MAX_AGE_MS) {
-    blockers.push("Broker cash/equity snapshot is older than 90 seconds");
+  const balanceAgeMs = brokerBalanceAgeMs(acct);
+  const balanceAgeText = Number.isFinite(balanceAgeMs)
+    ? `${Math.max(0, Math.round(balanceAgeMs / 1000))}s old`
+    : "missing";
+  const balanceError = String(acct.state?.brokerBalanceError || "").trim();
+  const safeBalanceError = balanceError
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  if (!(balanceAt > 0) || balanceAgeMs > LIVE_BALANCE_MAX_AGE_MS) {
+    blockers.push(`Broker cash/equity snapshot is ${balanceAgeText}; automatic refresh ${safeBalanceError ? `failed: ${safeBalanceError}` : "is pending"}`);
   }
   if (cfg.broker === "robinhood" && acct.state?.brokerHealth?.status === "disconnected") {
     blockers.push("Robinhood health probe is disconnected");
@@ -6094,6 +6130,9 @@ function liveControlSummaryHTML(acct) {
   const riskBudget = Number.isFinite(Number(cfg.riskPerTradePct)) && pv > 0
     ? pv * Number(cfg.riskPerTradePct)
     : null;
+  const premiumSpendBudget = Number.isFinite(Number(cfg.baseRiskPct)) && Number(acct.state?.cash) >= 0
+    ? Number(acct.state.cash) * Number(cfg.baseRiskPct)
+    : null;
   const allocationBudget = Number.isFinite(Number(cfg.maxPositionPct)) && pv > 0
     ? pv * Number(cfg.maxPositionPct)
     : null;
@@ -6112,9 +6151,10 @@ function liveControlSummaryHTML(acct) {
     <summary style="cursor:pointer;font-weight:800;color:${statusColor}">${armed ? "LIVE ENTRIES ELIGIBLE" : "LIVE ENTRIES BLOCKED"} · effective configuration</summary>
     <div style="margin-top:8px;color:${statusColor};font-weight:650">${blockText}</div>
     <div style="margin-top:8px"><b>Execution</b> · live entries ${cfg.liveEntriesEnabled === true ? "ON" : "OFF"} · auto-execute ${cfg.autoExecute === true ? "ON" : "OFF"} · cash reserve ${cfg.useCashReserve ? "ON" : "OFF"} · max ${valueOr(cfg.maxDayTrades)} entries/day · max ${valueOr(cfg.maxPositions)} positions</div>
+    <div><b>Broker balance</b> · authoritative snapshot ${balanceAgeText} · automatic refresh ${cfg.broker === "robinhood" ? `every ${(LIVE_BALANCE_REFRESH_AGE_MS / 1000).toFixed(0)}s` : "during each account cycle"} and immediately before entry commitment${safeBalanceError ? ` · last refresh error: ${safeBalanceError}` : ""}</div>
     <div><b>Exit mandate for new positions</b> · effective target ${pct(effectiveExitConfig.profitTarget)} · stop ${pct(cfg.stopLoss)} · one-contract bank ${pct(effectiveExitConfig.singleContractBankPct)} · trims ${pct(effectiveExitConfig.trim1Pct)} / ${pct(effectiveExitConfig.trim2Pct)} · mode ${cfg.exitMode || "automatic"} · held-position poll every ${((cfg.positionManagementMs ?? POSITION_MANAGEMENT_MS) / 1000).toFixed(0)}s</div>
     <div><b>Recent-data adaptation</b> · ${adaptiveText}${adaptive ? ` · profit lock arms ${pct(adaptive.profitLockArmPct)}; close after the larger of ${pct(adaptive.peakGivebackMin)} or ${(adaptive.peakGivebackFrac * 100).toFixed(0)}% of peak is given back` : ""}</div>
-    <div><b>Risk</b> · planned loss ${pct(cfg.riskPerTradePct)}/trade${riskBudget != null ? ` (~$${riskBudget.toFixed(2)})` : ""} · allocation ${pct(cfg.maxPositionPct)}/position${allocationBudget != null ? ` (~$${allocationBudget.toFixed(2)})` : ""} · open risk ${pct(cfg.maxPortfolioRiskPct)} · min net R:R ${valueOr(cfg.minimumRewardRisk, "unset")} · max trade $${valueOr(cfg.maxTradeSize, 500)}</div>
+    <div><b>Risk and affordability</b> · premium spend ${pct(cfg.baseRiskPct)} of cash${premiumSpendBudget != null ? ` (~$${premiumSpendBudget.toFixed(2)})` : ""} · planned stop loss ${pct(cfg.riskPerTradePct)} of equity${riskBudget != null ? ` (~$${riskBudget.toFixed(2)})` : ""} · governor allocation ${pct(cfg.maxPositionPct)} of equity${allocationBudget != null ? ` (~$${allocationBudget.toFixed(2)})` : ""} · open risk ${pct(cfg.maxPortfolioRiskPct)} · min net R:R ${valueOr(cfg.minimumRewardRisk, "unset")} · absolute trade cap $${valueOr(cfg.maxTradeSize, 500)}</div>
     <div><b>Halts</b> · daily ${pct(cfg.dailyLossLimitPct)} · weekly ${pct(cfg.weeklyLossLimitPct)} · high-water drawdown ${pct(cfg.highWaterDrawdownLimitPct)} · ${valueOr(cfg.maxConsecutiveLosses)} consecutive losses</div>
     <div><b>Signal gates</b> · setup ≥${cfg.minSetupQuality ?? 50} · calls ≥${cfg.bullEntry ?? 68} · puts ≤${cfg.bearEntry ?? 32} · opening freeze 15m · closing freeze 15m · 7–45 DTE · real two-sided quote/liquidity/delta/friction checks required</div>
   </details>`;
@@ -7991,7 +8031,7 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
     <div style="background:#ffffff;border:1px solid #d4d8e0;border-radius:12px;padding:24px;max-width:420px;width:90%;max-height:calc(100vh - 40px);overflow-y:auto;box-sizing:border-box">
       <h2 style="margin:0 0 16px;color:#1c1d22">Settings: ${acct.name}</h2>
       <form method="POST" action="/api/accounts/${acctId}/config">
-        <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Max Premium Allocation (%)</label>
+        <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Premium spend ceiling (% of available cash)</label>
         <input name="baseRiskPct" type="number" step="0.01" value="${(cfg.baseRiskPct * 100).toFixed(1)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Profit Target (%)</label>
         <input name="profitTarget" type="number" step="1" value="${(cfg.profitTarget * 100).toFixed(0)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
@@ -8034,8 +8074,8 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
         <input name="maxTradeSize" type="number" value="${cfg.maxTradeSize || 500}" placeholder="500" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
         <div style="font-size:12px;font-weight:800;color:#3a3b42;margin:14px 0 8px">Live risk and halt controls</div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">
-          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Planned loss / trade (%)</label><input name="riskPerTradePct" type="number" step="0.05" min="0" value="${((cfg.riskPerTradePct ?? 0.005) * 100).toFixed(2)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
-          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Max position allocation (%)</label><input name="maxPositionPct" type="number" step="0.5" min="0" value="${((cfg.maxPositionPct ?? 0.10) * 100).toFixed(1)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Planned loss at stop (% of equity)</label><input name="riskPerTradePct" type="number" step="0.05" min="0" value="${((cfg.riskPerTradePct ?? 0.005) * 100).toFixed(2)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Governor allocation ceiling (% of equity)</label><input name="maxPositionPct" type="number" step="0.5" min="0" value="${((cfg.maxPositionPct ?? 0.10) * 100).toFixed(1)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
           <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Max total open risk (%)</label><input name="maxPortfolioRiskPct" type="number" step="0.5" min="0" value="${((cfg.maxPortfolioRiskPct ?? 0.02) * 100).toFixed(1)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
           <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Max entries / day (blank=off)</label><input name="maxDayTrades" type="number" min="1" value="${cfg.maxDayTrades ?? ""}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
           <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Daily loss halt (%)</label><input name="dailyLossLimitPct" type="number" step="0.5" min="0" value="${cfg.dailyLossLimitPct == null ? "" : (cfg.dailyLossLimitPct * 100).toFixed(1)}" placeholder="off" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
@@ -10665,8 +10705,13 @@ async function refreshBrokerBalances(acct, { maxAgeMs = 4000, logErrors = false 
       applyBrokerBalanceInfo(acct, info);
       acct._brokerBalanceInfo = info;
       acct._brokerBalanceRefreshedAt = Date.now();
+      if (info && (Number.isFinite(info.buyingPower) || Number.isFinite(info.totalEquity))) {
+        acct.state.brokerBalanceAt = Date.now();
+        delete acct.state.brokerBalanceError;
+      }
       return info;
     } catch (e) {
+      acct.state.brokerBalanceError = e.message;
       if (logErrors) log(acct, "TRADIER LIVE REFRESH: balance error — " + e.message);
       return acct._brokerBalanceInfo || null;
     } finally {
@@ -10895,6 +10940,7 @@ async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, expiry
   if (!acct.config.autoExecute) {
     return { skipped: true, reason: `Tradier: autoExecute off — entry for ${ticker} not sent (enable on the account)` };
   }
+  await ensureFreshBrokerBalance(acct);
   const initialCommitBlock = liveEntryCommitBlock(acct, entryEpoch);
   if (initialCommitBlock) return { skipped: true, reason: `Tradier commit blocked: ${initialCommitBlock}` };
 
@@ -10983,6 +11029,7 @@ async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, expiry
     ai: aiThesis || null,
   };
 
+  await ensureFreshBrokerBalance(acct);
   const finalCommitBlock = liveEntryCommitBlock(acct, entryEpoch);
   if (finalCommitBlock) {
     delete acct.state.meta[occ];
@@ -11894,6 +11941,45 @@ async function workRobinhoodEntryOrders(acct, now) {
   }
 }
 
+async function refreshRobinhoodBalance(acct) {
+  if (!acct || acct.config.broker !== "robinhood" || !robinhood.isConnected) {
+    throw new Error("Robinhood balance refresh unavailable while broker is disconnected");
+  }
+  const state = acct.state;
+  const res = await robinhood.getPortfolio();
+  const env = res && res.data ? res.data : res;
+  const fields = extractRobinhoodPortfolioFields(res);
+  if (!acct._rhPortfolioShapeLogged) {
+    acct._rhPortfolioShapeLogged = true;
+    log(acct, `RH-RAW PORTFOLIO: ${JSON.stringify(env).slice(0, 900)}`);
+    log(acct, `RH-PORTFOLIO PARSED: total=$${fields.totalEquity ?? "?"} bp=$${fields.buyingPower ?? "?"} source=${fields.source || "none"}`);
+  }
+
+  const eqNum = fields.totalEquity;
+  const bpNum = fields.buyingPower;
+  if (!((bpNum != null && bpNum >= 0) || (eqNum != null && eqNum > 0))) {
+    throw new Error("Robinhood portfolio response had no usable buying power or total account value");
+  }
+  const prevCash = typeof state.cash === "number" ? state.cash : null;
+  if (bpNum != null && bpNum >= 0) state.cash = bpNum;
+  if (eqNum != null && eqNum > 0) {
+    state.brokerEquity = eqNum;
+    if (Array.isArray(state.rhUnsettled) && state.rhUnsettled.length > 0) state.rhUnsettled = [];
+    const cashDelta = (prevCash != null && bpNum != null) ? (bpNum - prevCash) : null;
+    reconcileBrokerCapital(acct, eqNum, { cashDelta });
+  } else {
+    delete state.brokerEquity;
+  }
+  state.brokerBalanceAt = Date.now();
+  delete state.brokerBalanceError;
+
+  if (!(eqNum != null && eqNum > 0) && Array.isArray(state.rhUnsettled) && state.rhUnsettled.length > 0) {
+    const today = getETDateStr();
+    state.rhUnsettled = state.rhUnsettled.filter(entry => entry.date === today);
+  }
+  return fields;
+}
+
 async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshBalance = true } = {}) {
   if (acct.config.broker !== "robinhood" || !robinhood.isConnected) return;
   const state = acct.state;
@@ -11904,42 +11990,11 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
   const prevPositions = Array.isArray(state.positions) ? state.positions.filter(p => !p._pending) : [];
 
   if (refreshBalance) try {
-    const res = await robinhood.getPortfolio();
-    const env = res && res.data ? res.data : res;
-    // Prefer total_value over equity_value. equity_value is the stock sleeve and is often "0"
-    // on options-only cash accounts; reading it first pinned brokerEquity at 0 and forced the
-    // cash+rhUnsettled fallback, which double-counted today's option sale proceeds (~+$650 fake PV).
-    const fields = extractRobinhoodPortfolioFields(res);
-    if (!acct._rhPortfolioShapeLogged) {
-      acct._rhPortfolioShapeLogged = true;
-      log(acct, `RH-RAW PORTFOLIO: ${JSON.stringify(env).slice(0, 900)}`);
-      log(acct, `RH-PORTFOLIO PARSED: total=$${fields.totalEquity ?? "?"} bp=$${fields.buyingPower ?? "?"} source=${fields.source || "none"}`);
-    }
-    const eqNum = fields.totalEquity;
-    const bpNum = fields.buyingPower;
-    const prevCash = typeof state.cash === "number" ? state.cash : null;
-    if (bpNum != null && bpNum >= 0) state.cash = bpNum;
-    if (eqNum != null && eqNum > 0) {
-      state.brokerEquity = eqNum;
-      // total_value already includes cash from today's sales — drop the synthetic unsettled credit
-      // so a later brokerEquity miss cannot reinflate PV.
-      if (Array.isArray(state.rhUnsettled) && state.rhUnsettled.length > 0) state.rhUnsettled = [];
-      const cashDelta = (prevCash != null && bpNum != null) ? (bpNum - prevCash) : null;
-      reconcileBrokerCapital(acct, eqNum, { cashDelta });
-    } else {
-      delete state.brokerEquity; // never let a stale equity reading override the live fallback math
-    }
-    if ((bpNum != null && bpNum >= 0) || (eqNum != null && eqNum > 0)) {
-      state.brokerBalanceAt = Date.now();
-    }
-    // Sale proceeds settle T+1: anything booked on a prior day is assumed absorbed into buying
-    // power by now, so drop it from the unsettled credit (portfolioValue adds what remains).
-    // Only keep today's credits when we do NOT have an authoritative total_value reading.
-    if (!(eqNum != null && eqNum > 0) && Array.isArray(state.rhUnsettled) && state.rhUnsettled.length > 0) {
-      const today = getETDateStr();
-      state.rhUnsettled = state.rhUnsettled.filter(e => e.date === today);
-    }
-  } catch (e) { log(acct, `ROBINHOOD SYNC: balance error — ${e.message}`); }
+    await refreshRobinhoodBalance(acct);
+  } catch (e) {
+    state.brokerBalanceError = e.message;
+    log(acct, `ROBINHOOD SYNC: balance error — ${e.message}`);
+  }
 
   try {
     const now = Date.now();
@@ -13177,12 +13232,19 @@ async function runRobinhoodPositionManagement(acct) {
   if (acct.config.broker !== "robinhood" || !robinhood.isConnected) return { skipped: true };
   const hasHolding = (acct.state.positions || []).some(pos => !pos._pending);
   const hasExitIntent = Object.values(acct.state.meta || {}).some(meta => meta?.exitOrderPlacedAt);
-  if (!hasHolding && !hasExitIntent) {
+  const balanceNeedsRefresh = brokerBalanceAgeMs(acct) > LIVE_BALANCE_REFRESH_AGE_MS;
+  if (!hasHolding && !hasExitIntent && !balanceNeedsRefresh) {
     acct._lastPositionManagerAt = Date.now();
     return { skipped: true };
   }
 
   return withBrokerExecutionLane(acct, async () => {
+    if (balanceNeedsRefresh) await ensureFreshBrokerBalance(acct);
+    if (!hasHolding && !hasExitIntent) {
+      acct._lastPositionManagerAt = Date.now();
+      saveAccounts();
+      return { skipped: true, balanceRefreshed: true };
+    }
     const quotes = await fetchHeldRobinhoodQuotes(acct);
     await syncRobinhoodAccount(acct, quotes, { workEntries: true, refreshBalance: false });
 

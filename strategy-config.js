@@ -17,9 +17,14 @@ export const QUICK_PROFIT_CONFIG = Object.freeze({
   peakGivebackMin: 0.025,
   peakGivebackFrac: 0.25,
   positionManagementMs: 5_000,
-  riskPerTradePct: 0.02,
-  maxPortfolioRiskPct: 0.04,
-  maxPositionPct: 0.10,
+  // A ~$600 options account cannot buy a quality contract under a $60 premium ceiling. Keep
+  // allocation separate from the loss-at-stop budget: a $300 contract with a -20% stop plans
+  // roughly $60 of premium risk, before spread/fees.
+  baseRiskPct: 0.50,
+  riskPerTradePct: 0.10,
+  maxPortfolioRiskPct: 0.20,
+  maxPositionPct: 0.50,
+  useCashReserve: false,
   dailyLossLimitPct: 0.04,
   maxDayTrades: 2,
   maxPositions: 3,
