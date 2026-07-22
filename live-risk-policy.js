@@ -1,6 +1,5 @@
 export const CAPITAL_PRESERVATION_POLICY = Object.freeze({
   riskPerTradePct: 0.005,
-  maxRiskPerTradePct: 0.01,
   maxPortfolioRiskPct: 0.02,
   maxPositionPct: 0.10,
   dailyLossLimitPct: 0.02,
@@ -15,56 +14,41 @@ export const CAPITAL_PRESERVATION_POLICY = Object.freeze({
   trim2Pct: 0.40,
   singleContractBankPct: 0.40,
   minimumRewardRisk: 1.5,
-  // No admissible sample currently proves a positive live edge. New entries remain in observation
-  // mode until a future forward-validation release explicitly re-arms them; exits stay automated.
-  liveEntriesEnabled: false,
+  liveEntriesEnabled: true,
 });
 
-const finite = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
-const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
-const clean = value => +value.toFixed(6);
+export const LIVE_RISK_DEFAULTS = Object.freeze({
+  riskPerTradePct: CAPITAL_PRESERVATION_POLICY.riskPerTradePct,
+  maxPortfolioRiskPct: CAPITAL_PRESERVATION_POLICY.maxPortfolioRiskPct,
+  maxPositionPct: CAPITAL_PRESERVATION_POLICY.maxPositionPct,
+  dailyLossLimitPct: CAPITAL_PRESERVATION_POLICY.dailyLossLimitPct,
+  weeklyLossLimitPct: CAPITAL_PRESERVATION_POLICY.weeklyLossLimitPct,
+  highWaterDrawdownLimitPct: CAPITAL_PRESERVATION_POLICY.highWaterDrawdownLimitPct,
+  maxConsecutiveLosses: CAPITAL_PRESERVATION_POLICY.maxConsecutiveLosses,
+  maxDayTrades: CAPITAL_PRESERVATION_POLICY.maxDayTrades,
+  minimumRewardRisk: 1.0,
+  liveEntriesEnabled: true,
+});
+
+const finite = value => Number.isFinite(Number(value));
 
 /**
- * Normalize a live account into hard capital-preservation bounds. Lower user-selected limits are
- * retained; settings may tighten these rails but cannot silently loosen them.
+ * Backfill missing live controls without rewriting explicit user choices. Every value inserted by
+ * this function is persisted, logged by the caller, and rendered in Settings. Invalid explicit
+ * values are left intact so the risk governor can reject them visibly instead of silently running
+ * a different strategy than the dashboard advertises.
  */
 export function normalizeLiveRiskConfig(config = {}) {
-  const policy = CAPITAL_PRESERVATION_POLICY;
   const next = { ...config };
-  const retiredDeadlinePreset = next.strategyPreset === "march1m";
 
-  next.riskPerTradePct = clamp(finite(next.riskPerTradePct, policy.riskPerTradePct), 0.001, policy.maxRiskPerTradePct);
-  next.maxPortfolioRiskPct = clamp(
-    finite(next.maxPortfolioRiskPct, policy.maxPortfolioRiskPct),
-    next.riskPerTradePct,
-    policy.maxPortfolioRiskPct,
-  );
-  next.maxPositionPct = clamp(finite(next.maxPositionPct, policy.maxPositionPct), 0.01, policy.maxPositionPct);
-  // `baseRiskPct` is the legacy premium-allocation field. Keep it as an allocation ceiling only.
-  next.baseRiskPct = clamp(finite(next.baseRiskPct, next.maxPositionPct), 0.01, next.maxPositionPct);
-  next.dailyLossLimitPct = clamp(finite(next.dailyLossLimitPct, policy.dailyLossLimitPct), 0.005, policy.dailyLossLimitPct);
-  next.weeklyLossLimitPct = clamp(finite(next.weeklyLossLimitPct, policy.weeklyLossLimitPct), 0.01, policy.weeklyLossLimitPct);
-  next.highWaterDrawdownLimitPct = clamp(finite(next.highWaterDrawdownLimitPct, policy.highWaterDrawdownLimitPct), 0.02, policy.highWaterDrawdownLimitPct);
-  next.maxConsecutiveLosses = Math.round(clamp(finite(next.maxConsecutiveLosses, policy.maxConsecutiveLosses), 1, policy.maxConsecutiveLosses));
-  next.maxDayTrades = Math.round(clamp(finite(next.maxDayTrades, policy.maxDayTrades), 1, policy.maxDayTrades));
-  next.maxPositions = Math.round(clamp(finite(next.maxPositions, policy.maxPositions), 1, policy.maxPositions));
-  next.stopLoss = Math.max(-0.20, Math.min(-0.05, finite(next.stopLoss, policy.stopLoss)));
-  next.minimumRewardRisk = Math.max(policy.minimumRewardRisk, finite(next.minimumRewardRisk, policy.minimumRewardRisk));
-  next.profitTarget = clean(Math.max(
-    retiredDeadlinePreset ? policy.profitTarget : finite(next.profitTarget, policy.profitTarget),
-    Math.abs(next.stopLoss) * next.minimumRewardRisk,
-  ));
-  next.trim1Pct = clamp(finite(next.trim1Pct, policy.trim1Pct), 0.10, next.profitTarget);
-  next.trim2Pct = clamp(finite(next.trim2Pct, policy.trim2Pct), next.trim1Pct, next.profitTarget);
-  next.singleContractBankPct = clean(Math.max(
-    finite(next.singleContractBankPct, next.profitTarget),
-    Math.abs(next.stopLoss) * next.minimumRewardRisk,
-  ));
-  next.useCashReserve = true;
-  next.learningEnabled = false;
-  next.allowLiveSelfPromotion = false;
-  next.liveEntriesEnabled = false;
-  if (retiredDeadlinePreset) next.strategyPreset = "capital";
+  for (const [key, value] of Object.entries(LIVE_RISK_DEFAULTS)) {
+    if (next[key] === undefined) next[key] = value;
+  }
+  if (next.singleContractBankPct === undefined) {
+    next.singleContractBankPct = finite(next.profitTarget)
+      ? Number(next.profitTarget)
+      : CAPITAL_PRESERVATION_POLICY.singleContractBankPct;
+  }
 
   const changes = [];
   for (const [key, value] of Object.entries(next)) {

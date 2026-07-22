@@ -10,6 +10,8 @@ import webpush from "web-push";
 import { robinhood } from "./robinhood.js";
 import { tradier } from "./tradier.js";
 import { directionalSetupQuality, entryPriority, momentumEntryGate, rankEntryCandidates, rankPreparedEntries } from "./strategy-priority.js";
+import { completeStrategyConfig, QUICK_PROFIT_CONFIG } from "./strategy-config.js";
+import { deriveAdaptiveExitProfile } from "./adaptive-exit.js";
 import { applyUnderlyingSnapshots, shouldRecordSelectionCohort, summarizeRankOne } from "./decision-telemetry.js";
 import {
   createManagementPlan,
@@ -775,7 +777,7 @@ const STATE_FILE = process.env.STATE_FILE || "state.json";
 const ACCOUNTS_FILE = process.env.ACCOUNTS_FILE || (process.env.STATE_FILE ? process.env.STATE_FILE.replace(/state\.json$/, "accounts.json") : "accounts.json");
 const HINT_FILE = "hint.txt";
 const CYCLE_MS = 60_000;       // 60s between cycles when market open
-const POSITION_MANAGEMENT_MS = 15_000; // held positions are managed independently of entry discovery
+const POSITION_MANAGEMENT_MS = 15_000; // visible default; active presets may request a faster cadence
 const POSITION_MANAGER_STALE_MS = 45_000;
 const RH_OPTION_QUOTE_MAX_AGE_MS = 45_000;
 const CYCLE_MS_CLOSED = 90_000; // slower after-hours polling
@@ -989,6 +991,9 @@ const DEFAULT_CONFIG = {
   // strategy toggle, if any. Purely a UI label — the actual behavior lives in the fields above,
   // which the toggle sets directly. null = never used the toggle / since manually edited.
   strategyPreset: null,
+  // Explicit operator control. Live entries are eligible only when this and autoExecute are both
+  // enabled; the dashboard renders both switches and the current blocking reason.
+  liveEntriesEnabled: true,
   // Synthetic option pricing is not admissible performance evidence. Historical simulations may
   // opt in explicitly for UI experiments, but default/shadow/live ledgers never use it.
   allowSyntheticSimulation: false,
@@ -1041,6 +1046,7 @@ function createAccountRuntime(id, name, config, state) {
     lastWatchlistRefresh: 0,
     lastNewsScan: 0,
     latestNewsBrief: "",
+    dailyTape: null,
   };
   runtime._brokerBindingChanges = brokerBinding.changes;
   runtime._riskPolicyChanges = applyLiveRiskPolicy(runtime);
@@ -1058,8 +1064,13 @@ const LEARNING_VARIANTS = [
   { key: "baseline", name: "Baseline", desc: "parent config, unchanged", tweak: {} },
   { key: "selective", name: "High conviction", desc: "quality ≥75, 4% allocation cap", tweak: { minSetupQuality: 75, baseRiskPct: 0.04 } },
   { key: "loose", name: "Looser filter", desc: "quality ≥45 — more shots", tweak: { minSetupQuality: 45 } },
-  { key: "quicktp", name: "Quick profits", desc: "TP +20% / SL -20%", tweak: { profitTarget: 0.20, stopLoss: -0.20 } },
-  { key: "runner", name: "Let it run", desc: "TP +80%, later trims", tweak: { profitTarget: 0.80, trim1Pct: 0.30, trim2Pct: 0.60 } },
+  {
+    key: "quicktp",
+    name: "Quick profits",
+    desc: "Adaptive bank +10–15% / profit lock / stop -20% / risk 2% equity / max 2 entries",
+    tweak: QUICK_PROFIT_CONFIG,
+  },
+  { key: "runner", name: "Let it run", desc: "TP +80%, trims +30%/+60%", tweak: { profitTarget: 0.80, trim1Pct: 0.30, trim2Pct: 0.60, singleContractBankPct: 0.80, minimumRewardRisk: 1.5, exitMode: "runner" } },
   { key: "smallsize", name: "Small size", desc: "2% allocation cap, up to 3 positions", tweak: { baseRiskPct: 0.02, maxPositions: 3 } },
 ];
 
@@ -1068,13 +1079,23 @@ const LEARNING_VARIANTS = [
 // below — there'd be nothing to switch TO — so give it real default values there instead.
 const BASELINE_STRATEGY_TWEAK = {
   goal: DEFAULT_CONFIG.goal,
-  bullEntry: 65, bearEntry: 35, minSetupQuality: 50, baseRiskPct: 0.15,
+  bullEntry: 65, bearEntry: 35, minSetupQuality: 50, baseRiskPct: 0.10,
   profitTarget: 0.40, stopLoss: -0.35, trim1Pct: 0.25, trim2Pct: 0.50,
-  maxPositions: null,
+  singleContractBankPct: 0.25, minimumRewardRisk: 1.0, exitMode: "quick_bank",
+  adaptiveProfitTarget: false,
+  adaptiveTargetMinPct: 0.10, adaptiveTargetMaxPct: 0.15,
+  adaptiveTargetFallbackPct: 0.12, adaptiveTargetReachRate: 0.65,
+  adaptiveTargetLookback: 20, adaptiveTargetMinSamples: 5,
+  profitLockArmPct: 0.10, peakGivebackMin: 0.04, peakGivebackFrac: 0.30,
+  positionManagementMs: POSITION_MANAGEMENT_MS,
+  riskPerTradePct: 0.005, maxPortfolioRiskPct: 0.02, maxPositionPct: 0.10,
+  weeklyLossLimitPct: 0.04, highWaterDrawdownLimitPct: 0.05,
+  maxPositions: 3,
   useCashReserve: DEFAULT_CONFIG.useCashReserve,
-  maxDayTrades: DEFAULT_CONFIG.maxDayTrades,
-  dailyLossLimitPct: DEFAULT_CONFIG.dailyLossLimitPct,
-  maxConsecutiveLosses: DEFAULT_CONFIG.maxConsecutiveLosses,
+  maxDayTrades: 2,
+  dailyLossLimitPct: 0.02,
+  maxConsecutiveLosses: 2,
+  liveEntriesEnabled: true,
 };
 
 // Historical deadline target retained only to render old telemetry. It is never offered as a live
@@ -1105,6 +1126,7 @@ const CAPITAL_PRESERVATION_TRACK = {
     weeklyLossLimitPct: CAPITAL_PRESERVATION_POLICY.weeklyLossLimitPct,
     highWaterDrawdownLimitPct: CAPITAL_PRESERVATION_POLICY.highWaterDrawdownLimitPct,
     maxConsecutiveLosses: CAPITAL_PRESERVATION_POLICY.maxConsecutiveLosses,
+    liveEntriesEnabled: true,
   },
 };
 
@@ -1113,6 +1135,17 @@ function liveStrategyPresets() {
     ...LEARNING_VARIANTS,
     CAPITAL_PRESERVATION_TRACK,
   ];
+}
+
+function strategyConfigFor(currentConfig, key) {
+  const variant = liveStrategyPresets().find(item => item.key === key);
+  if (!variant) return null;
+  const override = key === "baseline" ? {} : variant.tweak;
+  return {
+    variant,
+    config: completeStrategyConfig(currentConfig, BASELINE_STRATEGY_TWEAK, override),
+    ownedKeys: [...new Set([...Object.keys(BASELINE_STRATEGY_TWEAK), ...Object.keys(override)])],
+  };
 }
 
 function tradingDaysBetween(isoStart, isoEnd) {
@@ -1153,17 +1186,20 @@ function march1mPace(acct, pv) {
 }
 
 // ─── Live Strategy Preset Toggle ───
-// Applies a named preset to a real account's config. Learning-lab variants share the same
-// knobs as shadows; March $1M is live-only. Broker / autoExecute / watchlist are left alone.
+// Applies a named preset to a real account's config. Every strategy-owned field is reset from the
+// visible baseline before the named override is applied, so stale exit/risk values cannot survive
+// a preset switch. Broker binding / autoExecute / watchlist remain explicit account controls.
 function applyStrategyPreset(acct, key) {
-  const variant = liveStrategyPresets().find(v => v.key === key);
-  if (!variant) return { ok: false, reason: `Unknown strategy preset "${key}"` };
+  const resolved = strategyConfigFor(acct.config, key);
+  if (!resolved) return { ok: false, reason: `Unknown strategy preset "${key}"` };
+  const { variant, config: nextConfig, ownedKeys } = resolved;
   // Every preset starts from a complete live baseline. Applying only the target's sparse tweak
   // leaves dangerous settings behind when switching away from March mode (reserve=false,
   // daily loss=22%, etc.), even though the UI says a different strategy is active.
-  const tweak = { ...BASELINE_STRATEGY_TWEAK, ...(key === "baseline" ? {} : variant.tweak) };
   const changes = [];
-  for (const [k, v] of Object.entries(tweak)) {
+  const entriesWereEnabled = acct.config.liveEntriesEnabled === true;
+  for (const k of ownedKeys) {
+    const v = nextConfig[k];
     const before = acct.config[k];
     if (before !== v) changes.push(`${k} ${before} → ${v}`);
     acct.config[k] = v;
@@ -1171,19 +1207,38 @@ function applyStrategyPreset(acct, key) {
   acct.config.strategyPreset = key;
   const policyChanges = applyLiveRiskPolicy(acct);
   if (policyChanges.length) changes.push(...policyChanges.map(change => `${change.key} ${change.before} → ${change.after}`));
+  if (entriesWereEnabled !== (acct.config.liveEntriesEnabled === true)) {
+    acct._entryEpoch = (acct._entryEpoch || 0) + 1;
+    if (acct.config.liveEntriesEnabled !== true) scheduleWorkingEntryCancellation(acct, "strategy disabled live entries");
+  }
   log(acct, `STRATEGY: switched to "${variant.name}" (${variant.desc})${changes.length ? " — " + changes.join(", ") : " — already matched, no fields changed"}`);
   saveAccounts();
   return { ok: true, variant, changes };
 }
 
-function ensureCapitalPreservationTrack(acct) {
-  if (!acct || acct.learning || acct.config.broker !== "robinhood") return false;
+function ensureLiveConfigDefaults(acct) {
+  if (!acct || acct.learning || !["robinhood", "tradier"].includes(acct.config.broker)) return false;
   const pendingChanges = Array.isArray(acct._riskPolicyChanges) ? acct._riskPolicyChanges : [];
-  const changes = [...pendingChanges, ...applyLiveRiskPolicy(acct)];
+  const changes = [...pendingChanges];
   acct._riskPolicyChanges = [];
-  if (!changes.length && acct.state._capitalPolicyVersion === 1) return false;
-  acct.state._capitalPolicyVersion = 1;
-  log(acct, `CAPITAL POLICY: live risk bounded to ${(acct.config.riskPerTradePct * 100).toFixed(2)}% planned loss/trade, ${(acct.config.maxPositionPct * 100).toFixed(0)}% allocation, ${(acct.config.dailyLossLimitPct * 100).toFixed(1)}% daily halt; new live entries are observation-only pending forward validation; protective exits remain active; live self-learning disabled.`);
+  const resolved = acct.config.strategyPreset
+    ? strategyConfigFor(acct.config, acct.config.strategyPreset)
+    : null;
+  if (resolved) {
+    const entriesWereEnabled = acct.config.liveEntriesEnabled === true;
+    for (const key of resolved.ownedKeys) {
+      const value = resolved.config[key];
+      if (acct.config[key] === value) continue;
+      changes.push({ key, before: acct.config[key], after: value });
+      acct.config[key] = value;
+    }
+    if (entriesWereEnabled !== (acct.config.liveEntriesEnabled === true)) {
+      acct._entryEpoch = (acct._entryEpoch || 0) + 1;
+    }
+  }
+  changes.push(...applyLiveRiskPolicy(acct));
+  if (!changes.length) return false;
+  log(acct, `LIVE CONFIG: reconciled the visible active preset/defaults (${changes.map(change => `${change.key} ${change.before}→${change.after}`).join(", ")}).`);
   return true;
 }
 
@@ -1375,11 +1430,11 @@ function loadAccounts() {
     if (fs.existsSync(ACCOUNTS_FILE)) {
       const data = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, "utf-8"));
       if (data.meta && data.accounts) {
-        let brokerBindingSanitized = false;
+        let persistedConfigChanged = false;
         for (const [id, acctData] of Object.entries(data.accounts)) {
           const acct = createAccountRuntime(id, acctData.name, acctData.config, acctData.state);
           if (acct._brokerBindingChanges?.length) {
-            brokerBindingSanitized = true;
+            persistedConfigChanged = true;
             console.warn(`  [${id}] BROKER BINDING SANITIZED: ${acct._brokerBindingChanges.map(change => `${change.key} ${change.before} → ${change.after}`).join(", ")}`);
           }
           acct.paused = acctData.paused || false;
@@ -1397,12 +1452,14 @@ function loadAccounts() {
           if (typeof acctData.lastWatchlistRefresh === "number") acct.lastWatchlistRefresh = acctData.lastWatchlistRefresh;
           if (typeof acctData.lastNewsScan === "number") acct.lastNewsScan = acctData.lastNewsScan;
           if (typeof acctData.latestNewsBrief === "string") acct.latestNewsBrief = acctData.latestNewsBrief;
+          if (acctData.dailyTape && typeof acctData.dailyTape === "object") acct.dailyTape = acctData.dailyTape;
           // Restore the persisted portfolio-value chart series across restarts/redeploys.
           if (Array.isArray(acctData.portfolioHistory)) acct.dashboard.portfolioHistory = acctData.portfolioHistory;
           if (Array.isArray(acctData.decisionJournal)) acct.dashboard.decisionJournal = acctData.decisionJournal.slice(-500);
           accounts.set(id, acct);
+          if (ensureLiveConfigDefaults(acct)) persistedConfigChanged = true;
         }
-        if (brokerBindingSanitized) saveAccounts();
+        if (persistedConfigChanged) saveAccounts();
         return true;
       }
     }
@@ -1466,6 +1523,7 @@ function saveAccounts({ strict = false } = {}) {
       lastWatchlistRefresh: acct.lastWatchlistRefresh || 0,
       lastNewsScan: acct.lastNewsScan || 0,
       latestNewsBrief: acct.latestNewsBrief || "",
+      dailyTape: acct.dailyTape || null,
       // Persist the portfolio-value series so the chart survives server restarts/redeploys
       // (previously it lived only in memory and reset every deploy). Capped to bound file size.
       portfolioHistory: (acct.dashboard?.portfolioHistory || []).slice(-10000),
@@ -3089,6 +3147,24 @@ function isAdmissiblePerformanceTrade(trade) {
   return true;
 }
 
+function managementConfigForNewEntry(acct, optionType = null) {
+  const cfg = acct?.config || {};
+  if (cfg.adaptiveProfitTarget !== true || optionType === "equity") return cfg;
+  const confirmedHistory = (acct.state?.history || []).filter(isAdmissiblePerformanceTrade);
+  const profile = deriveAdaptiveExitProfile(confirmedHistory, cfg, optionType);
+  return {
+    ...cfg,
+    profitTarget: profile.targetPct,
+    singleContractBankPct: profile.targetPct,
+    trim1Pct: profile.targetPct,
+    trim2Pct: profile.targetPct,
+    profitLockArmPct: profile.profitLockArmPct,
+    peakGivebackMin: profile.peakGivebackMin,
+    peakGivebackFrac: profile.peakGivebackFrac,
+    adaptiveExitProfile: profile,
+  };
+}
+
 function portfolioValue(state, quotes) {
   // Broker accounts: trust Tradier's own total_equity. It already nets settled cash, filled
   // positions, AND capital reserved by working (unfilled) orders — so nothing appears to "vanish"
@@ -3377,7 +3453,7 @@ function liveEntryCommitBlock(acct, entryEpoch = null) {
   const broker = acct?.config?.broker;
   if (broker !== "tradier" && broker !== "robinhood") return null;
   if (acct.config.liveEntriesEnabled !== true) {
-    return "Live entries are observation-only pending forward validation; protective exits remain active";
+    return "Live entries are disabled in Settings; protective exits remain active";
   }
   if (acct.paused) return `Account is paused (${acct.pausedBy || "manual"})`;
   if (entryEpoch != null && entryEpoch !== (acct._entryEpoch || 0)) {
@@ -3838,10 +3914,144 @@ function getActiveHintsSummary(acct) {
   }).join(", ");
 }
 
-// ─── Auto News Scanner (runs every 3 hours) ───
+// ─── Hourly news scanner + standard daily tape assessment ───
 
 const NEWS_INTERVAL = 60 * 60_000; // 1 hour
 let globalLastNewsScan = 0; // shared across all accounts to avoid duplicate Claude calls
+
+async function fetchYahooTapeQuote(symbol, label) {
+  try {
+    const encoded = encodeURIComponent(symbol);
+    const r = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encoded}?interval=5m&range=1d`, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+    });
+    if (!r.ok) return { label, symbol, available: false, error: `HTTP ${r.status}` };
+    const data = await r.json();
+    const result = data.chart?.result?.[0];
+    const meta = result?.meta || {};
+    const closes = result?.indicators?.quote?.[0]?.close || [];
+    const current = [...closes].reverse().find(Number.isFinite) ?? Number(meta.regularMarketPrice);
+    const previousClose = Number(meta.chartPreviousClose ?? meta.previousClose);
+    if (!(current > 0) || !(previousClose > 0)) return { label, symbol, available: false, error: "no current/previous price" };
+    return {
+      label,
+      symbol,
+      available: true,
+      price: +current.toFixed(3),
+      previousClose: +previousClose.toFixed(3),
+      changePct: +(((current - previousClose) / previousClose) * 100).toFixed(2),
+      marketState: meta.marketState || null,
+      exchangeTimezone: meta.exchangeTimezoneName || null,
+      source: "Yahoo Finance chart",
+    };
+  } catch (error) {
+    return { label, symbol, available: false, error: error.message };
+  }
+}
+
+async function fetchDailyTapeInputs(apiKey, headlines, acct) {
+  const quoteSpecs = [
+    ["NQ=F", "Nasdaq-100 futures"],
+    ["ES=F", "S&P 500 futures"],
+    ["RTY=F", "Russell 2000 futures"],
+    ["CL=F", "WTI crude oil futures"],
+    ["^VIX", "VIX"],
+    ["^TNX", "US 10-year yield index"],
+  ];
+  const quotePromise = Promise.all(quoteSpecs.map(([symbol, label]) => fetchYahooTapeQuote(symbol, label)));
+  const day = todayStr();
+  const earningsPromise = (async () => {
+    if (!apiKey) return { available: false, rows: [], error: "Finnhub key missing" };
+    try {
+      const r = await fetch(`https://finnhub.io/api/v1/calendar/earnings?from=${day}&to=${day}&token=${apiKey}`);
+      if (!r.ok) return { available: false, rows: [], error: `HTTP ${r.status}` };
+      const data = await r.json();
+      const focus = new Set([
+        "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "GOOG", "META", "TSLA", "AVGO", "AMD", "NFLX",
+        ...(acct.tickers || []),
+      ]);
+      const rows = (data.earningsCalendar || [])
+        .filter(row => focus.has(String(row.symbol || "").toUpperCase()))
+        .slice(0, 30)
+        .map(row => ({ symbol: row.symbol, hour: row.hour || "unknown", date: row.date }));
+      return { available: true, rows, source: "Finnhub earnings calendar" };
+    } catch (error) {
+      return { available: false, rows: [], error: error.message };
+    }
+  })();
+  const economicPromise = (async () => {
+    if (!apiKey) return { available: false, rows: [], error: "Finnhub key missing" };
+    try {
+      const r = await fetch(`https://finnhub.io/api/v1/calendar/economic?from=${day}&to=${day}&token=${apiKey}`);
+      if (!r.ok) return { available: false, rows: [], error: `HTTP ${r.status}` };
+      const data = await r.json();
+      const rows = (data.economicCalendar || data.economicCalendarData || [])
+        .filter(row => !row.country || row.country === "US")
+        .slice(0, 20)
+        .map(row => ({ event: row.event, time: row.time || row.date, impact: row.impact || null }));
+      return { available: true, rows, source: "Finnhub economic calendar" };
+    } catch (error) {
+      return { available: false, rows: [], error: error.message };
+    }
+  })();
+
+  const [quotes, earnings, economic] = await Promise.all([quotePromise, earningsPromise, economicPromise]);
+  return {
+    observedAt: new Date().toISOString(),
+    tradingDateET: day,
+    quotes,
+    earnings,
+    economic,
+    headlines: (headlines || []).slice(0, 25).map(row => ({
+      source: row.source,
+      ticker: row.ticker || null,
+      title: row.title,
+      summary: row.summary || "",
+    })),
+  };
+}
+
+function validateDailyTapeAssessment(result, inputs) {
+  const score = Math.max(1, Math.min(10, Math.round(Number(result?.score))));
+  if (!Number.isFinite(score)) throw new Error("daily tape score is missing");
+  const summary = String(result?.summary || "").replace(/\s+/g, " ").trim();
+  if (!summary) throw new Error("daily tape summary is missing");
+  return {
+    version: 1,
+    date: inputs.tradingDateET,
+    observedAt: inputs.observedAt,
+    score,
+    label: String(result?.label || (score <= 4 ? "below average" : score <= 6 ? "mixed" : "favorable")).slice(0, 80),
+    confidence: Math.max(0, Math.min(100, Math.round(Number(result?.confidence) || 0))),
+    summary: summary.slice(0, 700),
+    drivers: (Array.isArray(result?.drivers) ? result.drivers : []).slice(0, 6).map(String),
+    sourceStatus: {
+      marketSnapshots: inputs.quotes.filter(row => row.available).length,
+      marketSnapshotsRequested: inputs.quotes.length,
+      earningsCalendar: inputs.earnings.available,
+      economicCalendar: inputs.economic.available,
+      headlines: inputs.headlines.length,
+    },
+    usage: "advisory context supplied to every Claude entry validation; no standalone hidden veto",
+  };
+}
+
+async function assessDailyTape(acct, apiKey, headlines) {
+  const inputs = await fetchDailyTapeInputs(apiKey, headlines, acct);
+  const prompt = `You are the daily tape analyst for a short-term options trading system. Rate how clean and predictable TODAY'S US session is for directional option entries.
+
+You may use ONLY the timestamped data below. Do not invent prices, percentages, events, or reporting times. If an input is unavailable, say so through lower confidence rather than filling it in.
+
+DATA:
+${JSON.stringify(inputs)}
+
+Scoring: 1 = exceptionally hostile/unpredictable, 4 = below average with elevated reversal risk, 5-6 = mixed/normal, 10 = unusually clean and predictable. Consider index futures, oil/geopolitical headlines, VIX/rates, scheduled macro releases, and major after-close earnings that can distort positioning.
+
+Respond with ONLY valid JSON:
+{"score":4,"label":"below average","confidence":80,"summary":"For today, I’d still rate the tape below average—roughly 4/10 for a clean, predictable session. [Use only facts present in DATA and explain the main reversal/volatility drivers in one more sentence.]","drivers":["specific sourced driver"]}`;
+  const raw = await callClaudeRaw(prompt, 3, 768);
+  return validateDailyTapeAssessment(extractLLMJSON(raw), inputs);
+}
 
 async function fetchMarketNews(apiKey, tickers) {
   const headlines = [];
@@ -3888,8 +4098,15 @@ async function runNewsScan(acct, apiKey) {
   log(acct, "NEWS SCAN: Fetching latest market headlines...");
 
   const headlines = await fetchMarketNews(apiKey, acct.tickers);
+  try {
+    const dailyTape = await assessDailyTape(acct, apiKey, headlines);
+    for (const [, a] of accounts) a.dailyTape = dailyTape;
+    log(acct, `DAILY TAPE: ${dailyTape.score}/10 ${dailyTape.label} (${dailyTape.confidence}% confidence) — ${dailyTape.summary}`);
+  } catch (error) {
+    log(acct, `DAILY TAPE ERROR: ${error.message} — keeping the last visible assessment; no score-based gate was applied`);
+  }
   if (headlines.length === 0) {
-    log(acct, "NEWS SCAN: No headlines fetched");
+    log(acct, "NEWS SCAN: No headlines fetched; daily tape used direct market/calendar inputs only");
     return;
   }
 
@@ -3996,6 +4213,7 @@ Rules:
 
 async function validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, candidates, effectiveQuality = setupQuality.quality) {
   const cfg = acct.config;
+  const dailyTape = acct.dailyTape?.date === todayStr() ? acct.dailyTape : null;
   const isEquity = cfg.broker === "robinhood" && rhTradeMode(cfg) === "equity";
   const direction = analysis.score >= cfg.bullEntry
     ? (isEquity ? 'BULLISH (buying shares)' : 'BULLISH (buying calls)')
@@ -4049,6 +4267,8 @@ RSI: ${analysis.rsi?.toFixed(1) || 'N/A'}
 EMA Stack: ${analysis.aligned ? 'Aligned bullish (8>21>50)' : analysis.bearish ? 'Aligned bearish (50>21>8)' : 'Mixed/transitioning'}
 Setup Quality: ${effectiveQuality}/100 (${effectiveQuality > setupQuality.quality ? 'momentum-runner quality exceeds base quality' : setupQuality.tight ? 'tight base' : 'wide range'}, ${setupQuality.breakingOut ? 'breaking out' : 'no base breakout'}, vol ${setupQuality.volDeclining ? 'declining in base' : 'normal'})
 Market Regime: ${regime.label}
+Daily Tape: ${dailyTape ? `${dailyTape.score}/10 ${dailyTape.label} (${dailyTape.confidence}% confidence) — ${dailyTape.summary}` : 'unavailable; do not infer a score'}
+Daily Tape Use: Treat the tape assessment as market-wide reversal/volatility context, not an automatic veto. Explicitly explain whether this ticker's setup is strong enough for those conditions.
 ${earningsInfo.hasEarnings ? `⚠ EARNINGS in ${earningsInfo.daysUntil} days (${earningsInfo.date}); eligible contracts expire before it` : 'No reported earnings inside the option horizon'}
 ${cfg.customPromptSuffix ? `Additional context: ${cfg.customPromptSuffix}` : ''}
 ${contractSection}
@@ -4365,13 +4585,14 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
   const maxAllocationBudget = state.cash * acct.riskPct;
   const direction = isBullish ? "BULLISH" : "BEARISH";
   let type = isBullish ? "call" : "put";
+  const entryExitConfig = managementConfigForNewEntry(acct, type);
 
   // ─── Step 1: Check validation cache (skips both chain fetch AND Claude call) ───
   let claudeResult = { approve: true, confidence: 70, concerns: [], reasoning: "", suggestion: "", contractIdx: 0 };
   let selectedCandidate = null;
   let candidates = [];
 
-  const validationContext = `${cfg.broker}:${rhTradeMode(cfg)}:${regime?.mode || "unknown"}:${cfg.customPromptSuffix || ""}`;
+  const validationContext = `${cfg.broker}:${rhTradeMode(cfg)}:${regime?.mode || "unknown"}:tape-${acct.dailyTape?.date || "none"}-${acct.dailyTape?.score || "na"}:${cfg.customPromptSuffix || ""}`;
   const cached = getCachedValidation(acct.id, ticker, analysis.score, direction, validationContext);
   if (cached) {
     claudeResult = cached.result;
@@ -4554,9 +4775,9 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
       const frictionPct = selectedCandidate.roundTripFrictionPct != null
         ? selectedCandidate.roundTripFrictionPct / 100
         : ((selectedCandidate.ask - selectedCandidate.bid) + (2 * FEE_PER_CONTRACT / 100)) / selectedCandidate.ask;
-      const maxFrictionPct = Math.min(0.15, Math.max(0.06, 0.5 * (cfg.profitTarget || 0.12)));
+      const maxFrictionPct = Math.min(0.15, Math.max(0.06, 0.5 * (entryExitConfig.profitTarget || 0.12)));
       if (!Number.isFinite(frictionPct) || frictionPct > maxFrictionPct) {
-        return { skipped: true, reason: `Contract executable friction ${(frictionPct * 100).toFixed(1)}% exceeds ${(maxFrictionPct * 100).toFixed(1)}% cap for a +${((cfg.profitTarget || 0.12) * 100).toFixed(0)}% target — spread would consume the edge` };
+        return { skipped: true, reason: `Contract executable friction ${(frictionPct * 100).toFixed(1)}% exceeds ${(maxFrictionPct * 100).toFixed(1)}% cap for a +${((entryExitConfig.profitTarget || 0.12) * 100).toFixed(0)}% target — spread would consume the edge` };
       }
       strike = selectedCandidate.strike;
       dte = selectedCandidate.dte;
@@ -4585,7 +4806,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
   let expectedEntryPremium = type === "equity" ? spot : premium;
   if ((cfg.broker === "tradier" || cfg.broker === "robinhood") && selectedCandidate && type !== "equity") {
     const conviction = Math.max(0, Math.min(1, (claudeResult.confidence || 0) / 100));
-    const maxOverpayPct = Math.min(MAX_ENTRY_OVERPAY_PCT, Math.max(0.03, (cfg.profitTarget || 0.40) * 0.4));
+    const maxOverpayPct = Math.min(MAX_ENTRY_OVERPAY_PCT, Math.max(0.03, (entryExitConfig.profitTarget || 0.40) * 0.4));
     expectedEntryPremium = entryLimitPrice(selectedCandidate.bid, selectedCandidate.ask, premium, conviction, { maxOverpayPct });
   } else if (isRhEquityOnly) {
     const eqBid = quote.bid ?? null;
@@ -4617,7 +4838,10 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
       cash: Math.max(0, Math.min(state.cash, deployable)),
       entryPrice,
       stopLossPct: cfg.stopLoss,
-      profitTargetPct: Math.min(cfg.profitTarget, cfg.singleContractBankPct ?? cfg.profitTarget),
+      profitTargetPct: Math.min(
+        entryExitConfig.profitTarget,
+        entryExitConfig.singleContractBankPct ?? entryExitConfig.profitTarget,
+      ),
       minimumRewardRisk: cfg.minimumRewardRisk ?? 1.5,
       riskPerTradePct: cfg.riskPerTradePct ?? 0.005,
       maxPositionPct: cfg.maxPositionPct ?? Math.min(cfg.baseRiskPct || 0.10, 0.10),
@@ -4722,12 +4946,12 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
         return { skipped: true, reason: `Tradier: ${occ} has no current tradeable two-sided quote — cannot preflight` };
       }
       const frictionPct = ((fresh.ask - fresh.bid) + (2 * FEE_PER_CONTRACT / 100)) / fresh.ask;
-      const maxFrictionPct = Math.min(0.15, Math.max(0.06, 0.5 * (cfg.profitTarget || 0.12)));
+      const maxFrictionPct = Math.min(0.15, Math.max(0.06, 0.5 * (entryExitConfig.profitTarget || 0.12)));
       if (!Number.isFinite(frictionPct) || frictionPct > maxFrictionPct) {
         return { skipped: true, reason: `Tradier: ${occ} executable friction ${(frictionPct * 100).toFixed(1)}% exceeds ${(maxFrictionPct * 100).toFixed(1)}% — spread consumes the target` };
       }
       const conviction = Math.max(0, Math.min(1, (claudeResult.confidence || 0) / 100));
-      const maxOverpayPct = Math.min(MAX_ENTRY_OVERPAY_PCT, Math.max(0.03, (cfg.profitTarget || 0.40) * 0.4));
+      const maxOverpayPct = Math.min(MAX_ENTRY_OVERPAY_PCT, Math.max(0.03, (entryExitConfig.profitTarget || 0.40) * 0.4));
       const liveLimit = entryLimitPrice(fresh.bid, fresh.ask, fresh.mid, conviction, { maxOverpayPct });
       const freshRiskDecision = governedOptionSizing ? optionRiskDecisionFor(liveLimit, fresh.bid, fresh.ask) : null;
       if (freshRiskDecision && !freshRiskDecision.approved) {
@@ -4783,7 +5007,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
         premium = fresh.mid;
 
         const frictionPct = ((ask - bid) + (2 * FEE_PER_CONTRACT / 100)) / ask;
-        const maxFrictionPct = Math.min(0.15, Math.max(0.06, 0.5 * (cfg.profitTarget || 0.12)));
+        const maxFrictionPct = Math.min(0.15, Math.max(0.06, 0.5 * (entryExitConfig.profitTarget || 0.12)));
         if (!Number.isFinite(frictionPct) || frictionPct > maxFrictionPct) {
           return { skipped: true, reason: `Robinhood: ${occ} executable friction ${(frictionPct * 100).toFixed(1)}% now exceeds ${(maxFrictionPct * 100).toFixed(1)}% — ranked edge disappeared` };
         }
@@ -4796,7 +5020,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
           roundTripFrictionPct: +(frictionPct * 100).toFixed(1),
         };
 
-        const maxOverpayPct = Math.min(MAX_ENTRY_OVERPAY_PCT, Math.max(0.03, (cfg.profitTarget || 0.40) * 0.4));
+        const maxOverpayPct = Math.min(MAX_ENTRY_OVERPAY_PCT, Math.max(0.03, (entryExitConfig.profitTarget || 0.40) * 0.4));
         const limit = entryLimitPrice(bid, ask, premium, conviction, { maxOverpayPct });
         const freshRiskDecision = governedOptionSizing ? optionRiskDecisionFor(limit, bid, ask) : null;
         if (freshRiskDecision && !freshRiskDecision.approved) {
@@ -4832,7 +5056,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
           trimLevel: 0,
           bestPnlPct: 0,
           bestExitPnlPct: 0,
-          managementPlan: createManagementPlan(cfg, { type, dte }),
+          managementPlan: createManagementPlan(entryExitConfig, { type, dte }),
           entryAtrPct: analysis.atrPct ?? null,
           setupQuality: effectiveQuality,
           ai: aiThesis || null,
@@ -4965,7 +5189,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
     trimLevel: 0,
     bestPnlPct: 0,
     bestExitPnlPct: 0,
-    managementPlan: createManagementPlan(cfg, { type, dte }),
+    managementPlan: createManagementPlan(managementConfigForNewEntry(acct, type), { type, dte }),
     ...aiThesis,
     // Capture ATR% at entry so the spot stop can scale to the underlying's normal noise.
     // Noisy names (AMKR ~5%, NOK ~6%) need a wider stop than calm names (UNH ~2%).
@@ -5072,7 +5296,7 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
     cost: totalCost, openDate: acct._simDateStr || getETDateStr(),
     openTime: acct._simNow || Date.now(),
     trimLevel: 0, bestPnlPct: 0, bestExitPnlPct: 0,
-    managementPlan: createManagementPlan(cfg, { type, dte }, acct._simNow || Date.now()),
+    managementPlan: createManagementPlan(managementConfigForNewEntry(acct, type), { type, dte }, acct._simNow || Date.now()),
     claudeConfidence: claudeResult.confidence,
     claudeReasoning: (claudeResult.reasoning || "").trim() || `Backtest entry on technicals: ${isBull ? "BULLISH" : "BEARISH"} setup, score ${analysis.score}/100, setup quality ${sq.quality}/100, regime ${regime.label}.`,
     claudeSuggestion: claudeResult.suggestion || "",
@@ -5635,18 +5859,10 @@ async function manageOpenPositions(acct, quotes, analyses = null, shortTermAnaly
     if (trailMark > 0) recordMarkTrail(pos, trailMark, now, executableBid, pos.liveAsk);
 
     // A broker holding with no frozen plan predates this lifecycle manager (or was opened manually).
-    // Freeze a modest quick-bank policy once; do not let today's account preset silently turn PATH
-    // or another legacy one-lot into a +50% runner on its first management tick.
+    // Freeze the exact effective configuration shown in the dashboard; never inject a hidden
+    // legacy +12% quick-bank mandate.
     const canFreezePlan = cfg.broker !== "robinhood" || isEquity || verifiedRobinhoodOption;
-    const plan = canFreezePlan && !pos.managementPlan && cfg.broker === "robinhood" && !isEquity
-      ? createManagementPlan({
-          ...cfg,
-          exitMode: "quick_bank",
-          profitTarget: Math.min(Number(cfg.profitTarget) || 0.12, 0.12),
-          trim1Pct: Math.min(Number(cfg.trim1Pct) || 0.10, 0.10),
-          trim2Pct: Math.max(0.18, Number(cfg.trim2Pct) || 0.18),
-        }, pos, now)
-      : managementPlanFor(pos, cfg, now);
+    const plan = managementPlanFor(pos, cfg, now);
     if (canFreezePlan) pos.managementPlan = plan;
     const analysis = anMap[pos.ticker] || null;
     const shortTerm = stMap[pos.ticker] || null;
@@ -5838,6 +6054,68 @@ function lwcChartData(windowCandles, fullCandles, emaConfigs = [], lines = []) {
   return { candles, volume, emas, lines: priceLines };
 }
 
+function liveControlSummaryHTML(acct) {
+  const cfg = acct.config;
+  if (cfg.broker !== "robinhood" && cfg.broker !== "tradier") return "";
+
+  const blockers = [];
+  if (cfg.liveEntriesEnabled !== true) blockers.push("Live entries toggle is OFF");
+  if (cfg.autoExecute !== true) blockers.push("Auto-execute is OFF");
+  if (acct.paused) blockers.push(`Account paused (${acct.pausedBy || "manual"})`);
+  if (!acct.dashboard?.marketOpen && !cfg.tradeWhenClosed) blockers.push("Market is closed");
+  const breaker = riskBreakerStatus(acct);
+  if (breaker) blockers.push(breaker);
+  const balanceAt = Number(acct.state?.brokerBalanceAt);
+  if (!(balanceAt > 0) || Date.now() - balanceAt > LIVE_BALANCE_MAX_AGE_MS) {
+    blockers.push("Broker cash/equity snapshot is older than 90 seconds");
+  }
+  if (cfg.broker === "robinhood" && acct.state?.brokerHealth?.status === "disconnected") {
+    blockers.push("Robinhood health probe is disconnected");
+  }
+  if (cfg.broker === "robinhood" && RH_REQUIRE_APPROVAL) {
+    blockers.push("RH_REQUIRE_APPROVAL compatibility lock is ON");
+  }
+
+  const armed = blockers.length === 0;
+  const statusColor = armed ? "#067a2f" : "#9a5b00";
+  const statusBg = armed ? "#ecfdf3" : "#fff8e6";
+  const statusBorder = armed ? "#86efac" : "#f5cc75";
+  const pct = value => value == null || value === ""
+    ? "off"
+    : Number.isFinite(Number(value))
+      ? `${(Number(value) * 100).toFixed(2).replace(/\.00$/, "")}%`
+      : "invalid";
+  const valueOr = (value, fallback = "unlimited") => value == null || value === "" ? fallback : value;
+  const pv = portfolioValue(acct.state, acct.dashboard?.quotes || {});
+  const riskBudget = Number.isFinite(Number(cfg.riskPerTradePct)) && pv > 0
+    ? pv * Number(cfg.riskPerTradePct)
+    : null;
+  const allocationBudget = Number.isFinite(Number(cfg.maxPositionPct)) && pv > 0
+    ? pv * Number(cfg.maxPositionPct)
+    : null;
+  const effectiveExitConfig = managementConfigForNewEntry(acct, null);
+  const adaptive = effectiveExitConfig.adaptiveExitProfile || null;
+  const adaptiveText = adaptive
+    ? adaptive.sampleSize < adaptive.minSamples
+      ? `ON · using visible fallback ${pct(adaptive.targetPct)} until ${adaptive.minSamples} confirmed executable outcomes (${adaptive.sampleSize}/${adaptive.minSamples}); then highest ${pct(adaptive.minTargetPct)}–${pct(adaptive.maxTargetPct)} boundary reached by ≥${(adaptive.requiredReachRate * 100).toFixed(0)}% of the last ${adaptive.lookback}`
+      : `ON · ${pct(adaptive.targetPct)} selected from ${adaptive.sampleSize} recent ${adaptive.source} outcomes (${(adaptive.reachRate * 100).toFixed(0)}% reached it; required ≥${(adaptive.requiredReachRate * 100).toFixed(0)}%; tested range ${pct(adaptive.minTargetPct)}–${pct(adaptive.maxTargetPct)})`
+    : "OFF";
+  const blockText = armed
+    ? "No account-level blocker. A trade still requires a qualifying signal and executable contract."
+    : blockers.map(reason => `• ${reason}`).join("<br>");
+
+  return `<details open style="margin:10px 0 14px;padding:10px 12px;border-radius:8px;border:1px solid ${statusBorder};background:${statusBg};color:#27303f;font-size:12px;line-height:1.55">
+    <summary style="cursor:pointer;font-weight:800;color:${statusColor}">${armed ? "LIVE ENTRIES ELIGIBLE" : "LIVE ENTRIES BLOCKED"} · effective configuration</summary>
+    <div style="margin-top:8px;color:${statusColor};font-weight:650">${blockText}</div>
+    <div style="margin-top:8px"><b>Execution</b> · live entries ${cfg.liveEntriesEnabled === true ? "ON" : "OFF"} · auto-execute ${cfg.autoExecute === true ? "ON" : "OFF"} · cash reserve ${cfg.useCashReserve ? "ON" : "OFF"} · max ${valueOr(cfg.maxDayTrades)} entries/day · max ${valueOr(cfg.maxPositions)} positions</div>
+    <div><b>Exit mandate for new positions</b> · effective target ${pct(effectiveExitConfig.profitTarget)} · stop ${pct(cfg.stopLoss)} · one-contract bank ${pct(effectiveExitConfig.singleContractBankPct)} · trims ${pct(effectiveExitConfig.trim1Pct)} / ${pct(effectiveExitConfig.trim2Pct)} · mode ${cfg.exitMode || "automatic"} · held-position poll every ${((cfg.positionManagementMs ?? POSITION_MANAGEMENT_MS) / 1000).toFixed(0)}s</div>
+    <div><b>Recent-data adaptation</b> · ${adaptiveText}${adaptive ? ` · profit lock arms ${pct(adaptive.profitLockArmPct)}; close after the larger of ${pct(adaptive.peakGivebackMin)} or ${(adaptive.peakGivebackFrac * 100).toFixed(0)}% of peak is given back` : ""}</div>
+    <div><b>Risk</b> · planned loss ${pct(cfg.riskPerTradePct)}/trade${riskBudget != null ? ` (~$${riskBudget.toFixed(2)})` : ""} · allocation ${pct(cfg.maxPositionPct)}/position${allocationBudget != null ? ` (~$${allocationBudget.toFixed(2)})` : ""} · open risk ${pct(cfg.maxPortfolioRiskPct)} · min net R:R ${valueOr(cfg.minimumRewardRisk, "unset")} · max trade $${valueOr(cfg.maxTradeSize, 500)}</div>
+    <div><b>Halts</b> · daily ${pct(cfg.dailyLossLimitPct)} · weekly ${pct(cfg.weeklyLossLimitPct)} · high-water drawdown ${pct(cfg.highWaterDrawdownLimitPct)} · ${valueOr(cfg.maxConsecutiveLosses)} consecutive losses</div>
+    <div><b>Signal gates</b> · setup ≥${cfg.minSetupQuality ?? 50} · calls ≥${cfg.bullEntry ?? 68} · puts ≤${cfg.bearEntry ?? 32} · opening freeze 15m · closing freeze 15m · 7–45 DTE · real two-sided quote/liquidity/delta/friction checks required</div>
+  </details>`;
+}
+
 function dashboardHTML(acct, { spectator = false } = {}) {
   const state = acct.state;
   const dashboard = acct.dashboard;
@@ -5853,16 +6131,20 @@ function dashboardHTML(acct, { spectator = false } = {}) {
   const pv = portfolioValue(state, dashboard.quotes);
   const pnlPct = ((pv - STARTING_CASH) / STARTING_CASH * 100).toFixed(1);
   const progress = ((pv / GOAL) * 100).toFixed(1);
-  const pace = march1mPace(acct, pv);
-  const marchBanner = pace
-    ? `<div style="margin:10px 0 14px;padding:10px 12px;border-radius:8px;border:1px solid #99f6e4;background:#ecfdf5;color:#134e4a;font-size:12px;line-height:1.45">
-        <b>March $1M track</b> · ${pace.daysLeft} sessions left · need ~<b>${pace.needDailyPct.toFixed(1)}%/day</b>
-        · this week target ~$${pace.weekTarget.toFixed(0)}
-        · sleeve ${((cfg.baseRiskPct || 0) * 100).toFixed(0)}% · bank +${((cfg.profitTarget || 0) * 100).toFixed(0)}%
+  const marchBanner = liveControlSummaryHTML(acct);
+  const dailyTape = acct.dailyTape?.date === todayStr() ? acct.dailyTape : null;
+  const safeTapeText = value => String(value || "")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  const tapeColor = !dailyTape ? "#8a909b" : dailyTape.score <= 4 ? "#e8473f" : dailyTape.score <= 6 ? "#b07400" : "#00a843";
+  const dailyTapeHTML = dailyTape
+    ? `<div style="margin-bottom:8px;padding:9px 10px;background:#f6f7f9;border-radius:4px;font-size:11px;border-left:4px solid ${tapeColor}">
+        <div style="font-weight:800;color:${tapeColor};margin-bottom:3px">TODAY'S TAPE ${dailyTape.score}/10 · ${safeTapeText(dailyTape.label).toUpperCase()} · ${dailyTape.confidence}% confidence</div>
+        <div>${safeTapeText(dailyTape.summary)}</div>
+        ${dailyTape.drivers?.length ? `<div style="margin-top:4px;color:#6b7280">Drivers: ${dailyTape.drivers.map(safeTapeText).join(" · ")}</div>` : ""}
+        <div style="margin-top:4px;color:#8a909b">Updated ${new Date(dailyTape.observedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} · inputs ${dailyTape.sourceStatus?.marketSnapshots ?? 0}/${dailyTape.sourceStatus?.marketSnapshotsRequested ?? 0} market snapshots, ${dailyTape.sourceStatus?.headlines ?? 0} headlines, earnings ${dailyTape.sourceStatus?.earningsCalendar ? "available" : "unavailable"}, macro ${dailyTape.sourceStatus?.economicCalendar ? "available" : "unavailable"} · supplied to every entry validation; no standalone hidden veto</div>
       </div>`
-    : (cfg.broker === "robinhood"
-      ? `<div style="margin:10px 0 14px;padding:10px 12px;border-radius:8px;border:1px solid #99f6e4;background:#ecfdf5;color:#134e4a;font-size:12px"><b>Capital-preservation rails</b> · planned loss ≤${((cfg.riskPerTradePct || 0) * 100).toFixed(2)}%/trade · allocation ≤${((cfg.maxPositionPct || 0) * 100).toFixed(0)}% · daily halt ${((cfg.dailyLossLimitPct || 0) * 100).toFixed(1)}% · no live self-promotion</div>`
-      : "");
+    : `<div style="margin-bottom:8px;padding:9px 10px;background:#f6f7f9;border-radius:4px;font-size:11px;border-left:4px solid #8a909b;color:#8a909b">Today's Haiku tape score is not available yet. No score-based rule is being applied.</div>`;
 
   const llmBadge = spectator
     ? `<span class="llm-toggle" title="Read-only in spectator mode">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>`
@@ -6235,6 +6517,7 @@ ${spectator ? '<div style="margin:8px 0 12px;padding:8px 12px;border:1px solid #
   </div>
   <div class="card">
     <h2>AI Assistant &amp; News Intel</h2>
+    ${dailyTapeHTML}
     <div style="margin-bottom:8px;padding:6px 10px;background:#f6f7f9;border-radius:4px;font-size:11px;border-left:3px solid ${(acct.latestNewsBrief || "").includes("CRITICAL") ? "#e8473f" : (acct.latestNewsBrief || "").includes("ELEVATED") ? "#b07400" : "#d4d8e0"}">${acct.latestNewsBrief || '<span style="opacity:.4">News scan runs hourly...</span>'}</div>
     ${hints ? `<div style="margin-bottom:8px">${hints}</div>` : ''}
     ${(() => {
@@ -7710,6 +7993,28 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
         <input name="profitTarget" type="number" step="1" value="${(cfg.profitTarget * 100).toFixed(0)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Stop Loss (%)</label>
         <input name="stopLoss" type="number" step="1" value="${(cfg.stopLoss * 100).toFixed(0)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">One-contract bank (%)</label><input name="singleContractBankPct" type="number" step="1" min="1" value="${((cfg.singleContractBankPct ?? cfg.profitTarget) * 100).toFixed(0)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Minimum net reward/risk</label><input name="minimumRewardRisk" type="number" step="0.05" min="0" value="${cfg.minimumRewardRisk ?? 1}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">First trim (%)</label><input name="trim1Pct" type="number" step="1" min="1" value="${((cfg.trim1Pct ?? cfg.profitTarget) * 100).toFixed(0)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Second trim (%)</label><input name="trim2Pct" type="number" step="1" min="1" value="${((cfg.trim2Pct ?? cfg.profitTarget) * 100).toFixed(0)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+        </div>
+        <label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Exit mode</label>
+        <select name="exitMode" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box"><option value="quick_bank" ${(cfg.exitMode || "quick_bank") === "quick_bank" ? "selected" : ""}>Quick bank — close remainder at target</option><option value="runner" ${cfg.exitMode === "runner" ? "selected" : ""}>Runner — trim then trail</option></select>
+        <div style="font-size:12px;font-weight:800;color:#3a3b42;margin:14px 0 8px">Adaptive quick-profit boundary</div>
+        <label style="display:flex;gap:8px;align-items:center;font-size:12px;margin-bottom:10px"><input name="adaptiveProfitTarget" type="checkbox" ${cfg.adaptiveProfitTarget === true ? "checked" : ""}> Use confirmed recent executable peaks to select the target</label>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:6px">
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Target minimum (%)</label><input name="adaptiveTargetMinPct" type="number" step="1" min="1" value="${((cfg.adaptiveTargetMinPct ?? 0.10) * 100).toFixed(0)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Target maximum (%)</label><input name="adaptiveTargetMaxPct" type="number" step="1" min="1" value="${((cfg.adaptiveTargetMaxPct ?? 0.15) * 100).toFixed(0)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Thin-sample fallback (%)</label><input name="adaptiveTargetFallbackPct" type="number" step="1" min="1" value="${((cfg.adaptiveTargetFallbackPct ?? 0.12) * 100).toFixed(0)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Required reach rate (%)</label><input name="adaptiveTargetReachRate" type="number" step="1" min="1" max="100" value="${((cfg.adaptiveTargetReachRate ?? 0.65) * 100).toFixed(0)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Recent-trade lookback</label><input name="adaptiveTargetLookback" type="number" min="1" value="${cfg.adaptiveTargetLookback ?? 20}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Minimum samples</label><input name="adaptiveTargetMinSamples" type="number" min="1" value="${cfg.adaptiveTargetMinSamples ?? 5}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Minimum giveback (%)</label><input name="peakGivebackMin" type="number" step="0.5" min="0.5" value="${((cfg.peakGivebackMin ?? 0.025) * 100).toFixed(1)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Peak giveback fraction (%)</label><input name="peakGivebackFrac" type="number" step="1" min="5" max="100" value="${((cfg.peakGivebackFrac ?? 0.25) * 100).toFixed(0)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Position poll cadence (seconds)</label><input name="positionManagementSeconds" type="number" min="5" max="60" value="${Math.round((cfg.positionManagementMs ?? POSITION_MANAGEMENT_MS) / 1000)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+        </div>
+        <p style="font-size:11px;color:#6b7280;margin:0 0 12px">The effective target, sample count, reach rate, lock arm, and giveback rule are shown above the dashboard. Every new position freezes its exact plan at entry.</p>
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Goal ($)</label>
         <input name="goal" type="number" value="${cfg.goal}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Capital contributed / zero-point ($)${cfg.broker === "robinhood" || cfg.broker === "tradier" ? " — deposits go here, not into P&L" : ""}</label>
@@ -7723,6 +8028,17 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
         <input name="maxPositions" type="number" value="${cfg.maxPositions || ""}" placeholder="unlimited" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Max Trade Size ($ Circuit Breaker)</label>
         <input name="maxTradeSize" type="number" value="${cfg.maxTradeSize || 500}" placeholder="500" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
+        <div style="font-size:12px;font-weight:800;color:#3a3b42;margin:14px 0 8px">Live risk and halt controls</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Planned loss / trade (%)</label><input name="riskPerTradePct" type="number" step="0.05" min="0" value="${((cfg.riskPerTradePct ?? 0.005) * 100).toFixed(2)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Max position allocation (%)</label><input name="maxPositionPct" type="number" step="0.5" min="0" value="${((cfg.maxPositionPct ?? 0.10) * 100).toFixed(1)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Max total open risk (%)</label><input name="maxPortfolioRiskPct" type="number" step="0.5" min="0" value="${((cfg.maxPortfolioRiskPct ?? 0.02) * 100).toFixed(1)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Max entries / day (blank=off)</label><input name="maxDayTrades" type="number" min="1" value="${cfg.maxDayTrades ?? ""}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Daily loss halt (%)</label><input name="dailyLossLimitPct" type="number" step="0.5" min="0" value="${cfg.dailyLossLimitPct == null ? "" : (cfg.dailyLossLimitPct * 100).toFixed(1)}" placeholder="off" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Weekly loss halt (%)</label><input name="weeklyLossLimitPct" type="number" step="0.5" min="0" value="${cfg.weeklyLossLimitPct == null ? "" : (cfg.weeklyLossLimitPct * 100).toFixed(1)}" placeholder="off" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">High-water drawdown halt (%)</label><input name="highWaterDrawdownLimitPct" type="number" step="0.5" min="0" value="${cfg.highWaterDrawdownLimitPct == null ? "" : (cfg.highWaterDrawdownLimitPct * 100).toFixed(1)}" placeholder="off" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Consecutive-loss halt (blank=off)</label><input name="maxConsecutiveLosses" type="number" min="1" value="${cfg.maxConsecutiveLosses ?? ""}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+        </div>
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Min Setup Quality (0=trade anything, 50=default, 100=perfect setups only)</label>
         <input name="minSetupQuality" type="number" value="${cfg.minSetupQuality ?? 50}" min="0" max="100" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">
@@ -7734,6 +8050,7 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
         <input type="hidden" name="configForm" value="1">
         <div style="border-top:1px solid #e3e6ea;margin:4px 0 14px;padding-top:14px">
           <div style="font-size:12px;color:#6b7280;margin-bottom:10px">Broker: <strong style="color:${cfg.broker === "tradier" ? "#00a843" : "#6b7280"}">${(cfg.broker || "paper").toUpperCase()}${cfg.broker === "tradier" ? " · LIVE" : ""}</strong></div>
+          ${(cfg.broker === "robinhood" || cfg.broker === "tradier") ? `<label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;font-weight:800;color:#1c1d22"><input type="checkbox" name="liveEntriesEnabled" ${cfg.liveEntriesEnabled === true ? "checked" : ""}> Live entries eligible (master entry switch)</label>` : ""}
           <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="useCashReserve" ${cfg.useCashReserve ? "checked" : ""}> Use cash reserve (50%→25% buffer)</label>
           <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="autoExecute" ${cfg.autoExecute ? "checked" : ""}> Auto-execute broker orders (full autonomy)</label>
           <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#3a3b42"><input type="checkbox" name="tradeWhenClosed" ${cfg.tradeWhenClosed ? "checked" : ""}> Trade when market closed (testing/sandbox)</label>
@@ -8580,7 +8897,7 @@ function startDashboard(defaultAcct, apiKey) {
           target.paused = false;
           target.pausedBy = null;
         }
-        log(target, `RISK REVIEW: baselines reset $${(oldBase ?? 0).toFixed(0)} → $${pv.toFixed(0)}, rolling loss streak/cooldown cleared; trading may resume within hard live limits`);
+        log(target, `RISK REVIEW: baselines reset $${(oldBase ?? 0).toFixed(0)} → $${pv.toFixed(0)}, rolling loss streak/cooldown cleared; configured entry controls now apply`);
         saveAccounts();
       }
       res.writeHead(302, { Location: `/?a=${riskResetMatch[1]}` });
@@ -8667,9 +8984,52 @@ function startDashboard(defaultAcct, apiKey) {
       req.on("end", () => {
         const params = new URLSearchParams(body);
         const cfg = target.config;
-        if (params.has("baseRiskPct")) cfg.baseRiskPct = parseFloat(params.get("baseRiskPct")) / 100;
-        if (params.has("profitTarget")) cfg.profitTarget = parseFloat(params.get("profitTarget")) / 100;
-        if (params.has("stopLoss")) cfg.stopLoss = parseFloat(params.get("stopLoss")) / 100;
+        const beforeConfig = { ...cfg };
+        const setPercent = (name, { allowNull = false, negative = false } = {}) => {
+          if (!params.has(name)) return;
+          const raw = params.get(name).trim();
+          if (raw === "" && allowNull) {
+            cfg[name] = null;
+            return;
+          }
+          const parsed = parseFloat(raw) / 100;
+          const valid = Number.isFinite(parsed) && (negative ? parsed < 0 : parsed >= 0);
+          if (valid) cfg[name] = parsed;
+          else log(target, `SETTINGS REJECTED: ${name}="${raw}" is invalid; kept ${cfg[name]}`);
+        };
+        setPercent("baseRiskPct");
+        setPercent("profitTarget");
+        setPercent("stopLoss", { negative: true });
+        setPercent("singleContractBankPct");
+        setPercent("trim1Pct");
+        setPercent("trim2Pct");
+        setPercent("riskPerTradePct");
+        setPercent("maxPositionPct");
+        setPercent("maxPortfolioRiskPct");
+        setPercent("dailyLossLimitPct", { allowNull: true });
+        setPercent("weeklyLossLimitPct", { allowNull: true });
+        setPercent("highWaterDrawdownLimitPct", { allowNull: true });
+        setPercent("adaptiveTargetMinPct");
+        setPercent("adaptiveTargetMaxPct");
+        setPercent("adaptiveTargetFallbackPct");
+        setPercent("adaptiveTargetReachRate");
+        setPercent("peakGivebackMin");
+        setPercent("peakGivebackFrac");
+        if (params.has("minimumRewardRisk")) {
+          const value = parseFloat(params.get("minimumRewardRisk"));
+          if (Number.isFinite(value) && value >= 0) cfg.minimumRewardRisk = value;
+          else log(target, `SETTINGS REJECTED: minimumRewardRisk="${params.get("minimumRewardRisk")}" is invalid; kept ${cfg.minimumRewardRisk}`);
+        }
+        if (["quick_bank", "runner"].includes(params.get("exitMode"))) cfg.exitMode = params.get("exitMode");
+        if (params.has("adaptiveTargetLookback")) cfg.adaptiveTargetLookback = Math.max(1, parseInt(params.get("adaptiveTargetLookback")) || 20);
+        if (params.has("adaptiveTargetMinSamples")) cfg.adaptiveTargetMinSamples = Math.max(1, parseInt(params.get("adaptiveTargetMinSamples")) || 5);
+        if (params.has("positionManagementSeconds")) cfg.positionManagementMs = Math.max(5_000, Math.min(60_000, (parseInt(params.get("positionManagementSeconds")) || 15) * 1000));
+        cfg.adaptiveTargetMinPct = Math.max(0.01, cfg.adaptiveTargetMinPct ?? 0.10);
+        cfg.adaptiveTargetMaxPct = Math.max(cfg.adaptiveTargetMinPct, cfg.adaptiveTargetMaxPct ?? 0.15);
+        cfg.adaptiveTargetFallbackPct = Math.max(cfg.adaptiveTargetMinPct, Math.min(cfg.adaptiveTargetMaxPct, cfg.adaptiveTargetFallbackPct ?? 0.12));
+        cfg.adaptiveTargetReachRate = Math.max(0.01, Math.min(1, cfg.adaptiveTargetReachRate ?? 0.65));
+        cfg.peakGivebackMin = Math.max(0.005, Math.min(0.25, cfg.peakGivebackMin ?? 0.025));
+        cfg.peakGivebackFrac = Math.max(0.05, Math.min(1, cfg.peakGivebackFrac ?? 0.25));
         if (params.has("goal")) cfg.goal = parseFloat(params.get("goal")) || cfg.goal;
         // Capital base (zero-point). Prefer absolute set; optional deposit delta stacks on top.
         if (params.has("startingCash") && params.get("startingCash") !== "") {
@@ -8699,19 +9059,29 @@ function startDashboard(defaultAcct, apiKey) {
         // Broker binding is immutable. Only canonical runtime ids can own process-global live
         // credentials; an API-crafted config request cannot rebind a paper account or vice versa.
         if (params.has("configForm")) {
+          cfg.adaptiveProfitTarget = params.get("adaptiveProfitTarget") === "on" || params.get("adaptiveProfitTarget") === "true";
           cfg.useCashReserve = params.get("useCashReserve") === "on" || params.get("useCashReserve") === "true";
           cfg.autoExecute = params.get("autoExecute") === "on" || params.get("autoExecute") === "true";
           cfg.tradeWhenClosed = params.get("tradeWhenClosed") === "on" || params.get("tradeWhenClosed") === "true";
+          if (cfg.broker === "robinhood" || cfg.broker === "tradier") {
+            cfg.liveEntriesEnabled = params.get("liveEntriesEnabled") === "on" || params.get("liveEntriesEnabled") === "true";
+          }
         }
+        cfg.strategyPreset = null;
         Object.assign(cfg, sanitizeRuntimeBrokerConfig(id, cfg).config);
         const policyChanges = applyLiveRiskPolicy(target);
         const liveCfg = target.config;
+        if (beforeConfig.liveEntriesEnabled !== liveCfg.liveEntriesEnabled) {
+          target._entryEpoch = (target._entryEpoch || 0) + 1;
+          if (liveCfg.liveEntriesEnabled !== true) scheduleWorkingEntryCancellation(target, "live-entry toggle off");
+          log(target, `LIVE ENTRIES: ${liveCfg.liveEntriesEnabled === true ? "ON — eligible when all displayed gates pass" : "OFF — working buys canceled; exits remain active"}`);
+        }
         target.riskPct = effectiveRiskPct(liveCfg.baseRiskPct, target.currentRegime);
         if (policyChanges.length) {
-          log(target, `CAPITAL POLICY: settings tightened to hard live bounds (${policyChanges.map(change => `${change.key} ${change.before}→${change.after}`).join(", ")})`);
+          log(target, `LIVE CONFIG: filled missing visible settings (${policyChanges.map(change => `${change.key}=${change.after}`).join(", ")}); submitted values were not rewritten`);
         }
         saveAccounts();
-        console.log(`  [${id}] Config updated: allocation=${(liveCfg.baseRiskPct * 100).toFixed(1)}% plannedRisk=${((liveCfg.riskPerTradePct || 0) * 100).toFixed(2)}% target=${(liveCfg.profitTarget * 100)}% stop=${(liveCfg.stopLoss * 100)}% minQuality=${liveCfg.minSetupQuality} bullEntry=${liveCfg.bullEntry} bearEntry=${liveCfg.bearEntry}`);
+        console.log(`  [${id}] Config updated: liveEntries=${liveCfg.liveEntriesEnabled === true} autoExecute=${liveCfg.autoExecute === true} allocation=${(liveCfg.baseRiskPct * 100).toFixed(1)}% plannedRisk=${((liveCfg.riskPerTradePct || 0) * 100).toFixed(2)}% target=${(liveCfg.profitTarget * 100)}% oneLotBank=${((liveCfg.singleContractBankPct ?? liveCfg.profitTarget) * 100)}% stop=${(liveCfg.stopLoss * 100)}% minNetRR=${liveCfg.minimumRewardRisk} minQuality=${liveCfg.minSetupQuality} bullEntry=${liveCfg.bullEntry} bearEntry=${liveCfg.bearEntry}`);
         res.writeHead(302, { Location: `/?a=${id}` });
         res.end();
       });
@@ -8764,7 +9134,7 @@ function startDashboard(defaultAcct, apiKey) {
     // Fail closed instead of advertising controls that do not exist.
     if (req.method === "POST" && pathname === "/api/rh-approval") {
       res.writeHead(410, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-      res.end(JSON.stringify({ error: "Manual approval queue retired; live entries are observation-only" }));
+      res.end(JSON.stringify({ error: "Manual approval queue retired; use the visible Live entries and Auto-execute settings" }));
       return;
     }
 
@@ -10329,7 +10699,7 @@ async function ensureRobinhoodAccount() {
 
     // Guard: startingCash must be > 0 to avoid +Infinity% P&L
     if (!(acct.config.startingCash > 0)) acct.config.startingCash = DEFAULT_CONFIG.startingCash;
-    ensureCapitalPreservationTrack(acct);
+    ensureLiveConfigDefaults(acct);
     console.log(`  Robinhood: live account present — cash $${(acct.state.cash || 0).toFixed(2)} (capital base $${acct.config.startingCash})`);
     return;
   }
@@ -10350,7 +10720,7 @@ async function ensureRobinhoodAccount() {
   };
   const acct = createAccountRuntime("robinhood", `Robinhood Live`, config, state);
   accounts.set("robinhood", acct);
-  ensureCapitalPreservationTrack(acct);
+  ensureLiveConfigDefaults(acct);
   saveAccounts();
   console.log(`  Robinhood: provisioned LIVE account ✓ — seeded cash $${state.cash.toFixed(2)}, autoExecute OFF (arm explicitly after verification)`);
 }
@@ -10415,6 +10785,7 @@ function effectivePositionCount(acct) {
 async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, expiryStr = null, dte, qty, premium, direction, bid = null, ask = null, setupQuality = 0, claudeConfidence = 0, aiThesis = null, maxBudget = null, entryEpoch = null }) {
   const expStr = expiryStr || new Date(expiryDate).toISOString().slice(0, 10);
   const occ = tradier.buildOCC(ticker, expStr, type, strike);
+  const entryExitConfig = managementConfigForNewEntry(acct, type);
 
   // In-flight de-dupe: skip if a working order already exists for this underlying. The set is
   // refreshed once per cycle in syncBrokerAccount; fall back to a fresh fetch if unavailable.
@@ -10444,13 +10815,13 @@ async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, expiry
   }
 
   const frictionPct = ((ask - bid) + (2 * FEE_PER_CONTRACT / 100)) / ask;
-  const maxFrictionPct = Math.min(0.15, Math.max(0.06, 0.5 * (acct.config.profitTarget || 0.12)));
+  const maxFrictionPct = Math.min(0.15, Math.max(0.06, 0.5 * (entryExitConfig.profitTarget || 0.12)));
   if (!Number.isFinite(frictionPct) || frictionPct > maxFrictionPct) {
     return { skipped: true, reason: `Tradier: ${occ} executable friction ${(frictionPct * 100).toFixed(1)}% now exceeds ${(maxFrictionPct * 100).toFixed(1)}% — ranked edge disappeared` };
   }
 
   const conviction = Math.max(0, Math.min(1, (claudeConfidence || 0) / 100));
-  const maxOverpayPct = Math.min(MAX_ENTRY_OVERPAY_PCT, Math.max(0.03, (acct.config.profitTarget || 0.40) * 0.4));
+  const maxOverpayPct = Math.min(MAX_ENTRY_OVERPAY_PCT, Math.max(0.03, (entryExitConfig.profitTarget || 0.40) * 0.4));
   const limit = entryLimitPrice(bid, ask, premium, conviction, { maxOverpayPct });
   const hardBudget = Math.min(
     maxBudget != null ? maxBudget : Infinity,
@@ -10464,8 +10835,8 @@ async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, expiry
     entryPrice: limit,
     stopLossPct: acct.config.stopLoss,
     profitTargetPct: Math.min(
-      acct.config.profitTarget,
-      acct.config.singleContractBankPct ?? acct.config.profitTarget,
+      entryExitConfig.profitTarget,
+      entryExitConfig.singleContractBankPct ?? entryExitConfig.profitTarget,
     ),
     minimumRewardRisk: acct.config.minimumRewardRisk ?? 1.5,
     riskPerTradePct: acct.config.riskPerTradePct ?? 0.005,
@@ -10497,7 +10868,7 @@ async function placeBrokerEntry(acct, { ticker, type, strike, expiryDate, expiry
     trimLevel: 0,
     bestPnlPct: 0,
     bestExitPnlPct: 0,
-    managementPlan: createManagementPlan(acct.config, { type, dte }),
+    managementPlan: createManagementPlan(entryExitConfig, { type, dte }),
     entryAtrPct: acct.dashboard?.analyses?.[ticker]?.atrPct ?? null,
     setupQuality,
     plannedRiskDollars: +(liveRiskDecision.metrics.maxLossPerContract * qty).toFixed(2),
@@ -12735,9 +13106,18 @@ async function runRobinhoodPositionManagement(acct) {
   }, { skipIfBusy: true });
 }
 
+function robinhoodPositionManagementCadenceMs() {
+  const requested = [...accounts.values()]
+    .filter(acct => acct.config.broker === "robinhood")
+    .map(acct => Number(acct.config.positionManagementMs))
+    .filter(Number.isFinite)
+    .map(ms => Math.max(5_000, Math.min(60_000, ms)));
+  return requested.length ? Math.min(...requested) : POSITION_MANAGEMENT_MS;
+}
+
 function startRobinhoodPositionManager() {
   if (![...accounts.values()].some(acct => acct.config.broker === "robinhood")) return;
-  console.log(`  Robinhood position manager: independent ${POSITION_MANAGEMENT_MS / 1000}s held-position cadence`);
+  console.log(`  Robinhood position manager: independent ${robinhoodPositionManagementCadenceMs() / 1000}s held-position cadence (visible per-account setting)`);
   const tick = async () => {
     const startedAt = Date.now();
     const marketOpen = isMarketOpenLocal();
@@ -12753,7 +13133,7 @@ function startRobinhoodPositionManager() {
         }
       }
     }
-    const cadence = marketOpen ? POSITION_MANAGEMENT_MS : CYCLE_MS;
+    const cadence = marketOpen ? robinhoodPositionManagementCadenceMs() : CYCLE_MS;
     const nextIn = Math.max(5_000, cadence - (Date.now() - startedAt));
     setTimeout(tick, nextIn);
   };
@@ -12995,14 +13375,15 @@ async function runCycle(acct, sharedQuotes, apiKey) {
       if (jItem) { jItem.eligibility = "stale"; jItem.outcome = "blocked"; jItem.reason = "No fresh two-sided quote at global rank snapshot"; }
       continue;
     }
+    const rankedExitConfig = managementConfigForNewEntry(acct, pf.type);
     const frictionPct = ((fresh.ask - fresh.bid) + (2 * FEE_PER_CONTRACT / 100)) / fresh.ask;
-    const maxFrictionPct = Math.min(0.15, Math.max(0.06, 0.5 * (cfg.profitTarget || 0.12)));
+    const maxFrictionPct = Math.min(0.15, Math.max(0.06, 0.5 * (rankedExitConfig.profitTarget || 0.12)));
     if (!Number.isFinite(frictionPct) || frictionPct > maxFrictionPct) {
       if (jItem) { jItem.eligibility = "stale"; jItem.outcome = "blocked"; jItem.reason = `Friction widened to ${(frictionPct * 100).toFixed(1)}%`; }
       continue;
     }
     const conviction = Math.max(0, Math.min(1, (pf.claudeConfidence || 0) / 100));
-    const maxOverpayPct = Math.min(MAX_ENTRY_OVERPAY_PCT, Math.max(0.03, (cfg.profitTarget || 0.40) * 0.4));
+    const maxOverpayPct = Math.min(MAX_ENTRY_OVERPAY_PCT, Math.max(0.03, (rankedExitConfig.profitTarget || 0.40) * 0.4));
     const limit = entryLimitPrice(fresh.bid, fresh.ask, fresh.mid, conviction, { maxOverpayPct });
     const qty = Math.min(pf.qty, Math.floor((pf.maxBudget || 0) / (limit * 100)));
     if (qty < 1) {
@@ -13078,11 +13459,12 @@ async function runCycle(acct, sharedQuotes, apiKey) {
         // Push notification — replicate this trade
         const entryA = analyses[ticker];
         const topSignals = entryA?.sigs?.slice(0, 2).map(s => s.text).join(" · ") || "";
-        const tpPrice = (result.entryPremium * (1 + (acct.config.profitTarget || 0.40))).toFixed(2);
+        const entryExitConfig = managementConfigForNewEntry(acct, result.type);
+        const tpPrice = (result.entryPremium * (1 + (entryExitConfig.profitTarget || 0.40))).toFixed(2);
         const slPrice = (result.entryPremium * (1 + (acct.config.stopLoss || -0.35))).toFixed(2);
         sendPush(
           `🤖 ${result.ticker} ${result.type.toUpperCase()} $${result.strike} [${acct.name}]`,
-          `Entry: $${result.entryPremium.toFixed(2)} · ${result.dte}d · ${result.qty}x\nTP: $${tpPrice} (+${((acct.config.profitTarget || 0.40) * 100).toFixed(0)}%) · SL: $${slPrice}\nScore: ${entryA?.score ?? '?'}/100 · Setup: ${result.setupQuality}/100\n${topSignals}`,
+          `Entry: $${result.entryPremium.toFixed(2)} · ${result.dte}d · ${result.qty}x\nTP: $${tpPrice} (+${((entryExitConfig.profitTarget || 0.40) * 100).toFixed(0)}%) · SL: $${slPrice}\nTape: ${acct.dailyTape?.score ?? "?"}/10 · Score: ${entryA?.score ?? '?'}/100 · Setup: ${result.setupQuality}/100\n${topSignals}`,
           true // urgent
         ).catch(() => {});
         // Tweet trade entry with chart
@@ -13133,11 +13515,15 @@ async function runCycle(acct, sharedQuotes, apiKey) {
 
 // ─── Paused Cycle (exits only — no LLM calls, no new entries) ───
 
-async function runPausedCycle(acct, sharedQuotes) {
+async function runPausedCycle(acct, sharedQuotes, apiKey) {
   const state = acct.state;
   const cfg = acct.config;
   const dash = acct.dashboard;
   dash.marketOpen = acct.config.broker === "robinhood" ? isMarketOpenLocal() : isMarketOpen();
+
+  // A pause blocks entries, not situational awareness. Keep the standard daily Haiku tape/news
+  // assessment current even when there are no positions to manage.
+  await runNewsScan(acct, apiKey);
 
   // Keep dashboard quotes alive so PV and UI don't freeze while paused
   for (const ticker of Object.keys(sharedQuotes)) {
@@ -13849,7 +14235,7 @@ async function main() {
             const acctMarketOpen = acct.config.broker === "robinhood" ? marketOpenLocal : marketOpen;
             const tradeThis = acctMarketOpen || acct.config.tradeWhenClosed;
             if (acct.paused) {
-              await runPausedCycle(acct, sharedQuotes);
+              await runPausedCycle(acct, sharedQuotes, apiKey);
             } else if (tradeThis) {
               if (!acctMarketOpen) log(acct, "TRADE-WHEN-CLOSED — running full cycle while market is closed (test mode)");
               await runCycle(acct, sharedQuotes, apiKey);

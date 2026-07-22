@@ -1,7 +1,7 @@
 /**
  * Entry-order halt policy for live brokers.
  *
- * Independent audits found in-flight buys that could outlive a pause or observation lock.
+ * Independent audits found in-flight buys that could outlive a pause or disabled entry toggle.
  * These helpers are pure so the fail-closed rules can be unit-tested without loading bot.js.
  */
 
@@ -13,7 +13,7 @@ export function entryBuyHaltReason(acct = {}) {
   const broker = acct?.config?.broker;
   if (broker !== "tradier" && broker !== "robinhood") return null;
   if (acct.config?.liveEntriesEnabled !== true) {
-    return "observation lock";
+    return "live-entry toggle off";
   }
   if (acct.paused) {
     return `pause (${acct.pausedBy || "manual"})`;
@@ -27,7 +27,7 @@ export function ambiguousBuyReplayAllowed(acct = {}) {
 }
 
 /**
- * Broker-visible working buys must be canceled on any entry halt (risk, user pause, observation).
+ * Broker-visible working buys must be canceled on any entry halt (risk, user pause, entry toggle).
  * Ambiguous submissions without an order id cannot be canceled remotely — they stay quarantined
  * and must not be replayed (see ambiguousBuyReplayAllowed).
  */

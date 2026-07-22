@@ -48,16 +48,16 @@ function evaluateLive(position, { bid, ask, mark = (bid + ask) / 2, trail = [], 
   });
 }
 
-test("FIG and HPE replay: repeated executable losses stop near the hard limit", () => {
+test("FIG and HPE replay: repeated executable losses stop at the configured limit", () => {
   const fig = evaluateLive(
     { ticker: "FIG", entryPremium: 2.96 },
     {
-      bid: 2.01,
-      ask: 2.18,
+      bid: 1.88,
+      ask: 2.02,
       trail: [
-        { ts: NOW - 120_000, bid: 2.16, bookCoherent: true },
-        { ts: NOW - 60_000, bid: 2.10, bookCoherent: true },
-        { ts: NOW, bid: 2.01, bookCoherent: true },
+        { ts: NOW - 120_000, bid: 1.92, bookCoherent: true },
+        { ts: NOW - 60_000, bid: 1.90, bookCoherent: true },
+        { ts: NOW, bid: 1.88, bookCoherent: true },
       ],
     },
   );
@@ -76,8 +76,8 @@ test("FIG and HPE replay: repeated executable losses stop near the hard limit", 
 
   assert.equal(fig.reasonCode, "PREMIUM_STOP");
   assert.equal(hpe.reasonCode, "PREMIUM_STOP");
-  assert.equal(fig.plan.stopLoss, -0.25);
-  assert.equal(hpe.plan.stopLoss, -0.25);
+  assert.equal(fig.plan.stopLoss, -0.35);
+  assert.equal(hpe.plan.stopLoss, -0.35);
 });
 
 test("KO replay: an unlocked one-lot banks the executable +10% touch", () => {

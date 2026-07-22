@@ -1,21 +1,23 @@
 const DAY_MS = 86_400_000;
-const MAX_OPTION_STOP_LOSS_PCT = -0.25;
+const DEFAULT_OPTION_STOP_LOSS_PCT = -0.25;
 
 const finite = (value, fallback = 0) => Number.isFinite(value) ? value : fallback;
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+const thresholdTolerance = (value, threshold) => Number.EPSILON
+  * Math.max(1, Math.abs(value), Math.abs(threshold)) * 8;
+const atOrAbove = (value, threshold) => value >= threshold - thresholdTolerance(value, threshold);
+const atOrBelow = (value, threshold) => value <= threshold + thresholdTolerance(value, threshold);
 
 export function optionDisasterFloorForStop(stopLoss = -0.35) {
-  const configured = Number.isFinite(stopLoss) && stopLoss < 0 ? stopLoss : -0.35;
-  // A configured stop is a risk limit, not a suggestion that may be widened. Long-option
-  // automation is additionally capped at a 25% premium loss; Sean's published guidance treats
-  // ~30% including buffer as the outside limit, and live execution still needs room for spread.
-  return Math.max(configured, MAX_OPTION_STOP_LOSS_PCT);
+  // Compatibility name retained for persisted plans. The configured stop is now the actual stop;
+  // it is never silently tightened to a hidden hard-coded percentage.
+  return Number.isFinite(stopLoss) && stopLoss < 0 ? stopLoss : -0.35;
 }
 
 export function confirmedPremiumStop({
   trail = [],
   entryPremium = 0,
-  stopLoss = MAX_OPTION_STOP_LOSS_PCT,
+  stopLoss = DEFAULT_OPTION_STOP_LOSS_PCT,
   bid = 0,
   ask = 0,
   now = Date.now(),
@@ -152,9 +154,16 @@ export function createManagementPlan(config = {}, position = {}, now = Date.now(
     criticalDte: 3,
     lowDteLoss: -0.20,
     lowDteProfit: 0.20,
-    profitLockArmPct: Math.min(0.10, profitTarget, trim1Pct),
-    peakGivebackFrac: 0.30,
-    peakGivebackMin: 0.04,
+    profitLockArmPct: Number.isFinite(config.profitLockArmPct)
+      ? clamp(config.profitLockArmPct, 0.01, profitTarget)
+      : Math.min(0.10, profitTarget, trim1Pct),
+    peakGivebackFrac: Number.isFinite(config.peakGivebackFrac)
+      ? clamp(config.peakGivebackFrac, 0.05, 1)
+      : 0.30,
+    peakGivebackMin: Number.isFinite(config.peakGivebackMin)
+      ? clamp(config.peakGivebackMin, 0.005, 0.25)
+      : 0.04,
+    adaptiveExitProfile: config.adaptiveExitProfile || null,
     staleMinHeldDays: 3,
     staleLifeConsumed: 0.35,
     staleDteThreshold: 10,
@@ -295,13 +304,13 @@ export function evaluatePosition({
   const originalQty = Math.max(qty, finite(position.originalQty, qty));
   const trimLevel = Math.max(0, finite(position.trimLevel, 0));
   const exitMode = plan.exitMode || (plan.profitTarget > plan.trim2Pct ? "runner" : "quick_bank");
-  const nearTarget = exitPnlPct >= plan.profitTarget * plan.nearTargetFrac;
+  const nearTarget = atOrAbove(exitPnlPct, plan.profitTarget * plan.nearTargetFrac);
   const givebackThreshold = Math.max(plan.peakGivebackMin, bestExitPnlPct * plan.peakGivebackFrac);
   // A runner is a distinct mandate: before trim two is completed, universal +10% locks must not
   // silently turn +30/+60/+80 policy into quick-bank behavior. Protective rules still apply.
   const runnerArmed = exitMode !== "runner" || trimLevel >= 2;
   const givingBack = runnerArmed
-    && bestExitPnlPct >= plan.profitLockArmPct
+    && atOrAbove(bestExitPnlPct, plan.profitLockArmPct)
     && givebackPct >= givebackThreshold;
   const stalling = premiumTrailStalling(position.markTrail || [])
     || (underlyingQuoteFresh && !!signals.stalling);
@@ -380,7 +389,7 @@ export function evaluatePosition({
 
   // Capital-protection rules. Time remaining changes the ATR allowance, but never turns a
   // shallow premium print into a stop by itself.
-  if (isEquity && exitPnlPct <= plan.stopLoss) {
+  if (isEquity && atOrBelow(exitPnlPct, plan.stopLoss)) {
     return makeDecision(base, "close", "EQUITY_STOP", `stop loss ${(exitPnlPct * 100).toFixed(0)}%`, { urgency: "protective", priceMode: "marketable" });
   }
   if (!isEquity && dteRemaining <= plan.criticalDte) {
@@ -395,7 +404,7 @@ export function evaluatePosition({
   // Near expiry, theta/gamma risk is itself the invalidation. Do not let the longer premium-stop
   // confirmation window shadow this explicit urgent exit; broker pricing sanity still rejects a
   // one-off incoherent quote.
-  if (!isEquity && dteRemaining <= plan.lowDteThreshold && exitPnlPct <= plan.lowDteLoss) {
+  if (!isEquity && dteRemaining <= plan.lowDteThreshold && atOrBelow(exitPnlPct, plan.lowDteLoss)) {
     return makeDecision(base, "close", "LOW_DTE_LOSS", `low-DTE tight stop ${(exitPnlPct * 100).toFixed(0)}% (${dteRemaining.toFixed(1)}d left, theta accelerating)`, { urgency: "urgent", priceMode: "marketable" });
   }
   if (!isEquity && premiumStop.wideEscalated) {
@@ -411,7 +420,7 @@ export function evaluatePosition({
     const moveLabel = isEquity ? "stock down" : `underlying ${position.type === "put" ? "up" : "down"}`;
     return makeDecision(base, "close", "STRUCTURAL_SPOT_STOP", `spot stop: ${moveLabel} ${(adverseSpotMove * 100).toFixed(1)}% from entry (DTE-aware threshold ${(spotStopThreshold * 100).toFixed(1)}%, ATR ${(atrPct * 100).toFixed(1)}%)`, { urgency: "protective", priceMode: "marketable" });
   }
-  if (!isEquity && exitPnlPct <= plan.stopLoss) {
+  if (!isEquity && atOrBelow(exitPnlPct, plan.stopLoss)) {
     // A single crossed/empty option quote must not liquidate a real position. Live options require
     // repeated exact-contract bids over a bounded window and a coherent two-sided book. Paper
     // replay has no broker book, so its modeled bid is acted on immediately.
@@ -424,7 +433,7 @@ export function evaluatePosition({
     return makeDecision(base, "hold", "PREMIUM_STOP_CONFIRMING", `protective stop breached at ${(exitPnlPct * 100).toFixed(0)}%; confirming exact bids ${premiumStop.sampleCount}/${premiumStop.requiredSamples}${spreadLabel}`);
   }
 
-  const underwater = exitPnlPct <= plan.signalExitMinLoss;
+  const underwater = atOrBelow(exitPnlPct, plan.signalExitMinLoss);
   const signalInvalidated = thesis.reversed && (
     (thesis.deepReversal && thesis.spotAgainst) ||
     (underwater && (dteRemaining <= plan.staleDteThreshold || lifeConsumed >= 0.50))
@@ -436,7 +445,7 @@ export function evaluatePosition({
   const staleAndWeak = !isEquity
     && underlyingQuoteFresh
     && heldDays >= plan.staleMinHeldDays
-    && exitPnlPct <= plan.staleLossPct
+    && atOrBelow(exitPnlPct, plan.staleLossPct)
     && bestExitPnlPct < plan.staleMaxPeakPct
     && thesis.weak
     && (lifeConsumed >= plan.staleLifeConsumed || dteRemaining <= plan.staleDteThreshold);
@@ -444,14 +453,20 @@ export function evaluatePosition({
     return makeDecision(base, "close", "TIME_DECAY_INVALIDATION", `time-decay exit ${(exitPnlPct * 100).toFixed(0)}% after ${heldDays.toFixed(1)}d (${(lifeConsumed * 100).toFixed(0)}% of option life used, thesis ${thesis.state})`, { urgency: "protective", priceMode: "marketable" });
   }
 
-  if (qty === 1 && trimLevel === 0 && exitPnlPct >= plan.singleContractBankPct) {
+  // Quick-bank means bank the entire executable win. Checking it before trim logic prevents a
+  // multi-contract holding from selling only 25% at the advertised target and exposing the rest
+  // to a fast reversal before the next quote cycle.
+  if (exitMode === "quick_bank" && atOrAbove(exitPnlPct, plan.profitTarget)) {
+    return makeDecision(base, "close", "PROFIT_TARGET", `quick-bank target +${(exitPnlPct * 100).toFixed(0)}% on executable price`, { priceMode: "bank" });
+  }
+  if (qty === 1 && trimLevel === 0 && atOrAbove(exitPnlPct, plan.singleContractBankPct)) {
     return makeDecision(base, "close", "SINGLE_CONTRACT_BANK", `single-contract profit bank +${(exitPnlPct * 100).toFixed(0)}% (cannot partial-trim)`, { qty: 1, priceMode: "bank" });
   }
-  if (trimLevel === 0 && exitPnlPct >= plan.trim1Pct && qty > 1) {
+  if (trimLevel === 0 && atOrAbove(exitPnlPct, plan.trim1Pct) && qty > 1) {
     const trimQty = Math.min(qty - 1, Math.max(1, Math.floor(originalQty * 0.25)));
     return makeDecision(base, "trim", "TRIM_1", `trim 1 (+${(exitPnlPct * 100).toFixed(0)}%, executable gain)`, { qty: trimQty, priceMode: "bank" });
   }
-  if (exitMode === "runner" && trimLevel === 1 && exitPnlPct >= plan.trim2Pct) {
+  if (exitMode === "runner" && trimLevel === 1 && atOrAbove(exitPnlPct, plan.trim2Pct)) {
     if (qty === 1) {
       return makeDecision(
         base,
@@ -468,13 +483,13 @@ export function evaluatePosition({
   // Profit-taking is evaluated against what a buyer is bidding now, not the midpoint shown in P&L.
   // In quick-bank mode this closes the post-trim remainder. Runner mode reaches trim two first,
   // leaving a real window for the 8/21 EMA trail before the higher final target.
-  if (exitPnlPct >= plan.profitTarget) {
+  if (atOrAbove(exitPnlPct, plan.profitTarget)) {
     return makeDecision(base, "close", "PROFIT_TARGET", `profit target +${(exitPnlPct * 100).toFixed(0)}% on executable price`, { priceMode: "bank" });
   }
-  if (trimLevel >= 1 && exitPnlPct <= 0) {
+  if (trimLevel >= 1 && atOrBelow(exitPnlPct, 0)) {
     return makeDecision(base, "close", "POST_TRIM_BREAKEVEN", `breakeven stop (post-trim, executable peak +${(bestExitPnlPct * 100).toFixed(0)}%)`, { urgency: "protective", priceMode: "marketable" });
   }
-  if (trimLevel >= 2 && exitPnlPct <= 0.15) {
+  if (trimLevel >= 2 && atOrBelow(exitPnlPct, 0.15)) {
     return makeDecision(base, "close", "POST_TRIM_TRAIL", "trailing stop (post-trim2, locked +15%)", { urgency: "protective", priceMode: "marketable" });
   }
 
@@ -485,21 +500,21 @@ export function evaluatePosition({
   }
 
   if (runnerArmed && isFriday && etHour >= plan.eowHour) {
-    if (exitPnlPct >= plan.eowHardMinPnl) {
+    if (atOrAbove(exitPnlPct, plan.eowHardMinPnl)) {
       return makeDecision(base, "close", "EOW_PROFIT_LOCK", `EOW profit lock +${(exitPnlPct * 100).toFixed(0)}%`, { priceMode: "bank" });
     }
-    if (exitPnlPct >= plan.eowSoftMinPnl && (stalling || nearTarget)) {
+    if (atOrAbove(exitPnlPct, plan.eowSoftMinPnl) && (stalling || nearTarget)) {
       return makeDecision(base, "close", "EOW_SOFT_LOCK", `EOW soft lock +${(exitPnlPct * 100).toFixed(0)}% (${nearTarget ? "near target" : "move stalling"})`, { priceMode: "bank" });
     }
   }
   if (runnerArmed && etHour >= plan.eodSoftHour && etHour < plan.eodTightenHour
-      && exitPnlPct >= plan.eodSoftMinPnl && (stalling || nearTarget)) {
+      && atOrAbove(exitPnlPct, plan.eodSoftMinPnl) && (stalling || nearTarget)) {
     return makeDecision(base, "close", "EOD_SOFT_LOCK", `EOD soft lock +${(exitPnlPct * 100).toFixed(0)}% (${nearTarget ? "near target" : "move stalling"})`, { priceMode: "bank" });
   }
-  if (runnerArmed && etHour >= plan.eodTightenHour && exitPnlPct >= plan.eodHardMinPnl) {
+  if (runnerArmed && etHour >= plan.eodTightenHour && atOrAbove(exitPnlPct, plan.eodHardMinPnl)) {
     return makeDecision(base, "close", "EOD_PROFIT_LOCK", `EOD lock +${(exitPnlPct * 100).toFixed(0)}% (3:45 PM tighten)`, { priceMode: "bank" });
   }
-  if (!isEquity && dteRemaining <= plan.lowDteThreshold && exitPnlPct >= plan.lowDteProfit) {
+  if (!isEquity && dteRemaining <= plan.lowDteThreshold && atOrAbove(exitPnlPct, plan.lowDteProfit)) {
     return makeDecision(base, "close", "LOW_DTE_PROFIT", `low DTE accelerated exit +${(exitPnlPct * 100).toFixed(0)}% (${dteRemaining.toFixed(1)}d left)`, { priceMode: "bank" });
   }
 
