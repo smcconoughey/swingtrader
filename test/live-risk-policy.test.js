@@ -51,8 +51,27 @@ test("quick-profit values remain exactly as configured", () => {
   assert.equal(config.liveEntriesEnabled, true);
 });
 
+test("allocation, reserve, and even invalid explicit values remain visible rather than silently clamped", () => {
+  const { config } = normalizeLiveRiskConfig({
+    broker: "robinhood",
+    baseRiskPct: 5,
+    maxPositionPct: 0.35,
+    stopLoss: -2,
+    profitTarget: 0.001,
+    useCashReserve: false,
+    liveEntriesEnabled: true,
+  });
+  assert.equal(config.baseRiskPct, 5);
+  assert.equal(config.maxPositionPct, 0.35);
+  assert.equal(config.stopLoss, -2);
+  assert.equal(config.profitTarget, 0.001);
+  assert.equal(config.useCashReserve, false);
+  assert.equal(config.liveEntriesEnabled, true);
+});
+
 test("paper accounts are not rewritten by the live policy", () => {
-  const account = { config: { broker: "paper", baseRiskPct: 0.50 } };
+  const account = { config: { broker: "paper", baseRiskPct: 0.50, useCashReserve: false } };
   assert.deepEqual(applyLiveRiskPolicy(account), []);
   assert.equal(account.config.baseRiskPct, 0.50);
+  assert.equal(account.config.useCashReserve, false);
 });

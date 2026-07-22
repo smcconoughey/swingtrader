@@ -1,3 +1,11 @@
+/**
+ * Live-broker config normalization.
+ *
+ * This layer backfills missing, visible controls only. Explicit settings are never silently
+ * clamped or replaced: the dashboard shows them and the risk governor rejects invalid inputs with
+ * a visible reason instead of running a different strategy than the operator selected.
+ */
+
 export const CAPITAL_PRESERVATION_POLICY = Object.freeze({
   riskPerTradePct: 0.005,
   maxPortfolioRiskPct: 0.02,
@@ -32,12 +40,6 @@ export const LIVE_RISK_DEFAULTS = Object.freeze({
 
 const finite = value => Number.isFinite(Number(value));
 
-/**
- * Backfill missing live controls without rewriting explicit user choices. Every value inserted by
- * this function is persisted, logged by the caller, and rendered in Settings. Invalid explicit
- * values are left intact so the risk governor can reject them visibly instead of silently running
- * a different strategy than the dashboard advertises.
- */
 export function normalizeLiveRiskConfig(config = {}) {
   const next = { ...config };
 

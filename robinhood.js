@@ -832,6 +832,43 @@ const robinhood = {
     return match ? (match.id || match.option_id || match.instrument_id || null) : null;
   },
 
+  async getPnlTradeHistory({ span = "all", symbol = null, cursor = null, accountNumber } = {}) {
+    if (!discoveredTools.has("get_pnl_trade_history")) {
+      throw new Error("get_pnl_trade_history not available on this MCP session");
+    }
+    const acctNum = accountNumber || discoveredAccountNumber;
+    if (!acctNum) throw new Error("No account number");
+    const args = buildSchemaArgs("get_pnl_trade_history", {
+      account_number: acctNum,
+      span,
+      symbol: symbol ? String(symbol).toUpperCase() : undefined,
+      cursor: cursor || undefined,
+    });
+    return extractContent(await callTool("get_pnl_trade_history", args));
+  },
+
+  async getRealizedPnl({
+    span = "3month",
+    startDate = null,
+    endDate = null,
+    assetClasses = null,
+    accountNumber,
+  } = {}) {
+    if (!discoveredTools.has("get_realized_pnl")) {
+      throw new Error("get_realized_pnl not available on this MCP session");
+    }
+    const acctNum = accountNumber || discoveredAccountNumber;
+    if (!acctNum) throw new Error("No account number");
+    const args = buildSchemaArgs("get_realized_pnl", {
+      account_number: acctNum,
+      span: (startDate || endDate) ? undefined : span,
+      start_date: startDate || undefined,
+      end_date: endDate || undefined,
+      asset_classes: assetClasses || undefined,
+    });
+    return extractContent(await callTool("get_realized_pnl", args));
+  },
+
   async getHistoricals(symbol, span = "year", interval = "day") {
     const toolName = discoveredTools.has("get_historicals") ? "get_historicals"
       : discoveredTools.has("get_stock_historicals") ? "get_stock_historicals"

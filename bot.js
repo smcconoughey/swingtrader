@@ -58,6 +58,10 @@ import {
   tradierFillDelta,
 } from "./tradier-fill-accounting.js";
 import {
+  diffRobinhoodTradeHistory,
+  extractRobinhoodPortfolioFields,
+} from "./robinhood-portfolio.js";
+import {
   clearEntryOrderTracking,
   entryIntentSatisfiedByHolding,
   exactOptionQuoteMatches,
@@ -4844,7 +4848,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
       ),
       minimumRewardRisk: cfg.minimumRewardRisk ?? 1.5,
       riskPerTradePct: cfg.riskPerTradePct ?? 0.005,
-      maxPositionPct: cfg.maxPositionPct ?? Math.min(cfg.baseRiskPct || 0.10, 0.10),
+      maxPositionPct: cfg.maxPositionPct ?? cfg.baseRiskPct ?? 0.10,
       maxPositionDollars: dollarCap,
       aggregateRiskBudgetDollars: pv * (cfg.maxPortfolioRiskPct ?? 0.02),
       openRiskDollars: estimatedOpenRiskDollars(acct),
@@ -8052,6 +8056,7 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
           <div style="font-size:12px;color:#6b7280;margin-bottom:10px">Broker: <strong style="color:${cfg.broker === "tradier" ? "#00a843" : "#6b7280"}">${(cfg.broker || "paper").toUpperCase()}${cfg.broker === "tradier" ? " · LIVE" : ""}</strong></div>
           ${(cfg.broker === "robinhood" || cfg.broker === "tradier") ? `<label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;font-weight:800;color:#1c1d22"><input type="checkbox" name="liveEntriesEnabled" ${cfg.liveEntriesEnabled === true ? "checked" : ""}> Live entries eligible (master entry switch)</label>` : ""}
           <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="useCashReserve" ${cfg.useCashReserve ? "checked" : ""}> Use cash reserve (50%→25% buffer)</label>
+          <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="liveEntriesEnabled" ${cfg.liveEntriesEnabled ? "checked" : ""}> Allow new live entries</label>
           <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="autoExecute" ${cfg.autoExecute ? "checked" : ""}> Auto-execute broker orders (full autonomy)</label>
           <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#3a3b42"><input type="checkbox" name="tradeWhenClosed" ${cfg.tradeWhenClosed ? "checked" : ""}> Trade when market closed (testing/sandbox)</label>
           ${cfg.broker === "tradier" ? `<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px">
@@ -10181,6 +10186,104 @@ self.addEventListener('pushsubscriptionchange', e => {
       return;
     }
 
+    // ─── Robinhood: Trade audit (local history vs broker PnL / option orders) ───
+    if (pathname === "/api/rh-trade-audit") {
+      if (!robinhood.isConnected) {
+        res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: "Robinhood MCP not connected" }));
+        return;
+      }
+      const rhAcct = accounts.get("robinhood") || activeAcct;
+      const span = url.searchParams.get("span") || "all";
+      const out = {
+        at: new Date().toISOString(),
+        accountId: rhAcct?.id || null,
+        portfolio: null,
+        local: {
+          cash: rhAcct?.state?.cash ?? null,
+          brokerEquity: rhAcct?.state?.brokerEquity ?? null,
+          portfolioValue: rhAcct ? portfolioValue(rhAcct.state, rhAcct.dashboard?.quotes || {}) : null,
+          startingCash: rhAcct?.config?.startingCash ?? null,
+          openPositions: rhAcct?.state?.positions?.length ?? 0,
+          historyCount: rhAcct?.state?.history?.length ?? 0,
+          historyPnl: +(rhAcct?.state?.history || [])
+            .filter(t => typeof t?.pnlDollar === "number")
+            .reduce((s, t) => s + t.pnlDollar, 0)
+            .toFixed(2),
+          rhUnsettled: rhAcct?.state?.rhUnsettled || [],
+          history: (rhAcct?.state?.history || []).map(t => ({
+            ticker: t.ticker,
+            type: t.type,
+            strike: t.strike,
+            occSymbol: t.occSymbol,
+            qty: t.qty,
+            openDate: t.openDate,
+            closeDate: t.closeDate,
+            entryPremium: t.entryPremium,
+            closePremium: t.closePremium,
+            pnlDollar: t.pnlDollar,
+            reason: t.reason,
+            exitOrderId: t._exitOrderId || null,
+          })),
+        },
+        diff: null,
+        realizedPnl: null,
+        optionOrders: null,
+        errors: {},
+      };
+      try {
+        out.portfolio = extractRobinhoodPortfolioFields(await robinhood.getPortfolio());
+      } catch (e) {
+        out.errors.portfolio = e.message;
+      }
+      try {
+        const brokerHist = await robinhood.getPnlTradeHistory({ span });
+        out.diff = diffRobinhoodTradeHistory(rhAcct?.state?.history || [], brokerHist);
+        out.brokerPnlRaw = brokerHist;
+      } catch (e) {
+        out.errors.pnlTradeHistory = e.message;
+      }
+      try {
+        out.realizedPnl = await robinhood.getRealizedPnl({ span: span === "all" ? "year" : span, assetClasses: ["option"] });
+      } catch (e) {
+        out.errors.realizedPnl = e.message;
+      }
+      try {
+        const ordersRes = await robinhood.getOptionsOrders({});
+        const raw = ordersRes?.data ?? ordersRes;
+        const orders = Array.isArray(raw) ? raw
+          : Array.isArray(raw?.orders) ? raw.orders
+            : Array.isArray(raw?.results) ? raw.results : [];
+        out.optionOrders = {
+          count: orders.length,
+          filled: orders.filter(o => String(o.state || "").toLowerCase() === "filled"
+            || Number(o.processed_quantity || o.cumulative_quantity || 0) > 0).length,
+          orders: orders.slice(0, 100).map(o => ({
+            id: o.id || o.order_id || null,
+            state: o.state || null,
+            chain_symbol: o.chain_symbol || o.symbol || null,
+            side: o.legs?.[0]?.side || o.side || null,
+            position_effect: o.legs?.[0]?.position_effect || o.position_effect || null,
+            quantity: o.quantity || o.processed_quantity || null,
+            average_price: o.average_price || o.premium || null,
+            created_at: o.created_at || null,
+            updated_at: o.updated_at || null,
+          })),
+        };
+      } catch (e) {
+        out.errors.optionOrders = e.message;
+      }
+      const cash = out.local.cash;
+      const start = out.local.startingCash;
+      const histPnl = out.local.historyPnl;
+      if (typeof cash === "number" && typeof start === "number" && typeof histPnl === "number") {
+        out.cashGapVsHistory = +((cash - (start + histPnl))).toFixed(2);
+      }
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify(out));
+      return;
+    }
+
     // ─── Robinhood: Get Historicals ───
     if (pathname === "/api/rh-historicals") {
       const sym = url.searchParams.get("symbol");
@@ -10655,15 +10758,10 @@ async function ensureRobinhoodAccount() {
   if (robinhood.isConnected) {
     try {
       const portRes = await robinhood.getPortfolio();
-      const port = portRes && portRes.data ? portRes.data : portRes;
-      if (port) {
-        const bp = port.buying_power?.buying_power || port.buying_power || port.cash;
-        const bpNum = typeof bp === "string" ? parseFloat(bp) : (typeof bp === "number" ? bp : NaN);
-        if (!isNaN(bpNum) && bpNum >= 0) seedCash = bpNum;
-        const eq = port.equity_value || port.total_value;
-        const eqNum = typeof eq === "string" ? parseFloat(eq) : (typeof eq === "number" ? eq : NaN);
-        if (!isNaN(eqNum) && eqNum >= 0) seedCash = eqNum;
-      }
+      const fields = extractRobinhoodPortfolioFields(portRes);
+      // Prefer full account value; never let equity_value="0" (stock sleeve) overwrite buying power.
+      if (fields.buyingPower != null && fields.buyingPower >= 0) seedCash = fields.buyingPower;
+      if (fields.totalEquity != null && fields.totalEquity > 0) seedCash = fields.totalEquity;
     } catch (e) {
       console.log(`  Robinhood: balance fetch failed during provision — ${e.message}`);
     }
@@ -11808,41 +11906,36 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
   if (refreshBalance) try {
     const res = await robinhood.getPortfolio();
     const env = res && res.data ? res.data : res;
-    // Robinhood's other MCP endpoints wrap their payload in a {results:[...]} envelope; the
-    // equity fields were being read off the wrapper (where they don't exist), so brokerEquity
-    // never populated and PV silently degraded to buying power — which excludes unsettled sale
-    // proceeds. That's how a manual KO close read as a phantom -40% day and tripped the breaker.
-    const port = env?.results?.[0] ?? env?.portfolio ?? env;
-    if (port && typeof port === "object") {
-      // DIAGNOSTIC (once per process): log the FULL envelope so field names are observable
-      // from the deploy logs, not guessed at.
-      if (!acct._rhPortfolioShapeLogged) {
-        acct._rhPortfolioShapeLogged = true;
-        log(acct, `RH-RAW PORTFOLIO: ${JSON.stringify(env).slice(0, 900)}`);
-      }
-      let eq = port.equity_value ?? port.total_value ?? port.total_equity ?? port.portfolio_value
-        ?? port.equity ?? port.market_value ?? port.total_market_value ?? port.extended_hours_equity;
-      if (eq && typeof eq === "object") eq = eq.amount ?? eq.value; // {amount:"429.11",currency:"USD"} shape
-      const eqNum = typeof eq === "string" ? parseFloat(eq) : (typeof eq === "number" ? eq : NaN);
-      let bp = port.buying_power?.buying_power ?? port.buying_power ?? port.options_buying_power ?? port.cash;
-      if (bp && typeof bp === "object") bp = bp.amount ?? bp.value;
-      const bpNum = typeof bp === "string" ? parseFloat(bp) : (typeof bp === "number" ? bp : NaN);
-      const prevCash = typeof state.cash === "number" ? state.cash : null;
-      if (!isNaN(bpNum) && bpNum >= 0) state.cash = bpNum;
-      if (!isNaN(eqNum) && eqNum >= 0) {
-        state.brokerEquity = eqNum;
-        const cashDelta = (prevCash != null && !isNaN(bpNum)) ? (bpNum - prevCash) : null;
-        reconcileBrokerCapital(acct, eqNum, { cashDelta });
-      } else {
-        delete state.brokerEquity; // never let a stale equity reading override the live fallback math
-      }
-      if ((!isNaN(bpNum) && bpNum >= 0) || (!isNaN(eqNum) && eqNum >= 0)) {
-        state.brokerBalanceAt = Date.now();
-      }
+    // Prefer total_value over equity_value. equity_value is the stock sleeve and is often "0"
+    // on options-only cash accounts; reading it first pinned brokerEquity at 0 and forced the
+    // cash+rhUnsettled fallback, which double-counted today's option sale proceeds (~+$650 fake PV).
+    const fields = extractRobinhoodPortfolioFields(res);
+    if (!acct._rhPortfolioShapeLogged) {
+      acct._rhPortfolioShapeLogged = true;
+      log(acct, `RH-RAW PORTFOLIO: ${JSON.stringify(env).slice(0, 900)}`);
+      log(acct, `RH-PORTFOLIO PARSED: total=$${fields.totalEquity ?? "?"} bp=$${fields.buyingPower ?? "?"} source=${fields.source || "none"}`);
+    }
+    const eqNum = fields.totalEquity;
+    const bpNum = fields.buyingPower;
+    const prevCash = typeof state.cash === "number" ? state.cash : null;
+    if (bpNum != null && bpNum >= 0) state.cash = bpNum;
+    if (eqNum != null && eqNum > 0) {
+      state.brokerEquity = eqNum;
+      // total_value already includes cash from today's sales — drop the synthetic unsettled credit
+      // so a later brokerEquity miss cannot reinflate PV.
+      if (Array.isArray(state.rhUnsettled) && state.rhUnsettled.length > 0) state.rhUnsettled = [];
+      const cashDelta = (prevCash != null && bpNum != null) ? (bpNum - prevCash) : null;
+      reconcileBrokerCapital(acct, eqNum, { cashDelta });
+    } else {
+      delete state.brokerEquity; // never let a stale equity reading override the live fallback math
+    }
+    if ((bpNum != null && bpNum >= 0) || (eqNum != null && eqNum > 0)) {
+      state.brokerBalanceAt = Date.now();
     }
     // Sale proceeds settle T+1: anything booked on a prior day is assumed absorbed into buying
     // power by now, so drop it from the unsettled credit (portfolioValue adds what remains).
-    if (Array.isArray(state.rhUnsettled) && state.rhUnsettled.length > 0) {
+    // Only keep today's credits when we do NOT have an authoritative total_value reading.
+    if (!(eqNum != null && eqNum > 0) && Array.isArray(state.rhUnsettled) && state.rhUnsettled.length > 0) {
       const today = getETDateStr();
       state.rhUnsettled = state.rhUnsettled.filter(e => e.date === today);
     }
