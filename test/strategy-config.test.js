@@ -38,9 +38,11 @@ test("quick profits atomically clears stale exit and reward-risk values", () => 
   assert.equal(config.adaptiveTargetFallbackPct, 0.12);
   assert.equal(config.adaptiveTargetReachRate, 0.65);
   assert.equal(config.positionManagementMs, 5_000);
-  assert.equal(config.riskPerTradePct, 0.02);
-  assert.equal(config.maxPortfolioRiskPct, 0.04);
-  assert.equal(config.maxPositionPct, 0.10);
+  assert.equal(config.baseRiskPct, 0.50);
+  assert.equal(config.riskPerTradePct, 0.10);
+  assert.equal(config.maxPortfolioRiskPct, 0.20);
+  assert.equal(config.maxPositionPct, 0.50);
+  assert.equal(config.useCashReserve, false);
   assert.equal(config.dailyLossLimitPct, 0.04);
   assert.equal(config.maxDayTrades, 2);
 });
@@ -81,23 +83,23 @@ test("quick profits closes a one-contract position at the visible 12% fallback t
   assert.equal(decision.reasonCode, "PROFIT_TARGET");
 });
 
-test("quick profits can fund one tight-spread contract in an $850 account", () => {
+test("quick profits can fund one quality contract in a $600 account", () => {
   const decision = sizeLongOptionEntry({
-    accountEquity: 850,
-    cash: 850,
-    entryPrice: 0.50,
+    accountEquity: 600,
+    cash: 600,
+    entryPrice: 2.50,
     stopLossPct: QUICK_PROFIT_CONFIG.stopLoss,
     profitTargetPct: QUICK_PROFIT_CONFIG.profitTarget,
     minimumRewardRisk: QUICK_PROFIT_CONFIG.minimumRewardRisk,
     riskPerTradePct: QUICK_PROFIT_CONFIG.riskPerTradePct,
     maxPositionPct: QUICK_PROFIT_CONFIG.maxPositionPct,
-    aggregateRiskBudgetDollars: 850 * QUICK_PROFIT_CONFIG.maxPortfolioRiskPct,
-    exitFrictionDollarsPerContract: 1,
+    aggregateRiskBudgetDollars: 600 * QUICK_PROFIT_CONFIG.maxPortfolioRiskPct,
+    exitFrictionDollarsPerContract: 4,
     entryFeePerContract: 0.03,
     exitFeePerContract: 0.03,
   });
 
   assert.equal(decision.approved, true);
-  assert.ok(decision.quantity >= 1);
-  assert.ok(decision.metrics.expectedMaxLossDollars <= 17);
+  assert.equal(decision.quantity, 1);
+  assert.ok(decision.metrics.expectedMaxLossDollars <= 60);
 });
