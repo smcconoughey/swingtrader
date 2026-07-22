@@ -298,6 +298,17 @@ test("multi-contract position still performs a partial first trim", () => {
   assert.equal(decision.qty, 1);
 });
 
+test("multi-contract quick-bank position closes the entire holding at its advertised target", () => {
+  const decision = evaluate(
+    { qty: 4, originalQty: 4 },
+    { mark: 1.13, bid: 1.12 },
+  );
+  assert.equal(decision.plan.exitMode, "quick_bank");
+  assert.equal(decision.action, "close");
+  assert.equal(decision.reasonCode, "PROFIT_TARGET");
+  assert.equal(decision.qty, 4);
+});
+
 test("quick-bank plan closes the post-trim remainder at target instead of advertising a dead trim two", () => {
   const decision = evaluate(
     { qty: 3, originalQty: 4, trimLevel: 1 },
@@ -504,8 +515,8 @@ test("a legacy widened-stop plan is migrated without changing its frozen profit 
   const migrated = managementPlanFor(position, { profitTarget: 0.12 }, NOW + DAY);
 
   assert.equal(migrated.version, 2);
-  assert.equal(migrated.stopLoss, -0.25);
-  assert.equal(migrated.disasterFloor, -0.25);
+  assert.equal(migrated.stopLoss, -0.35);
+  assert.equal(migrated.disasterFloor, -0.35);
   assert.equal(migrated.profitTarget, 0.80);
 });
 

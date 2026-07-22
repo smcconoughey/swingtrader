@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { applyLiveRiskPolicy, normalizeLiveRiskConfig } from "../live-risk-policy.js";
 
-test("the retired full-cash preset migrates to bounded capital-preservation settings", () => {
+test("explicit live settings are never silently rewritten", () => {
   const { config, changes } = normalizeLiveRiskConfig({
     broker: "robinhood",
     strategyPreset: "march1m",
@@ -18,66 +18,55 @@ test("the retired full-cash preset migrates to bounded capital-preservation sett
     learningEnabled: true,
   });
 
-  assert.equal(config.strategyPreset, "capital");
-  assert.equal(config.baseRiskPct, 0.10);
+  assert.equal(config.strategyPreset, "march1m");
+  assert.equal(config.baseRiskPct, 1);
   assert.equal(config.riskPerTradePct, 0.005);
   assert.equal(config.maxPositionPct, 0.10);
-  assert.equal(config.stopLoss, -0.20);
-  assert.equal(config.profitTarget, 0.40);
-  assert.equal(config.dailyLossLimitPct, 0.02);
-  assert.equal(config.maxConsecutiveLosses, 2);
-  assert.equal(config.maxDayTrades, 2);
-  assert.equal(config.maxPositions, 3);
-  assert.equal(config.useCashReserve, true);
-  assert.equal(config.learningEnabled, false);
-  assert.equal(config.liveEntriesEnabled, false);
+  assert.equal(config.stopLoss, -0.25);
+  assert.equal(config.profitTarget, 0.12);
+  assert.equal(config.dailyLossLimitPct, 0.22);
+  assert.equal(config.maxConsecutiveLosses, 4);
+  assert.equal(config.maxDayTrades, 3);
+  assert.equal(config.maxPositions, 6);
+  assert.equal(config.useCashReserve, false);
+  assert.equal(config.learningEnabled, true);
+  assert.equal(config.liveEntriesEnabled, true);
   assert.ok(changes.length > 0);
 });
 
-test("users can raise allocation and disable cash reserve without silent reset", () => {
+test("quick-profit values remain exactly as configured", () => {
+  const { config } = normalizeLiveRiskConfig({
+    riskPerTradePct: 0.0025,
+    maxPositionPct: 0.05,
+    dailyLossLimitPct: 0.01,
+    stopLoss: -0.10,
+    profitTarget: 0.10,
+  });
+
+  assert.equal(config.riskPerTradePct, 0.0025);
+  assert.equal(config.maxPositionPct, 0.05);
+  assert.equal(config.dailyLossLimitPct, 0.01);
+  assert.equal(config.stopLoss, -0.10);
+  assert.equal(config.profitTarget, 0.10);
+  assert.equal(config.liveEntriesEnabled, true);
+});
+
+test("allocation, reserve, and even invalid explicit values remain visible rather than silently clamped", () => {
   const { config } = normalizeLiveRiskConfig({
     broker: "robinhood",
-    strategyPreset: "quicktp",
-    baseRiskPct: 0.35,
-    maxPositionPct: 0.10, // stale ceiling from old hard rail
-    profitTarget: 0.20,
-    stopLoss: -0.20,
-    useCashReserve: false,
-    liveEntriesEnabled: true,
-    dailyLossLimitPct: 0.05,
-    maxConsecutiveLosses: 3,
-  });
-
-  assert.equal(config.strategyPreset, "quicktp");
-  assert.equal(config.baseRiskPct, 0.35);
-  assert.equal(config.maxPositionPct, 0.35);
-  assert.equal(config.profitTarget, 0.20);
-  assert.equal(config.stopLoss, -0.20);
-  assert.equal(config.useCashReserve, false);
-  assert.equal(config.liveEntriesEnabled, true);
-  assert.equal(config.dailyLossLimitPct, 0.05);
-  assert.equal(config.maxConsecutiveLosses, 3);
-});
-
-test("quick-profit targets are not inflated by a hidden 1.5R floor", () => {
-  const { config } = normalizeLiveRiskConfig({
-    profitTarget: 0.20,
-    stopLoss: -0.20,
-    minimumRewardRisk: 1.5,
-  });
-  assert.equal(config.profitTarget, 0.20);
-});
-
-test("absurd out-of-range values are still sanity-clamped", () => {
-  const { config } = normalizeLiveRiskConfig({
     baseRiskPct: 5,
+    maxPositionPct: 0.35,
     stopLoss: -2,
     profitTarget: 0.001,
+    useCashReserve: false,
+    liveEntriesEnabled: true,
   });
-  assert.equal(config.baseRiskPct, 1);
-  assert.equal(config.maxPositionPct, 1);
-  assert.equal(config.stopLoss, -0.50);
-  assert.equal(config.profitTarget, 0.05);
+  assert.equal(config.baseRiskPct, 5);
+  assert.equal(config.maxPositionPct, 0.35);
+  assert.equal(config.stopLoss, -2);
+  assert.equal(config.profitTarget, 0.001);
+  assert.equal(config.useCashReserve, false);
+  assert.equal(config.liveEntriesEnabled, true);
 });
 
 test("paper accounts are not rewritten by the live policy", () => {

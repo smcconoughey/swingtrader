@@ -7,12 +7,12 @@ import {
   shouldCancelWorkingBuysOnHalt,
 } from "../entry-order-halt.js";
 
-test("observation lock blocks ambiguous buy replay and requires canceling working buys", () => {
+test("visible live-entry toggle blocks ambiguous buy replay and requires canceling working buys", () => {
   const acct = {
     paused: false,
     config: { broker: "robinhood", liveEntriesEnabled: false },
   };
-  assert.equal(entryBuyHaltReason(acct), "observation lock");
+  assert.equal(entryBuyHaltReason(acct), "live-entry toggle off");
   assert.equal(ambiguousBuyReplayAllowed(acct), false);
   assert.equal(shouldCancelWorkingBuysOnHalt(acct), true);
 });
