@@ -799,9 +799,9 @@ const robinhood = {
     return extractContent(await callTool(toolName, args));
   },
 
-  // Resolve the option instrument UUID for a specific contract. Orders (place/review) reference
-  // the contract only by option_id, but our chain candidates come from Tradier/Finnhub which don't
-  // carry Robinhood's id — so we look it up by chain_symbol + expiration + strike + type.
+  // Resolve the option instrument UUID for a specific contract. Orders reference the contract by
+  // option_id, while fallback chain candidates may lack Robinhood's instrument id. Resolve those
+  // candidates by chain symbol, expiration, strike, and type.
   async resolveOptionId(symbol, expirationDate, optionType, strikePrice, accountNumber) {
     const toolName = discoveredTools.has("get_option_instruments") ? "get_option_instruments"
       : findTool(/option_instruments/i);

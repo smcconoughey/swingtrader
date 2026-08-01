@@ -14,6 +14,18 @@ function clamp(value, min = 0, max = 100) {
   return Math.max(min, Math.min(max, value));
 }
 
+export function entryDirectionForScore(score, cfg = {}) {
+  const value = finiteOr(score, 50);
+  if (cfg.llmOpportunityMode === true) {
+    if (value >= 53) return "bullish";
+    if (value <= 47) return "bearish";
+    return null;
+  }
+  if (value >= finiteOr(cfg.bullEntry, 68)) return "bullish";
+  if (value <= finiteOr(cfg.bearEntry, 32)) return "bearish";
+  return null;
+}
+
 // Convert both trade directions to the same scale: higher always means stronger conviction.
 // A 10-score put is therefore conviction 90, not weaker than a 34-score put.
 export function directionalConviction(decision) {
