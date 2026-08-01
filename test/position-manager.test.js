@@ -88,7 +88,7 @@ test("SPY regression: intended limit is ignored and one long-DTE loss quote wait
   assert.equal(decision.metrics.premiumStopConfirmed, false);
 });
 
-test("three coherent exact bids through the configured stop close a live option", () => {
+test("three coherent exact bids are a warning while the underlying thesis is intact", () => {
   const decision = evaluate(
     {
       markTrail: [
@@ -100,9 +100,27 @@ test("three coherent exact bids through the configured stop close a live option"
     { mark: 0.74, bid: 0.72, ask: 0.76 },
   );
 
+  assert.equal(decision.action, "hold");
+  assert.equal(decision.reasonCode, "HOLD_PREMIUM_THESIS_INTACT");
+  assert.equal(decision.metrics.premiumStopConfirmed, true);
+});
+
+test("a confirmed premium stop closes when price action also weakens the thesis", () => {
+  const decision = evaluate(
+    {
+      markTrail: [
+        { ts: NOW - 120_000, bid: 0.74, bookCoherent: true },
+        { ts: NOW - 60_000, bid: 0.73, bookCoherent: true },
+        { ts: NOW, bid: 0.72, bookCoherent: true },
+      ],
+    },
+    { spot: 98, mark: 0.74, bid: 0.72, ask: 0.76 },
+    { score: 40 },
+  );
+
   assert.equal(decision.action, "close");
   assert.equal(decision.reasonCode, "PREMIUM_STOP");
-  assert.equal(decision.metrics.premiumStopConfirmed, true);
+  assert.equal(decision.metrics.thesisState, "weak");
 });
 
 test("a newly coherent quote cannot promote earlier wide bids into stop confirmation", () => {
@@ -142,7 +160,7 @@ test("a display refresh cannot make a stale executable bid satisfy the stop wind
   assert.equal(decision.metrics.premiumStopSamples, 2);
 });
 
-test("confirmed premium stop keeps hard-stop priority when the structural spot stop also fires", () => {
+test("structural invalidation has priority over an option-premium warning", () => {
   const decision = evaluate(
     {
       markTrail: [
@@ -155,7 +173,7 @@ test("confirmed premium stop keeps hard-stop priority when the structural spot s
   );
 
   assert.equal(decision.action, "close");
-  assert.equal(decision.reasonCode, "PREMIUM_STOP");
+  assert.equal(decision.reasonCode, "STRUCTURAL_SPOT_STOP");
   assert.equal(decision.metrics.premiumStopConfirmed, true);
   assert.ok(decision.metrics.adverseSpotMove >= decision.metrics.spotStopThreshold);
 });
@@ -172,7 +190,7 @@ test("low-DTE loss is urgent instead of waiting behind premium-stop confirmation
   assert.equal(decision.metrics.premiumStopConfirmed, false);
 });
 
-test("15-second manager cadence can confirm a stop after a continuous minute", () => {
+test("15-second manager cadence confirms the premium warning without forcing an exit", () => {
   const decision = evaluate(
     {
       markTrail: [
@@ -186,8 +204,8 @@ test("15-second manager cadence can confirm a stop after a continuous minute", (
     { mark: 0.72, bid: 0.70, ask: 0.74 },
   );
 
-  assert.equal(decision.action, "close");
-  assert.equal(decision.reasonCode, "PREMIUM_STOP");
+  assert.equal(decision.action, "hold");
+  assert.equal(decision.reasonCode, "HOLD_PREMIUM_THESIS_INTACT");
   assert.equal(decision.metrics.premiumStopConfirmed, true);
   assert.equal(decision.metrics.premiumStopSpanMs, 60_000);
 });
@@ -242,7 +260,7 @@ test("a wide book remains quarantined before the bounded escalation interval", (
   assert.equal(decision.metrics.premiumStopWideEscalated, false);
 });
 
-test("a sustained wide-book stop escalates after three minutes with patient pricing", () => {
+test("a sustained wide-book warning still holds while the thesis is intact", () => {
   const decision = evaluate(
     {
       markTrail: [
@@ -255,10 +273,10 @@ test("a sustained wide-book stop escalates after three minutes with patient pric
     { mark: 0.90, bid: 0.68, ask: 1.12 },
   );
 
-  assert.equal(decision.action, "close");
-  assert.equal(decision.reasonCode, "PREMIUM_STOP_WIDE_BOOK");
-  assert.equal(decision.urgency, "urgent");
-  assert.equal(decision.priceMode, "patient");
+  assert.equal(decision.action, "hold");
+  assert.equal(decision.reasonCode, "HOLD_PREMIUM_THESIS_INTACT");
+  assert.equal(decision.urgency, "routine");
+  assert.equal(decision.priceMode, "none");
   assert.equal(decision.metrics.premiumStopConfirmed, false);
   assert.equal(decision.metrics.premiumStopWideEscalated, true);
   assert.equal(decision.metrics.premiumStopSpanMs, 180_000);

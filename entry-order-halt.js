@@ -11,7 +11,7 @@
  */
 export function entryBuyHaltReason(acct = {}) {
   const broker = acct?.config?.broker;
-  if (broker !== "tradier" && broker !== "robinhood") return null;
+  if (broker !== "robinhood") return null;
   if (acct.config?.liveEntriesEnabled !== true) {
     return "live-entry toggle off";
   }

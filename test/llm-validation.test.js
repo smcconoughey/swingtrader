@@ -49,3 +49,25 @@ test("invalid or missing contract indices do not silently select contract zero",
   assert.throws(() => validateEntryDecision(base, { candidateCount: 3 }), /contractIdx/);
   assert.throws(() => validateEntryDecision({ ...base, contractIdx: 9 }, { candidateCount: 3 }), /contractIdx/);
 });
+
+test("structured trade plan preserves thesis and structural invalidation", () => {
+  const result = validateEntryDecision({
+    approve: true,
+    confidence: 82,
+    concerns: [],
+    reasoning: "Evidence supports the entry.",
+    suggestion: "Enter on confirmation.",
+    tradePlan: {
+      thesis: "Relative strength continues.",
+      entryTrigger: "Break above the morning high on volume.",
+      invalidation: "Daily close below the reclaimed 21 EMA.",
+      firstTarget: "$220 resistance.",
+      stretchTarget: "$228.",
+      timeHorizon: "One to three weeks.",
+      uncertainty: "Macro reversal.",
+    },
+  });
+
+  assert.equal(result.tradePlan.invalidation, "Daily close below the reclaimed 21 EMA.");
+  assert.equal(result.tradePlan.timeHorizon, "One to three weeks.");
+});
