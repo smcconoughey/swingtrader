@@ -22,7 +22,7 @@ export const CAPITAL_PRESERVATION_POLICY = Object.freeze({
   trim2Pct: 0.40,
   singleContractBankPct: 0.40,
   minimumRewardRisk: 1.5,
-  liveEntriesEnabled: true,
+  liveEntriesEnabled: false,
 });
 
 export const LIVE_RISK_DEFAULTS = Object.freeze({
@@ -35,10 +35,11 @@ export const LIVE_RISK_DEFAULTS = Object.freeze({
   maxConsecutiveLosses: CAPITAL_PRESERVATION_POLICY.maxConsecutiveLosses,
   maxDayTrades: CAPITAL_PRESERVATION_POLICY.maxDayTrades,
   minimumRewardRisk: 1.0,
-  liveEntriesEnabled: true,
+  liveEntriesEnabled: false,
   // Human-trader mode: evaluate every real opportunity, but keep execution atomic and bounded.
   // Portfolio loss telemetry remains visible; it no longer silently pauses the account.
-  traderCopilotVersion: 1,
+  traderCopilotVersion: 2,
+  automationMode: "profit_only",
   portfolioHaltsEnabled: false,
   opportunityLimitsEnabled: false,
   llmOpportunityMode: true,
@@ -72,9 +73,12 @@ export function applyLiveRiskPolicy(account) {
   // One explicit migration for the Robinhood account. The old defaults made a normal option
   // contract mathematically impossible to buy, then paused the whole account for drawdowns.
   // This changes opportunity selection, not the broker/cash/duplicate-order safety boundary.
-  if (account.config.broker === "robinhood" && account.config.traderCopilotVersion !== 1) {
+  if (account.config.broker === "robinhood" && account.config.traderCopilotVersion !== 2) {
     const migration = {
-      traderCopilotVersion: 1,
+      traderCopilotVersion: 2,
+      automationMode: "profit_only",
+      liveEntriesEnabled: false,
+      autoExecute: true,
       portfolioHaltsEnabled: false,
       opportunityLimitsEnabled: false,
       llmOpportunityMode: true,
@@ -83,6 +87,12 @@ export function applyLiveRiskPolicy(account) {
       maxDayTrades: null,
     };
     for (const [key, value] of Object.entries(migration)) {
+      if (config[key] !== value) changes.push({ key, before: config[key], after: value });
+      config[key] = value;
+    }
+  }
+  if (config.automationMode === "profit_only") {
+    for (const [key, value] of Object.entries({ liveEntriesEnabled: false, autoExecute: true })) {
       if (config[key] !== value) changes.push({ key, before: config[key], after: value });
       config[key] = value;
     }
