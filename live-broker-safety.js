@@ -1,6 +1,5 @@
 export const CANONICAL_LIVE_BROKERS = Object.freeze({
   robinhood: "robinhood",
-  tradier: "tradier",
 });
 
 const LIVE_BROKERS = new Set(Object.values(CANONICAL_LIVE_BROKERS));

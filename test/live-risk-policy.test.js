@@ -75,3 +75,25 @@ test("paper accounts are not rewritten by the live policy", () => {
   assert.equal(account.config.baseRiskPct, 0.50);
   assert.equal(account.config.useCashReserve, false);
 });
+
+test("legacy Robinhood account migrates once to opportunity-first one-contract mode", () => {
+  const account = {
+    config: {
+      broker: "robinhood",
+      useCashReserve: true,
+      maxDayTrades: 2,
+    },
+  };
+  const changes = applyLiveRiskPolicy(account);
+
+  assert.equal(account.config.traderCopilotVersion, 1);
+  assert.equal(account.config.entrySizingMode, "one_contract");
+  assert.equal(account.config.portfolioHaltsEnabled, false);
+  assert.equal(account.config.opportunityLimitsEnabled, false);
+  assert.equal(account.config.llmOpportunityMode, true);
+  assert.equal(account.config.useCashReserve, false);
+  assert.equal(account.config.maxDayTrades, null);
+  assert.ok(changes.length > 0);
+
+  assert.deepEqual(applyLiveRiskPolicy(account), []);
+});

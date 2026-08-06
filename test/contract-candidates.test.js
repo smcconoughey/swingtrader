@@ -5,8 +5,8 @@ import { buildCandidateContracts, entryLimitPrice } from "../option-contracts.js
 
 const NOW = new Date("2026-07-13T12:00:00-05:00").getTime();
 
-function chainWith(options) {
-  return [{ expirationDate: "2026-08-07", dataSource: "tradier", options: { CALL: options, PUT: [] } }];
+function chainWith(options, dataSource = "finnhub") {
+  return [{ expirationDate: "2026-08-07", dataSource, options: { CALL: options, PUT: [] } }];
 }
 
 function contract(overrides = {}) {
@@ -39,7 +39,7 @@ test("candidate builder preserves expiration date, source, Greeks, and executabl
   const expiry = new Date(out.expiryDate);
   assert.equal(`${expiry.getFullYear()}-${String(expiry.getMonth() + 1).padStart(2, "0")}-${String(expiry.getDate()).padStart(2, "0")}`, "2026-08-07");
   assert.equal(out.expiryStr, "2026-08-07");
-  assert.equal(out.dataSource, "tradier");
+  assert.equal(out.dataSource, "finnhub");
   assert.equal(out.theta, -0.04);
   assert.ok(out.roundTripFrictionPct > 4 && out.roundTripFrictionPct < 5);
 });
@@ -51,6 +51,11 @@ test("candidate builder requires meaningful OI or volume", () => {
     contract({ occSymbol: "FLOW", openInterest: 0, volume: 50 }),
   ]), "call", 100, 12, NOW);
   assert.deepEqual(new Set(out.map(x => x.occSymbol)), new Set(["OI", "FLOW"]));
+});
+
+test("an exact tight Robinhood market is liquidity evidence when activity fields are absent", () => {
+  const chain = chainWith([{ ...contract({ openInterest: 0, volume: 0 }), bid: 1.95, ask: 2.05 }], "robinhood");
+  assert.equal(buildCandidateContracts(chain, "call", 100, 12, NOW).length, 1);
 });
 
 test("candidate builder fails closed when delta is missing or below the live minimum", () => {
