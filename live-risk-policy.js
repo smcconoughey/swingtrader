@@ -36,13 +36,6 @@ export const LIVE_RISK_DEFAULTS = Object.freeze({
   maxDayTrades: CAPITAL_PRESERVATION_POLICY.maxDayTrades,
   minimumRewardRisk: 1.0,
   liveEntriesEnabled: true,
-  // Human-trader mode: evaluate every real opportunity, but keep execution atomic and bounded.
-  // Portfolio loss telemetry remains visible; it no longer silently pauses the account.
-  traderCopilotVersion: 1,
-  portfolioHaltsEnabled: false,
-  opportunityLimitsEnabled: false,
-  llmOpportunityMode: true,
-  entrySizingMode: "one_contract",
 });
 
 const finite = value => Number.isFinite(Number(value));
@@ -67,26 +60,8 @@ export function normalizeLiveRiskConfig(config = {}) {
 }
 
 export function applyLiveRiskPolicy(account) {
-  if (!account?.config || account.config.broker !== "robinhood") return [];
+  if (!account?.config || !["robinhood", "tradier"].includes(account.config.broker)) return [];
   const { config, changes } = normalizeLiveRiskConfig(account.config);
-  // One explicit migration for the Robinhood account. The old defaults made a normal option
-  // contract mathematically impossible to buy, then paused the whole account for drawdowns.
-  // This changes opportunity selection, not the broker/cash/duplicate-order safety boundary.
-  if (account.config.broker === "robinhood" && account.config.traderCopilotVersion !== 1) {
-    const migration = {
-      traderCopilotVersion: 1,
-      portfolioHaltsEnabled: false,
-      opportunityLimitsEnabled: false,
-      llmOpportunityMode: true,
-      entrySizingMode: "one_contract",
-      useCashReserve: false,
-      maxDayTrades: null,
-    };
-    for (const [key, value] of Object.entries(migration)) {
-      if (config[key] !== value) changes.push({ key, before: config[key], after: value });
-      config[key] = value;
-    }
-  }
   account.config = config;
   return changes;
 }

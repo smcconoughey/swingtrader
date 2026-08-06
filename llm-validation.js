@@ -23,33 +23,12 @@ export function validateEntryDecision(value, { candidateCount = 0 } = {}) {
     contractIdx = requested - 1;
   }
 
-  let tradePlan = null;
-  if (value.tradePlan != null) {
-    if (!value.tradePlan || typeof value.tradePlan !== "object" || Array.isArray(value.tradePlan)) {
-      throw new TypeError("tradePlan must be an object");
-    }
-    const text = key => typeof value.tradePlan[key] === "string" ? value.tradePlan[key].trim() : "";
-    tradePlan = {
-      thesis: text("thesis"),
-      entryTrigger: text("entryTrigger"),
-      invalidation: text("invalidation"),
-      firstTarget: text("firstTarget"),
-      stretchTarget: text("stretchTarget"),
-      timeHorizon: text("timeHorizon"),
-      uncertainty: text("uncertainty"),
-    };
-    if (!tradePlan.thesis || !tradePlan.invalidation || !tradePlan.firstTarget || !tradePlan.timeHorizon) {
-      throw new TypeError("tradePlan requires thesis, invalidation, firstTarget, and timeHorizon");
-    }
-  }
-
   return {
     approve: value.approve,
     confidence,
     concerns: value.concerns.slice(0, 20),
     reasoning: value.reasoning.trim(),
     suggestion: value.suggestion.trim(),
-    ...(tradePlan ? { tradePlan } : {}),
     ...(candidateCount > 0 ? { contractIdx } : {}),
   };
 }

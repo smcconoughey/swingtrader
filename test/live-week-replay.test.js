@@ -48,7 +48,7 @@ function evaluateLive(position, { bid, ask, mark = (bid + ask) / 2, trail = [], 
   });
 }
 
-test("FIG and HPE replay: premium losses alone do not invent thesis invalidation", () => {
+test("FIG and HPE replay: repeated executable losses stop at the configured limit", () => {
   const fig = evaluateLive(
     { ticker: "FIG", entryPremium: 2.96 },
     {
@@ -74,8 +74,8 @@ test("FIG and HPE replay: premium losses alone do not invent thesis invalidation
     },
   );
 
-  assert.equal(fig.reasonCode, "HOLD_PREMIUM_THESIS_INTACT");
-  assert.equal(hpe.reasonCode, "HOLD_PREMIUM_THESIS_INTACT");
+  assert.equal(fig.reasonCode, "PREMIUM_STOP");
+  assert.equal(hpe.reasonCode, "PREMIUM_STOP");
   assert.equal(fig.plan.stopLoss, -0.35);
   assert.equal(hpe.plan.stopLoss, -0.35);
 });

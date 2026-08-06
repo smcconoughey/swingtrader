@@ -24,11 +24,7 @@ export function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 
       if (!c.strike || c.strike <= 0) continue;
       if (!c.bid || c.bid <= 0) continue;
       if (!c.ask || c.ask <= 0 || c.ask < c.bid) continue;
-      const liveSpreadPct = c.ask > 0 ? (c.ask - c.bid) / ((c.ask + c.bid) / 2) : Infinity;
-      const activityConfirmed = (c.openInterest || 0) >= 100 || (c.volume || 0) >= 50;
-      // Robinhood's exact quote tool does not always expose OI/volume. A tight, current two-sided
-      // executable market is still direct liquidity evidence; other feeds retain the activity gate.
-      if (!activityConfirmed && !(exp.dataSource === "robinhood" && liveSpreadPct <= 0.15)) continue;
+      if ((c.openInterest || 0) < 100 && (c.volume || 0) < 50) continue;
 
       const mid = +((c.bid + c.ask) / 2).toFixed(2);
       if (mid < 0.25) continue;

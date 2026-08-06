@@ -8,7 +8,8 @@ import { TwitterApi } from "twitter-api-v2";
 import { Resvg } from "@resvg/resvg-js";
 import webpush from "web-push";
 import { robinhood } from "./robinhood.js";
-import { directionalSetupQuality, entryDirectionForScore, entryPriority, momentumEntryGate, rankEntryCandidates, rankPreparedEntries } from "./strategy-priority.js";
+import { tradier } from "./tradier.js";
+import { directionalSetupQuality, entryPriority, momentumEntryGate, rankEntryCandidates, rankPreparedEntries } from "./strategy-priority.js";
 import { completeStrategyConfig, QUICK_PROFIT_CONFIG } from "./strategy-config.js";
 import { deriveAdaptiveExitProfile } from "./adaptive-exit.js";
 import { applyUnderlyingSnapshots, shouldRecordSelectionCohort, summarizeRankOne } from "./decision-telemetry.js";
@@ -51,22 +52,15 @@ import {
   shouldCancelWorkingBuysOnHalt,
 } from "./entry-order-halt.js";
 import {
+  applyTradierTrimFill,
+  isConfirmedTradeOutcome,
+  matchTradierExitOrder,
+  tradierFillDelta,
+} from "./tradier-fill-accounting.js";
+import {
   diffRobinhoodTradeHistory,
   extractRobinhoodPortfolioFields,
 } from "./robinhood-portfolio.js";
-import {
-  normalizeRobinhoodOptionChain,
-  robinhoodChainInstrumentIds,
-} from "./robinhood-chain.js";
-import {
-  activeDirectivesFor,
-  applyOperatorDirectives,
-  automatedExitBlock,
-  describeOperatorDirectives,
-  parseOperatorDirectives,
-} from "./operator-directives.js";
-import { classifyWorkingOptionOrders } from "./order-authority.js";
-import { commandCenterHTML } from "./dashboard-command-center.js";
 import {
   clearEntryOrderTracking,
   entryIntentSatisfiedByHolding,
@@ -792,7 +786,8 @@ const POSITION_MANAGER_STALE_MS = 45_000;
 const RH_OPTION_QUOTE_MAX_AGE_MS = 45_000;
 const CYCLE_MS_CLOSED = 90_000; // slower after-hours polling
 const API_DELAY_FINNHUB = 150;  // Finnhub free tier
-function apiDelay() { return API_DELAY_FINNHUB; }
+const API_DELAY_TRADIER = 25;   // Tradier batch-friendly
+function apiDelay() { return tradier.isConnected ? API_DELAY_TRADIER : API_DELAY_FINNHUB; }
 const DEFAULT_IV = 0.30;
 
 // Swing-trade contract quality — we ONLY want real, near-the-money directional trades, never cheap
@@ -816,8 +811,10 @@ const CHOPPY_MIN_BULL_SCORE = 72;
 const CHOPPY_MIN_BEAR_SCORE = 28; // must be <= this for puts (stricter than default bearEntry)
 // Earnings calendar cache (one Finnhub call per ticker per day).
 const earningsCache = new Map();
-// Market-data provenance counters are running totals since process start.
-const marketDataStats = { finnhub: 0, yahoo: 0, lastSource: "—", lastAt: 0 };
+// Live market-data provenance counters so the UI can show whether the bot is on Tradier (live,
+// fill-accurate) data or has fallen back to Finnhub/Yahoo. Reset is not needed — these are running
+// totals since process start; the dashboard shows the current primary + fallback counts.
+const marketDataStats = { tradier: 0, finnhub: 0, yahoo: 0, lastSource: "—", lastAt: 0 };
 function noteDataSource(src) {
   if (marketDataStats[src] != null) marketDataStats[src]++;
   marketDataStats.lastSource = src;
@@ -967,7 +964,7 @@ const DEFAULT_CONFIG = {
   maxPositions: 6,
   minSetupQuality: 60,
   customPromptSuffix: "",
-  // Broker binding: "paper" (simulated) | "robinhood" (live, broker is source of truth)
+  // Broker binding: "paper" (simulated) | "tradier" (live, broker is source of truth) | "robinhood"
   broker: "paper",
   // When false, the trust-scaled 50%->25% cash reserve gate is bypassed (per-trade sizing,
   // max positions, sector caps, and DTE staggering still apply). Toggleable per account.
@@ -977,6 +974,10 @@ const DEFAULT_CONFIG = {
   // When true, this account runs the full trading cycle (entries + exits) even while the market
   // is closed — intended for testing live execution against a broker sandbox on weekends/after hours.
   tradeWhenClosed: false,
+  // Margin safety rails: when Tradier reports zero option BP on a margin account, allow a small
+  // explicit spend limit without ever planning beyond this max negative-cash floor.
+  marginZeroCashSpendLimit: 200,
+  marginMaxDebt: 250,
   // ─── Loss circuit breakers (enforced in riskBreakerStatus / evaluateRiskHalts) ───
   // After this many consecutive losing closes, stop opening NEW positions for the rest of the
   // ET day (exits keep running). Streak resets on any winning close and at the next day open.
@@ -1020,7 +1021,6 @@ function createAccountRuntime(id, name, config, state) {
       cash: brokerBinding.config.startingCash || DEFAULT_CONFIG.startingCash,
       positions: [],
       history: [],
-      operatorDirectives: {},
 
     },
     dashboard: {
@@ -1221,7 +1221,7 @@ function applyStrategyPreset(acct, key) {
 }
 
 function ensureLiveConfigDefaults(acct) {
-  if (!acct || acct.learning || acct.config.broker !== "robinhood") return false;
+  if (!acct || acct.learning || !["robinhood", "tradier"].includes(acct.config.broker)) return false;
   const pendingChanges = Array.isArray(acct._riskPolicyChanges) ? acct._riskPolicyChanges : [];
   const changes = [...pendingChanges];
   acct._riskPolicyChanges = [];
@@ -1241,13 +1241,6 @@ function ensureLiveConfigDefaults(acct) {
     }
   }
   changes.push(...applyLiveRiskPolicy(acct));
-  if (acct.config.broker === "robinhood" && acct.config.portfolioHaltsEnabled === false
-      && acct.paused && acct.pausedBy === "risk") {
-    acct.paused = false;
-    acct.pausedBy = null;
-    acct._entryEpoch = (acct._entryEpoch || 0) + 1;
-    changes.push({ key: "risk pause", before: "paused", after: "cleared" });
-  }
   if (!changes.length) return false;
   log(acct, `LIVE CONFIG: reconciled the visible active preset/defaults (${changes.map(change => `${change.key} ${change.before}→${change.after}`).join(", ")}).`);
   return true;
@@ -2800,7 +2793,9 @@ function getETParts() {
   };
 }
 
-// US market holidays (NYSE/Nasdaq), used by the local session clock.
+// US market holidays (NYSE/Nasdaq) — FALLBACK only, used when the Tradier exchange clock isn't
+// available. Tradier's /markets/clock is authoritative when connected (it also handles ad-hoc
+// closures and is always correct on early-close days).
 const MARKET_HOLIDAYS = new Set([
   // 2025
   "2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26", "2025-06-19", "2025-07-04", "2025-09-01", "2025-11-27", "2025-12-25",
@@ -2816,11 +2811,27 @@ const MARKET_HALF_DAYS = new Set([
   "2027-11-26",
 ]);
 
+// Authoritative market state pulled from the Tradier exchange clock and cached briefly. This is the
+// source of truth when Tradier is connected — it flips to "open" the instant the exchange does and
+// is always right about holidays/early closes. Refreshed by the main loop (and forced near the open).
 let _marketClock = { state: null, nextChange: null, fetchedAt: 0, source: "local" };
-async function refreshMarketClock() {
-  const state = isMarketOpenLocal() ? "open" : "closed";
-  if (_marketClock.state && _marketClock.state !== state) diag("clock", "system", { from: _marketClock.state, to: state });
-  _marketClock = { state, nextChange: null, fetchedAt: Date.now(), source: "local" };
+async function refreshMarketClock(force = false) {
+  if (!tradier.isConnected) return;
+  if (!force && Date.now() - _marketClock.fetchedAt < 30_000) return;
+  try {
+    const clk = await tradier.getClock();
+    if (clk && clk.state) {
+      const prevState = _marketClock.state;
+      _marketClock = { state: clk.state, nextChange: clk.next_change || null, fetchedAt: Date.now(), source: "tradier" };
+      // Record only the transition, not every poll — a few rows per day.
+      if (prevState && prevState !== clk.state) {
+        diag("clock", "system", {
+          from: prevState, to: clk.state, nextChange: clk.next_change || null,
+          desc: clk.description || null,
+        });
+      }
+    }
+  } catch { /* keep last good reading; fall back to local calc below */ }
 }
 
 // True only when the regular session is open. Prefers the broker clock; falls back to a local ET
@@ -2842,7 +2853,12 @@ function isMarketOpenLocal() {
   }
 }
 
-function isMarketOpen() { return isMarketOpenLocal(); }
+function isMarketOpen() {
+  if (_marketClock.source === "tradier" && _marketClock.state && Date.now() - _marketClock.fetchedAt < 5 * 60_000) {
+    return _marketClock.state === "open"; // "premarket"/"postmarket"/"closed" are all NOT regular-session open
+  }
+  return isMarketOpenLocal();
+}
 
 function getETDateStr() {
   try {
@@ -2957,6 +2973,13 @@ function nextExpiry(ticker, { targetDTE = TARGET_DTE, refDate = null, state = nu
 // ─── API Layer ───
 
 async function fetchQuote(sym, key) {
+  // Primary: Tradier (real-time, fill-accurate) when the arm is connected.
+  if (tradier.isConnected) {
+    try {
+      const q = await tradier.getQuote(sym);
+      if (q && q.c > 0) { noteDataSource("tradier"); return q; }
+    } catch { }
+  }
   try {
     const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${key}`);
     if (r.ok) {
@@ -2978,7 +3001,14 @@ async function fetchQuote(sym, key) {
 }
 
 async function fetchCandles(sym, key) {
-  // Try Finnhub first.
+  // Primary: Tradier daily history when connected.
+  if (tradier.isConnected) {
+    try {
+      const candles = await tradier.getHistoricals(sym, 90);
+      if (candles && candles.length > 0) return candles;
+    } catch { }
+  }
+  // Try Finnhub next
   try {
     const to = Math.floor(Date.now() / 1000);
     const from = to - 90 * 86400;
@@ -3012,20 +3042,14 @@ async function fetchCandles(sym, key) {
   }
 }
 
-// ─── Options Chain (Robinhood primary, Finnhub fallback) ───
+// ─── Options Chain (Tradier primary, Finnhub fallback) ───
 
-async function fetchFullOptionsChain(sym, apiKey, spot = null) {
-  // Use the execution broker's own exact instruments and quotes first. This removes the mismatch
-  // where one venue selected a contract that Robinhood later could not identify or quote.
-  if (robinhood.isConnected && robinhood.optionsEnabled) {
+async function fetchFullOptionsChain(sym, apiKey) {
+  // Primary: Tradier — real-time chain with ORATS Greeks/IV, normalized to the Finnhub shape.
+  if (tradier.isConnected) {
     try {
-      const instruments = await robinhood.getOptionInstruments(sym);
-      const ids = robinhoodChainInstrumentIds(instruments, { symbol: sym, spot });
-      if (ids.length) {
-        const marketData = await robinhood.getOptionMarketData(ids);
-        const chain = normalizeRobinhoodOptionChain(instruments, marketData, { symbol: sym, spot });
-        if (chain.length) return chain;
-      }
+      const chain = await tradier.getOptionsChainNormalized(sym);
+      if (chain && chain.length > 0) return chain.map(exp => ({ ...exp, dataSource: "tradier" }));
     } catch { }
   }
   // Fallback: Finnhub option chain.
@@ -3123,12 +3147,6 @@ function isAdmissiblePerformanceTrade(trade) {
   if (!isConfirmedTradeOutcome(trade)) return false;
   if (trade.type !== "equity" && !(Number(trade.strike) > 0)) return false;
   return true;
-}
-
-function isConfirmedTradeOutcome(trade = {}) {
-  if (!trade || trade._pendingFill || trade._nonFillReason) return false;
-  return typeof trade.pnlDollar === "number" && Number.isFinite(trade.pnlDollar)
-    && Number(trade.qty || trade.quantity || 0) > 0;
 }
 
 function managementConfigForNewEntry(acct, optionType = null) {
@@ -3403,7 +3421,6 @@ function recordTradeOutcome(acct, pnlDollar) {
 // Entry-time gate. Returns a human-readable reason when new entries are blocked, else null.
 function riskBreakerStatus(acct) {
   const cfg = acct.config;
-  if (cfg.portfolioHaltsEnabled === false) return null;
   const pv = portfolioValue(acct.state, acct.dashboard?.quotes || {});
   const r = ensureRiskState(acct, pv);
 
@@ -3441,11 +3458,15 @@ function brokerBalanceAgeMs(acct, now = Date.now()) {
 }
 
 async function ensureFreshBrokerBalance(acct, { maxAgeMs = LIVE_BALANCE_REFRESH_AGE_MS } = {}) {
-  if (!acct || acct.config?.broker !== "robinhood") return false;
+  if (!acct || !["tradier", "robinhood"].includes(acct.config?.broker)) return false;
   if (brokerBalanceAgeMs(acct) <= maxAgeMs) return true;
   acct.state.brokerBalanceRefreshAttemptAt = Date.now();
   try {
-    await refreshRobinhoodBalance(acct);
+    if (acct.config.broker === "tradier") {
+      await refreshBrokerBalances(acct, { maxAgeMs: 0, logErrors: true });
+    } else {
+      await refreshRobinhoodBalance(acct);
+    }
     const fresh = brokerBalanceAgeMs(acct) <= LIVE_BALANCE_MAX_AGE_MS;
     if (fresh) delete acct.state.brokerBalanceError;
     else acct.state.brokerBalanceError = "Broker returned no usable buying-power or account-value field";
@@ -3459,7 +3480,7 @@ async function ensureFreshBrokerBalance(acct, { maxAgeMs = LIVE_BALANCE_REFRESH_
 
 function liveEntryCommitBlock(acct, entryEpoch = null) {
   const broker = acct?.config?.broker;
-  if (broker !== "robinhood") return null;
+  if (broker !== "tradier" && broker !== "robinhood") return null;
   if (acct.config.liveEntriesEnabled !== true) {
     return "Live entries are disabled in Settings; protective exits remain active";
   }
@@ -3484,7 +3505,6 @@ function liveEntryCommitBlock(acct, entryEpoch = null) {
 // exits but nothing new opens until manually resumed.
 function evaluateRiskHalts(acct, pv) {
   const cfg = acct.config;
-  if (cfg.portfolioHaltsEnabled === false) return;
   const r = ensureRiskState(acct, pv);
   if (!(pv > 0)) return;
   const dayPnlPct = r.dayStartPV > 0 ? (pv - r.dayStartPV) / r.dayStartPV : 0;
@@ -3511,7 +3531,7 @@ function evaluateRiskHalts(acct, pv) {
   if (r.haltNotified === kind || (kind !== "daily" && acct.state.portfolioRisk?.haltNotified === kind)) return;
   r.haltNotified = kind;
   if (kind !== "daily") acct.state.portfolioRisk.haltNotified = kind;
-  const isLive = cfg.broker === "robinhood";
+  const isLive = cfg.broker === "tradier" || cfg.broker === "robinhood";
   msg += isLive ? " Account PAUSED — exits keep running; resume manually from the dashboard." : " New entries blocked.";
   log(acct, `🚨 ${kind.toUpperCase()} RISK HALT: ${msg}`);
   diag("risk_halt", acct, { kind, drawdownPct: +(drawdownPct * 100).toFixed(1), baseline: +baseline.toFixed(2), pv: +pv.toFixed(2), paused: isLive });
@@ -3727,21 +3747,6 @@ function extractLLMJSON(raw) {
 async function processHint(hintText, acct) {
   const state = acct.state;
   const dash = acct.dashboard;
-  // Safety/authority commands never depend on an LLM being online or understanding the wording.
-  // applyHintResult persists the same parsed directive after this deterministic acknowledgement.
-  const directPositionCommands = parseOperatorDirectives(hintText, {
-    openTickers: (state.positions || []).map(position => position.ticker),
-  });
-  if (directPositionCommands.length) {
-    return {
-      type: "action",
-      response: "Operator instruction recognized and will be enforced before any broker submission.",
-      tickers: [],
-      removeTickers: [],
-      urgency: "high",
-      advice: "Durable position-management directive.",
-    };
-  }
   // Full per-position detail (basis, live mark, P&L, stop/target levels) so the assistant can
   // answer "will it hit my stop?" instead of claiming not to know its own bot's stop level.
   const cfg = acct.config;
@@ -3753,13 +3758,9 @@ async function processHint(hintText, acct) {
     const stopMult = plan.stopLoss;
     const stopP = p.entryPremium > 0 ? (p.entryPremium * (1 + stopMult)).toFixed(2) : "?";
     const tpP = p.entryPremium > 0 ? (p.entryPremium * (1 + plan.profitTarget)).toFixed(2) : "?";
-    const savedTradePlan = p.tradePlan || p.ai?.tradePlan || null;
-    const planContext = savedTradePlan
-      ? `, thesis: ${savedTradePlan.thesis}; invalidation: ${savedTradePlan.invalidation}` : "";
-    return `${p.ticker} ${isEq ? "shares" : `$${p.strike} ${p.type.toUpperCase()}`} x${p.qty}: entry $${p.entryPremium?.toFixed(2)}, now $${cur != null ? cur.toFixed(2) : "?"} (${pnlStr}), ${isEq ? "stop" : "premium warning"} $${stopP} (${(stopMult * 100).toFixed(0)}%${isEq ? "" : "; not an exit without thesis damage/expiry pressure"}), frozen target $${tpP} (+${(plan.profitTarget * 100).toFixed(0)}%)${isEq ? "" : `, ${(p.dteRemaining ?? p.dte ?? 0).toFixed(0)} DTE`}${planContext}`;
+    return `${p.ticker} ${isEq ? "shares" : `$${p.strike} ${p.type.toUpperCase()}`} x${p.qty}: entry $${p.entryPremium?.toFixed(2)}, now $${cur != null ? cur.toFixed(2) : "?"} (${pnlStr}), confirmed stop $${stopP} (${(stopMult * 100).toFixed(0)}%${isEq ? "" : "; repeated coherent exact bids required"}), frozen target $${tpP} (+${(plan.profitTarget * 100).toFixed(0)}%)${isEq ? "" : `, ${(p.dteRemaining ?? p.dte ?? 0).toFixed(0)} DTE`}`;
   });
-  const directiveSummary = describeOperatorDirectives(state) || "none";
-  const portfolioContext = `Portfolio: $${state.cash.toFixed(0)} cash, ${state.positions.length} positions open${positionLines.length ? `:\n${positionLines.join("\n")}` : " (none)"}. Watchlist: ${acct.tickers.join(", ")}. Active hints: ${acct.activeHints.map(h => `${h.ticker} ${h.bias > 0 ? '+' : ''}${h.bias}`).join(", ") || "none"}. Durable operator directives: ${directiveSummary}.`;
+  const portfolioContext = `Portfolio: $${state.cash.toFixed(0)} cash, ${state.positions.length} positions open${positionLines.length ? `:\n${positionLines.join("\n")}` : " (none)"}. Watchlist: ${acct.tickers.join(", ")}. Active hints: ${acct.activeHints.map(h => `${h.ticker} ${h.bias > 0 ? '+' : ''}${h.bias}`).join(", ") || "none"}.`;
 
   // Gather any available analysis for tickers mentioned in the message
   const mentionedTickers = Object.keys(dash.analyses).filter(t =>
@@ -3842,10 +3843,6 @@ async function checkHints(acct) {
 }
 
 async function applyHintResult(acct, result, userMessage) {
-  const positionDirectives = parseOperatorDirectives(userMessage, {
-    openTickers: (acct.state.positions || []).map(position => position.ticker),
-  });
-  const appliedPositionDirectives = applyOperatorDirectives(acct.state, positionDirectives);
   const direct = inferDirectWatchlistDirectives(userMessage);
   if (direct.tickers.length > 0) {
     const existing = new Set((result.tickers || []).map(t => String(t.symbol || "").toUpperCase()));
@@ -3906,21 +3903,6 @@ async function applyHintResult(acct, result, userMessage) {
     if (mutation.notFound.length) parts.push(`${mutation.notFound.join(", ")} ${mutation.notFound.length === 1 ? "was" : "were"} not on the watchlist`);
     if (mutation.rejected.length) parts.push(`Rejected ${mutation.rejected.join(", ")}`);
     result.response = parts.join(". ") + (parts.length ? "." : "");
-  }
-  if (appliedPositionDirectives.length) {
-    const confirmations = appliedPositionDirectives.map(directive => {
-      const subject = directive.scope === "*" ? "all positions" : directive.scope;
-      if (directive.kind === "no_realized_loss") {
-        return directive.cleared
-          ? `Cleared the no-loss exit directive for ${subject}`
-          : `Automation will not submit a loss-making exit for ${subject} until you clear this directive`;
-      }
-      return directive.cleared
-        ? `Resumed automated management for ${subject}`
-        : `${subject} is now advice-only; automation will not submit exits`;
-    });
-    result.response = `${confirmations.join(". ")}.`;
-    log(acct, `OPERATOR DIRECTIVE: ${confirmations.join("; ")}`);
   }
 
   // Store in chat history (keep last 30 exchanges)
@@ -4257,7 +4239,7 @@ Rules:
 
 // ─── Claude Pre-Entry Validation ───
 
-async function validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, candidates, effectiveQuality = setupQuality.quality, entryConcerns = []) {
+async function validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, candidates, effectiveQuality = setupQuality.quality) {
   const cfg = acct.config;
   const dailyTape = acct.dailyTape?.date === todayStr() ? acct.dailyTape : null;
   const isEquity = cfg.broker === "robinhood" && rhTradeMode(cfg) === "equity";
@@ -4284,9 +4266,7 @@ async function validateEntryWithClaude(acct, ticker, quote, analysis, setupQuali
       return `${num} | ${exp}      | ${dte} | ${strike} | ${mid} | ${iv} | ${delta} | ${oi} | ${vol} | ${spread}`;
     }).join('\n');
     contractSection = `\nReal options chain (${candidates.length} pre-vetted near-the-money / ITM contracts — all δ≥${MIN_OPTION_DELTA}, no far-OTM lottery tickets):\n${header}\n${rows}`;
-    const spendCap = Math.max(0, Math.min(acct.state?.cash || 0, cfg.maxTradeSize || 500,
-      cfg.broker === "robinhood" ? RH_MAX_POSITION_DOLLARS : Infinity));
-    contractInstruction = `\nSelect exactly one contract index (1-${candidates.length}) whose estimated one-contract cost is within the $${spendCap.toFixed(0)} spend cap. Prefer ATM-to-slightly-ITM (δ${PREFERRED_DELTA_MIN}-${PREFERRED_DELTA_MAX}) with a liquid, tight market. Approve when the evidence supports positive expected value; explain uncertainty instead of rejecting merely because the setup is imperfect. Never assume the system will substitute a cheaper contract.`;
+    contractInstruction = `\nSelect the best contract index (1-${candidates.length}). These are all real, near-the-money directional contracts — prefer the ATM-to-slightly-ITM strike (δ${PREFERRED_DELTA_MIN}-${PREFERRED_DELTA_MAX}) with the best liquidity and tightest spread. Only approve if this is a genuinely high-conviction setup worth real capital; we trade infrequently and only take trades likely to win — when in doubt, PASS.`;
   } else if (isEquity) {
     contractSection = '\nThis is an EQUITY (shares) trade — no options contracts. Evaluate whether buying shares at the current price is a good swing entry.';
   } else {
@@ -4318,17 +4298,15 @@ Market Regime: ${regime.label}
 Daily Tape: ${dailyTape ? `${dailyTape.score}/10 ${dailyTape.label} (${dailyTape.confidence}% confidence) — ${dailyTape.summary}` : 'unavailable; do not infer a score'}
 Daily Tape Use: Treat the tape assessment as market-wide reversal/volatility context, not an automatic veto. Explicitly explain whether this ticker's setup is strong enough for those conditions.
 ${earningsInfo.hasEarnings ? `⚠ EARNINGS in ${earningsInfo.daysUntil} days (${earningsInfo.date}); eligible contracts expire before it` : 'No reported earnings inside the option horizon'}
-${entryConcerns.length ? `Observed risks/warnings (context, not automatic vetoes):\n- ${entryConcerns.join('\n- ')}` : 'No additional deterministic warnings.'}
-${cfg.customPromptSuffix ? `Durable operator context: ${cfg.customPromptSuffix}` : ''}
+${cfg.customPromptSuffix ? `Additional context: ${cfg.customPromptSuffix}` : ''}
 ${contractSection}
 
 ${evalQuestions}
 
 Respond with ONLY valid JSON (no markdown, no backticks). Keep "reasoning" tight — 2-3 sentences
 covering the setup read, the main risk, and why you approve/reject the ${isEquity ? 'entry' : 'contract'}.
-The tradePlan must describe the stock thesis and structural invalidation—not an arbitrary option-premium percentage.
 "suggestion" is a one-line takeaway. Do not pad; brevity is graded:
-{"approve": true, "confidence": 75, "concerns": [], "reasoning": "2-3 sentence rationale", "suggestion": "one-line takeaway", "tradePlan":{"thesis":"why the underlying should move","entryTrigger":"price/volume confirmation","invalidation":"observable stock or thesis condition","firstTarget":"first stock-price objective","stretchTarget":"runner objective","timeHorizon":"expected holding window","uncertainty":"what could make this read wrong"}${candidates?.length > 0 ? ', "contractIdx": 1' : ''}}`;
+{"approve": true, "confidence": 75, "concerns": [], "reasoning": "2-3 sentence rationale", "suggestion": "one-line takeaway"${candidates?.length > 0 ? ', "contractIdx": 1' : ''}}`;
 
   try {
     const raw = await callClaude(promptText, 3, 512);
@@ -4354,10 +4332,7 @@ async function analyzeTickerOnDemand(acct, sym, userQuestion) {
   const claudeLogs = loadClaudeLog().filter(e => e.ticker === sym && e.acctId === acct.id).sort((a, b) => b.ts - a.ts);
 
   const priceStr = q ? `$${q.c.toFixed(2)} (${q.dp >= 0 ? '+' : ''}${q.dp?.toFixed(2)}% today)` : "unknown";
-  const positionPlan = pos?.tradePlan || pos?.ai?.tradePlan || null;
-  const posStr = pos
-    ? `Currently holding ${pos.qty}x $${pos.strike} ${pos.type.toUpperCase()} (entry $${pos.entrySpot?.toFixed(2)}, opened ${pos.openDate}, Claude confidence was ${pos.claudeConfidence}%)${positionPlan ? `\nRecorded thesis: ${positionPlan.thesis}\nRecorded structural invalidation: ${positionPlan.invalidation}\nRecorded targets/horizon: ${positionPlan.firstTarget}${positionPlan.stretchTarget ? ` then ${positionPlan.stretchTarget}` : ""}; ${positionPlan.timeHorizon}` : ""}`
-    : "Not currently held";
+  const posStr = pos ? `Currently holding ${pos.qty}x $${pos.strike} ${pos.type.toUpperCase()} (entry $${pos.entrySpot?.toFixed(2)}, opened ${pos.openDate}, Claude confidence was ${pos.claudeConfidence}%)` : "Not currently held";
   const prevValidations = claudeLogs.slice(0, 3).map(e =>
     `  ${new Date(e.ts).toLocaleDateString()} — ${e.outcome} (${e.confidence}% confidence, $${e.price?.toFixed(2)}): "${e.suggestion}"`
   ).join("\n") || "  None";
@@ -4486,30 +4461,20 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
   const state = acct.state;
   const cfg = acct.config;
   const entryEpoch = acct._entryEpoch || 0;
-  if (cfg.broker === "robinhood") {
+  if (["tradier", "robinhood"].includes(cfg.broker)) {
     await ensureFreshBrokerBalance(acct);
   }
   const liveCommitBlock = liveEntryCommitBlock(acct, entryEpoch);
   const observationPreflight = preflightOnly
-    && cfg.broker === "robinhood"
+    && (cfg.broker === "tradier" || cfg.broker === "robinhood")
     && cfg.liveEntriesEnabled !== true
     && !acct.paused;
   if (liveCommitBlock && !observationPreflight) return { skipped: true, reason: liveCommitBlock };
   if (state.positions.some(p => p.ticker === ticker)) return null;
   // Broker accounts: also skip names with a working (unfilled) order this cycle so we don't
   // stack duplicate orders while an earlier one is still resting.
-  if (cfg.broker === "robinhood" && acct._inflightTickers?.has(ticker.toUpperCase())) {
+  if ((cfg.broker === "tradier" || cfg.broker === "robinhood") && acct._inflightTickers?.has(ticker.toUpperCase())) {
     return { skipped: true, reason: `Broker: working order already open for ${ticker}` };
-  }
-  const entryConcerns = [];
-  const recentLosses = Number(state.portfolioRisk?.consecutiveLosses || state.risk?.consecLosses || 0);
-  if (recentLosses >= 2) {
-    entryConcerns.push(`${recentLosses} consecutive realized losses: demand fresh, independent evidence and avoid repeating the same failed thesis`);
-  }
-  const currentPv = portfolioValue(state, acct.dashboard?.quotes || {});
-  const highWater = Number(state.portfolioRisk?.highWaterPv || 0);
-  if (highWater > 0 && currentPv > 0 && currentPv < highWater) {
-    entryConcerns.push(`Portfolio is ${(((currentPv - highWater) / highWater) * 100).toFixed(1)}% below its high water; evaluate correlation and whether this is genuinely new edge`);
   }
 
   // Loss circuit breakers: consecutive-loss streak, daily loss limit, day-trade cap.
@@ -4526,12 +4491,11 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
   // Hard cap on concurrent positions — prevents over-deployment that drained cash to $25.
   // null means unlimited (user explicitly cleared the cap).
   // In choppy regimes, always cap at 3 (correlation + whipsaw risk), even when unlimited.
-  const configuredMax = cfg.opportunityLimitsEnabled === false
-    ? null : (cfg.maxPositions != null ? cfg.maxPositions : null);
+  const configuredMax = cfg.maxPositions != null ? cfg.maxPositions : null;
   const maxPos = regime?.mode === "choppy"
     ? (configuredMax != null ? Math.min(configuredMax, 3) : 3)
     : configuredMax;
-  const openCount = cfg.broker === "robinhood" ? effectivePositionCount(acct) : state.positions.length;
+  const openCount = (cfg.broker === "tradier" || cfg.broker === "robinhood") ? effectivePositionCount(acct) : state.positions.length;
   if (maxPos !== null && openCount >= maxPos) {
     return { skipped: true, reason: `Max positions (${maxPos}${regime?.mode === "choppy" ? ", choppy cap" : ""}) already open or pending` };
   }
@@ -4539,7 +4503,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
   // Example: holding CL+XLE+USO means one bad oil headline unwinds three positions together.
   // OTHER sector is unlimited (unmapped tickers have unknown correlation).
   const sector = getSector(ticker);
-  if (cfg.opportunityLimitsEnabled !== false && sector !== "OTHER") {
+  if (sector !== "OTHER") {
     const heldTickers = new Set(state.positions.map(p => p.ticker.toUpperCase()));
     const pendingInSector = [...(acct._inflightTickers || [])]
       .filter(t => !heldTickers.has(t) && getSector(t) === sector).length;
@@ -4553,8 +4517,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
   // guard — it keeps 25%–50% of portfolio value in cash depending on conviction.
 
   // Early exit: skip tickers that aren't actionable (WAIT zone) before any expensive checks
-  const entryDirection = entryDirectionForScore(analysis.score, cfg);
-  if (!entryDirection) return null;
+  if (analysis.score < cfg.bullEntry && analysis.score > cfg.bearEntry) return null;
 
   const et = getETDate();
   const etHour = et.getHours() + et.getMinutes() / 60;
@@ -4562,29 +4525,23 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
   // (spreads/whipsaws in the opening minutes), not signal quality, so a strong score doesn't buy
   // an exemption the way it does near the close.
   if (etHour >= MARKET_OPEN_HOUR && etHour < OPEN_FREEZE_END_HOUR) {
-    const warning = `Opening ${OPEN_FREEZE_MINUTES} minutes: spreads and reversals may be unstable (${etHour.toFixed(2)} ET)`;
-    if (cfg.llmOpportunityMode === true) entryConcerns.push(warning);
-    else return { skipped: true, reason: `Opening freeze — ${warning}` };
+    return { skipped: true, reason: `Opening freeze — waiting ${OPEN_FREEZE_MINUTES}min after the 9:30 ET open for spreads to settle (${etHour.toFixed(2)}h)` };
   }
   if (etHour >= EOD_FREEZE_HOUR && analysis.score < 80 && analysis.score > 20) {
-    const warning = `Late-day entry (${etHour.toFixed(1)} ET) with non-extreme score ${analysis.score}`;
-    if (cfg.llmOpportunityMode === true) entryConcerns.push(warning);
-    else return { skipped: true, reason: `EOD freeze — ${warning}` };
+    return { skipped: true, reason: `EOD freeze (${etHour.toFixed(1)} >= ${EOD_FREEZE_HOUR}h, score ${analysis.score} not extreme enough)` };
   }
 
   // Use the better of consolidation quality (tight base) or momentum quality (trending runner).
   // SRxTrades buys both: tight-base breakouts AND 8 EMA taps on leaders in motion.
-  const isBullish = entryDirection === "bullish";
-  const isBearish = entryDirection === "bearish";
+  const isBullish = analysis.score >= cfg.bullEntry;
+  const isBearish = analysis.score <= cfg.bearEntry;
   const setupQuality = detectConsolidation(acct.candleCache[ticker]);
   const momentumQuality = detectMomentumQuality(acct.candleCache[ticker]);
   const directionalQuality = directionalSetupQuality(setupQuality, momentumQuality, isBullish);
   const effectiveQuality = directionalQuality.quality;
   const minQuality = acct.config.minSetupQuality ?? 50;
   if (effectiveQuality < minQuality) {
-    const warning = `Direction-matched setup quality ${effectiveQuality}/100 is below legacy threshold ${minQuality} (base ${directionalQuality.baseQuality}, momentum ${directionalQuality.momentumQuality}, range ${setupQuality.rangePct}%)`;
-    if (cfg.llmOpportunityMode === true) entryConcerns.push(warning);
-    else return { skipped: true, reason: warning };
+    return { skipped: true, reason: `Low direction-matched setup quality ${effectiveQuality}/100 (base:${directionalQuality.baseQuality} mom:${directionalQuality.momentumQuality}, need >=${minQuality}, range ${setupQuality.rangePct}%)` };
   }
 
   // ─── Local pre-filters (catch what Claude would reject without API call) ───
@@ -4594,29 +4551,20 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
   const undercutReclaim = detectUndercutReclaim(acct.candleCache[ticker]);
   const uppercut = detectUppercut(acct.candleCache[ticker]);
   if (isBullish && uppercut.detected) {
-    const warning = `Bullish direction conflicts with ${uppercut.pattern || "Uppercut"} (${uppercut.quality}/100)`;
-    if (cfg.llmOpportunityMode === true) entryConcerns.push(warning);
-    else return { skipped: true, reason: `Direction veto — ${warning}` };
+    return { skipped: true, reason: `Direction veto — bullish call conflicts with ${uppercut.pattern || "Uppercut"} (${uppercut.quality}/100)` };
   }
   if (isBearish && undercutReclaim.detected) {
-    const warning = `Bearish direction conflicts with ${undercutReclaim.pattern || "Undercut & Reclaim"} (${undercutReclaim.quality}/100)`;
-    if (cfg.llmOpportunityMode === true) entryConcerns.push(warning);
-    else return { skipped: true, reason: `Direction veto — ${warning}` };
+    return { skipped: true, reason: `Direction veto — bearish put conflicts with ${undercutReclaim.pattern || "Undercut & Reclaim"} (${undercutReclaim.quality}/100)` };
   }
 
   const shortTerm = acct.dashboard?.shortTermAnalyses?.[ticker] || null;
   const momGate = momentumEntryGate(cfg, analysis, shortTerm, quote, isBullish);
-  if (momGate) {
-    if (cfg.llmOpportunityMode === true) entryConcerns.push(momGate);
-    else return { skipped: true, reason: momGate };
-  }
+  if (momGate) return { skipped: true, reason: momGate };
 
   // SRxTrades style: relative strength names often have RSI 70-90 on 8 EMA taps — that IS the setup.
   // Only block truly parabolic RSI that indicates exhaustion, not healthy momentum.
   if (isBullish && analysis.rsi > 85 && !analysis.aligned) {
-    const warning = `RSI ${analysis.rsi.toFixed(1)} is parabolic while EMAs are misaligned`;
-    if (cfg.llmOpportunityMode === true) entryConcerns.push(warning);
-    else return { skipped: true, reason: warning };
+    return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} parabolic with misaligned EMAs — exhaustion risk, not a healthy strength setup` };
   }
   // Robinhood without options: equity longs only — skip all bearish/put setups
   if (cfg.broker === "robinhood" && rhTradeMode(cfg) === "equity" && isBearish) {
@@ -4624,38 +4572,28 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
   }
 
   if (isBearish && analysis.rsi > 30 && analysis.rsi < 55 && !analysis.bearish) {
-    const warning = `RSI ${analysis.rsi.toFixed(1)} is neutral and EMA stack is not bearish`;
-    if (cfg.llmOpportunityMode === true) entryConcerns.push(warning);
-    else return { skipped: true, reason: warning };
+    return { skipped: true, reason: `RSI ${analysis.rsi.toFixed(1)} neutral with non-bearish EMA stack — weak put setup` };
   }
 
   // Risk-off regime contradicts bullish calls
   if (isBullish && regime.mode === "risk-off" && !analysis.aligned) {
-    const warning = `Risk-off regime and misaligned EMAs contradict the bullish direction`;
-    if (cfg.llmOpportunityMode === true) entryConcerns.push(warning);
-    else return { skipped: true, reason: warning };
+    return { skipped: true, reason: `Risk-off regime + misaligned EMAs contradicts bullish call bias` };
   }
 
   // Choppy regime (broken EMA stack while above 50): highest whipsaw rate — demand alignment + score.
   if (regime.mode === "choppy") {
     if (isBullish && (!analysis.aligned || analysis.score < CHOPPY_MIN_BULL_SCORE)) {
-      const warning = `Choppy tape with bullish score ${analysis.score} and EMA alignment ${analysis.aligned ? "yes" : "no"}`;
-      if (cfg.llmOpportunityMode === true) entryConcerns.push(warning);
-      else return { skipped: true, reason: warning };
+      return { skipped: true, reason: `Choppy regime — need aligned 8>21>50 stack AND score >= ${CHOPPY_MIN_BULL_SCORE} for calls (score ${analysis.score}, aligned ${analysis.aligned ? "yes" : "no"})` };
     }
     if (isBearish && (!analysis.bearish || analysis.score > CHOPPY_MIN_BEAR_SCORE)) {
-      const warning = `Choppy tape with bearish score ${analysis.score} and bearish EMA alignment ${analysis.bearish ? "yes" : "no"}`;
-      if (cfg.llmOpportunityMode === true) entryConcerns.push(warning);
-      else return { skipped: true, reason: warning };
+      return { skipped: true, reason: `Choppy regime — puts need bearish EMA stack AND score <= ${CHOPPY_MIN_BEAR_SCORE} (score ${analysis.score})` };
     }
   }
 
   // Range cap: tight consolidation setups need <15%; aligned EMA leaders (SRxTrades style) allow up to 60%
   const maxRange = (analysis.aligned && isBullish) || (analysis.bearish && isBearish) ? 60 : 15;
   if (parseFloat(setupQuality.rangePct) > maxRange) {
-    const warning = `Range ${setupQuality.rangePct}% exceeds the legacy ${maxRange}% consolidation threshold`;
-    if (cfg.llmOpportunityMode === true) entryConcerns.push(warning);
-    else return { skipped: true, reason: warning };
+    return { skipped: true, reason: `Range ${setupQuality.rangePct}% too wide (max ${maxRange}%) — extended move, not consolidation setup` };
   }
 
   let earningsInfo = { available: false, hasEarnings: false, daysUntil: null };
@@ -4665,19 +4603,17 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
   } catch (error) {
     earningsInfo = { available: false, hasEarnings: false, daysUntil: null, error: error.message };
   }
-  if (earningsInfo.available === false && cfg.broker === "robinhood") {
-    entryConcerns.push(`Earnings calendar unavailable (${earningsInfo.error || "unknown error"})`);
+  if (earningsInfo.available === false && (cfg.broker === "tradier" || cfg.broker === "robinhood")) {
+    return { skipped: true, reason: `Earnings calendar unavailable (${earningsInfo.error || "unknown error"}) — live long-premium entry fails closed` };
   }
   if (earningsInfo.hasEarnings && earningsInfo.daysUntil <= 14) {
-    entryConcerns.push(`Earnings in ${earningsInfo.daysUntil} days (${earningsInfo.date}); event volatility is inside the swing horizon`);
+    return { skipped: true, reason: `Earnings in ${earningsInfo.daysUntil} days (${earningsInfo.date}) — every eligible swing contract would cross the event` };
   }
 
   const spot = quote.c;
   // Legacy `riskPct` is an allocation fraction, not risk. Keep it only as a regime-scaled
   // affordability ceiling; the risk governor below sizes from loss at the stop.
-  const oneContractMode = cfg.entrySizingMode === "one_contract"
-    && !(cfg.broker === "robinhood" && rhTradeMode(cfg) === "equity");
-  const maxAllocationBudget = oneContractMode ? state.cash : state.cash * acct.riskPct;
+  const maxAllocationBudget = state.cash * acct.riskPct;
   const direction = isBullish ? "BULLISH" : "BEARISH";
   let type = isBullish ? "call" : "put";
   const entryExitConfig = managementConfigForNewEntry(acct, type);
@@ -4687,7 +4623,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
   let selectedCandidate = null;
   let candidates = [];
 
-  const validationContext = `${cfg.broker}:${rhTradeMode(cfg)}:${regime?.mode || "unknown"}:tape-${acct.dailyTape?.date || "none"}-${acct.dailyTape?.score || "na"}:warnings-${entryConcerns.join("|")}:${cfg.customPromptSuffix || ""}`;
+  const validationContext = `${cfg.broker}:${rhTradeMode(cfg)}:${regime?.mode || "unknown"}:tape-${acct.dailyTape?.date || "none"}-${acct.dailyTape?.score || "na"}:${cfg.customPromptSuffix || ""}`;
   const cached = getCachedValidation(acct.id, ticker, analysis.score, direction, validationContext);
   if (cached) {
     claudeResult = cached.result;
@@ -4701,14 +4637,12 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
       try {
         let chain = getCachedChain(ticker);
         if (!chain) {
-          chain = await fetchFullOptionsChain(ticker, apiKey, spot);
+          chain = await fetchFullOptionsChain(ticker, apiKey);
           await delay(apiDelay());
           if (chain) setCachedChain(ticker, chain);
         }
         if (chain) {
-          const built = buildCandidateContracts(chain, type, spot, 15);
-          candidates = cfg.llmOpportunityMode === true
-            ? built : removeEarningsCrossingContracts(built, earningsInfo);
+          candidates = removeEarningsCrossingContracts(buildCandidateContracts(chain, type, spot, 15), earningsInfo);
           // Validation may stay cached for 30 minutes, but its contract quote must not. Remap the
           // approved strike/expiry onto the freshly built chain so bid/ask/mid are current.
           if (selectedCandidate) {
@@ -4729,14 +4663,12 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
       try {
         let chain = getCachedChain(ticker);
         if (!chain) {
-          chain = await fetchFullOptionsChain(ticker, apiKey, spot);
+          chain = await fetchFullOptionsChain(ticker, apiKey);
           await delay(apiDelay());
           if (chain) setCachedChain(ticker, chain);
         }
         if (chain) {
-          const built = buildCandidateContracts(chain, type, spot, 15);
-          candidates = cfg.llmOpportunityMode === true
-            ? built : removeEarningsCrossingContracts(built, earningsInfo);
+          candidates = removeEarningsCrossingContracts(buildCandidateContracts(chain, type, spot, 15), earningsInfo);
           log(acct, `OPTIONS ${ticker}: ${candidates.length} viable ${type} contracts (${chain.length} expiries)`);
         }
       } catch (e) {
@@ -4758,7 +4690,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
       }
     } else {
     try {
-      claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, rhUsesOptionsForEntry(cfg) ? candidates : null, effectiveQuality, entryConcerns);
+      claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, rhUsesOptionsForEntry(cfg) ? candidates : null, effectiveQuality);
       selectedCandidate = candidates.length > 0 ? candidates[claudeResult.contractIdx ?? 0] : null;
       // Stagger expirations: if Claude's pick lands on an over-concentrated expiry, prefer an
       // equally-valid candidate on a less-crowded expiration date.
@@ -4789,7 +4721,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
       });
     } catch (e) {
       // Same fail-closed rule as the parse path: live capital never trades on a skipped check.
-      if (cfg.broker === "robinhood") {
+      if (cfg.broker === "tradier" || cfg.broker === "robinhood") {
         log(acct, `CLAUDE VALIDATE ${ticker}: Error — ${e.message}. Live account → skipping trade (fail closed).`);
         return { skipped: true, reason: `AI validation errored (${e.message}) — failing closed on a live account` };
       }
@@ -4813,15 +4745,14 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
     regime,
   });
   let deployable, reservePct;
-  if (oneContractMode || cfg.useCashReserve === false) {
+  if (cfg.useCashReserve === false) {
     deployable = state.cash;
     reservePct = 0;
   } else {
     ({ deployable, reservePct } = deployableCash(state, pv, trust));
   }
   const maxSize = cfg.maxTradeSize || 500;
-  const maxContractCost = Math.min(maxAllocationBudget, deployable, maxSize,
-    cfg.broker === "robinhood" ? RH_MAX_POSITION_DOLLARS : Infinity);
+  const maxContractCost = Math.min(maxAllocationBudget, deployable, maxSize);
 
   let strike = 0, dte = 0, expiryDate = 0, premium = 0, posIv = 0, optionsSource = "robinhood";
   let costPer = 0;
@@ -4835,9 +4766,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
     unitName = "share";
   } else {
     const originalCandidate = selectedCandidate;
-    selectedCandidate = oneContractMode
-      ? (selectedCandidate?.mid > 0 && selectedCandidate.mid * 100 <= maxContractCost ? selectedCandidate : null)
-      : chooseAffordableCandidate(candidates, selectedCandidate, maxContractCost, acct);
+    selectedCandidate = chooseAffordableCandidate(candidates, selectedCandidate, maxContractCost, acct);
     if (expectedPackage?.contract) {
       const expected = expectedPackage.contract;
       const sameContract = selectedCandidate
@@ -4846,9 +4775,6 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
       if (!sameContract) {
         return { skipped: true, reason: `Ranked contract ${expected.expiryStr} $${expected.strike} is no longer the executable package — refusing an unranked substitution` };
       }
-    }
-    if (oneContractMode && originalCandidate && !selectedCandidate) {
-      return { skipped: true, reason: `LLM-selected contract costs $${(originalCandidate.mid * 100).toFixed(0)}, above the $${maxContractCost.toFixed(0)} spend cap — refusing to substitute a different contract` };
     }
     if (selectedCandidate && originalCandidate && selectedCandidate !== originalCandidate) {
       contractDowngraded = {
@@ -4909,7 +4835,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
   // Size live orders from the price we actually plan to submit, not the optimistic midpoint.
   // Otherwise leaning toward the ask can push the real order over its cash/risk/max-size ceiling.
   let expectedEntryPremium = type === "equity" ? spot : premium;
-  if (cfg.broker === "robinhood" && selectedCandidate && type !== "equity") {
+  if ((cfg.broker === "tradier" || cfg.broker === "robinhood") && selectedCandidate && type !== "equity") {
     const conviction = Math.max(0, Math.min(1, (claudeResult.confidence || 0) / 100));
     const maxOverpayPct = Math.min(MAX_ENTRY_OVERPAY_PCT, Math.max(0.03, (entryExitConfig.profitTarget || 0.40) * 0.4));
     expectedEntryPremium = entryLimitPrice(selectedCandidate.bid, selectedCandidate.ask, premium, conviction, { maxOverpayPct });
@@ -4928,11 +4854,11 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
   }
 
   const budget = Math.min(maxAllocationBudget, deployable, maxSize);
-  let qty = oneContractMode ? 1 : Math.max(1, Math.floor(budget / sizingCostPer));
+  let qty = Math.max(1, Math.floor(budget / sizingCostPer));
   let totalCost = qty * sizingCostPer;
 
-  const governedOptionSizing = !oneContractMode && !isRhEquityOnly && type !== "equity"
-    && (cfg.broker === "robinhood" || Number.isFinite(cfg.riskPerTradePct));
+  const governedOptionSizing = !isRhEquityOnly && type !== "equity"
+    && (["tradier", "robinhood"].includes(cfg.broker) || Number.isFinite(cfg.riskPerTradePct));
   const optionRiskDecisionFor = (entryPrice, bid, ask) => {
     const spread = bid > 0 && ask >= bid ? ask - bid : 0;
     const dollarCap = cfg.broker === "robinhood"
@@ -4981,6 +4907,16 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
 
   // Circuit Breaker: Max Trade Size
   if (totalCost > maxSize) {
+    if (!preflightOnly && (cfg.broker === "tradier" || cfg.broker === "robinhood")) {
+      acct.paused = true; // Hard stop for real money
+      acct.pausedBy = "risk"; // breaker pause: exits keep managing open positions
+      acct._entryEpoch = (acct._entryEpoch || 0) + 1;
+      saveAccounts();
+      scheduleWorkingEntryCancellation(acct, "circuit-breaker size halt");
+      const msg = `🚨 CIRCUIT BREAKER TRIPPED: Trade for ${ticker} costs $${totalCost.toFixed(2)} (exceeds $${maxSize} max). Account is now PAUSED.`;
+      log(acct, msg);
+      sendPush(`🚨 Circuit Breaker [${acct.name}]`, msg, true).catch(()=>{});
+    }
     return { skipped: true, reason: `Trade size $${totalCost.toFixed(2)} exceeds maxTradeSize of $${maxSize}.` };
   }
 
@@ -5005,7 +4941,6 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
     claudeReasoning,
     claudeSuggestion: claudeResult.suggestion || "",
     claudeConcerns: claudeResult.concerns || [],
-    tradePlan: claudeResult.tradePlan || null,
     setupQuality: effectiveQuality,
     baseSetupQuality: directionalQuality.baseQuality,
     momentumSetupQuality: directionalQuality.momentumQuality,
@@ -5026,7 +4961,60 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
 
   // ─── Broker accounts: place a REAL buy_to_open and let the next sync reconcile state ───
   // Broker is the source of truth, so we do NOT push a synthetic position or mutate cash here.
-  if (cfg.broker === "robinhood") {
+  if (cfg.broker === "tradier") {
+    // Never place a live order on fabricated pricing. Require a real chosen contract with a real
+    // two-sided mid; synthetic Black-Scholes pricing (DEFAULT_IV) is for paper simulation only.
+    if (optionsSource === "synthetic" || !selectedCandidate || !(premium > 0)) {
+      return { skipped: true, reason: `Tradier: no real option market for ${ticker} (source ${optionsSource}) — refusing to trade on synthetic pricing` };
+    }
+    if (!acct.config.autoExecute && !preflightOnly) {
+      return { skipped: true, reason: `Tradier: autoExecute off — entry for ${ticker} not sent (enable on the account)` };
+    }
+    if (preflightOnly) {
+      const occ = tradier.buildOCC(ticker, selectedCandidate.expiryStr, type, strike);
+      const fresh = await fetchExactOptionQuote(occ);
+      if (!fresh?.twoSided || fresh.tradeable === false) {
+        return { skipped: true, reason: `Tradier: ${occ} has no current tradeable two-sided quote — cannot preflight` };
+      }
+      const frictionPct = ((fresh.ask - fresh.bid) + (2 * FEE_PER_CONTRACT / 100)) / fresh.ask;
+      const maxFrictionPct = Math.min(0.15, Math.max(0.06, 0.5 * (entryExitConfig.profitTarget || 0.12)));
+      if (!Number.isFinite(frictionPct) || frictionPct > maxFrictionPct) {
+        return { skipped: true, reason: `Tradier: ${occ} executable friction ${(frictionPct * 100).toFixed(1)}% exceeds ${(maxFrictionPct * 100).toFixed(1)}% — spread consumes the target` };
+      }
+      const conviction = Math.max(0, Math.min(1, (claudeResult.confidence || 0) / 100));
+      const maxOverpayPct = Math.min(MAX_ENTRY_OVERPAY_PCT, Math.max(0.03, (entryExitConfig.profitTarget || 0.40) * 0.4));
+      const liveLimit = entryLimitPrice(fresh.bid, fresh.ask, fresh.mid, conviction, { maxOverpayPct });
+      const freshRiskDecision = governedOptionSizing ? optionRiskDecisionFor(liveLimit, fresh.bid, fresh.ask) : null;
+      if (freshRiskDecision && !freshRiskDecision.approved) {
+        return { skipped: true, reason: `Tradier refreshed risk ${freshRiskDecision.reasonCode}: ${freshRiskDecision.reason}` };
+      }
+      if (freshRiskDecision) optionRiskDecision = freshRiskDecision;
+      const liveQty = Math.min(qty, freshRiskDecision?.quantity ?? qty, Math.floor(budget / (liveLimit * 100)));
+      if (liveQty < 1) return { skipped: true, reason: `Tradier: ${occ} no longer fits $${budget.toFixed(0)} budget` };
+      selectedCandidate = {
+        ...selectedCandidate,
+        bid: fresh.bid,
+        ask: fresh.ask,
+        mid: fresh.mid,
+        spread: +(fresh.ask - fresh.bid).toFixed(2),
+        spreadPct: +(((fresh.ask - fresh.bid) / fresh.mid) * 100).toFixed(1),
+        roundTripFrictionPct: +(frictionPct * 100).toFixed(1),
+      };
+      return buildEntryPreflight({
+        ticker, type, direction, strike, dte, expiryDate, qty: liveQty,
+        entryPremium: liveLimit, cost: liveQty * liveLimit * 100,
+        setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence,
+        trust, selectedCandidate, optionsSource, maxBudget: budget,
+      });
+    }
+    return await placeBrokerEntry(acct, {
+      ticker, type, strike, expiryDate, dte, qty, premium, direction,
+      expiryStr: selectedCandidate.expiryStr,
+      bid: selectedCandidate.bid, ask: selectedCandidate.ask,
+      setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence,
+      aiThesis, maxBudget: budget, entryEpoch,
+    });
+  } else if (cfg.broker === "robinhood") {
     if (!acct.config.autoExecute && !preflightOnly) {
       return { skipped: true, reason: `Robinhood: autoExecute off — entry for ${ticker} not sent (enable on the account)` };
     }
@@ -5365,7 +5353,6 @@ function clearExitOrderTracking(meta, { keepAttempts = true } = {}) {
   delete meta.exitOrderLimit;
   delete meta.exitOrderRefId;
   delete meta.exitOrderTicker;
-  delete meta.exitOrderOwner;
   delete meta.exitPriceMode;
   delete meta.exitReason;
   delete meta.exitIsTrim;
@@ -5408,7 +5395,9 @@ async function closePosition(acct, pos, currentPremium, reason, qtyToClose, exec
   // Broker (live) accounts: place a real sell_to_close and let the next sync reconcile.
   // Returns null so the exit loop keeps the position until the fill is confirmed by the broker.
   if (!acct._simMode) {
-    if (acct.config.broker === "robinhood") {
+    if (acct.config.broker === "tradier") {
+      return placeBrokerExit(acct, pos, currentPremium, reason, qty, pnlPct, pnlDollar, execution);
+    } else if (acct.config.broker === "robinhood") {
       if (isEquity) {
         if (!state.meta[pos.ticker]) state.meta[pos.ticker] = {};
         const equityMeta = state.meta[pos.ticker];
@@ -5417,20 +5406,6 @@ async function closePosition(acct, pos, currentPremium, reason, qtyToClose, exec
           equityMeta.rhEquityManualOnlyNoticeAt = Date.now();
           log(acct, `ROBINHOOD EQUITY EXIT SUPPRESSED ${pos.ticker}: equity automation is manual-only; no broker order was sent`);
         }
-        return null;
-      }
-      if (pos._operatorWorkingOrder) {
-        log(acct, `ROBINHOOD OPTION EXIT SUPPRESSED ${pos.ticker}: operator-owned broker order ${pos._operatorWorkingOrder.orderId || ""} is active for this exact contract`);
-        return null;
-      }
-      const earlyDirectiveBlock = automatedExitBlock({
-        state,
-        ticker: pos.ticker,
-        entryPremium: pos.entryPremium,
-        proposedExitPrice: currentPremium,
-      });
-      if (earlyDirectiveBlock) {
-        log(acct, `ROBINHOOD OPTION EXIT SUPPRESSED ${pos.ticker}: ${earlyDirectiveBlock.reason}`);
         return null;
       }
       if (!acct._inflightTickers) acct._inflightTickers = new Set();
@@ -5519,17 +5494,6 @@ async function closePosition(acct, pos, currentPremium, reason, qtyToClose, exec
           return null;
         }
         const limit = pricing.limit;
-        const finalDirectiveBlock = automatedExitBlock({
-          state,
-          ticker: pos.ticker,
-          entryPremium: pos.entryPremium,
-          proposedExitPrice: limit,
-        });
-        if (finalDirectiveBlock) {
-          acct._inflightTickers.delete(pos.ticker.toUpperCase());
-          log(acct, `ROBINHOOD OPTION EXIT SUPPRESSED ${pos.ticker}: ${finalDirectiveBlock.reason}`);
-          return null;
-        }
 
         if (pricing.operatorEscalation && occKey) {
           if (!acct.state.meta[occKey]) acct.state.meta[occKey] = {};
@@ -5583,7 +5547,6 @@ async function closePosition(acct, pos, currentPremium, reason, qtyToClose, exec
             exitOrderPlacedAt: Date.now(),
             exitOrderLimit: limit,
             exitOrderTicker: pos.ticker.toUpperCase(),
-            exitOrderOwner: "automation",
             exitPriceMode: priceMode,
             exitReason: reason,
             exitIsTrim: isTrimLocal,
@@ -5907,7 +5870,7 @@ async function manageOpenPositions(acct, quotes, analyses = null, shortTermAnaly
     if (!quote) { remaining.push(pos); continue; }
 
     const isEquity = pos.type === "equity";
-    const liveOption = !isEquity && cfg.broker === "robinhood";
+    const liveOption = !isEquity && (cfg.broker === "tradier" || cfg.broker === "robinhood");
     const spot = quote.c;
     pos._lastSpot = spot;
     const verifiedRobinhoodOption = cfg.broker !== "robinhood" || isEquity || isVerifiedRobinhoodContract(pos);
@@ -5936,7 +5899,7 @@ async function manageOpenPositions(acct, quotes, analyses = null, shortTermAnaly
     const analysis = anMap[pos.ticker] || null;
     const shortTerm = stMap[pos.ticker] || null;
     const emaSignals = positionEmaSignals(acct, pos);
-    let decision = evaluatePosition({
+    const decision = evaluatePosition({
       position: pos,
       plan,
       market: {
@@ -5963,37 +5926,6 @@ async function manageOpenPositions(acct, quotes, analyses = null, shortTermAnaly
       },
       now,
     });
-
-    if (decision.action !== "hold" && pos._operatorWorkingOrder) {
-      decision = {
-        ...decision,
-        action: "hold",
-        reasonCode: "HOLD_MANUAL_BROKER_ORDER",
-        reason: `operator-owned broker order ${pos._operatorWorkingOrder.orderId || ""} is active for this exact contract; automation is advisory-only`,
-        qty: 0,
-        urgency: "routine",
-        priceMode: "none",
-      };
-    }
-    if (decision.action !== "hold") {
-      const directiveBlock = automatedExitBlock({
-        state,
-        ticker: pos.ticker,
-        entryPremium: pos.entryPremium,
-        proposedExitPrice: decision.executionPrice,
-      });
-      if (directiveBlock) {
-        decision = {
-          ...decision,
-          action: "hold",
-          reasonCode: directiveBlock.reasonCode,
-          reason: directiveBlock.reason,
-          qty: 0,
-          urgency: "routine",
-          priceMode: "none",
-        };
-      }
-    }
 
     if (canFreezePlan) {
       Object.assign(pos, decision.statePatch);
@@ -6156,7 +6088,7 @@ function lwcChartData(windowCandles, fullCandles, emaConfigs = [], lines = []) {
 
 function liveControlSummaryHTML(acct) {
   const cfg = acct.config;
-  if (cfg.broker !== "robinhood") return "";
+  if (cfg.broker !== "robinhood" && cfg.broker !== "tradier") return "";
 
   const blockers = [];
   if (cfg.liveEntriesEnabled !== true) blockers.push("Live entries toggle is OFF");
@@ -6212,20 +6144,19 @@ function liveControlSummaryHTML(acct) {
       : `ON · ${pct(adaptive.targetPct)} selected from ${adaptive.sampleSize} recent ${adaptive.source} outcomes (${(adaptive.reachRate * 100).toFixed(0)}% reached it; required ≥${(adaptive.requiredReachRate * 100).toFixed(0)}%; tested range ${pct(adaptive.minTargetPct)}–${pct(adaptive.maxTargetPct)})`
     : "OFF";
   const blockText = armed
-    ? "No account-level blocker. The copilot evaluates each actionable setup; execution still requires an affordable exact contract and current two-sided market."
+    ? "No account-level blocker. A trade still requires a qualifying signal and executable contract."
     : blockers.map(reason => `• ${reason}`).join("<br>");
-  const copilotMode = cfg.entrySizingMode === "one_contract" && cfg.llmOpportunityMode === true;
 
   return `<details open style="margin:10px 0 14px;padding:10px 12px;border-radius:8px;border:1px solid ${statusBorder};background:${statusBg};color:#27303f;font-size:12px;line-height:1.55">
     <summary style="cursor:pointer;font-weight:800;color:${statusColor}">${armed ? "LIVE ENTRIES ELIGIBLE" : "LIVE ENTRIES BLOCKED"} · effective configuration</summary>
     <div style="margin-top:8px;color:${statusColor};font-weight:650">${blockText}</div>
-    <div style="margin-top:8px"><b>Execution</b> · live entries ${cfg.liveEntriesEnabled === true ? "ON" : "OFF"} · auto-execute ${cfg.autoExecute === true ? "ON" : "OFF"} · ${copilotMode ? "one contract per approved setup" : `cash reserve ${cfg.useCashReserve ? "ON" : "OFF"} · max ${valueOr(cfg.maxDayTrades)} entries/day · max ${valueOr(cfg.maxPositions)} positions`}</div>
+    <div style="margin-top:8px"><b>Execution</b> · live entries ${cfg.liveEntriesEnabled === true ? "ON" : "OFF"} · auto-execute ${cfg.autoExecute === true ? "ON" : "OFF"} · cash reserve ${cfg.useCashReserve ? "ON" : "OFF"} · max ${valueOr(cfg.maxDayTrades)} entries/day · max ${valueOr(cfg.maxPositions)} positions</div>
     <div><b>Broker balance</b> · authoritative snapshot ${balanceAgeText} · automatic refresh ${cfg.broker === "robinhood" ? `every ${(LIVE_BALANCE_REFRESH_AGE_MS / 1000).toFixed(0)}s` : "during each account cycle"} and immediately before entry commitment${safeBalanceError ? ` · last refresh error: ${safeBalanceError}` : ""}</div>
-    <div><b>Exit mandate for new positions</b> · effective target ${pct(effectiveExitConfig.profitTarget)} · ${cfg.broker === "robinhood" ? `premium warning ${pct(cfg.stopLoss)} (requires thesis damage/expiry pressure; catastrophic floor ${pct(-0.70)})` : `stop ${pct(cfg.stopLoss)}`} · one-contract bank ${pct(effectiveExitConfig.singleContractBankPct)} · trims ${pct(effectiveExitConfig.trim1Pct)} / ${pct(effectiveExitConfig.trim2Pct)} · mode ${cfg.exitMode || "automatic"} · held-position poll every ${((cfg.positionManagementMs ?? POSITION_MANAGEMENT_MS) / 1000).toFixed(0)}s</div>
+    <div><b>Exit mandate for new positions</b> · effective target ${pct(effectiveExitConfig.profitTarget)} · stop ${pct(cfg.stopLoss)} · one-contract bank ${pct(effectiveExitConfig.singleContractBankPct)} · trims ${pct(effectiveExitConfig.trim1Pct)} / ${pct(effectiveExitConfig.trim2Pct)} · mode ${cfg.exitMode || "automatic"} · held-position poll every ${((cfg.positionManagementMs ?? POSITION_MANAGEMENT_MS) / 1000).toFixed(0)}s</div>
     <div><b>Recent-data adaptation</b> · ${adaptiveText}${adaptive ? ` · profit lock arms ${pct(adaptive.profitLockArmPct)}; close after the larger of ${pct(adaptive.peakGivebackMin)} or ${(adaptive.peakGivebackFrac * 100).toFixed(0)}% of peak is given back` : ""}</div>
-    <div><b>Risk and affordability</b> · ${copilotMode ? `one selected contract must fit broker cash and the explicit $${valueOr(cfg.maxTradeSize, 500)} order cap; no cheaper contract substitution` : `premium spend ${pct(cfg.baseRiskPct)} of cash${premiumSpendBudget != null ? ` (~$${premiumSpendBudget.toFixed(2)})` : ""} · planned stop loss ${pct(cfg.riskPerTradePct)} of equity${riskBudget != null ? ` (~$${riskBudget.toFixed(2)})` : ""} · governor allocation ${pct(cfg.maxPositionPct)} of equity${allocationBudget != null ? ` (~$${allocationBudget.toFixed(2)})` : ""} · open risk ${pct(cfg.maxPortfolioRiskPct)} · min net R:R ${valueOr(cfg.minimumRewardRisk, "unset")}`}</div>
-    <div><b>Portfolio telemetry</b> · ${cfg.portfolioHaltsEnabled === false ? "loss streaks and drawdowns are advisory; they do not pause opportunity review" : `daily ${pct(cfg.dailyLossLimitPct)} · weekly ${pct(cfg.weeklyLossLimitPct)} · high-water drawdown ${pct(cfg.highWaterDrawdownLimitPct)} · ${valueOr(cfg.maxConsecutiveLosses)} consecutive losses`}</div>
-    <div><b>Opportunity review</b> · calls ≥${cfg.bullEntry ?? 68} · puts ≤${cfg.bearEntry ?? 32} · ${cfg.llmOpportunityMode === true ? "timing, setup quality, RSI, regime, range, and earnings are fed to the LLM as evidence—not hard vetoes" : `setup ≥${cfg.minSetupQuality ?? 50} and legacy timing/market gates apply`} · exact identity, cash, current two-sided quote, liquidity, delta, and friction remain required</div>
+    <div><b>Risk and affordability</b> · premium spend ${pct(cfg.baseRiskPct)} of cash${premiumSpendBudget != null ? ` (~$${premiumSpendBudget.toFixed(2)})` : ""} · planned stop loss ${pct(cfg.riskPerTradePct)} of equity${riskBudget != null ? ` (~$${riskBudget.toFixed(2)})` : ""} · governor allocation ${pct(cfg.maxPositionPct)} of equity${allocationBudget != null ? ` (~$${allocationBudget.toFixed(2)})` : ""} · open risk ${pct(cfg.maxPortfolioRiskPct)} · min net R:R ${valueOr(cfg.minimumRewardRisk, "unset")} · absolute trade cap $${valueOr(cfg.maxTradeSize, 500)}</div>
+    <div><b>Halts</b> · daily ${pct(cfg.dailyLossLimitPct)} · weekly ${pct(cfg.weeklyLossLimitPct)} · high-water drawdown ${pct(cfg.highWaterDrawdownLimitPct)} · ${valueOr(cfg.maxConsecutiveLosses)} consecutive losses</div>
+    <div><b>Signal gates</b> · setup ≥${cfg.minSetupQuality ?? 50} · calls ≥${cfg.bullEntry ?? 68} · puts ≤${cfg.bearEntry ?? 32} · opening freeze 15m · closing freeze 15m · 7–45 DTE · real two-sided quote/liquidity/delta/friction checks required</div>
   </details>`;
 }
 
@@ -6314,11 +6245,6 @@ function dashboardHTML(acct, { spectator = false } = {}) {
     const manager = p.lastManagementDecision;
     const managerColor = manager?.action === "hold" ? "#138f86" : manager?.action === "trim" ? "#b07400" : "#e8473f";
     const managerBadge = manager ? `<span title="${manager.reason}" style="display:inline-block;margin-left:5px;padding:1px 5px;border:1px solid ${managerColor}55;border-radius:3px;color:${managerColor};font-size:8px;white-space:nowrap">${manager.action.toUpperCase()} · ${manager.reasonCode}</span>` : "";
-    const directiveLabels = activeDirectivesFor(state, p.ticker).map(directive =>
-      directive.kind === "no_realized_loss" ? "NO LOSS EXIT" : "ADVICE ONLY");
-    if (p._operatorWorkingOrder) directiveLabels.unshift("MANUAL ORDER OWNS EXIT");
-    const authorityBadge = directiveLabels.length
-      ? `<span style="display:inline-block;margin-left:5px;padding:1px 5px;border:1px solid #6a4df466;border-radius:3px;color:#6a4df4;font-size:8px;white-space:nowrap">${directiveLabels.join(" · ")}</span>` : "";
     const aiRow = hasAI ? `<tr id="${rowId}" style="display:none;background:#6a4df412">
       <td colspan="12" style="padding:10px 12px;font-size:11px;color:#4a4b52;line-height:1.6">
         <div style="color:#6a4df4;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">AI Thought Process at Entry ${p.claudeConfidence ? `(${p.claudeConfidence}% confidence)` : ''}</div>
@@ -6337,17 +6263,19 @@ function dashboardHTML(acct, { spectator = false } = {}) {
       </td>
     </tr>` : "";
     return `<tr>
-      <td><a href="/ticker/${p.ticker}"><b>${p.ticker}</b></a>${managerBadge}${authorityBadge}${aiToggle}<a href="/media?a=${acct.id}&ticker=${p.ticker}" title="Compose a shareable post for ${p.ticker}" style="margin-left:6px;text-decoration:none;font-size:11px" onclick="event.stopPropagation()">📣</a></td><td>${(p.type || "?").toUpperCase()}</td><td>${p.strike > 0 ? "$" + p.strike : "—"}</td>
+      <td><a href="/ticker/${p.ticker}"><b>${p.ticker}</b></a>${managerBadge}${aiToggle}<a href="/media?a=${acct.id}&ticker=${p.ticker}" title="Compose a shareable post for ${p.ticker}" style="margin-left:6px;text-decoration:none;font-size:11px" onclick="event.stopPropagation()">📣</a></td><td>${(p.type || "?").toUpperCase()}</td><td>${p.strike > 0 ? "$" + p.strike : "—"}</td>
       <td style="white-space:nowrap">${p.spot != null ? "$" + Number(p.spot).toFixed(2) : "—"}<br><span style="color:${spotColor};font-size:10px">${spotChg >= 0 ? "+" : ""}${spotChg.toFixed(2)} (${spotChgPct >= 0 ? "+" : ""}${spotChgPct.toFixed(1)}%)</span><br><span style="color:${spotFromEntryColor};font-size:10px">from entry: ${spotFromEntry >= 0 ? "+" : ""}${spotFromEntry.toFixed(1)}%</span></td>
       <td>${p.dteLeft != null ? Number(p.dteLeft).toFixed(1) + "d" : "—"}</td><td>${p.qty}</td>
       <td>$${(+p.entryPremium || 0).toFixed(2)}${(p.intendedEntryPremium && Math.abs(p.intendedEntryPremium - p.entryPremium) >= 0.01) ? `<br><span style="font-size:9px;color:#9aa0aa" title="Bot's intended limit before the actual fill">intended $${(+p.intendedEntryPremium).toFixed(2)}</span>` : ''}</td><td>$${p.curPremium != null ? Number(p.curPremium).toFixed(2) : "—"}</td>
       <td style="color:${color}">${p.pnlPct >= 0 ? "+" : ""}${((p.pnlPct || 0) * 100).toFixed(1)}% ($${(p.pnlDollar || 0).toFixed(0)})</td>
       <td><span style="color:#00a843">TP $${p.profitTarget.premium}</span> (${p.pctToProfit}% away)</td>
-      <td><span style="color:#b07400">${p.type === "equity" ? "SL" : "WARN"} $${p.stopLoss.premium}</span> (${p.pctToStop}% away)${p.type === "equity" ? "" : '<br><span style="font-size:8px;color:#6b7280">needs thesis damage</span>'}</td>
+      <td><span style="color:#e8473f">SL $${p.stopLoss.premium}</span> (${p.pctToStop}% away)</td>
       <td style="font-size:10px;color:#6b7280">${p.openDate || '—'}</td>
       <td style="font-size:10px;color:#6b7280">δ${p.greeks.delta} θ${p.greeks.theta}<br><span style="color:${p.optionsSource === 'synthetic' ? '#8a909b' : '#138f86'}" title="Source / IV used for pricing">${(p.optionsSource || 'synthetic').toUpperCase()} IV ${((p.iv || 0.30) * 100).toFixed(0)}% ${p.optionsSource === 'synthetic' ? '○' : '●'}</span>${(p.liveMark != null && p.liveBid > 0 && p.liveAsk > 0)
   ? `<br><span title="Live two-sided market — used for marks & fills">b $${(+p.liveBid).toFixed(2)} / a $${(+p.liveAsk).toFixed(2)} · ${(((p.liveAsk - p.liveBid) / ((p.liveAsk + p.liveBid) / 2)) * 100).toFixed(0)}% wide</span>`
-  : ''}</td>
+  : (p.optionsSource === 'tradier' && !p._pending
+    ? `<br><span style="color:#d2691e" title="No live two-sided market, so the bot won't fire exits on a fabricated price. P&L shown uses a Black-Scholes model mark from the live contract IV. A real market returns when the option is open & liquid.">⚠ ${p.markReason || 'no live mark'} · model $${p.displayMark != null ? (+p.displayMark).toFixed(2) : '?'}</span>`
+    : '')}</td>
     </tr>${aiRow}`;
   }).join("") : '<tr><td colspan="13" style="opacity:.5">No open positions</td></tr>';
 
@@ -6520,17 +6448,6 @@ function dashboardHTML(acct, { spectator = false } = {}) {
     return `<div style="margin-bottom:6px;font-size:11px"><span style="color:#6b7280">${when} ET</span> ${rows || "<span style='opacity:.5'>no BUY candidates</span>"}</div>`;
   }).join("") : '<span style="opacity:.5;font-size:11px">No entry ranking history yet — fills after the next cycle with BUY candidates.</span>';
 
-  const commandCenter = commandCenterHTML({
-    acct,
-    pv,
-    pnlPct: Number(pnlPct),
-    posSource,
-    dailyTape,
-    latestNewsBrief: acct.latestNewsBrief,
-    currentRegime,
-    spectator,
-  });
-
   return `<!DOCTYPE html><html><head><meta charset="utf-8">
 <title>Swing Trader Dashboard</title>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -6539,6 +6456,7 @@ function dashboardHTML(acct, { spectator = false } = {}) {
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="SwingTrader">
 <meta name="theme-color" content="#f6f7f9">
+<meta http-equiv="refresh" content="30">
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
   body{background:#f6f7f9;color:#23242a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:13px;padding:20px}
@@ -6591,119 +6509,11 @@ function dashboardHTML(acct, { spectator = false } = {}) {
   .acct-btn.delete:hover{border-color:#e8473f;color:#e8473f}
   .llm-toggle{color:#6a4df4;font-size:10px;cursor:pointer;padding:2px 8px;border:1px solid #6a4df440;border-radius:4px;transition:all .2s}
   .llm-toggle:hover{background:#6a4df420;border-color:#6a4df4;color:#6a4df4}
-  .dashboard-head{max-width:1440px;margin:0 auto 14px;display:flex;align-items:flex-end;justify-content:space-between;gap:16px}
-  .dashboard-head .sub{margin:0}
-  .control-drawer{max-width:1440px;margin:0 auto 14px;background:#fff;border:1px solid #e3e6ea;border-radius:10px}
-  .control-drawer>summary{cursor:pointer;list-style:none;padding:10px 14px;font-size:11px;font-weight:800;color:#6b7280;text-transform:uppercase;letter-spacing:.08em}
-  .control-drawer>summary::-webkit-details-marker{display:none}
-  .control-drawer>summary:after{content:'›';float:right;font-size:17px;line-height:12px;transition:transform .2s}
-  .control-drawer[open]>summary:after{transform:rotate(90deg)}
-  .control-drawer-body{padding:0 14px 12px}
-  .jarvis-shell{max-width:1440px;margin:0 auto 18px;display:grid;grid-template-columns:minmax(0,1.7fr) minmax(300px,.75fr);gap:16px;align-items:start}
-  .jarvis-chat-card,.rail-card{background:#fff;border:1px solid #e3e6ea;border-radius:18px;box-shadow:0 8px 30px rgba(35,36,42,.06)}
-  .jarvis-chat-card{min-width:0;overflow:hidden}
-  .jarvis-chat-head{display:flex;justify-content:space-between;align-items:center;padding:18px 20px 14px;border-bottom:1px solid #eceef1}
-  .jarvis-chat-head h2{font-size:22px;letter-spacing:-.03em;margin:2px 0 0;color:#23242a}
-  .jarvis-kicker{font-size:9px;font-weight:850;color:#6a4df4;letter-spacing:.14em}
-  .jarvis-live{font-size:10px;font-weight:800;color:#6b7280;display:flex;align-items:center;gap:6px}
-  .jarvis-live span{width:8px;height:8px;border-radius:50%;background:#00a843;box-shadow:0 0 0 4px #00a84318}
-  .chat-stream{padding:18px 20px 8px;max-height:820px;overflow-y:auto;scroll-behavior:smooth}
-  .chat-message{max-width:88%;margin:0 0 16px}
-  .chat-message.from-user{margin-left:auto}
-  .chat-speaker{font-size:9px;font-weight:800;letter-spacing:.08em;color:#9aa0aa;margin:0 0 4px 8px}
-  .chat-message.from-user .chat-speaker{text-align:right;margin-right:8px}
-  .chat-bubble{padding:11px 14px;border-radius:16px;line-height:1.55;font-size:13px;background:#f3f4f6;color:#30313a}
-  .from-jarvis .chat-bubble{border-bottom-left-radius:5px;background:#f7f5ff;border:1px solid #e7e1ff}
-  .from-user .chat-bubble{border-bottom-right-radius:5px;background:#6a4df4;color:#fff}
-  .snapshot-message{max-width:100%;margin-bottom:14px}
-  .snapshot-message .chat-bubble{padding:16px}
-  .snapshot-lead{font-size:17px;font-weight:850;letter-spacing:-.02em;margin-bottom:12px}
-  .snapshot-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
-  .snapshot-stats>div{padding:10px;background:#fff;border:1px solid #e8e5f5;border-radius:10px;min-width:0}
-  .snapshot-stats span,.snapshot-stats small{display:block;font-size:9px;color:#8a909b;text-transform:uppercase;letter-spacing:.06em}
-  .snapshot-stats b{display:block;font-size:16px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:2px 0}
-  .snapshot-stats small{text-transform:none;letter-spacing:0}
-  .positive{color:#00a843!important}.negative{color:#e8473f!important}.caution{color:#b07400!important}
-  .snapshot-callout{font-size:12px;margin-top:10px;color:#4a4b52}
-  .intel-in-chat{margin:0 0 18px 0;padding-left:34px}
-  .intel-title,.rail-title{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:11px;font-weight:850;text-transform:uppercase;letter-spacing:.07em;color:#6b7280;margin-bottom:8px}
-  .intel-title small{font-size:9px;font-weight:600;letter-spacing:0;text-transform:none;color:#aab0bb}
-  .idea-stack,.position-stack{display:grid;gap:8px}
-  .trade-idea,.position-brief{display:block;padding:12px;border:1px solid #e7e8ec;border-radius:12px;color:#30313a;background:#fff;text-decoration:none;transition:border-color .15s,transform .15s,box-shadow .15s}
-  .trade-idea:hover,.position-brief:hover{border-color:#6a4df477;box-shadow:0 5px 18px rgba(35,36,42,.08);text-decoration:none;transform:translateY(-1px)}
-  .trade-idea.featured{border-color:#6a4df466;background:linear-gradient(135deg,#fff 0%,#faf8ff 100%)}
-  .trade-idea-top,.position-brief-top,.trade-idea-quote,.position-brief-numbers{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
-  .trade-symbol{font-size:17px;font-weight:900;color:#23242a;letter-spacing:-.02em}
-  .trade-status{font-size:8px;font-weight:900;letter-spacing:.07em;border-radius:999px;padding:4px 7px;background:#f1f2f4;color:#6b7280}
-  .trade-status.bull{background:#e9f9ef;color:#067a2f}.trade-status.bear{background:#fff0ef;color:#c9342d}.trade-status.warn{background:#fff6df;color:#946100}
-  .trade-idea-quote{justify-content:flex-start;font-size:10px;color:#6b7280;margin-top:5px}
-  .trade-idea-quote b{font-size:12px;color:#30313a}
-  .trade-idea-reason,.position-thesis{font-size:11px;line-height:1.45;color:#575966;margin-top:8px}
-  .trade-idea-more,.rail-link{display:flex;align-items:center;justify-content:space-between;margin-top:9px;padding-top:8px;border-top:1px solid #eef0f3;color:#138f86;font-size:10px;font-weight:750}
-  .trade-idea-more span,.rail-link span{font-size:18px;line-height:10px}
-  .wider-ideas{margin-top:8px}
-  .wider-ideas>summary{cursor:pointer;color:#6a4df4;font-size:11px;font-weight:800;padding:8px 2px;list-style:none}
-  .wider-ideas>summary::-webkit-details-marker{display:none}
-  .wider-ideas>summary span{float:right;background:#6a4df418;padding:2px 7px;border-radius:10px}
-  .wider-ideas[open]>summary{margin-bottom:4px}
-  .chat-empty,.rail-empty{padding:14px;border:1px dashed #d6d9df;border-radius:10px;color:#8a909b;font-size:11px;line-height:1.5}
-  .quick-prompts{display:flex;gap:6px;overflow-x:auto;padding:9px 20px 6px;border-top:1px solid #eceef1;scrollbar-width:none}
-  .quick-prompts::-webkit-scrollbar{display:none}
-  .quick-prompts button{flex:0 0 auto;border:1px solid #ded8f8;background:#f8f6ff;color:#5c43d5;padding:7px 10px;border-radius:999px;font-size:10px;font-weight:750;cursor:pointer}
-  .jarvis-compose{display:flex;align-items:flex-end;gap:8px;margin:5px 16px 0;padding:8px;border:1px solid #d8dae1;border-radius:16px;background:#fff;box-shadow:0 4px 20px rgba(35,36,42,.08)}
-  .jarvis-compose textarea{flex:1;border:0;outline:0;resize:none;min-height:24px;max-height:120px;padding:5px 6px;background:transparent;color:#23242a;font:inherit;font-size:15px;line-height:1.4}
-  .jarvis-compose button{width:36px;height:36px;flex:0 0 36px;border:0;border-radius:11px;background:#6a4df4;color:#fff;font-size:20px;font-weight:850;cursor:pointer}
-  .compose-note,.spectator-compose{font-size:9px;color:#9aa0aa;text-align:center;padding:6px 16px 13px}
-  .insight-rail{display:grid;gap:12px;position:sticky;top:12px}
-  .rail-card{padding:14px}
-  .rail-title b{font-size:9px;color:#6a4df4;background:#6a4df412;border-radius:999px;padding:4px 7px}
-  .position-brief-top{font-size:12px}.position-brief-top strong{font-size:13px}
-  .position-brief-numbers{justify-content:flex-start;margin-top:5px;color:#6b7280;font-size:9px}
-  .position-authority{margin-top:7px;padding:5px 7px;border-radius:6px;background:#f3efff;color:#5c43d5;font-size:8px;font-weight:900;letter-spacing:.04em}
-  .market-copy{font-size:11px;line-height:1.5;color:#575966;padding:8px 0;border-top:1px solid #eef0f3}
-  .account-mini-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-  .account-mini-grid>div{padding:9px;background:#f7f8fa;border-radius:9px}.account-mini-grid span{display:block;font-size:9px;color:#8a909b;text-transform:uppercase}.account-mini-grid b{display:block;font-size:15px;margin-top:2px}
-  .deep-dive{max-width:1440px;margin:0 auto 80px;border:1px solid #dde0e5;border-radius:12px;background:#fff}
-  .deep-dive>summary{cursor:pointer;list-style:none;padding:14px 16px;color:#4f5260;font-size:12px;font-weight:850}
-  .deep-dive>summary::-webkit-details-marker{display:none}.deep-dive>summary:after{content:'Open';float:right;color:#6a4df4;font-size:10px}
-  .deep-dive[open]>summary{border-bottom:1px solid #e7e8ec}.deep-dive[open]>summary:after{content:'Close'}
-  .deep-dive-body{padding:16px}
-  .mobile-dock{display:none}
   body{padding-left:max(20px,env(safe-area-inset-left));padding-right:max(20px,env(safe-area-inset-right));padding-top:max(20px,env(safe-area-inset-top))}
   /* Wide data tables scroll horizontally inside their card instead of breaking the layout */
   .card{overflow-x:auto;-webkit-overflow-scrolling:touch}
   @media(max-width:600px){
-    body{font-size:13px;padding:0 0 calc(74px + env(safe-area-inset-bottom));background:#f3f4f6}
-    .tab-bar{display:none}
-    .dashboard-head{padding:max(12px,env(safe-area-inset-top)) 14px 8px;margin:0;align-items:center;background:#fff}
-    .dashboard-head h1{font-size:15px;color:#23242a;margin:0}
-    .dashboard-head .sub{display:none}
-    .control-drawer{margin:0;border-radius:0;border-width:1px 0;background:#fff}
-    .control-drawer>summary{padding:9px 14px}
-    .jarvis-shell{display:block;margin:8px 0 0}
-    .jarvis-chat-card{border-radius:0;border-left:0;border-right:0;box-shadow:none}
-    .jarvis-chat-head{padding:12px 14px 10px;position:sticky;top:0;background:#fff;z-index:5}
-    .jarvis-chat-head h2{font-size:20px}
-    .chat-stream{padding:14px 12px 4px;max-height:none;overflow:visible}
-    .chat-message{max-width:94%;margin-bottom:13px}
-    .snapshot-message{max-width:100%}
-    .snapshot-message .chat-bubble{padding:12px}
-    .snapshot-stats{grid-template-columns:1fr 1fr}
-    .snapshot-stats>div{padding:8px}
-    .snapshot-stats b{font-size:15px}
-    .intel-in-chat{padding-left:0;margin-bottom:16px}
-    .trade-idea{padding:11px}
-    .trade-symbol{font-size:16px}
-    .quick-prompts{padding:8px 12px 5px;background:#fff}
-    .jarvis-compose{position:sticky;bottom:calc(58px + env(safe-area-inset-bottom));z-index:7;margin:4px 8px 0;background:#fff}
-    .compose-note{padding-bottom:9px;background:#fff}
-    .insight-rail{position:static;padding:10px 10px 0}
-    .rail-card{border-radius:14px;box-shadow:none}
-    .deep-dive{margin:10px 10px 20px;border-radius:12px}
-    .deep-dive-body{padding:10px}
-    .mobile-dock{display:grid;grid-template-columns:repeat(4,1fr);position:fixed;z-index:20;left:0;right:0;bottom:0;padding:5px 6px calc(5px + env(safe-area-inset-bottom));background:#fffffff2;border-top:1px solid #dfe2e7;backdrop-filter:blur(18px)}
-    .mobile-dock a{display:flex;flex-direction:column;align-items:center;gap:2px;color:#656875;font-size:9px;font-weight:750;padding:3px;text-decoration:none}
-    .mobile-dock span{display:flex;align-items:center;justify-content:center;min-width:25px;height:22px;padding:0 4px;border-radius:8px;color:#5c43d5;background:#f1edff;font-size:10px;font-weight:850}
+    body{font-size:13px;padding:10px;padding-left:max(10px,env(safe-area-inset-left));padding-right:max(10px,env(safe-area-inset-right))}
     h1{font-size:17px}
     .sub{font-size:10px;line-height:1.7}
     .card{padding:12px}
@@ -6720,52 +6530,11 @@ function dashboardHTML(acct, { spectator = false } = {}) {
   }
 </style></head><body>
 ${tabBarHTML(acct.id, { spectator })}
-<div class="dashboard-head">
-  <div><h1>${acct.name || "Swing Trader"}</h1>
-  <div class="sub">Capital $${STARTING_CASH.toLocaleString(undefined, { maximumFractionDigits: 0 })} → $${GOAL.toLocaleString()} Goal &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}" id="mkt-badge">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; <span id="live-indicator" style="color:#00a843">LIVE</span> updates every 5s &nbsp;|&nbsp; <span id="pv-header">$${pv.toFixed(0)}</span> <span id="pnl-header" style="color:${pnlPct >= 0 ? '#00a843' : '#e8473f'}">(${pnlPct >= 0 ? '+' : ''}${pnlPct}%)</span> &nbsp;|&nbsp; <span style="color:${currentRegime.mode === 'risk-on' ? '#00a843' : currentRegime.mode === 'cautious' ? '#b07400' : '#e8473f'};font-size:10px">${currentRegime.mode.toUpperCase()}</span> &nbsp;|&nbsp; ${llmBadge}${acct.paused ? ' &nbsp;|&nbsp; <span style="color:#e8473f;font-weight:bold">⏸ PAUSED</span>' : ''}</div></div>
-</div>
+${accountActionsHTML(acct.id, { spectator })}
+${strategyPresetHTML(acct.id, { spectator })}
+<h1>${acct.name || "Swing Trader"}</h1>
 ${spectator ? '<div style="margin:8px 0 12px;padding:8px 12px;border:1px solid #2f6fed40;background:#2f6fed12;color:#2f6fed;border-radius:8px;font-size:12px;font-weight:700">Spectator mode: read-only dashboard. Settings, broker controls, notifications, and AI prompts are disabled.</div>' : ''}
-<details class="control-drawer" id="account-controls">
-  <summary>Account, strategy and notification controls</summary>
-  <div class="control-drawer-body">${accountActionsHTML(acct.id, { spectator })}${strategyPresetHTML(acct.id, { spectator })}</div>
-</details>
-
-${commandCenter}
-<script>
-(function initJarvisComposer() {
-  const input = document.getElementById('jarvis-input');
-  document.querySelectorAll('.quick-prompts button[data-prompt]').forEach(button => {
-    button.addEventListener('click', () => {
-      if (!input) return;
-      input.value = button.dataset.prompt || '';
-      input.focus();
-      input.dispatchEvent(new Event('input'));
-    });
-  });
-  if (input) {
-    input.addEventListener('input', () => {
-      input.style.height = 'auto';
-      input.style.height = Math.min(120, input.scrollHeight) + 'px';
-    });
-    input.addEventListener('keydown', event => {
-      if (event.key === 'Enter' && !event.shiftKey) {
-        event.preventDefault();
-        if (input.value.trim()) input.form.requestSubmit();
-      }
-    });
-  }
-  // Refresh the deeper market state without interrupting a thought being typed.
-  setInterval(() => {
-    if (document.visibilityState !== 'visible') return;
-    if (input && (document.activeElement === input || input.value.trim())) return;
-    location.reload();
-  }, 60_000);
-})();
-</script>
-
-<details class="deep-dive" id="deep-dive">
-<summary>Full dashboard, charts and diagnostics</summary>
-<div class="deep-dive-body">
+<div class="sub">Capital $${STARTING_CASH.toLocaleString(undefined, { maximumFractionDigits: 0 })} → $${GOAL.toLocaleString()} Goal &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}" id="mkt-badge">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; <span id="live-indicator" style="color:#00a843">LIVE</span> updates every 5s &nbsp;|&nbsp; <span id="pv-header">$${pv.toFixed(0)}</span> <span id="pnl-header" style="color:${pnlPct >= 0 ? '#00a843' : '#e8473f'}">(${pnlPct >= 0 ? '+' : ''}${pnlPct}%)</span> &nbsp;|&nbsp; <span style="color:${currentRegime.mode === 'risk-on' ? '#00a843' : currentRegime.mode === 'cautious' ? '#b07400' : '#e8473f'};font-size:10px">${currentRegime.mode.toUpperCase()}</span> &nbsp;|&nbsp; <span class="llm-toggle" onclick="fetch('/api/llm-provider',{method:'POST'}).then(()=>location.reload())" title="Click to switch LLM provider">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>${acct.paused ? ' &nbsp;|&nbsp; <span style="color:#e8473f;font-weight:bold">⏸ PAUSED</span>' : ''}</div>
 
 <div class="grid">
   <div class="card">
@@ -6773,14 +6542,21 @@ ${commandCenter}
     <div class="stat ${pnlPct >= 0 ? "" : "neg"}" id="pv-card-wrap"><div class="val" id="pv-card">$${pv.toFixed(0)}</div><div class="lbl">Total Value</div></div>
     <div class="stat ${pnlPct >= 0 ? "" : "neg"}" id="pnl-card-wrap"><div class="val" id="pnl-card">${pnlPct >= 0 ? "+" : ""}${pnlPct}%</div><div class="lbl">P&L vs capital</div></div>
     <div class="stat"><div class="val" id="capital-card">$${STARTING_CASH.toFixed(0)}</div><div class="lbl">Capital in</div></div>
-    <div class="stat"><div class="val" id="cash-card">$${state.cash.toFixed(0)}</div><div class="lbl">Cash</div></div>
+    <div class="stat"><div class="val" id="cash-card">$${state.cash.toFixed(0)}</div><div class="lbl">${cfg.broker === "tradier" ? ((state.accountType || "") === "cash" ? "Settled Cash" : "Spend Limit") : "Cash"}</div></div>
+
+    ${cfg.broker === "tradier" ? `
+    <div class="stat"><div class="val" style="font-size:14px;color:${(state.accountType || "") === "cash" ? "#00a843" : "#b07400"}">${(state.accountType || "?").toUpperCase()}</div><div class="lbl">Account Type</div></div>
+    ${state.unsettledCash > 0 ? `<div class="stat"><div class="val" id="unsettled-card" style="font-size:14px;color:#b07400">${state.unsettledCash.toFixed(0)}</div><div class="lbl">Unsettled (T+1)</div></div>` : ""}
+    ${state.reservedBuyingPower > 0 ? `<div class="stat"><div class="val" style="font-size:14px;color:#d2691e">$${state.reservedBuyingPower.toFixed(0)}</div><div class="lbl">Reserved (working orders)</div></div>` : ""}
+    ${(state.accountType && state.accountType !== "cash") ? `<div style="font-size:11px;color:#b07400;margin-top:6px">⚠️ This is a ${state.accountType.toUpperCase()} account — margin/leverage apply. You wanted a cash account.</div>` : ""}` : ""}
     <div class="progress"><div class="progress-bar" style="width:${Math.min(100, progress)}%"></div></div>
     <div style="font-size:11px;color:#6b7280">${progress}% to $${GOAL.toLocaleString()} goal</div>
     ${marchBanner}
     <div style="font-size:10px;color:#8a909b;margin-top:6px" title="Where price/option data came from this session">
-      📡 Data: <span style="color:#138f86">${marketDataStats.lastSource === "—" ? "Awaiting quote" : marketDataStats.lastSource.toUpperCase()}</span>
+      📡 Data: <span style="color:${tradier.isConnected ? "#138f86" : "#d2691e"}">${tradier.isConnected ? "Tradier LIVE" : "Finnhub/Yahoo (fallback)"}</span>
       · last quote via <b>${(marketDataStats.lastSource || "—").toUpperCase()}</b>
-      · usage F:${marketDataStats.finnhub} Y:${marketDataStats.yahoo}
+      · usage T:${marketDataStats.tradier} F:${marketDataStats.finnhub} Y:${marketDataStats.yahoo}
+      ${cfg.broker === "tradier" ? `· marks: bid/ask mid (synthetic refused)` : ""}
     </div>
   </div>
   <div class="card">
@@ -6814,7 +6590,7 @@ ${marketCard}
 
 <div class="card" style="margin-bottom:16px">
   <h2>Open Positions (${state.positions.length})</h2>
-  <table><tr><th>Ticker</th><th>Type</th><th>Strike</th><th>Stock Price</th><th>DTE</th><th>Qty</th><th>Entry</th><th>Current</th><th>P&L</th><th>Profit Target</th><th>Premium Warning</th><th>Opened</th><th>Greeks</th></tr>${posRows}</table>
+  <table><tr><th>Ticker</th><th>Type</th><th>Strike</th><th>Stock Price</th><th>DTE</th><th>Qty</th><th>Entry</th><th>Current</th><th>P&L</th><th>Profit Target</th><th>Stop Loss</th><th>Opened</th><th>Greeks</th></tr>${posRows}</table>
   ${positionCharts}
 </div>
 
@@ -7147,8 +6923,6 @@ function toggleAnalysis() {
   <h2>Live Log</h2>
   <div class="log" id="live-log">${logLines || '<span style="opacity:.5">Waiting for first cycle...</span>'}</div>
 </div>
-</div>
-</details>
 
 <script>
 let prevPrices = {};
@@ -8134,10 +7908,12 @@ function tabBarHTML(activeId, { spectator = false } = {}) {
     const color = pnl >= 0 ? "#00a843" : "#e8473f";
     const isActive = id === activeId;
     const statusDot = acct.paused ? "🔴" : "🟢";
-    const liveBadge = acct.config.broker === "robinhood"
+    const liveBadge = acct.config.broker === "tradier"
+      ? `<span class="tab-live" style="background:#00a8431c;color:#00a843;border:1px solid #00a84340;border-radius:4px;padding:0 4px;font-size:9px;font-weight:bold;margin-left:4px">LIVE</span>`
+      : acct.config.broker === "robinhood"
       ? `<span class="tab-live" style="background:#00a8431c;color:#00a843;border:1px solid #00a84340;border-radius:4px;padding:0 4px;font-size:9px;font-weight:bold;margin-left:4px">RH LIVE</span>`
       : "";
-    tabs.push(`<a href="/?a=${id}" class="acct-tab ${isActive ? "active" : ""}" title="${acct.name}">
+    tabs.push(`<a href="/?a=${id}" class="acct-tab ${isActive ? "active" : ""}" title="${acct.name}${acct.config.broker === "tradier" ? " — LIVE Tradier account" : ""}">
       <span class="tab-status">${statusDot}</span>
       <span class="tab-name">${acct.name}</span>${liveBadge}
       <span class="tab-pv">$${pv.toFixed(0)}</span>
@@ -8152,6 +7928,7 @@ function tabBarHTML(activeId, { spectator = false } = {}) {
     ${spectator ? "" : `<a href="#" class="acct-tab new-tab" onclick="document.getElementById('acct-modal').style.display='flex';return false">+ New Account</a>
     <a href="/?sim=new" class="acct-tab new-tab" style="border-color:#6a4df440;color:#6a4df4">&#x1F9EA; Simulator</a>`}
     <a href="/robinhood" class="acct-tab new-tab" style="border-color:#00a84330;color:#00a843">🔒 Robinhood MCP</a>
+    <a href="/tradier" class="acct-tab new-tab" style="border-color:#2f6fed40;color:#2f6fed">📈 Tradier</a>
     <a href="/media?a=${activeId}" class="acct-tab new-tab" style="border-color:#6a4df440;color:#6a4df4">📣 Media</a>
   </div>
   <div class="global-stats">
@@ -8284,18 +8061,18 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
         <p style="font-size:11px;color:#6b7280;margin:0 0 12px">The effective target, sample count, reach rate, lock arm, and giveback rule are shown above the dashboard. Every new position freezes its exact plan at entry.</p>
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Goal ($)</label>
         <input name="goal" type="number" value="${cfg.goal}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
-        <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Capital contributed / zero-point ($)${cfg.broker === "robinhood" ? " — deposits go here, not into P&L" : ""}</label>
+        <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Capital contributed / zero-point ($)${cfg.broker === "robinhood" || cfg.broker === "tradier" ? " — deposits go here, not into P&L" : ""}</label>
         <input name="startingCash" type="number" step="0.01" value="${cfg.startingCash || 0}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:6px;box-sizing:border-box">
         <p style="font-size:11px;color:#6b7280;margin:0 0 12px">P&amp;L = portfolio value − this number. When you deposit into Robinhood, update this (or use Record deposit below) so funding isn’t counted as profit.</p>
-        ${cfg.broker === "robinhood" ? `
+        ${(cfg.broker === "robinhood" || cfg.broker === "tradier") ? `
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Record deposit / withdrawal ($)</label>
         <input name="capitalDeposit" type="number" step="0.01" placeholder="e.g. 100 or -50" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
         ` : ""}
-        ${cfg.opportunityLimitsEnabled !== false ? `<label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Max Positions (blank = unlimited)</label>
-        <input name="maxPositions" type="number" value="${cfg.maxPositions || ""}" placeholder="unlimited" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">` : ""}
-        <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Maximum order amount ($)</label>
+        <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Max Positions (blank = unlimited)</label>
+        <input name="maxPositions" type="number" value="${cfg.maxPositions || ""}" placeholder="unlimited" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
+        <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Max Trade Size ($ Circuit Breaker)</label>
         <input name="maxTradeSize" type="number" value="${cfg.maxTradeSize || 500}" placeholder="500" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
-        ${cfg.entrySizingMode !== "one_contract" ? `<div style="font-size:12px;font-weight:800;color:#3a3b42;margin:14px 0 8px">Live risk and halt controls</div>
+        <div style="font-size:12px;font-weight:800;color:#3a3b42;margin:14px 0 8px">Live risk and halt controls</div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">
           <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Planned loss at stop (% of equity)</label><input name="riskPerTradePct" type="number" step="0.05" min="0" value="${((cfg.riskPerTradePct ?? 0.005) * 100).toFixed(2)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
           <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Governor allocation ceiling (% of equity)</label><input name="maxPositionPct" type="number" step="0.5" min="0" value="${((cfg.maxPositionPct ?? 0.10) * 100).toFixed(1)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
@@ -8305,7 +8082,7 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
           <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Weekly loss halt (%)</label><input name="weeklyLossLimitPct" type="number" step="0.5" min="0" value="${cfg.weeklyLossLimitPct == null ? "" : (cfg.weeklyLossLimitPct * 100).toFixed(1)}" placeholder="off" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
           <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">High-water drawdown halt (%)</label><input name="highWaterDrawdownLimitPct" type="number" step="0.5" min="0" value="${cfg.highWaterDrawdownLimitPct == null ? "" : (cfg.highWaterDrawdownLimitPct * 100).toFixed(1)}" placeholder="off" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
           <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Consecutive-loss halt (blank=off)</label><input name="maxConsecutiveLosses" type="number" min="1" value="${cfg.maxConsecutiveLosses ?? ""}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
-        </div>` : `<div style="font-size:12px;color:#6b7280;margin:12px 0">Legacy allocation, daily-entry, loss-streak, and portfolio-drawdown gates are disabled in Jarvis mode.</div>`}
+        </div>
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Min Setup Quality (0=trade anything, 50=default, 100=perfect setups only)</label>
         <input name="minSetupQuality" type="number" value="${cfg.minSetupQuality ?? 50}" min="0" max="100" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">
@@ -8316,11 +8093,16 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
         <input name="customPromptSuffix" value="${(cfg.customPromptSuffix || "").replace(/"/g, "&quot;")}" placeholder="e.g. Focus on tech sector only" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:16px;box-sizing:border-box">
         <input type="hidden" name="configForm" value="1">
         <div style="border-top:1px solid #e3e6ea;margin:4px 0 14px;padding-top:14px">
-          <div style="font-size:12px;color:#6b7280;margin-bottom:10px">Broker: <strong style="color:${cfg.broker === "robinhood" ? "#00a843" : "#6b7280"}">${(cfg.broker || "paper").toUpperCase()}${cfg.broker === "robinhood" ? " · LIVE" : ""}</strong></div>
-          ${cfg.entrySizingMode === "one_contract" ? `<div style="font-size:12px;color:#067a2f;background:#ecfdf3;border:1px solid #86efac;padding:9px;border-radius:7px;margin-bottom:10px">Jarvis mode: one affordable contract per approved setup. Portfolio drawdown limits are advisory and legacy setup filters are LLM context.</div>` : `<label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="useCashReserve" ${cfg.useCashReserve ? "checked" : ""}> Use cash reserve (50%→25% buffer)</label>`}
+          <div style="font-size:12px;color:#6b7280;margin-bottom:10px">Broker: <strong style="color:${cfg.broker === "tradier" ? "#00a843" : "#6b7280"}">${(cfg.broker || "paper").toUpperCase()}${cfg.broker === "tradier" ? " · LIVE" : ""}</strong></div>
+          ${(cfg.broker === "robinhood" || cfg.broker === "tradier") ? `<label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;font-weight:800;color:#1c1d22"><input type="checkbox" name="liveEntriesEnabled" ${cfg.liveEntriesEnabled === true ? "checked" : ""}> Live entries eligible (master entry switch)</label>` : ""}
+          <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="useCashReserve" ${cfg.useCashReserve ? "checked" : ""}> Use cash reserve (50%→25% buffer)</label>
           <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="liveEntriesEnabled" ${cfg.liveEntriesEnabled ? "checked" : ""}> Allow new live entries</label>
           <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="autoExecute" ${cfg.autoExecute ? "checked" : ""}> Auto-execute broker orders (full autonomy)</label>
           <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#3a3b42"><input type="checkbox" name="tradeWhenClosed" ${cfg.tradeWhenClosed ? "checked" : ""}> Trade when market closed (testing/sandbox)</label>
+          ${cfg.broker === "tradier" ? `<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px">
+            <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">0-cash spend limit ($)</label><input name="marginZeroCashSpendLimit" type="number" step="1" value="${cfg.marginZeroCashSpendLimit ?? DEFAULT_CONFIG.marginZeroCashSpendLimit}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+            <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Max margin debt ($)</label><input name="marginMaxDebt" type="number" step="1" value="${cfg.marginMaxDebt ?? DEFAULT_CONFIG.marginMaxDebt}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
+          </div><p style="font-size:11px;color:#b07400;margin:10px 0 0">⚠ LIVE account — orders execute with real money. Margin spend is capped by these limits. Use <strong>Pause</strong> as the kill switch (blocks new entries; exits still run to protect open positions).</p>` : ""}
         </div>
         <div style="display:flex;gap:8px">
           <button type="submit" style="flex:1;padding:10px;background:#6a4df4;color:#000;border:none;border-radius:6px;font-weight:bold;cursor:pointer">Save Settings</button>
@@ -8331,6 +8113,159 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
   </div>`;
 }
 
+// ─── Tradier Page ───
+
+function tradierPageHTML({ spectator = false } = {}) {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Tradier">
+<meta name="theme-color" content="#f6f7f9">
+<title>Tradier Data + Execution</title>
+<style>
+  body{background:#f6f7f9;color:#23242a;font-family:-apple-system,system-ui,sans-serif;margin:0;padding:24px;max-width:900px;margin:0 auto}
+  .card{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  @media(max-width:600px){
+    body{padding:14px}
+    h1{font-size:18px}
+    input,button{font-size:16px}
+    .grid{grid-template-columns:1fr 1fr}
+  }
+  h1{font-size:22px;margin:0 0 4px}
+  a.back{color:#2f6fed;text-decoration:none;font-size:13px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin:18px 0}
+  .stat{background:#ffffff;border:1px solid #e3e6ea;border-radius:10px;padding:14px}
+  .stat .label{font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.04em}
+  .stat .value{font-size:18px;font-weight:700;margin-top:4px}
+  .ok{color:#00a843}.bad{color:#e8473f}.muted{color:#6b7280}
+  .card{background:#ffffff;border:1px solid #e3e6ea;border-radius:10px;padding:16px;margin-top:16px}
+  input{padding:9px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22}
+  button{padding:9px 14px;background:#2f6fed;color:#1c1d22;border:none;border-radius:6px;font-weight:600;cursor:pointer}
+  pre{background:#f6f7f9;border:1px solid #e3e6ea;border-radius:8px;padding:12px;overflow:auto;font-size:12px;max-height:360px}
+  table{width:100%;border-collapse:collapse;font-size:12px}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #eceef1}
+</style></head>
+<body>
+  <a class="back" href="/">&larr; Back to dashboard</a>
+  <h1>📈 Tradier — Market Data + Execution Arm</h1>
+  <div class="muted" style="font-size:13px">Real-time quotes, candles & option chains (with Greeks/IV) feed the bot when connected. LLM analysis & news intel stay on the existing pipeline.</div>
+
+  <div class="grid" id="stats"><div class="stat"><div class="label">Status</div><div class="value muted">Loading…</div></div></div>
+
+  <div id="errbox" style="display:none;background:#fdecec;border:1px solid #e8473f44;border-radius:10px;padding:12px;margin-top:8px;font-size:12px;color:#e8473f"></div>
+
+  <div class="card">
+    <h3 style="margin:0 0 10px;font-size:15px">Connection</h3>
+    ${spectator ? `<div class="muted" style="font-size:12px">Spectator mode: environment, token, reconnect, and cancel-order controls are hidden.</div>` : `<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <select id="env" style="background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;padding:9px">
+        <option value="sandbox">sandbox</option>
+        <option value="production">production</option>
+      </select>
+      <input id="token" placeholder="Paste Tradier access token (optional)" style="flex:1;min-width:200px">
+      <button onclick="saveToken()">Save &amp; Connect</button>
+      <button onclick="reconnect()" style="background:#5457e6">Reconnect</button>
+      <button onclick="cancelAllOrders()" style="background:#e8473f">Cancel All Orders</button>
+    </div>
+    <div class="muted" style="font-size:11px;margin-top:8px">Leave the token blank to reconnect using the <code>TRADIER_ACCESS_TOKEN</code> env var. A token entered here is stored on the server (tradier_tokens.json).</div>`}
+  </div>
+
+  <div class="card">
+    <h3 style="margin:0 0 10px;font-size:15px">Quote / Option-Chain Lookup</h3>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <input id="sym" placeholder="Ticker e.g. SPY" value="SPY">
+      <button onclick="lookupQuote()">Quote</button>
+      <button onclick="lookupChain()" style="background:#5457e6">Option Chain</button>
+    </div>
+    <div id="lookup" style="margin-top:12px"></div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin:0 0 10px;font-size:15px">Pending Orders</h3>
+    <div id="pending" class="muted">None</div>
+  </div>
+
+<script>
+async function refresh(){
+  try{
+    const r = await fetch('/api/tradier-status'); const d = await r.json();
+    const conn = d.connected ? '<span class="ok">CONNECTED</span>' : '<span class="bad">NOT CONNECTED</span>';
+    const bi = d.balanceInfo || {};
+    const fmt = v => (v == null ? '—' : '$'+Number(v).toFixed(2));
+    const acctType = bi.accountType ? bi.accountType.toUpperCase() : '—';
+    const acctTypeHtml = bi.accountType === 'cash' ? '<span class="ok">CASH</span>'
+      : (bi.accountType && bi.accountType !== 'unknown') ? '<span class="bad">'+acctType+' ⚠</span>' : '—';
+    const ds = d.dataSource || {};
+    const dsHtml = d.connected
+      ? '<span class="ok">Tradier LIVE</span> <span class="muted">(last: '+((ds.lastSource||'—').toUpperCase())+' · T:'+(ds.tradier||0)+' F:'+(ds.finnhub||0)+' Y:'+(ds.yahoo||0)+')</span>'
+      : '<span class="bad">Finnhub/Yahoo fallback</span>';
+    document.getElementById('stats').innerHTML =
+      stat('Status', conn) +
+      stat('Environment', (d.environment||'—').toUpperCase()) +
+      stat('Account', d.accountId || 'data-only') +
+      stat('Account Type', acctTypeHtml) +
+      stat('Market', d.marketState || '—') +
+      stat('Usable BP', fmt(bi.buyingPower)) +
+      stat('Options BP', fmt(bi.optionBuyingPower)) +
+      (bi.rawOptionBuyingPower === 0 && bi.optionBuyingPower > 0 ? stat('Raw Options BP', '<span class="muted">$0.00 normalized</span>') : '') +
+      stat('Unsettled (T+1)', fmt(bi.unsettledCash)) +
+      (bi.accountType && bi.accountType !== 'cash' ? stat('Broker Cash', fmt(bi.marginCashAvailable ?? bi.totalCash)) + stat('Margin Cap', fmt(bi.marginSpendLimit)) : '') +
+      stat('Equity', fmt(bi.totalEquity)) +
+      stat('Data Source', dsHtml);
+    const eb = document.getElementById('errbox');
+    if(!d.connected && d.lastError){ eb.style.display='block'; eb.innerHTML='<b>Connection error:</b> '+d.lastError+'<br><span style="color:#6b7280">Endpoint: '+(d.baseUrl||'')+'</span><br><span style="color:#6b7280">A 401 usually means the token doesn\\'t match the selected environment (sandbox token vs production token).</span>'; }
+    else { eb.style.display='none'; }
+    if(d.environment){ const sel=document.getElementById('env'); if(sel) sel.value=d.environment; }
+    const po = d.pendingOrders||[];
+    document.getElementById('pending').innerHTML = po.length ? '<pre>'+JSON.stringify(po,null,2)+'</pre>' : '<span class="muted">None</span>';
+  }catch(e){ document.getElementById('stats').innerHTML = stat('Status','<span class="bad">error</span>'); }
+}
+function stat(l,v){return '<div class="stat"><div class="label">'+l+'</div><div class="value">'+v+'</div></div>';}
+async function reconnect(){
+  const btn=event.target; btn.textContent='…';
+  await fetch('/api/tradier-reconnect',{method:'POST'});
+  btn.textContent='Reconnect'; refresh();
+}
+async function cancelAllOrders(){
+  if(!confirm('Cancel ALL working Tradier orders? This will release reserved buying power.'))return;
+  const btn=event.target; const t=btn.textContent; btn.textContent='Canceling…';
+  const r=await fetch('/api/tradier-cancel-orders',{method:'POST'}); const d=await r.json();
+  btn.textContent=t; alert('Canceled '+d.canceled+' order(s)'+(d.errors&&d.errors.length?(' ('+d.errors.length+' error(s))'):''));
+  refresh();
+}
+async function saveToken(){
+  const token=document.getElementById('token').value.trim();
+  const env=document.getElementById('env').value;
+  const body='token='+encodeURIComponent(token)+'&env='+encodeURIComponent(env);
+  await fetch('/api/tradier-token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});
+  document.getElementById('token').value='';
+  refresh();
+}
+async function lookupQuote(){
+  const sym=document.getElementById('sym').value.trim().toUpperCase();
+  document.getElementById('lookup').innerHTML='Loading…';
+  const r=await fetch('/api/tradier-quote?sym='+sym); const d=await r.json();
+  document.getElementById('lookup').innerHTML='<pre>'+JSON.stringify(d,null,2)+'</pre>';
+}
+async function lookupChain(){
+  const sym=document.getElementById('sym').value.trim().toUpperCase();
+  document.getElementById('lookup').innerHTML='Loading chain…';
+  const r=await fetch('/api/tradier-chain?sym='+sym); const d=await r.json();
+  if(d.error){document.getElementById('lookup').innerHTML='<span class="bad">'+d.error+'</span>';return;}
+  let rows='';
+  for(const exp of (d.chain||[])){
+    rows+='<tr><td colspan="6" style="color:#2f6fed;font-weight:700">'+exp.expirationDate+'</td></tr>';
+    for(const c of (exp.options.CALL||[]).slice(0,4)){
+      rows+='<tr><td>CALL</td><td>$'+c.strike+'</td><td>'+c.bid+'/'+c.ask+'</td><td>IV '+(c.impliedVolatility!=null?(c.impliedVolatility*100).toFixed(0)+'%':'—')+'</td><td>δ'+(c.delta??'—')+'</td><td>OI '+c.openInterest+'</td></tr>';
+    }
+  }
+  document.getElementById('lookup').innerHTML='<table>'+rows+'</table>';
+}
+refresh(); setInterval(refresh, 8000);
+</script>
+</body></html>`;
+}
+
+// ─── Media Studio: compose shareable trade-plan posts + per-ticker chart cards ───
 function mediaPageHTML(acct, { spectator = false, featured = null } = {}) {
   const esc = s => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const ideas = gatherMediaIdeas(acct, { featured, max: 14 });
@@ -9444,11 +9379,6 @@ function startDashboard(defaultAcct, apiKey) {
     }
 
     // ─── Tradier: Data/Execution Arm Status ───
-    if (pathname.startsWith("/api/tradier-")) {
-      res.writeHead(410, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-      res.end(JSON.stringify({ error: "Tradier support has been removed; use the Robinhood endpoints." }));
-      return;
-    }
     if (pathname === "/api/tradier-status") {
       let clock = null, balances = null;
       if (tradier.isConnected) {
@@ -9986,6 +9916,7 @@ function startDashboard(defaultAcct, apiKey) {
     }
 
     if (pathname === "/api/state") {
+      await refreshBrokerBalances(activeAcct, { logErrors: true });
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       res.end(JSON.stringify({ cash: state.cash, positions: state.positions, history: state.history.slice(-50), quotes: dashboard.quotes, analyses: Object.fromEntries(Object.entries(dashboard.analyses).map(([k, v]) => [k, { score: v.score, signal: v.signal, price: v.price, rsi: v.rsi }])), activeHints: activeAcct.activeHints, portfolioValue: portfolioValue(state, dashboard.quotes), marketOpen: dashboard.marketOpen, log: dashboard.cycleLog.slice(-200), decisionJournal: (dashboard.decisionJournal || []).slice(-20), positionManagement: dashboard.positionManagement || [], managementJournal: (state.managementJournal || []).slice(-50) }));
       return;
@@ -10005,7 +9936,10 @@ function startDashboard(defaultAcct, apiKey) {
     }
 
     if (pathname === "/api/live") {
-      const balanceInfo = activeAcct._brokerBalanceInfo || null;
+      const balanceInfo = await refreshBrokerBalances(activeAcct, { logErrors: true });
+      if (activeAcct.config.broker === "tradier") {
+        appendPortfolioPoint(dashboard.portfolioHistory, Date.now(), portfolioValue(state, dashboard.quotes));
+      }
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       const tickers = {};
       for (const [sym, q] of Object.entries(dashboard.quotes)) {
@@ -10416,11 +10350,6 @@ self.addEventListener('pushsubscriptionchange', e => {
 
     // ─── Tradier Page ───
     if (pathname === "/tradier") {
-      res.writeHead(410, { "Content-Type": "text/plain" });
-      res.end("Tradier support has been removed. Use /robinhood.");
-      return;
-    }
-    if (pathname === "/tradier") {
       res.writeHead(200, { "Content-Type": "text/html" });
       res.end(tradierPageHTML({ spectator }));
       return;
@@ -10593,6 +10522,7 @@ self.addEventListener('pushsubscriptionchange', e => {
     }
 
     // Dashboard HTML
+    await refreshBrokerBalances(activeAcct, { logErrors: true });
     res.writeHead(200, { "Content-Type": "text/html" });
     res.end(dashboardHTML(activeAcct, { spectator }));
   });
@@ -10622,7 +10552,19 @@ async function fetchSharedMarketData(apiKey, sharedCandleCache) {
   const tickerList = [...allTickers];
   const sharedQuotes = {};
 
-  // Finnhub/Yahoo quotes are fetched one ticker at a time.
+  // Batch quotes via Tradier (25 symbols/call) — ~4s for 106 tickers vs ~16s sequential.
+  if (tradier.isConnected && tickerList.length > 0) {
+    const BATCH = 25;
+    for (let i = 0; i < tickerList.length; i += BATCH) {
+      try {
+        const batch = tickerList.slice(i, i + BATCH);
+        const qs = await tradier.getQuotes(batch);
+        Object.assign(sharedQuotes, qs);
+      } catch { }
+      if (i + BATCH < tickerList.length) await delay(apiDelay());
+    }
+  }
+  // Fallback / fill gaps one at a time
   for (const ticker of tickerList) {
     if (sharedQuotes[ticker]?.c > 0) continue;
     try {
@@ -11808,6 +11750,17 @@ function scheduleWorkingEntryCancellation(acct, reason) {
 }
 
 async function cancelWorkingEntryOrders(acct, reason = "entry halt") {
+  if (acct.config.broker === "tradier") {
+    const working = await brokerWorkingOrders(acct);
+    let requested = 0;
+    for (const order of working) {
+      if (order.side !== "buy_to_open" && order.side !== "buy") continue;
+      await tradier.cancelOrder(order.id);
+      requested++;
+    }
+    if (requested) log(acct, `ENTRY HALT: cancel requested for ${requested} Tradier buy order(s) — ${reason}`);
+    return requested;
+  }
   if (acct.config.broker !== "robinhood") return 0;
   let requested = 0;
   for (const [occ, meta] of Object.entries(acct.state.meta || {})) {
@@ -12052,7 +12005,6 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
     // one leg at a time, and a stale prior long must not reach exit-intent recovery.
     const nonLongOptionTickers = new Set();
     let optionOrdersSnapshot = null;
-    let workingOptionAuthorities = [];
 
     // Fetch equity positions
     const res = await robinhood.getPositions();
@@ -12086,26 +12038,11 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
             : Array.isArray(optWorkingRaw?.results) ? optWorkingRaw.results : [];
         // Treat every unknown/nonterminal state as active. A new broker state must retain locks,
         // never silently release them and permit a duplicate order.
-        workingOptionAuthorities = classifyWorkingOptionOrders(
-          optionOrdersSnapshot,
-          state.meta,
-          optionOrderIsTerminal,
-        );
-        for (const classification of workingOptionAuthorities) {
-          if (classification.ticker) brokerTickers.push(classification.ticker);
-          if (classification.owner === "automation") {
-            for (const meta of Object.values(state.meta || {})) {
-              const idMatches = classification.orderId != null && meta?.exitOrderId != null
-                && String(classification.orderId) === String(meta.exitOrderId);
-              const refMatches = classification.refId != null && meta?.exitOrderRefId != null
-                && String(classification.refId) === String(meta.exitOrderRefId);
-              if (idMatches || refMatches) meta.exitOrderOwner = "automation";
-            }
-          }
+        const optWorkingOrders = optionOrdersSnapshot.filter(order => !optionOrderIsTerminal(order));
+        for (const o of optWorkingOrders) {
+          const sym = (o.chain_symbol || o.symbol || "").toUpperCase();
+          if (sym) brokerTickers.push(sym);
         }
-        acct._operatorWorkingOrderTickers = new Set(
-          workingOptionAuthorities.filter(row => row.owner === "operator" && row.ticker).map(row => row.ticker),
-        );
       } catch (e) {
         inflightSnapshotComplete = false;
         log(acct, `ROBINHOOD SYNC: option working-orders fetch failed — preserving local order locks (${e.message})`);
@@ -12476,24 +12413,6 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
       }
     }
 
-    // Unmatched broker orders are operator-owned. Attach locks by exact instrument/OCC whenever
-    // possible; only fall back to ticker when there is exactly one held option contract for it.
-    const operatorOrders = workingOptionAuthorities.filter(row => row.owner === "operator");
-    for (const pos of positions.filter(position => position.type !== "equity")) {
-      const exactKeys = new Set([
-        pos.instrumentUrl ? `id:${normalizeOptionId(pos.instrumentUrl)}` : null,
-        pos.occSymbol ? `occ:${String(pos.occSymbol).toUpperCase()}` : null,
-      ].filter(Boolean));
-      let matching = operatorOrders.filter(row => row.contractKey && exactKeys.has(row.contractKey));
-      if (!matching.length) {
-        const sameTickerPositions = positions.filter(position => position.type !== "equity" && position.ticker === pos.ticker);
-        if (sameTickerPositions.length === 1) {
-          matching = operatorOrders.filter(row => !row.contractKey && row.ticker === pos.ticker);
-        }
-      }
-      pos._operatorWorkingOrder = matching[0] || null;
-    }
-
     // ── Broker-fill reconciliation helpers ──
     // Our own limit prices are working estimates, not fills. Everything below prefers the fill
     // Robinhood actually reports; the broker activity record is authoritative for cost basis.
@@ -12850,7 +12769,7 @@ async function syncRobinhoodAccount(acct, quotes, { workEntries = true, refreshB
         if (pos.type === "equity" || pos.optionsSource !== "robinhood") continue;
         const metaKey = pos.occSymbol || pos.optionMetaKey;
         const posMeta = metaKey ? state.meta[metaKey] : null;
-        if (!posMeta || !posMeta.exitOrderPlacedAt || posMeta.exitOrderOwner !== "automation") continue;
+        if (!posMeta || !posMeta.exitOrderPlacedAt) continue;
         const age = now - posMeta.exitOrderPlacedAt;
         if (!posMeta.exitOrderId && posMeta.exitOrderRefId
             && (!posMeta.exitRecoveryAttemptAt || now - posMeta.exitRecoveryAttemptAt >= 30_000)) {
@@ -13301,9 +13220,8 @@ function analyzeHeldPositions(acct, quotes) {
     if (!analysis) continue;
     if (shortTerm) shortTermAnalyses[ticker] = shortTerm;
     const blended = blendScores(analysis, shortTerm);
-    // Watchlist hints help discover entries. They are not durable position instructions and must
-    // never push an existing holding toward an automated exit.
-    analysis.score = Math.max(0, Math.min(100, blended.score));
+    const hintBias = getHintBias(acct, ticker);
+    analysis.score = Math.max(0, Math.min(100, blended.score + hintBias));
     analysis.signal = signalLabel(analysis.score);
     analyses[ticker] = analysis;
   }
@@ -13467,15 +13385,12 @@ async function runCycle(acct, sharedQuotes, apiKey) {
     dec.longTermScore = a ? Math.round(50 + (a.bullScore - a.bearScore) / 2) : null;
     dec.blendedScore = effectiveScore;
 
-    const scoreDirection = entryDirectionForScore(finalScore, cfg);
-    const copilotBullish = cfg.llmOpportunityMode === true && scoreDirection === "bullish" && finalScore < cfg.bullEntry;
-    const copilotBearish = cfg.llmOpportunityMode === true && scoreDirection === "bearish" && finalScore > cfg.bearEntry;
-    if (scoreDirection === "bullish") {
+    if (finalScore >= cfg.bullEntry) {
       if (alreadyHeld) { dec.action = "HOLD"; dec.reason = "Already in position"; }
-      else { dec.action = "BUY CALL"; dec.reason = `${copilotBullish && finalScore < cfg.bullEntry ? "LLM REVIEW · leaning" : "Bullish"} ${finalScore}/100 (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`; }
-    } else if (scoreDirection === "bearish") {
+      else { dec.action = "BUY CALL"; dec.reason = `Bullish ${finalScore}/100 (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`; }
+    } else if (finalScore <= cfg.bearEntry) {
       if (alreadyHeld) { dec.action = "HOLD"; dec.reason = "Already in position"; }
-      else { dec.action = "BUY PUT"; dec.reason = `${copilotBearish && finalScore > cfg.bearEntry ? "LLM REVIEW · leaning bearish" : "Bearish"} ${finalScore}/100 (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`; }
+      else { dec.action = "BUY PUT"; dec.reason = `Bearish ${finalScore}/100 (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`; }
     } else {
       dec.action = "WAIT";
       if (finalScore >= 55) dec.reason = `Score ${finalScore} — leaning bullish but need >=${cfg.bullEntry} (7d:${st?.score ?? '?'} 90d:${dec.longTermScore})`;
@@ -13496,6 +13411,7 @@ async function runCycle(acct, sharedQuotes, apiKey) {
 
 
   // Broker accounts: mirror real balance + positions before any exit/entry decisions.
+  if (cfg.broker === "tradier") await syncBrokerAccount(acct, quotes);
   if (acct._inflightExpiryReservations) {
     for (const ticker of acct._inflightExpiryReservations.keys()) {
       if (!acct._inflightTickers?.has(ticker)) acct._inflightExpiryReservations.delete(ticker);
@@ -13807,6 +13723,7 @@ async function runPausedCycle(acct, sharedQuotes, apiKey) {
 
   // Broker accounts: keep mirroring the real account so exits price off fresh marks/bids even while
   // paused (a hard risk-halt pauses entries but must not abandon open positions).
+  if (cfg.broker === "tradier") await syncBrokerAccount(acct, quotes);
 
   // Every pause is entry-only. Risk controls and the manual kill switch must never abandon an
   // already-open position; protective exits continue on their normal broker lane.
@@ -14319,7 +14236,7 @@ async function main() {
     console.log("  X/Twitter: DRY-RUN mode — set ENABLE_TWEETS=true to post live");
   }
 
-  // Initialize Robinhood Agentic Trading.
+  // Initialize Robinhood Agentic Trading (per-account broker, same as Tradier)
   const rhOk = await robinhood.init();
   if (rhOk) {
     const optLabel = robinhood.optionsEnabled ? "equity + options" : "equity only";
@@ -14334,6 +14251,19 @@ async function main() {
     await ensureRhWatchlist();
     const modeLabel = rhTradeMode({ broker: "robinhood" });
     console.log(`  Robinhood: LIVE broker account ready (max: $${RH_MAX_POSITION_DOLLARS}/position, mode: ${modeLabel}${RH_AUTO_WATCHLIST ? `, auto-watchlist → "${RH_WATCHLIST_NAME}"` : ""})`);
+  }
+
+  // Initialize Tradier data + execution arm (primary market-data feed when connected)
+  if (process.env.TRADIER_ACCESS_TOKEN || fs.existsSync("tradier_tokens.json")) {
+    const trOk = await tradier.init();
+    if (trOk) {
+      console.log(`  Tradier: DATA FEED ACTIVE ✓ (${tradier.environment}) — quotes, candles & option chains routed through Tradier`);
+      await ensureTradierAccount();
+    } else {
+      console.log("  Tradier: NOT CONNECTED — falling back to Finnhub/Yahoo for market data");
+    }
+  } else {
+    console.log("  Tradier: not configured — set TRADIER_ACCESS_TOKEN to use real-time data. Using Finnhub/Yahoo.");
   }
 
   // Store apiKey in each account state for backwards compat
@@ -14392,6 +14322,7 @@ async function main() {
     }
     // Force broker sync immediately so positions are never stale after a deploy
     for (const [, acct] of accounts) {
+      if (acct.config.broker === "tradier") await syncBrokerAccount(acct, sharedQuotes);
       if (acct.config.broker === "robinhood") {
         await withBrokerExecutionLane(acct, () => syncRobinhoodAccount(acct, sharedQuotes));
       }
@@ -14416,9 +14347,11 @@ async function main() {
     }
     lastCycleTime = Date.now();
 
-    // Refresh the local exchange-session state before deciding what to run.
+    // Pull the authoritative exchange state from Tradier (cached 30s) before deciding what to run.
     await refreshMarketClock();
-    // Robinhood uses the local ET session clock; a market-data outage never blocks position sync.
+    // marketOpen uses Tradier clock (authoritative for Tradier-brokered accounts).
+    // marketOpenLocal uses only ET time — never touches Tradier — and is the sole signal for
+    // Robinhood accounts so that a Tradier API outage or stale state never blocks RH exits.
     const marketOpen = isMarketOpen();
     const marketOpenLocal = isMarketOpenLocal();
     // Accounts may opt into trading while closed (e.g. broker sandbox testing). If any non-paused
@@ -14453,6 +14386,7 @@ async function main() {
             // Learning lab: keep shadow variants alive for live RH accounts (idempotent) so they
             // collect strategy data every cycle — including while the parent is paused/settling.
             if (acct.config.broker === "robinhood" && !acct.learning && acct.config.learningEnabled !== false) ensureLearningAccounts(acct);
+            // Robinhood uses local ET time only — Tradier clock is irrelevant for RH.
             const acctMarketOpen = acct.config.broker === "robinhood" ? marketOpenLocal : marketOpen;
             const tradeThis = acctMarketOpen || acct.config.tradeWhenClosed;
             if (acct.paused) {
@@ -14476,7 +14410,7 @@ async function main() {
       console.log("");
       await delay((marketOpen || marketOpenLocal) ? CYCLE_MS : CYCLE_MS_CLOSED);
     } else {
-      // After hours.
+      // After hours (both Tradier clock and local ET time say market is closed)
       try {
         const { sharedQuotes } = await fetchSharedMarketData(apiKey, sharedCandleCache);
         for (const [, acct] of accounts) {

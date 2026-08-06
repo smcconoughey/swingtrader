@@ -145,10 +145,6 @@ export function createManagementPlan(config = {}, position = {}, now = Date.now(
     premiumStopMaxAgeMs: 5 * 60_000,
     premiumStopMaxSpreadPct: 0.20,
     premiumStopWideEscalationMs: 3 * 60_000,
-    // Premium is leveraged and can fall sharply while the stock thesis remains intact. A normal
-    // premium stop is therefore confirmation, not an independent reason to liquidate.
-    premiumStopRequiresThesisDamage: true,
-    catastrophicStopLoss: -0.70,
     bullEntry: finite(config.bullEntry, 65),
     bearEntry: finite(config.bearEntry, 35),
     signalExitScoreMargin: 3,
@@ -201,8 +197,6 @@ export function managementPlanFor(position = {}, config = {}, now = Date.now()) 
       premiumStopMaxAgeMs: 5 * 60_000,
       premiumStopMaxSpreadPct: 0.20,
       premiumStopWideEscalationMs: 3 * 60_000,
-      premiumStopRequiresThesisDamage: true,
-      catastrophicStopLoss: -0.70,
     };
   }
   return createManagementPlan(config, position, now);
@@ -393,20 +387,6 @@ export function evaluatePosition({
     return makeDecision(base, "hold", "NO_EXECUTABLE_BID", "hold: no current executable bid for this exact contract");
   }
 
-  const underwater = atOrBelow(exitPnlPct, plan.signalExitMinLoss);
-  const signalInvalidated = thesis.reversed && (
-    (thesis.deepReversal && thesis.spotAgainst) ||
-    (underwater && (dteRemaining <= plan.staleDteThreshold || lifeConsumed >= 0.50))
-  );
-  const catastrophicStopLoss = Number.isFinite(plan.catastrophicStopLoss)
-    ? plan.catastrophicStopLoss : -0.70;
-  const catastrophicPremiumLoss = atOrBelow(exitPnlPct, catastrophicStopLoss);
-  const premiumStopHasThesisConfirmation = plan.premiumStopRequiresThesisDamage === false
-    || thesis.reversed
-    || (thesis.weak && thesis.spotAgainst)
-    || adverseSpotMove >= spotStopThreshold * 0.75
-    || dteRemaining <= plan.lowDteThreshold;
-
   // Capital-protection rules. Time remaining changes the ATR allowance, but never turns a
   // shallow premium print into a stop by itself.
   if (isEquity && atOrBelow(exitPnlPct, plan.stopLoss)) {
@@ -415,16 +395,10 @@ export function evaluatePosition({
   if (!isEquity && dteRemaining <= plan.criticalDte) {
     return makeDecision(base, "close", "DTE_CRITICAL", `DTE critical (${dteRemaining.toFixed(1)}d remaining)`, { urgency: "urgent", priceMode: "marketable" });
   }
-  if (underlyingQuoteFresh && adverseSpotMove >= spotStopThreshold) {
-    const moveLabel = isEquity ? "stock down" : `underlying ${position.type === "put" ? "up" : "down"}`;
-    return makeDecision(base, "close", "STRUCTURAL_SPOT_STOP", `spot stop: ${moveLabel} ${(adverseSpotMove * 100).toFixed(1)}% from entry (DTE-aware threshold ${(spotStopThreshold * 100).toFixed(1)}%, ATR ${(atrPct * 100).toFixed(1)}%)`, { urgency: "protective", priceMode: "marketable" });
-  }
-  if (underlyingQuoteFresh && signalInvalidated) {
-    return makeDecision(base, "close", "THESIS_INVALIDATED", `signal reversed with confirmation (${thesis.state}, ${(exitPnlPct * 100).toFixed(0)}%, ${dteRemaining.toFixed(1)}d left)`, { urgency: "protective", priceMode: "marketable" });
-  }
-  // A coherent premium breach is actionable only when price/technicals also damage the thesis,
-  // when expiry is close, or at the explicitly catastrophic floor sized at entry.
-  if (!isEquity && premiumStop.confirmed && (premiumStopHasThesisConfirmation || catastrophicPremiumLoss)) {
+  // Once the exact-contract stop is confirmed, preserve that reason code even when the
+  // underlying also crossed its structural stop. The execution layer recognizes this explicit
+  // confirmation and will not let delta/IV attribution veto a coherent protective sale.
+  if (!isEquity && premiumStop.confirmed) {
     return makeDecision(base, "close", "PREMIUM_STOP", `confirmed premium stop ${(exitPnlPct * 100).toFixed(0)}% (limit ${(plan.stopLoss * 100).toFixed(0)}%)`, { urgency: "protective", priceMode: "marketable" });
   }
   // Near expiry, theta/gamma risk is itself the invalidation. Do not let the longer premium-stop
@@ -433,7 +407,7 @@ export function evaluatePosition({
   if (!isEquity && dteRemaining <= plan.lowDteThreshold && atOrBelow(exitPnlPct, plan.lowDteLoss)) {
     return makeDecision(base, "close", "LOW_DTE_LOSS", `low-DTE tight stop ${(exitPnlPct * 100).toFixed(0)}% (${dteRemaining.toFixed(1)}d left, theta accelerating)`, { urgency: "urgent", priceMode: "marketable" });
   }
-  if (!isEquity && premiumStop.wideEscalated && (premiumStopHasThesisConfirmation || catastrophicPremiumLoss)) {
+  if (!isEquity && premiumStop.wideEscalated) {
     return makeDecision(
       base,
       "close",
@@ -442,22 +416,30 @@ export function evaluatePosition({
       { urgency: "urgent", priceMode: "patient" },
     );
   }
+  if (underlyingQuoteFresh && adverseSpotMove >= spotStopThreshold) {
+    const moveLabel = isEquity ? "stock down" : `underlying ${position.type === "put" ? "up" : "down"}`;
+    return makeDecision(base, "close", "STRUCTURAL_SPOT_STOP", `spot stop: ${moveLabel} ${(adverseSpotMove * 100).toFixed(1)}% from entry (DTE-aware threshold ${(spotStopThreshold * 100).toFixed(1)}%, ATR ${(atrPct * 100).toFixed(1)}%)`, { urgency: "protective", priceMode: "marketable" });
+  }
   if (!isEquity && atOrBelow(exitPnlPct, plan.stopLoss)) {
     // A single crossed/empty option quote must not liquidate a real position. Live options require
     // repeated exact-contract bids over a bounded window and a coherent two-sided book. Paper
     // replay has no broker book, so its modeled bid is acted on immediately.
-    if (!requireExecutableBid && (premiumStopHasThesisConfirmation || catastrophicPremiumLoss)) {
+    if (!requireExecutableBid) {
       return makeDecision(base, "close", "PREMIUM_STOP", `confirmed premium stop ${(exitPnlPct * 100).toFixed(0)}% (limit ${(plan.stopLoss * 100).toFixed(0)}%)`, { urgency: "protective", priceMode: "marketable" });
     }
     const spreadLabel = Number.isFinite(premiumStop.spreadPct)
       ? `, spread ${(premiumStop.spreadPct * 100).toFixed(0)}%`
       : ", no coherent two-sided book";
-    const reasonCode = (!requireExecutableBid || premiumStop.confirmed || premiumStop.wideEscalated)
-      ? "HOLD_PREMIUM_THESIS_INTACT" : "PREMIUM_STOP_CONFIRMING";
-    const reason = (!requireExecutableBid || premiumStop.confirmed || premiumStop.wideEscalated)
-      ? `premium warning ${(exitPnlPct * 100).toFixed(0)}%; threshold is confirmed but thesis is not invalidated`
-      : `protective stop breached at ${(exitPnlPct * 100).toFixed(0)}%; confirming exact bids ${premiumStop.sampleCount}/${premiumStop.requiredSamples}${spreadLabel}`;
-    return makeDecision(base, "hold", reasonCode, reason);
+    return makeDecision(base, "hold", "PREMIUM_STOP_CONFIRMING", `protective stop breached at ${(exitPnlPct * 100).toFixed(0)}%; confirming exact bids ${premiumStop.sampleCount}/${premiumStop.requiredSamples}${spreadLabel}`);
+  }
+
+  const underwater = atOrBelow(exitPnlPct, plan.signalExitMinLoss);
+  const signalInvalidated = thesis.reversed && (
+    (thesis.deepReversal && thesis.spotAgainst) ||
+    (underwater && (dteRemaining <= plan.staleDteThreshold || lifeConsumed >= 0.50))
+  );
+  if (underlyingQuoteFresh && signalInvalidated) {
+    return makeDecision(base, "close", "THESIS_INVALIDATED", `signal reversed with confirmation (${thesis.state}, ${(exitPnlPct * 100).toFixed(0)}%, ${dteRemaining.toFixed(1)}d left)`, { urgency: "protective", priceMode: "marketable" });
   }
 
   const staleAndWeak = !isEquity

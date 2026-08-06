@@ -12,7 +12,7 @@ import {
 
 test("only canonical runtime ids retain process-global live broker bindings", () => {
   assert.equal(canonicalLiveBrokerForAccount("robinhood"), "robinhood");
-  assert.equal(canonicalLiveBrokerForAccount("tradier"), null);
+  assert.equal(canonicalLiveBrokerForAccount("tradier"), "tradier");
   assert.equal(isCanonicalLiveAccount("strategy-2"), false);
 
   const duplicate = sanitizeRuntimeBrokerConfig("strategy-2", {
@@ -33,7 +33,7 @@ test("only canonical runtime ids retain process-global live broker bindings", ()
   assert.equal(robinhood.config.broker, "robinhood");
   assert.equal(robinhood.config.autoExecute, true);
 
-  const uppercaseDuplicate = sanitizeRuntimeBrokerConfig("ROBINHOOD", { broker: "robinhood", autoExecute: true });
+  const uppercaseDuplicate = sanitizeRuntimeBrokerConfig("TRADIER", { broker: "tradier", autoExecute: true });
   assert.equal(uppercaseDuplicate.config.broker, "paper");
   assert.equal(uppercaseDuplicate.config.autoExecute, false);
 });

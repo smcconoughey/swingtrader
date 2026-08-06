@@ -2,7 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  entryDirectionForScore,
   directionalConviction,
   directionalSetupQuality,
   contractExecutionScore,
@@ -12,20 +11,6 @@ import {
   rankEntryCandidates,
   rankPreparedEntries,
 } from "../strategy-priority.js";
-
-test("Jarvis mode sends directional leaners to LLM review but ignores neutral noise", () => {
-  const cfg = { llmOpportunityMode: true, bullEntry: 68, bearEntry: 32 };
-  assert.equal(entryDirectionForScore(60, cfg), "bullish");
-  assert.equal(entryDirectionForScore(40, cfg), "bearish");
-  assert.equal(entryDirectionForScore(50, cfg), null);
-});
-
-test("legacy mode retains explicit score thresholds", () => {
-  const cfg = { llmOpportunityMode: false, bullEntry: 68, bearEntry: 32 };
-  assert.equal(entryDirectionForScore(67, cfg), null);
-  assert.equal(entryDirectionForScore(68, cfg), "bullish");
-  assert.equal(entryDirectionForScore(32, cfg), "bearish");
-});
 
 test("setup quality cannot use an uptrend to qualify a bearish entry", () => {
   const put = directionalSetupQuality(
