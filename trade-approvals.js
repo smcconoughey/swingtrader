@@ -141,6 +141,23 @@ export function rejectTradeApproval(state, id, now = Date.now()) {
   return { ok: true, approval };
 }
 
+export function cancelTradeApproval(state, id, now = Date.now()) {
+  const queue = queueFor(state);
+  expireStale(queue, now);
+  const approval = queue.find(row => row.id === id);
+  if (!approval) return { ok: false, reason: "approval not found" };
+  if (approval.status !== "approved") {
+    return { ok: false, reason: approval.status === "executing"
+      ? "broker submission has already started"
+      : `approval is ${approval.status}`, approval };
+  }
+  approval.status = "rejected";
+  approval.canceledAt = now;
+  approval.resolvedAt = now;
+  approval.resolutionReason = "operator canceled queued approval";
+  return { ok: true, approval };
+}
+
 export function beginApprovedTrade(state, rawProposal, now = Date.now()) {
   const proposal = normalizedProposal(rawProposal);
   const fingerprint = tradeApprovalFingerprint(proposal);

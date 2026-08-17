@@ -66,6 +66,7 @@ import {
   LOSS_EXIT_APPROVAL,
   approveTradeApproval,
   beginApprovedTrade,
+  cancelTradeApproval,
   finishApprovedTrade,
   pendingTradeApprovals,
   rejectTradeApproval,
@@ -6414,10 +6415,12 @@ function dashboardHTML(acct, { spectator = false } = {}) {
     const expiresText = Number.isFinite(expiresAt)
       ? `Expires ${new Date(expiresAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
       : "Short-lived approval";
-    const controls = spectator || status !== "pending" ? "" : `<div class="trade-approval-actions">
+    const controls = spectator ? "" : status === "pending" ? `<div class="trade-approval-actions">
       <button type="button" class="trade-approval-btn approve" data-trade-approval-action="approve" data-trade-approval-id="${approvalHtmlSafe(row.id)}">Approve trade</button>
       <button type="button" class="trade-approval-btn reject" data-trade-approval-action="reject" data-trade-approval-id="${approvalHtmlSafe(row.id)}">Reject</button>
-    </div>`;
+    </div>` : status === "approved" ? `<div class="trade-approval-actions">
+      <button type="button" class="trade-approval-btn reject" data-trade-approval-action="cancel" data-trade-approval-id="${approvalHtmlSafe(row.id)}">Cancel approval</button>
+    </div>` : "";
     return `<article class="trade-approval-item ${statusClass}">
       <div class="trade-approval-copy">
         <div class="trade-approval-heading"><span class="trade-approval-status ${statusClass}">${statusLabel}</span><strong>${entry ? "BUY TO OPEN" : "SELL AT LOSS"} · ${approvalHtmlSafe(row.ticker)}</strong></div>
@@ -7245,8 +7248,11 @@ function mainApprovalItem(row) {
   const expiresText = Number.isFinite(expiresAt)
     ? 'Expires ' + new Date(expiresAt).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})
     : 'Short-lived approval';
-  const controls = mainApprovalReadOnly || status !== 'pending' ? ''
-    : '<div class="trade-approval-actions"><button type="button" class="trade-approval-btn approve" data-trade-approval-action="approve" data-trade-approval-id="' + mainApprovalSafe(row.id) + '">Approve trade</button><button type="button" class="trade-approval-btn reject" data-trade-approval-action="reject" data-trade-approval-id="' + mainApprovalSafe(row.id) + '">Reject</button></div>';
+  const controls = mainApprovalReadOnly ? '' : status === 'pending'
+    ? '<div class="trade-approval-actions"><button type="button" class="trade-approval-btn approve" data-trade-approval-action="approve" data-trade-approval-id="' + mainApprovalSafe(row.id) + '">Approve trade</button><button type="button" class="trade-approval-btn reject" data-trade-approval-action="reject" data-trade-approval-id="' + mainApprovalSafe(row.id) + '">Reject</button></div>'
+    : status === 'approved'
+      ? '<div class="trade-approval-actions"><button type="button" class="trade-approval-btn reject" data-trade-approval-action="cancel" data-trade-approval-id="' + mainApprovalSafe(row.id) + '">Cancel approval</button></div>'
+      : '';
   return '<article class="trade-approval-item ' + statusClass + '"><div class="trade-approval-copy">'
     + '<div class="trade-approval-heading"><span class="trade-approval-status ' + statusClass + '">' + statusLabel + '</span><strong>' + (entry ? 'BUY TO OPEN' : 'SELL AT LOSS') + ' · ' + mainApprovalSafe(row.ticker) + '</strong></div>'
     + '<div class="trade-approval-contract">' + mainApprovalSafe(optionLabel) + '</div>'
@@ -7284,7 +7290,8 @@ async function decideMainTradeApproval(id, action) {
   });
   buttons.forEach(function(button) { button.disabled = true; });
   try {
-    const endpoint = action === 'approve' ? '/api/rh-approve/' : '/api/rh-reject/';
+    const endpoint = action === 'approve' ? '/api/rh-approve/'
+      : action === 'cancel' ? '/api/rh-cancel-approval/' : '/api/rh-reject/';
     const response = await fetch(endpoint + encodeURIComponent(id), { method: 'POST' });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || 'Decision could not be saved');
@@ -7292,7 +7299,9 @@ async function decideMainTradeApproval(id, action) {
       message.className = 'trade-approval-message success';
       message.textContent = action === 'approve'
         ? 'Approved. The order is queued for the next trading cycle and will be rechecked against the live price and buying power before submission.'
-        : 'Rejected. This exact proposal will not be submitted.';
+        : action === 'cancel'
+          ? 'Approval canceled before broker submission. This exact proposal will not be submitted.'
+          : 'Rejected. This exact proposal will not be submitted.';
     }
     await loadMainTradeApprovals();
   } catch (error) {
@@ -7830,20 +7839,31 @@ window.__CHARTS__ = ${JSON.stringify({ short: shortChartData, barrier: barrierCh
 function robinhoodPageHTML({ spectator = false } = {}) {
   const connected = robinhood.isConnected;
   const approvalAccount = accounts.get("robinhood");
-  const approvalRows = approvalAccount ? pendingTradeApprovals(approvalAccount.state) : [];
+  const approvalRows = approvalAccount ? (() => {
+    pendingTradeApprovals(approvalAccount.state);
+    return (approvalAccount.state.tradeApprovals || []).filter(row =>
+      (row.status === "pending" || row.status === "approved" || row.status === "executing")
+      && Number(row.expiresAt) > Date.now());
+  })() : [];
   const escapeApprovalHtml = value => String(value ?? "")
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   const approvalItems = approvalRows.length === 0
     ? '<div class="rh-empty">No decisions waiting for you</div>'
     : approvalRows.map(row => {
       const entry = row.kind === ENTRY_APPROVAL;
-      const label = entry ? "BUY ENTRY" : "SELL AT LOSS";
+      const label = `${row.status === "approved" ? "APPROVED · " : row.status === "executing" ? "SUBMITTING · " : ""}${entry ? "BUY ENTRY" : "SELL AT LOSS"}`;
       const detail = entry
         ? `${row.quantity}x up to $${Number(row.limitPrice).toFixed(2)} · est. $${Number(row.estimatedNotional || row.quantity * row.limitPrice * 100).toFixed(0)}`
         : `${row.quantity}x at $${Number(row.limitPrice).toFixed(2)} · est. net loss $${Number(row.estimatedLossDollars || 0).toFixed(2)} (${Number(row.estimatedLossPct || 0).toFixed(1)}%) · ${row.reason || "protective exit"}`;
+      const controls = spectator ? "" : row.status === "pending"
+        ? `<div style="display:flex;gap:6px"><button class="rh-btn primary small" data-rh-approval-action="approve" data-rh-approval-id="${escapeApprovalHtml(row.id)}">Approve</button><button class="rh-btn danger small" data-rh-approval-action="reject" data-rh-approval-id="${escapeApprovalHtml(row.id)}">Reject</button></div>`
+        : row.status === "approved"
+          ? `<div style="display:flex;gap:6px"><button class="rh-btn danger small" data-rh-approval-action="cancel" data-rh-approval-id="${escapeApprovalHtml(row.id)}">Cancel approval</button></div>`
+          : "";
       return `<div class="rh-pending-item">
         <div><div class="sym">${label} · ${escapeApprovalHtml(row.ticker)}</div><div class="detail">${escapeApprovalHtml(row.contractKey)}<br>${escapeApprovalHtml(detail)}</div></div>
-        ${spectator ? "" : `<div style="display:flex;gap:6px"><button class="rh-btn primary small" onclick="approveDecision('${row.id}')">Approve</button><button class="rh-btn danger small" onclick="rejectDecision('${row.id}')">Reject</button></div>`}
+        ${controls}
       </div>`;
     }).join("");
 
@@ -8041,6 +8061,7 @@ function robinhoodPageHTML({ spectator = false } = {}) {
 
 <script>
 // Access is gated site-wide by the server-side password (signed cookie), so the app loads directly.
+const rhApprovalReadOnly = ${spectator ? "true" : "false"};
 initApp();
 
 function initApp() {
@@ -8061,15 +8082,19 @@ async function loadApprovals() {
   try {
     const r = await fetch('/api/rh-status');
     const d = await r.json();
-    const rows = d.pendingOrders || [];
+    const rows = d.activeApprovals || d.pendingOrders || [];
     if (!rows.length) { el.innerHTML = '<div class="rh-empty">No decisions waiting for you</div>'; return; }
     el.innerHTML = rows.map(row => {
       const entry = row.kind === 'entry';
-      const label = entry ? 'BUY ENTRY' : 'SELL AT LOSS';
+      const label = (row.status === 'approved' ? 'APPROVED · ' : row.status === 'executing' ? 'SUBMITTING · ' : '') + (entry ? 'BUY ENTRY' : 'SELL AT LOSS');
       const detail = entry
         ? row.quantity+'x up to $'+Number(row.limitPrice).toFixed(2)+' · est. $'+Number(row.estimatedNotional || row.quantity*row.limitPrice*100).toFixed(0)
         : row.quantity+'x at $'+Number(row.limitPrice).toFixed(2)+' · est. net loss $'+Number(row.estimatedLossDollars || 0).toFixed(2)+' ('+Number(row.estimatedLossPct || 0).toFixed(1)+'%) · '+(row.reason || 'protective exit');
-      const controls = ${spectator ? "''" : "'<div style=\"display:flex;gap:6px\"><button class=\"rh-btn primary small\" onclick=\"approveDecision(\\\''+approvalSafe(row.id)+'\\\')\">Approve</button><button class=\"rh-btn danger small\" onclick=\"rejectDecision(\\\''+approvalSafe(row.id)+'\\\')\">Reject</button></div>'"};
+      const controls = rhApprovalReadOnly ? '' : row.status === 'pending'
+        ? '<div style="display:flex;gap:6px"><button class="rh-btn primary small" data-rh-approval-action="approve" data-rh-approval-id="'+approvalSafe(row.id)+'">Approve</button><button class="rh-btn danger small" data-rh-approval-action="reject" data-rh-approval-id="'+approvalSafe(row.id)+'">Reject</button></div>'
+        : row.status === 'approved'
+          ? '<div style="display:flex;gap:6px"><button class="rh-btn danger small" data-rh-approval-action="cancel" data-rh-approval-id="'+approvalSafe(row.id)+'">Cancel approval</button></div>'
+          : '';
       return '<div class="rh-pending-item"><div><div class="sym">'+label+' · '+approvalSafe(row.ticker)+'</div><div class="detail">'+approvalSafe(row.contractKey)+'<br>'+approvalSafe(detail)+'</div></div>'+controls+'</div>';
     }).join('');
   } catch (error) {
@@ -8090,6 +8115,22 @@ async function rejectDecision(id) {
   if (!r.ok) alert(d.error || 'Rejection failed');
   await loadApprovals();
 }
+
+async function cancelDecision(id) {
+  const r = await fetch('/api/rh-cancel-approval/'+encodeURIComponent(id), { method: 'POST' });
+  const d = await r.json();
+  if (!r.ok) alert(d.error || 'The approval could not be canceled; broker submission may already have started.');
+  await loadApprovals();
+}
+
+document.addEventListener('click', event => {
+  const button = event.target.closest('[data-rh-approval-action]');
+  if (!button) return;
+  const action = button.dataset.rhApprovalAction;
+  if (action === 'approve') approveDecision(button.dataset.rhApprovalId);
+  else if (action === 'cancel') cancelDecision(button.dataset.rhApprovalId);
+  else rejectDecision(button.dataset.rhApprovalId);
+});
 
 async function loadAccount() {
   const el = document.getElementById('account-data');
@@ -10197,6 +10238,19 @@ function startDashboard(defaultAcct, apiKey) {
       if (result.ok) {
         saveAccountsStrict();
         log(acct, `OPERATOR APPROVED ${result.approval.kind.toUpperCase()}: ${result.approval.ticker} ${result.approval.contractKey} — broker submission will revalidate price and buying power`);
+      }
+      res.writeHead(result.ok ? 200 : 409, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify(result.ok ? { ok: true, approval: result.approval } : { error: result.reason }));
+      return;
+    }
+
+    if (req.method === "POST" && pathname.startsWith("/api/rh-cancel-approval/")) {
+      const acct = accounts.get("robinhood");
+      const approvalId = decodeURIComponent(pathname.slice("/api/rh-cancel-approval/".length));
+      const result = acct ? cancelTradeApproval(acct.state, approvalId) : { ok: false, reason: "Robinhood account unavailable" };
+      if (result.ok) {
+        saveAccountsStrict();
+        log(acct, `OPERATOR CANCELED QUEUED ${result.approval.kind.toUpperCase()}: ${result.approval.ticker} ${result.approval.contractKey} — broker submission revoked`);
       }
       res.writeHead(result.ok ? 200 : 409, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       res.end(JSON.stringify(result.ok ? { ok: true, approval: result.approval } : { error: result.reason }));

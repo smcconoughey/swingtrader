@@ -6,6 +6,7 @@ import {
   LOSS_EXIT_APPROVAL,
   approveTradeApproval,
   beginApprovedTrade,
+  cancelTradeApproval,
   finishApprovedTrade,
   pendingTradeApprovals,
   rejectTradeApproval,
@@ -45,6 +46,23 @@ test("a higher entry price invalidates approval and creates a fresh request", ()
   assert.equal(next.approval.id, "new");
   assert.equal(next.authorized, false);
   assert.equal(state.tradeApprovals.find(row => row.id === "old").status, "expired");
+});
+
+test("an approved trade can be canceled while queued but not after submission starts", () => {
+  const queued = {};
+  requestTradeApproval(queued, entry(), { now: 100, idFactory: () => "cancel-me" });
+  approveTradeApproval(queued, "cancel-me", 200);
+  const canceled = cancelTradeApproval(queued, "cancel-me", 300);
+  assert.equal(canceled.ok, true);
+  assert.equal(canceled.approval.status, "rejected");
+  assert.equal(canceled.approval.resolutionReason, "operator canceled queued approval");
+  assert.equal(beginApprovedTrade(queued, entry(), 400).ok, false);
+
+  const submitting = {};
+  requestTradeApproval(submitting, entry(), { now: 100, idFactory: () => "too-late" });
+  approveTradeApproval(submitting, "too-late", 200);
+  beginApprovedTrade(submitting, entry(), 300);
+  assert.equal(cancelTradeApproval(submitting, "too-late", 301).ok, false);
 });
 
 test("loss approval authorizes the approved price or better, never a worse loss", () => {
