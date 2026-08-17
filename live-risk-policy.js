@@ -1,9 +1,8 @@
 /**
  * Live-broker config normalization.
  *
- * This layer backfills missing, visible controls only. Explicit settings are never silently
- * clamped or replaced: the dashboard shows them and the risk governor rejects invalid inputs with
- * a visible reason instead of running a different strategy than the operator selected.
+ * This layer backfills missing, visible controls. Versioned migrations may deliberately replace
+ * obsolete live defaults once; after migration, explicit settings remain operator-controlled.
  */
 
 export const CAPITAL_PRESERVATION_POLICY = Object.freeze({
@@ -35,15 +34,39 @@ export const LIVE_RISK_DEFAULTS = Object.freeze({
   maxConsecutiveLosses: CAPITAL_PRESERVATION_POLICY.maxConsecutiveLosses,
   maxDayTrades: CAPITAL_PRESERVATION_POLICY.maxDayTrades,
   minimumRewardRisk: 1.0,
-  liveEntriesEnabled: false,
+  liveEntriesEnabled: true,
   // Human-trader mode: evaluate every real opportunity, but keep execution atomic and bounded.
   // Portfolio loss telemetry remains visible; it no longer silently pauses the account.
-  traderCopilotVersion: 2,
-  automationMode: "profit_only",
+  traderCopilotVersion: 3,
+  automationMode: "operator_approval",
+  requireEntryApproval: true,
+  requireLossExitApproval: true,
   portfolioHaltsEnabled: false,
   opportunityLimitsEnabled: false,
   llmOpportunityMode: true,
   entrySizingMode: "one_contract",
+  strategyPreset: "quicktp",
+  dailyObjectivePct: 0.10,
+  profitTarget: 0.12,
+  stopLoss: -0.20,
+  trim1Pct: 0.12,
+  trim2Pct: 0.12,
+  singleContractBankPct: 0.12,
+  minimumRewardRisk: 0.35,
+  exitMode: "quick_bank",
+  adaptiveProfitTarget: true,
+  adaptiveTargetMinPct: 0.10,
+  adaptiveTargetMaxPct: 0.15,
+  adaptiveTargetFallbackPct: 0.12,
+  adaptiveTargetReachRate: 0.65,
+  adaptiveTargetLookback: 20,
+  adaptiveTargetMinSamples: 5,
+  profitLockArmPct: 0.08,
+  peakGivebackMin: 0.025,
+  peakGivebackFrac: 0.25,
+  positionManagementMs: 5_000,
+  useCashReserve: false,
+  maxTradeSize: null,
 });
 
 const finite = value => Number.isFinite(Number(value));
@@ -73,11 +96,13 @@ export function applyLiveRiskPolicy(account) {
   // One explicit migration for the Robinhood account. The old defaults made a normal option
   // contract mathematically impossible to buy, then paused the whole account for drawdowns.
   // This changes opportunity selection, not the broker/cash/duplicate-order safety boundary.
-  if (account.config.broker === "robinhood" && account.config.traderCopilotVersion !== 2) {
+  if (account.config.broker === "robinhood" && account.config.traderCopilotVersion !== 3) {
     const migration = {
-      traderCopilotVersion: 2,
-      automationMode: "profit_only",
-      liveEntriesEnabled: false,
+      traderCopilotVersion: 3,
+      automationMode: "operator_approval",
+      requireEntryApproval: true,
+      requireLossExitApproval: true,
+      liveEntriesEnabled: true,
       autoExecute: true,
       portfolioHaltsEnabled: false,
       opportunityLimitsEnabled: false,
@@ -85,6 +110,27 @@ export function applyLiveRiskPolicy(account) {
       entrySizingMode: "one_contract",
       useCashReserve: false,
       maxDayTrades: null,
+      strategyPreset: "quicktp",
+      dailyObjectivePct: 0.10,
+      profitTarget: 0.12,
+      stopLoss: -0.20,
+      trim1Pct: 0.12,
+      trim2Pct: 0.12,
+      singleContractBankPct: 0.12,
+      minimumRewardRisk: 0.35,
+      exitMode: "quick_bank",
+      adaptiveProfitTarget: true,
+      adaptiveTargetMinPct: 0.10,
+      adaptiveTargetMaxPct: 0.15,
+      adaptiveTargetFallbackPct: 0.12,
+      adaptiveTargetReachRate: 0.65,
+      adaptiveTargetLookback: 20,
+      adaptiveTargetMinSamples: 5,
+      profitLockArmPct: 0.08,
+      peakGivebackMin: 0.025,
+      peakGivebackFrac: 0.25,
+      positionManagementMs: 5_000,
+      maxTradeSize: null,
     };
     for (const [key, value] of Object.entries(migration)) {
       if (config[key] !== value) changes.push({ key, before: config[key], after: value });

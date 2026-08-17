@@ -25,6 +25,7 @@ test("quick profits atomically clears stale exit and reward-risk values", () => 
 
   assert.equal(config.broker, "robinhood");
   assert.equal(config.liveEntriesEnabled, true);
+  assert.equal(config.dailyObjectivePct, 0.10);
   assert.equal(config.profitTarget, 0.12);
   assert.equal(config.stopLoss, -0.20);
   assert.equal(config.trim1Pct, 0.12);

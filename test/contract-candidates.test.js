@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { buildCandidateContracts, entryLimitPrice } from "../option-contracts.js";
+import {
+  adaptiveSyntheticStrike,
+  buildCandidateContracts,
+  entryLimitPrice,
+  rankContractsForPosition,
+} from "../option-contracts.js";
 
 const NOW = new Date("2026-07-13T12:00:00-05:00").getTime();
 
@@ -73,4 +78,24 @@ test("entry limit remains between bid and ask and respects the overpay ceiling",
   assert.equal(entryLimitPrice(1, 1.20, 1.10, 0), 1.10);
   assert.equal(entryLimitPrice(1, 1.20, 1.10, 1), 1.20);
   assert.equal(entryLimitPrice(1, 2, 1.10, 1), 1.26);
+});
+
+test("position-specific ranking uses delta and volatility instead of a fixed strike offset", () => {
+  const candidates = [
+    { strike: 101, delta: 0.52, dte: 21, oi: 500, volume: 100, roundTripFrictionPct: 3, quality: 8, moneyness: 0.01 },
+    { strike: 98, delta: 0.66, dte: 28, oi: 500, volume: 100, roundTripFrictionPct: 3, quality: 8, moneyness: -0.02 },
+  ];
+  const noisy = rankContractsForPosition(candidates, {
+    optionType: "call", technicalScore: 62, setupQuality: 55, atrPct: 7,
+  });
+  assert.equal(noisy[0].strike, 98);
+  assert.ok(noisy[0].positionFitScore > noisy[1].positionFitScore);
+});
+
+test("synthetic strike depth adapts to spot, volatility, direction, and conviction", () => {
+  const calmCall = adaptiveSyntheticStrike({ spot: 100, optionType: "call", atrPct: 1, technicalScore: 90 });
+  const noisyCall = adaptiveSyntheticStrike({ spot: 100, optionType: "call", atrPct: 6, technicalScore: 60 });
+  const noisyPut = adaptiveSyntheticStrike({ spot: 100, optionType: "put", atrPct: 6, technicalScore: 40 });
+  assert.ok(noisyCall < calmCall);
+  assert.ok(noisyPut > 100);
 });

@@ -8,6 +8,66 @@ export const MAX_ENTRY_SPREAD_PCT = 0.30;
 export const MAX_ENTRY_OVERPAY_PCT = 0.15;
 export const MAX_ENTRY_IV = 1.50;
 
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+
+/**
+ * Re-rank already tradeable contracts for this specific setup. Strike depth is expressed through
+ * live delta, not a fixed percentage or dollar offset: weaker/noisier setups demand more intrinsic
+ * value, while stronger clean setups may sit closer to ATM. DTE similarly expands with volatility.
+ */
+export function positionContractScore(contract, context = {}) {
+  const technicalScore = finite(context.technicalScore, 50);
+  const directionalConviction = context.optionType === "put"
+    ? clamp((50 - technicalScore) / 50, 0, 1)
+    : clamp((technicalScore - 50) / 50, 0, 1);
+  const setupConviction = clamp(finite(context.setupQuality, 50) / 100, 0, 1);
+  const conviction = clamp(0.55 * directionalConviction + 0.45 * setupConviction, 0, 1);
+  const atrPct = clamp(finite(context.atrPct, 2), 0, 12);
+  const volatility = clamp(atrPct / 8, 0, 1);
+
+  // More uncertainty/volatility => deeper ITM (higher absolute delta). Strong clean evidence can
+  // use an ATM contract without paying for unnecessary intrinsic value.
+  const targetDelta = clamp(0.66 - conviction * 0.10 + volatility * 0.04, 0.54, 0.70);
+  const targetDte = clamp(21 + Math.round(volatility * 9) + Math.round((1 - conviction) * 4), 18, 35);
+  const delta = Math.abs(finite(contract?.delta, 0));
+  const dte = finite(contract?.dte, targetDte);
+  const spreadPct = finite(contract?.roundTripFrictionPct, finite(contract?.spreadPct, 100));
+  const activity = finite(contract?.oi) + finite(contract?.volume);
+  const moneyness = finite(contract?.moneyness, 0);
+
+  const execution = clamp((15 - spreadPct) / 13, 0, 1) * 35;
+  const liquidity = clamp(Math.log10(Math.max(1, activity + 1)) / 4, 0, 1) * 20;
+  const deltaFit = clamp(1 - Math.abs(delta - targetDelta) / 0.20, 0, 1) * 25;
+  const dteFit = clamp(1 - Math.abs(dte - targetDte) / 20, 0, 1) * 15;
+  const otmPenalty = Math.max(0, moneyness) * 100 * 2;
+  const sourceQuality = clamp(finite(contract?.quality), -10, 20) * 0.25;
+  return execution + liquidity + deltaFit + dteFit + sourceQuality - otmPenalty;
+}
+
+export function rankContractsForPosition(candidates = [], context = {}) {
+  return [...candidates]
+    .map(contract => ({
+      ...contract,
+      positionFitScore: positionContractScore(contract, context),
+    }))
+    .sort((a, b) => b.positionFitScore - a.positionFitScore
+      || a.roundTripFrictionPct - b.roundTripFrictionPct
+      || b.oi + b.volume - (a.oi + a.volume));
+}
+
+export function adaptiveSyntheticStrike({ spot, optionType, atrPct = 2, technicalScore = 50 } = {}) {
+  if (!(spot > 0)) return 0;
+  const interval = spot < 25 ? 0.5 : spot < 50 ? 1 : spot < 200 ? 2.5 : spot < 500 ? 5 : 10;
+  const directionalConviction = optionType === "put"
+    ? clamp((50 - finite(technicalScore, 50)) / 50, 0, 1)
+    : clamp((finite(technicalScore, 50) - 50) / 50, 0, 1);
+  const expectedMove = spot * clamp(finite(atrPct, 2) / 100, 0.005, 0.08);
+  const intrinsicBuffer = expectedMove * (0.65 - 0.30 * directionalConviction);
+  const raw = optionType === "put" ? spot + intrinsicBuffer : spot - intrinsicBuffer;
+  return +(Math.round(raw / interval) * interval).toFixed(2);
+}
+
 export function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 12, now = Date.now()) {
   const typeKey = type.toUpperCase();
   const candidates = [];
@@ -82,6 +142,8 @@ export function buildCandidateContracts(chain, type, spotPrice, maxCandidates = 
         spread,
         spreadPct: +(spreadPct * 100).toFixed(1),
         roundTripFrictionPct: +(roundTripFrictionPct * 100).toFixed(1),
+        moneyness,
+        moneynessPct: +(moneyness * 100).toFixed(2),
         feeDragPct: +(feeDragPct * 100).toFixed(1),
         quality,
       });

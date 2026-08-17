@@ -30,8 +30,10 @@ test("explicit live settings are never silently rewritten", () => {
   assert.equal(config.maxPositions, 6);
   assert.equal(config.useCashReserve, false);
   assert.equal(config.learningEnabled, true);
-  assert.equal(config.liveEntriesEnabled, false);
-  assert.equal(config.automationMode, "profit_only");
+  assert.equal(config.liveEntriesEnabled, true);
+  assert.equal(config.automationMode, "operator_approval");
+  assert.equal(config.requireEntryApproval, true);
+  assert.equal(config.requireLossExitApproval, true);
   assert.ok(changes.length > 0);
 });
 
@@ -49,7 +51,7 @@ test("quick-profit values remain exactly as configured", () => {
   assert.equal(config.dailyLossLimitPct, 0.01);
   assert.equal(config.stopLoss, -0.10);
   assert.equal(config.profitTarget, 0.10);
-  assert.equal(config.liveEntriesEnabled, false);
+  assert.equal(config.liveEntriesEnabled, true);
 });
 
 test("allocation, reserve, and even invalid explicit values remain visible rather than silently clamped", () => {
@@ -77,7 +79,7 @@ test("paper accounts are not rewritten by the live policy", () => {
   assert.equal(account.config.useCashReserve, false);
 });
 
-test("legacy Robinhood account migrates once to analysis plus profit-only execution", () => {
+test("legacy Robinhood account migrates once to quick-profit operator approval", () => {
   const account = {
     config: {
       broker: "robinhood",
@@ -87,16 +89,24 @@ test("legacy Robinhood account migrates once to analysis plus profit-only execut
   };
   const changes = applyLiveRiskPolicy(account);
 
-  assert.equal(account.config.traderCopilotVersion, 2);
-  assert.equal(account.config.automationMode, "profit_only");
-  assert.equal(account.config.liveEntriesEnabled, false);
+  assert.equal(account.config.traderCopilotVersion, 3);
+  assert.equal(account.config.automationMode, "operator_approval");
+  assert.equal(account.config.liveEntriesEnabled, true);
   assert.equal(account.config.autoExecute, true);
+  assert.equal(account.config.requireEntryApproval, true);
+  assert.equal(account.config.requireLossExitApproval, true);
   assert.equal(account.config.entrySizingMode, "one_contract");
   assert.equal(account.config.portfolioHaltsEnabled, false);
   assert.equal(account.config.opportunityLimitsEnabled, false);
   assert.equal(account.config.llmOpportunityMode, true);
   assert.equal(account.config.useCashReserve, false);
   assert.equal(account.config.maxDayTrades, null);
+  assert.equal(account.config.strategyPreset, "quicktp");
+  assert.equal(account.config.dailyObjectivePct, 0.10);
+  assert.equal(account.config.profitTarget, 0.12);
+  assert.equal(account.config.stopLoss, -0.20);
+  assert.equal(account.config.adaptiveProfitTarget, true);
+  assert.equal(account.config.maxTradeSize, null);
   assert.ok(changes.length > 0);
 
   assert.deepEqual(applyLiveRiskPolicy(account), []);
