@@ -1,4 +1,6 @@
 export const QUICK_PROFIT_CONFIG = Object.freeze({
+  // Measurement target only. It never relaxes affordability, contract quality, or approval rules.
+  dailyObjectivePct: 0.10,
   profitTarget: 0.12,
   stopLoss: -0.20,
   trim1Pct: 0.12,

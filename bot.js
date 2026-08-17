@@ -21,12 +21,12 @@ import {
 import {
   FEE_PER_CONTRACT,
   MIN_OPTION_DELTA,
-  PREFERRED_DELTA_MIN,
-  PREFERRED_DELTA_MAX,
   MAX_ENTRY_SPREAD_PCT,
   MAX_ENTRY_OVERPAY_PCT,
+  adaptiveSyntheticStrike,
   buildCandidateContracts,
   entryLimitPrice,
+  rankContractsForPosition,
 } from "./option-contracts.js";
 import {
   EXIT_INFLIGHT_GRACE_MS,
@@ -61,6 +61,16 @@ import {
   diffRobinhoodTradeHistory,
   extractRobinhoodPortfolioFields,
 } from "./robinhood-portfolio.js";
+import {
+  ENTRY_APPROVAL,
+  LOSS_EXIT_APPROVAL,
+  approveTradeApproval,
+  beginApprovedTrade,
+  finishApprovedTrade,
+  pendingTradeApprovals,
+  rejectTradeApproval,
+  requestTradeApproval,
+} from "./trade-approvals.js";
 import {
   clearEntryOrderTracking,
   entryIntentSatisfiedByHolding,
@@ -867,10 +877,6 @@ let LLM_PROVIDER = (process.env.LLM_PROVIDER || "claude").toLowerCase();
 
 // Robinhood execution is per-account (config.broker = "robinhood"), just like Tradier.
 
-// The old in-memory Robinhood "approval queue" was not durable or broker-backed. Keep the env
-// flag only as a fail-closed compatibility switch: when enabled, all new live entries are blocked.
-let RH_REQUIRE_APPROVAL = process.env.RH_REQUIRE_APPROVAL === "true";
-
 // RH_OPTIONS_ONLY: when true (default), Robinhood trades options only — no equity share fallback.
 // Set RH_OPTIONS_ONLY=false to allow equity fallback when options chain is unavailable.
 let RH_OPTIONS_ONLY = process.env.RH_OPTIONS_ONLY !== "false";
@@ -946,8 +952,11 @@ async function addRhWatchlistCandidate({ ticker, optionType, candidate, source =
 }
 
 
-// RH_MAX_POSITION_DOLLARS: Maximum dollar amount per Robinhood equity position (safety limit)
-const RH_MAX_POSITION_DOLLARS = parseInt(process.env.RH_MAX_POSITION_DOLLARS) || 500;
+// Optional operator ceiling. With no explicit env value, authoritative Robinhood buying power is
+// the affordability boundary; one-contract mode still prevents leverage from multiplying quantity.
+const configuredRhPositionCap = Number(process.env.RH_MAX_POSITION_DOLLARS);
+const RH_MAX_POSITION_DOLLARS = Number.isFinite(configuredRhPositionCap) && configuredRhPositionCap > 0
+  ? configuredRhPositionCap : Infinity;
 
 // ─── Default Account Config ───
 
@@ -1021,6 +1030,7 @@ function createAccountRuntime(id, name, config, state) {
       cash: brokerBinding.config.startingCash || DEFAULT_CONFIG.startingCash,
       positions: [],
       history: [],
+      tradeApprovals: [],
 
     },
     dashboard: {
@@ -1071,7 +1081,7 @@ const LEARNING_VARIANTS = [
   {
     key: "quicktp",
     name: "Quick profits",
-    desc: "Adaptive bank +10–15% / profit lock / stop -20% / risk 2% equity / max 2 entries",
+    desc: "10% daily measurement objective / adaptive bank +10–15% / profit lock / stop -20% / one best affordable contract",
     tweak: QUICK_PROFIT_CONFIG,
   },
   { key: "runner", name: "Let it run", desc: "TP +80%, trims +30%/+60%", tweak: { profitTarget: 0.80, trim1Pct: 0.30, trim2Pct: 0.60, singleContractBankPct: 0.80, minimumRewardRisk: 1.5, exitMode: "runner" } },
@@ -1135,10 +1145,11 @@ const CAPITAL_PRESERVATION_TRACK = {
 };
 
 function liveStrategyPresets() {
+  const quickProfit = LEARNING_VARIANTS.find(item => item.key === "quicktp");
   return [
-    ...LEARNING_VARIANTS,
+    quickProfit,
     CAPITAL_PRESERVATION_TRACK,
-  ];
+  ].filter(Boolean);
 }
 
 function strategyConfigFor(currentConfig, key) {
@@ -3421,6 +3432,7 @@ function recordTradeOutcome(acct, pnlDollar) {
 // Entry-time gate. Returns a human-readable reason when new entries are blocked, else null.
 function riskBreakerStatus(acct) {
   const cfg = acct.config;
+  if (cfg.portfolioHaltsEnabled === false) return null;
   const pv = portfolioValue(acct.state, acct.dashboard?.quotes || {});
   const r = ensureRiskState(acct, pv);
 
@@ -3494,9 +3506,6 @@ function liveEntryCommitBlock(acct, entryEpoch = null) {
   if (broker === "robinhood" && acct.state?.brokerHealth?.status === "disconnected") {
     return "Robinhood health probe is failing";
   }
-  if (broker === "robinhood" && RH_REQUIRE_APPROVAL) {
-    return "Robinhood manual-approval mode has no durable broker queue; use observation mode instead";
-  }
   return null;
 }
 
@@ -3505,6 +3514,7 @@ function liveEntryCommitBlock(acct, entryEpoch = null) {
 // exits but nothing new opens until manually resumed.
 function evaluateRiskHalts(acct, pv) {
   const cfg = acct.config;
+  if (cfg.portfolioHaltsEnabled === false) return;
   const r = ensureRiskState(acct, pv);
   if (!(pv > 0)) return;
   const dayPnlPct = r.dayStartPV > 0 ? (pv - r.dayStartPV) / r.dayStartPV : 0;
@@ -4266,7 +4276,9 @@ async function validateEntryWithClaude(acct, ticker, quote, analysis, setupQuali
       return `${num} | ${exp}      | ${dte} | ${strike} | ${mid} | ${iv} | ${delta} | ${oi} | ${vol} | ${spread}`;
     }).join('\n');
     contractSection = `\nReal options chain (${candidates.length} pre-vetted near-the-money / ITM contracts — all δ≥${MIN_OPTION_DELTA}, no far-OTM lottery tickets):\n${header}\n${rows}`;
-    contractInstruction = `\nSelect the best contract index (1-${candidates.length}). These are all real, near-the-money directional contracts — prefer the ATM-to-slightly-ITM strike (δ${PREFERRED_DELTA_MIN}-${PREFERRED_DELTA_MAX}) with the best liquidity and tightest spread. Only approve if this is a genuinely high-conviction setup worth real capital; we trade infrequently and only take trades likely to win — when in doubt, PASS.`;
+    const spendCap = Math.max(0, Math.min(acct.state?.cash || 0, cfg.maxTradeSize || Infinity,
+      cfg.broker === "robinhood" ? RH_MAX_POSITION_DOLLARS : Infinity));
+    contractInstruction = `\nContract #1 is the system's position-specific best fit after ranking live friction, liquidity, delta, DTE, volatility, and setup conviction. Evaluate that exact contract and return contractIdx 1. Its estimated one-contract cost must fit the $${spendCap.toFixed(0)} broker-buying-power boundary. Approve when the evidence supports positive expected value; explain uncertainty instead of rejecting merely because the setup is imperfect. The system will never substitute a cheaper contract.`;
   } else if (isEquity) {
     contractSection = '\nThis is an EQUITY (shares) trade — no options contracts. Evaluate whether buying shares at the current price is a good swing entry.';
   } else {
@@ -4613,10 +4625,19 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
   const spot = quote.c;
   // Legacy `riskPct` is an allocation fraction, not risk. Keep it only as a regime-scaled
   // affordability ceiling; the risk governor below sizes from loss at the stop.
-  const maxAllocationBudget = state.cash * acct.riskPct;
+  const oneContractMode = cfg.broker === "robinhood"
+    && cfg.entrySizingMode === "one_contract"
+    && rhTradeMode(cfg) !== "equity";
+  const maxAllocationBudget = oneContractMode ? state.cash : state.cash * acct.riskPct;
   const direction = isBullish ? "BULLISH" : "BEARISH";
   let type = isBullish ? "call" : "put";
   const entryExitConfig = managementConfigForNewEntry(acct, type);
+  const contractFitContext = {
+    optionType: type,
+    technicalScore: analysis.score,
+    setupQuality: effectiveQuality,
+    atrPct: analysis.atrPct,
+  };
 
   // ─── Step 1: Check validation cache (skips both chain fetch AND Claude call) ───
   let claudeResult = { approve: true, confidence: 70, concerns: [], reasoning: "", suggestion: "", contractIdx: 0 };
@@ -4642,15 +4663,14 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
           if (chain) setCachedChain(ticker, chain);
         }
         if (chain) {
-          candidates = removeEarningsCrossingContracts(buildCandidateContracts(chain, type, spot, 15), earningsInfo);
-          // Validation may stay cached for 30 minutes, but its contract quote must not. Remap the
-          // approved strike/expiry onto the freshly built chain so bid/ask/mid are current.
-          if (selectedCandidate) {
-            const approved = selectedCandidate;
-            selectedCandidate = candidates.find(c =>
-              c.expiryStr === approved.expiryStr && Math.abs(c.strike - approved.strike) < 0.001
-            ) || candidates[cached.result?.contractIdx ?? 0] || candidates[0] || null;
-          }
+          const built = removeEarningsCrossingContracts(
+            buildCandidateContracts(chain, type, spot, 15),
+            earningsInfo,
+          );
+          // Keep the pre-Jarvis market/earnings analysis, but re-rank the current live contracts
+          // for this exact position instead of reusing a stale strike choice.
+          candidates = rankContractsForPosition(built, contractFitContext);
+          selectedCandidate = candidates[0] || null;
         }
       } catch (e) {
         log(acct, `OPTIONS ${ticker}: cached affordability refresh failed — ${e.message}`);
@@ -4668,7 +4688,11 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
           if (chain) setCachedChain(ticker, chain);
         }
         if (chain) {
-          candidates = removeEarningsCrossingContracts(buildCandidateContracts(chain, type, spot, 15), earningsInfo);
+          candidates = removeEarningsCrossingContracts(
+            buildCandidateContracts(chain, type, spot, 15),
+            earningsInfo,
+          );
+          candidates = rankContractsForPosition(candidates, contractFitContext);
           log(acct, `OPTIONS ${ticker}: ${candidates.length} viable ${type} contracts (${chain.length} expiries)`);
         }
       } catch (e) {
@@ -4682,26 +4706,19 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
     // the target DTE and approve on the gates that already passed above.
     if (acct.learning) {
       claudeResult = { approve: true, confidence: 60, concerns: [], reasoning: "Learning variant — deterministic entry, no LLM validation", suggestion: "", contractIdx: 0 };
-      selectedCandidate = candidates.length > 0
-        ? [...candidates].sort((a, b) => Math.abs(a.dte - TARGET_DTE) - Math.abs(b.dte - TARGET_DTE))[0]
-        : null;
+      selectedCandidate = candidates[0] || null;
       if (!selectedCandidate) {
         return { skipped: true, reason: "Learning variant: no real-chain contract available — synthetic entries disabled" };
       }
     } else {
     try {
       claudeResult = await validateEntryWithClaude(acct, ticker, quote, analysis, setupQuality, earningsInfo, regime, rhUsesOptionsForEntry(cfg) ? candidates : null, effectiveQuality);
-      selectedCandidate = candidates.length > 0 ? candidates[claudeResult.contractIdx ?? 0] : null;
-      // Stagger expirations: if Claude's pick lands on an over-concentrated expiry, prefer an
-      // equally-valid candidate on a less-crowded expiration date.
-      if (selectedCandidate && countPositionsAtExpiry(state, selectedCandidate.expiryDate) >= MAX_PER_EXPIRY) {
-        const alt = candidates
-          .filter(c => countPositionsAtExpiry(state, c.expiryDate) < MAX_PER_EXPIRY)
-          .sort((a, b) => Math.abs(a.dte - TARGET_DTE) - Math.abs(b.dte - TARGET_DTE))[0];
-        if (alt) {
-          log(acct, `DTE STAGGER ${ticker}: ${selectedCandidate.expiryStr} over-concentrated — switching to ${alt.expiryStr} (${alt.dte}d)`);
-          selectedCandidate = alt;
-        }
+      selectedCandidate = candidates[0] || null;
+      // Do not substitute a lower-ranked expiry behind the operator's back. If today's best exact
+      // contract is already over-concentrated, skip the setup and wait for a clean package.
+      if (selectedCandidate
+          && countPositionsAtExpiry(state, selectedCandidate.expiryDate) >= MAX_PER_EXPIRY) {
+        return { skipped: true, reason: `Best contract expiry ${selectedCandidate.expiryStr} already has ${MAX_PER_EXPIRY} positions — refusing a lower-ranked substitution` };
       }
       setCachedValidation(acct.id, ticker, analysis.score, direction, claudeResult, selectedCandidate, validationContext);
       log(acct, `CLAUDE VALIDATE ${ticker}: ${claudeResult.approve ? 'APPROVED' : 'REJECTED'} (${claudeResult.confidence}%)${selectedCandidate ? ` → $${selectedCandidate.strike} ${selectedCandidate.expiryStr} (${selectedCandidate.dte}d)` : ''} — ${claudeResult.suggestion}${claudeResult.concerns?.length ? ' | ' + claudeResult.concerns.join(', ') : ''}`);
@@ -4745,14 +4762,16 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
     regime,
   });
   let deployable, reservePct;
-  if (cfg.useCashReserve === false) {
+  if (oneContractMode || cfg.useCashReserve === false) {
     deployable = state.cash;
     reservePct = 0;
   } else {
     ({ deployable, reservePct } = deployableCash(state, pv, trust));
   }
-  const maxSize = cfg.maxTradeSize || 500;
-  const maxContractCost = Math.min(maxAllocationBudget, deployable, maxSize);
+  const maxSize = Number.isFinite(Number(cfg.maxTradeSize)) && Number(cfg.maxTradeSize) > 0
+    ? Number(cfg.maxTradeSize) : Infinity;
+  const maxContractCost = Math.min(maxAllocationBudget, deployable, maxSize,
+    cfg.broker === "robinhood" ? RH_MAX_POSITION_DOLLARS : Infinity);
 
   let strike = 0, dte = 0, expiryDate = 0, premium = 0, posIv = 0, optionsSource = "robinhood";
   let costPer = 0;
@@ -4766,7 +4785,9 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
     unitName = "share";
   } else {
     const originalCandidate = selectedCandidate;
-    selectedCandidate = chooseAffordableCandidate(candidates, selectedCandidate, maxContractCost, acct);
+    selectedCandidate = oneContractMode
+      ? (selectedCandidate?.mid > 0 && selectedCandidate.mid * 100 <= maxContractCost ? selectedCandidate : null)
+      : chooseAffordableCandidate(candidates, selectedCandidate, maxContractCost, acct);
     if (expectedPackage?.contract) {
       const expected = expectedPackage.contract;
       const sameContract = selectedCandidate
@@ -4775,6 +4796,9 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
       if (!sameContract) {
         return { skipped: true, reason: `Ranked contract ${expected.expiryStr} $${expected.strike} is no longer the executable package — refusing an unranked substitution` };
       }
+    }
+    if (oneContractMode && originalCandidate && !selectedCandidate) {
+      return { skipped: true, reason: `Best contract costs $${(originalCandidate.mid * 100).toFixed(0)}, above the $${maxContractCost.toFixed(0)} buying-power boundary — refusing a cheaper substitute` };
     }
     if (selectedCandidate && originalCandidate && selectedCandidate !== originalCandidate) {
       contractDowngraded = {
@@ -4854,10 +4878,10 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
   }
 
   const budget = Math.min(maxAllocationBudget, deployable, maxSize);
-  let qty = Math.max(1, Math.floor(budget / sizingCostPer));
+  let qty = oneContractMode ? 1 : Math.max(1, Math.floor(budget / sizingCostPer));
   let totalCost = qty * sizingCostPer;
 
-  const governedOptionSizing = !isRhEquityOnly && type !== "equity"
+  const governedOptionSizing = !oneContractMode && !isRhEquityOnly && type !== "equity"
     && (["tradier", "robinhood"].includes(cfg.broker) || Number.isFinite(cfg.riskPerTradePct));
   const optionRiskDecisionFor = (entryPrice, bid, ask) => {
     const spread = bid > 0 && ask >= bid ? ask - bid : 0;
@@ -5027,6 +5051,7 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
 
       const expStr = selectedCandidate.expiryStr || new Date(expiryDate).toISOString().slice(0, 10);
       const occ = robinhood.buildOCC(ticker, expStr, type, strike);
+      let operatorEntryApproval = null;
 
       try {
         const conviction = Math.max(0, Math.min(1, (claudeResult.confidence || 0) / 100));
@@ -5071,6 +5096,43 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
             setupQuality: effectiveQuality, claudeConfidence: claudeResult.confidence,
             trust, selectedCandidate, optionsSource, maxBudget: budget,
           });
+        }
+
+        if (cfg.requireEntryApproval === true) {
+          const approvalProposal = {
+            kind: ENTRY_APPROVAL,
+            accountId: acct.id,
+            ticker,
+            contractKey: occ,
+            quantity: qty,
+            limitPrice: limit,
+            optionType: type,
+            strike,
+            expirationDate: expStr,
+            dte,
+            estimatedNotional: +(qty * limit * 100).toFixed(2),
+            setupQuality: effectiveQuality,
+            modelConfidence: claudeResult.confidence,
+            thesis: claudeResult.suggestion || claudeResult.reasoning || "",
+          };
+          const requestedApproval = requestTradeApproval(state, approvalProposal);
+          operatorEntryApproval = requestedApproval.approval;
+          if (requestedApproval.rejected) {
+            return { approvalRejected: true, skipped: true, reason: `You rejected ${qty}x ${occ}; suppressing the same proposal until it expires or materially changes` };
+          }
+          if (!requestedApproval.authorized) {
+            saveAccountsStrict();
+            if (requestedApproval.created) {
+              const message = `${ticker} ${type.toUpperCase()} $${strike} ${expStr} · ${qty}x up to $${limit.toFixed(2)} ($${(qty * limit * 100).toFixed(0)})`;
+              log(acct, `ENTRY APPROVAL REQUIRED: ${message} — no broker order submitted`);
+              sendPush(`Approve entry [${acct.name}]`, message, true).catch(() => {});
+            }
+            return {
+              approvalPending: true,
+              reason: `Awaiting your approval for ${qty}x ${occ} up to $${limit.toFixed(2)}`,
+              approval: requestedApproval.approval,
+            };
+          }
         }
 
         // Write meta AFTER limit is computed so entryPremium matches what we actually sent.
@@ -5127,6 +5189,38 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
           acct._inflightTickers.delete(ticker.toUpperCase());
           return { skipped: true, reason: `Robinhood commit blocked: ${commitBlock}` };
         }
+        const finalBuyingPower = Number(state.cash);
+        const finalAffordability = Math.min(
+          Number.isFinite(finalBuyingPower) ? finalBuyingPower : 0,
+          maxSize,
+          RH_MAX_POSITION_DOLLARS,
+        );
+        const finalNotional = qty * limit * 100;
+        if (!(finalNotional <= finalAffordability)) {
+          clearEntryOrderTracking(acct.state.meta[occ]);
+          acct._inflightTickers.delete(ticker.toUpperCase());
+          return {
+            skipped: true,
+            reason: `Robinhood commit blocked: $${finalNotional.toFixed(2)} order exceeds refreshed $${finalAffordability.toFixed(2)} buying-power boundary`,
+          };
+        }
+        if (operatorEntryApproval) {
+          const begun = beginApprovedTrade(state, {
+            kind: ENTRY_APPROVAL,
+            accountId: acct.id,
+            ticker,
+            contractKey: occ,
+            quantity: qty,
+            limitPrice: limit,
+          });
+          if (!begun.ok) {
+            clearEntryOrderTracking(acct.state.meta[occ]);
+            acct._inflightTickers.delete(ticker.toUpperCase());
+            return { skipped: true, reason: `Robinhood commit blocked: ${begun.reason}` };
+          }
+          operatorEntryApproval = begun.approval;
+          acct.state.meta[occ].operatorEntryApprovalId = begun.approval.id;
+        }
         // The intent/ref must survive a process restart before the network request can reach the
         // broker. A failed durable write aborts placement; an in-memory lock is not sufficient.
         saveAccountsStrict();
@@ -5151,6 +5245,12 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
         // cancel and walk away if the price runs — instead of sitting stale all day.
         acct.state.meta[occ].entryOrderId = brokerOrderId(res);
         if (!acct.state.meta[occ].entryOrderId) acct.state.meta[occ].entrySubmissionUnknownAt = Date.now();
+        if (operatorEntryApproval) {
+          finishApprovedTrade(state, operatorEntryApproval.id, {
+            ok: true,
+            reason: acct.state.meta[occ].entryOrderId ? "submitted to broker" : "submission status unknown; quarantined",
+          });
+        }
         saveAccountsStrict();
         log(acct, `ROBINHOOD OPTION ENTRY: BUY ${qty}x ${occ} @ $${limit.toFixed(2)} (${aggrLabel}; conviction ${(conviction * 100).toFixed(0)}%; bid ${bid ?? "?"}/ask ${ask ?? "?"}/mid ${premium}) — order ${res?.id || JSON.stringify(res).slice(0, 80)}`);
 
@@ -5166,10 +5266,19 @@ async function tryEntry(acct, ticker, analysis, quote, regime, apiKey, { preflig
       } catch (e) {
         const entryMeta = acct.state.meta[occ];
         if (e.brokerRejected) {
+          if (operatorEntryApproval) {
+            finishApprovedTrade(state, operatorEntryApproval.id, { ok: false, reason: e.message });
+          }
           delete acct.state.meta[occ];
           acct._inflightTickers?.delete(ticker.toUpperCase());
           log(acct, `ROBINHOOD OPTION ENTRY REJECTED ${ticker}: ${e.message}`);
           return { skipped: true, reason: `Robinhood option entry rejected: ${e.message}`, watchlistCandidate: selectedCandidate, watchlistType: type };
+        }
+        if (operatorEntryApproval) {
+          finishApprovedTrade(state, operatorEntryApproval.id, {
+            ok: true,
+            reason: "submission status unknown; quarantined for broker reconciliation",
+          });
         }
         if (entryMeta) entryMeta.entrySubmissionUnknownAt = Date.now();
         log(acct, `ROBINHOOD OPTION ENTRY STATUS UNKNOWN ${ticker}: ${e.message} — retaining ref/lock; no duplicate order will be sent`);
@@ -5282,9 +5391,15 @@ async function tryEntryForSim(acct, ticker, analysis, quote, regime, useClaude) 
   const maxRisk = state.cash * acct.riskPct;
   let type, strike;
   if (analysis.score >= cfg.bullEntry) {
-    type = "call"; strike = Math.round(spot / 5) * 5 + 5;
+    type = "call";
+    strike = adaptiveSyntheticStrike({
+      spot, optionType: type, atrPct: analysis.atrPct, technicalScore: analysis.score,
+    });
   } else if (analysis.score <= cfg.bearEntry) {
-    type = "put"; strike = Math.round(spot / 5) * 5 - 5;
+    type = "put";
+    strike = adaptiveSyntheticStrike({
+      spot, optionType: type, atrPct: analysis.atrPct, technicalScore: analysis.score,
+    });
   } else { return null; }
 
   // Pick an expiry from the ticker's cadence near TARGET_DTE, staggered off crowded expirations.
@@ -5430,6 +5545,7 @@ async function closePosition(acct, pos, currentPremium, reason, qtyToClose, exec
 
       const isTrimLocal = qty < pos.qty;
       const refId = crypto.randomUUID();
+      let operatorLossApproval = null;
 
       if (robinhood.optionsEnabled) {
         // Options exit — sell_to_close
@@ -5524,6 +5640,61 @@ async function closePosition(acct, pos, currentPremium, reason, qtyToClose, exec
           const requestedTrimLevel = execution.reasonCode === "TRIM_1" ? 1
             : execution.reasonCode === "TRIM_2" ? 2
               : execution.reasonCode === "EMA8_TRIM" ? 3 : null;
+          if (isTrimLocal && requestedTrimLevel != null
+              && exitMeta.trimPendingLevel === requestedTrimLevel
+              && exitMeta.trimPendingTargetQty > 0) {
+            qty = Math.min(qty, Math.max(0,
+              exitMeta.trimPendingTargetQty - (exitMeta.trimPendingFilledQty || 0)));
+          }
+          if (!(qty > 0)) {
+            acct._inflightTickers.delete(pos.ticker.toUpperCase());
+            log(acct, `ROBINHOOD OPTION EXIT BLOCKED: ${pos.ticker} requested exit quantity is already reconciled`);
+            return null;
+          }
+
+          const estimatedExitNetPnl = qty * (limit - pos.entryPremium) * 100
+            - qty * 2 * FEE_PER_CONTRACT;
+          if (acct.config.requireLossExitApproval === true && estimatedExitNetPnl < 0) {
+            const approvalProposal = {
+              kind: LOSS_EXIT_APPROVAL,
+              accountId: acct.id,
+              ticker: pos.ticker,
+              contractKey: occKey,
+              quantity: qty,
+              limitPrice: limit,
+              optionType: pos.type,
+              strike: pos.strike,
+              expirationDate: expStr,
+              entryPremium: pos.entryPremium,
+              estimatedLossPct: +(((limit - pos.entryPremium) / pos.entryPremium) * 100).toFixed(1),
+              estimatedLossDollars: +Math.abs(estimatedExitNetPnl).toFixed(2),
+              reason,
+              reasonCode: execution.reasonCode || null,
+            };
+            const requestedApproval = requestTradeApproval(state, approvalProposal);
+            operatorLossApproval = requestedApproval.approval;
+            if (requestedApproval.rejected) {
+              acct._inflightTickers.delete(pos.ticker.toUpperCase());
+              return null;
+            }
+            if (!requestedApproval.authorized) {
+              acct._inflightTickers.delete(pos.ticker.toUpperCase());
+              saveAccountsStrict();
+              if (requestedApproval.created) {
+                const message = `${pos.ticker} ${pos.type.toUpperCase()} $${pos.strike} · ${qty}x at $${limit.toFixed(2)} (${approvalProposal.estimatedLossPct}%) · ${reason}`;
+                log(acct, `LOSS EXIT APPROVAL REQUIRED: ${message} — no broker order submitted`);
+                sendPush(`Approve loss exit [${acct.name}]`, message, true).catch(() => {});
+              }
+              return null;
+            }
+            const begun = beginApprovedTrade(state, approvalProposal);
+            if (!begun.ok) {
+              acct._inflightTickers.delete(pos.ticker.toUpperCase());
+              log(acct, `ROBINHOOD OPTION EXIT BLOCKED: ${pos.ticker} ${begun.reason}`);
+              return null;
+            }
+            operatorLossApproval = begun.approval;
+          }
           if (isTrimLocal && requestedTrimLevel != null) {
             if (exitMeta.trimPendingLevel === requestedTrimLevel && exitMeta.trimPendingTargetQty > 0) {
               const remainingTrimQty = Math.max(0, exitMeta.trimPendingTargetQty - (exitMeta.trimPendingFilledQty || 0));
@@ -5557,6 +5728,7 @@ async function closePosition(acct, pos, currentPremium, reason, qtyToClose, exec
             exitTrimTargetLevel: requestedTrimLevel,
             exitStaleAfterMs: execution.urgency === "urgent" ? 15_000
               : execution.urgency === "protective" ? 20_000 : 3 * 60_000,
+            operatorLossApprovalId: operatorLossApproval?.id || null,
           });
           // Intent/ref must survive a process restart before the network request can reach the broker.
           saveAccountsStrict();
@@ -5582,12 +5754,28 @@ async function closePosition(acct, pos, currentPremium, reason, qtyToClose, exec
             log(acct, `ROBINHOOD OPTION EXIT: SELL ${qty}x ${occ} @ $${limit} (${isTrimLocal ? "TRIM" : "EXIT"} — ${reason}) — order ${res?.id || "?"}`);
             exitMeta.exitOrderId = brokerOrderId(res);
             if (!exitMeta.exitOrderId) exitMeta.exitSubmissionUnknownAt = Date.now();
+            if (operatorLossApproval) {
+              finishApprovedTrade(state, operatorLossApproval.id, {
+                ok: true,
+                reason: exitMeta.exitOrderId ? "submitted to broker" : "submission status unknown; quarantined",
+              });
+            }
+            saveAccountsStrict();
           } catch (e) {
             if (e.brokerRejected) {
+              if (operatorLossApproval) {
+                finishApprovedTrade(state, operatorLossApproval.id, { ok: false, reason: e.message });
+              }
               clearExitOrderTracking(exitMeta);
               acct._inflightTickers.delete(pos.ticker.toUpperCase());
               log(acct, `ROBINHOOD OPTION EXIT REJECTED ${pos.ticker}: ${e.message}`);
             } else {
+              if (operatorLossApproval) {
+                finishApprovedTrade(state, operatorLossApproval.id, {
+                  ok: true,
+                  reason: "submission status unknown; quarantined for broker reconciliation",
+                });
+              }
               exitMeta.exitSubmissionUnknownAt = Date.now();
               log(acct, `ROBINHOOD OPTION EXIT STATUS UNKNOWN ${pos.ticker}: ${e.message} — retaining ref ${refId} and duplicate-order lock`);
             }
@@ -6112,10 +6300,6 @@ function liveControlSummaryHTML(acct) {
   if (cfg.broker === "robinhood" && acct.state?.brokerHealth?.status === "disconnected") {
     blockers.push("Robinhood health probe is disconnected");
   }
-  if (cfg.broker === "robinhood" && RH_REQUIRE_APPROVAL) {
-    blockers.push("RH_REQUIRE_APPROVAL compatibility lock is ON");
-  }
-
   const armed = blockers.length === 0;
   const statusColor = armed ? "#067a2f" : "#9a5b00";
   const statusBg = armed ? "#ecfdf3" : "#fff8e6";
@@ -6150,13 +6334,14 @@ function liveControlSummaryHTML(acct) {
   return `<details open style="margin:10px 0 14px;padding:10px 12px;border-radius:8px;border:1px solid ${statusBorder};background:${statusBg};color:#27303f;font-size:12px;line-height:1.55">
     <summary style="cursor:pointer;font-weight:800;color:${statusColor}">${armed ? "LIVE ENTRIES ELIGIBLE" : "LIVE ENTRIES BLOCKED"} · effective configuration</summary>
     <div style="margin-top:8px;color:${statusColor};font-weight:650">${blockText}</div>
-    <div style="margin-top:8px"><b>Execution</b> · live entries ${cfg.liveEntriesEnabled === true ? "ON" : "OFF"} · auto-execute ${cfg.autoExecute === true ? "ON" : "OFF"} · cash reserve ${cfg.useCashReserve ? "ON" : "OFF"} · max ${valueOr(cfg.maxDayTrades)} entries/day · max ${valueOr(cfg.maxPositions)} positions</div>
+    <div style="margin-top:8px"><b>Execution</b> · live entries ${cfg.liveEntriesEnabled === true ? "ON" : "OFF"} · broker transport ${cfg.autoExecute === true ? "ARMED" : "OFF"} · ${cfg.requireEntryApproval === true ? "operator approval required for every entry" : "entries autonomous"} · ${cfg.requireLossExitApproval === true ? "loss exits require operator approval" : "loss exits autonomous"} · ${cfg.entrySizingMode === "one_contract" ? "one contract per approved setup" : `cash reserve ${cfg.useCashReserve ? "ON" : "OFF"}`}</div>
     <div><b>Broker balance</b> · authoritative snapshot ${balanceAgeText} · automatic refresh ${cfg.broker === "robinhood" ? `every ${(LIVE_BALANCE_REFRESH_AGE_MS / 1000).toFixed(0)}s` : "during each account cycle"} and immediately before entry commitment${safeBalanceError ? ` · last refresh error: ${safeBalanceError}` : ""}</div>
-    <div><b>Exit mandate for new positions</b> · effective target ${pct(effectiveExitConfig.profitTarget)} · stop ${pct(cfg.stopLoss)} · one-contract bank ${pct(effectiveExitConfig.singleContractBankPct)} · trims ${pct(effectiveExitConfig.trim1Pct)} / ${pct(effectiveExitConfig.trim2Pct)} · mode ${cfg.exitMode || "automatic"} · held-position poll every ${((cfg.positionManagementMs ?? POSITION_MANAGEMENT_MS) / 1000).toFixed(0)}s</div>
+    <div><b>Objective</b> · ${pct(cfg.dailyObjectivePct)} per day is measurement-only; it never relaxes contract quality, affordability, or approvals</div>
+    <div><b>Exit mandate for new positions</b> · effective target ${pct(effectiveExitConfig.profitTarget)} · stop ${pct(cfg.stopLoss)} · one-contract bank ${pct(effectiveExitConfig.singleContractBankPct)} · loss exits wait for approval · held-position poll every ${((cfg.positionManagementMs ?? POSITION_MANAGEMENT_MS) / 1000).toFixed(0)}s</div>
     <div><b>Recent-data adaptation</b> · ${adaptiveText}${adaptive ? ` · profit lock arms ${pct(adaptive.profitLockArmPct)}; close after the larger of ${pct(adaptive.peakGivebackMin)} or ${(adaptive.peakGivebackFrac * 100).toFixed(0)}% of peak is given back` : ""}</div>
-    <div><b>Risk and affordability</b> · premium spend ${pct(cfg.baseRiskPct)} of cash${premiumSpendBudget != null ? ` (~$${premiumSpendBudget.toFixed(2)})` : ""} · planned stop loss ${pct(cfg.riskPerTradePct)} of equity${riskBudget != null ? ` (~$${riskBudget.toFixed(2)})` : ""} · governor allocation ${pct(cfg.maxPositionPct)} of equity${allocationBudget != null ? ` (~$${allocationBudget.toFixed(2)})` : ""} · open risk ${pct(cfg.maxPortfolioRiskPct)} · min net R:R ${valueOr(cfg.minimumRewardRisk, "unset")} · absolute trade cap $${valueOr(cfg.maxTradeSize, 500)}</div>
-    <div><b>Halts</b> · daily ${pct(cfg.dailyLossLimitPct)} · weekly ${pct(cfg.weeklyLossLimitPct)} · high-water drawdown ${pct(cfg.highWaterDrawdownLimitPct)} · ${valueOr(cfg.maxConsecutiveLosses)} consecutive losses</div>
-    <div><b>Signal gates</b> · setup ≥${cfg.minSetupQuality ?? 50} · calls ≥${cfg.bullEntry ?? 68} · puts ≤${cfg.bearEntry ?? 32} · opening freeze 15m · closing freeze 15m · 7–45 DTE · real two-sided quote/liquidity/delta/friction checks required</div>
+    <div><b>Risk and affordability</b> · one selected contract must fit current broker buying power${cfg.maxTradeSize > 0 ? ` and the explicit $${cfg.maxTradeSize} order cap` : ""}; no cheaper contract substitution</div>
+    <div><b>Portfolio telemetry</b> · ${cfg.portfolioHaltsEnabled === false ? "loss streaks and drawdowns are advisory; they do not pause opportunity review" : `daily ${pct(cfg.dailyLossLimitPct)} · weekly ${pct(cfg.weeklyLossLimitPct)} · high-water drawdown ${pct(cfg.highWaterDrawdownLimitPct)} · ${valueOr(cfg.maxConsecutiveLosses)} consecutive losses`}</div>
+    <div><b>Signal gates</b> · original pre-Jarvis analysis preserved · setup ≥${cfg.minSetupQuality ?? 50} · calls ≥${cfg.bullEntry ?? 68} · puts ≤${cfg.bearEntry ?? 32} · opening/closing freezes · earnings, regime, real quote, liquidity, delta, and friction checks required</div>
   </details>`;
 }
 
@@ -7447,6 +7632,23 @@ window.__CHARTS__ = ${JSON.stringify({ short: shortChartData, barrier: barrierCh
 
 function robinhoodPageHTML({ spectator = false } = {}) {
   const connected = robinhood.isConnected;
+  const approvalAccount = accounts.get("robinhood");
+  const approvalRows = approvalAccount ? pendingTradeApprovals(approvalAccount.state) : [];
+  const escapeApprovalHtml = value => String(value ?? "")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const approvalItems = approvalRows.length === 0
+    ? '<div class="rh-empty">No decisions waiting for you</div>'
+    : approvalRows.map(row => {
+      const entry = row.kind === ENTRY_APPROVAL;
+      const label = entry ? "BUY ENTRY" : "SELL AT LOSS";
+      const detail = entry
+        ? `${row.quantity}x up to $${Number(row.limitPrice).toFixed(2)} · est. $${Number(row.estimatedNotional || row.quantity * row.limitPrice * 100).toFixed(0)}`
+        : `${row.quantity}x at $${Number(row.limitPrice).toFixed(2)} · est. net loss $${Number(row.estimatedLossDollars || 0).toFixed(2)} (${Number(row.estimatedLossPct || 0).toFixed(1)}%) · ${row.reason || "protective exit"}`;
+      return `<div class="rh-pending-item">
+        <div><div class="sym">${label} · ${escapeApprovalHtml(row.ticker)}</div><div class="detail">${escapeApprovalHtml(row.contractKey)}<br>${escapeApprovalHtml(detail)}</div></div>
+        ${spectator ? "" : `<div style="display:flex;gap:6px"><button class="rh-btn primary small" onclick="approveDecision('${row.id}')">Approve</button><button class="rh-btn danger small" onclick="rejectDecision('${row.id}')">Reject</button></div>`}
+      </div>`;
+    }).join("");
 
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -7559,6 +7761,11 @@ function robinhoodPageHTML({ spectator = false } = {}) {
       <div id="positions-data" class="rh-loading">Loading positions...</div>
     </div>
 
+    <div class="rh-card rh-full-width" id="approvals-card">
+      <h2>✋ Your Approval <span style="color:#6b7280;font-size:11px;font-weight:400">entries and loss exits only</span></h2>
+      <div id="approvals-data">${approvalItems}</div>
+    </div>
+
     <!-- Options Chain Lookup -->
     <div class="rh-card rh-full-width">
       <h2>📋 Options Chain</h2>
@@ -7593,7 +7800,7 @@ function robinhoodPageHTML({ spectator = false } = {}) {
     <!-- Entry posture -->
     <div class="rh-card">
       <h2>🛡️ Entry Posture</h2>
-      <div class="rh-empty">Observation-only: no new live entries until forward validation establishes an executable edge. Protective exits remain active.</div>
+      <div class="rh-empty">The bot surfaces one top-ranked, affordable exact contract at a time. Nothing is bought until you approve it. Profitable exits remain automatic; any exit below basis waits for your approval.</div>
     </div>
 
     <!-- Trading Controls -->
@@ -7606,7 +7813,7 @@ function robinhoodPageHTML({ spectator = false } = {}) {
       </div>
       <div class="rh-toggle">
         <label>New Entries</label>
-        <span style="font-size:11px;color:#b07400;min-width:80px">OBSERVE</span>
+        <span style="font-size:11px;color:#b07400;min-width:80px">APPROVAL</span>
       </div>
       <div class="rh-toggle">
         <label>Options Only</label>
@@ -7620,7 +7827,7 @@ function robinhoodPageHTML({ spectator = false } = {}) {
       </div>
       <div class="rh-stat"><span class="label">Trade Mode</span><span class="value" style="color:${robinhood.optionsEnabled ? '#00a843' : '#6b7280'}">${robinhood.optionsEnabled ? (RH_OPTIONS_ONLY ? 'Options only' : 'Options + equity fallback') : 'Equity only (no MCP options)'}</span></div>
       <div class="rh-stat"><span class="label">Watchlist</span><span class="value" style="font-size:11px">${RH_WATCHLIST_NAME}</span></div>
-      <div class="rh-stat"><span class="label">Max Position</span><span class="value">$${RH_MAX_POSITION_DOLLARS}</span></div>
+      <div class="rh-stat"><span class="label">Affordability</span><span class="value">${Number.isFinite(RH_MAX_POSITION_DOLLARS) ? `$${RH_MAX_POSITION_DOLLARS} cap` : "Broker buying power"}</span></div>
       <div style="margin-top:12px">
         <button class="rh-btn danger" onclick="killSwitch()" style="width:100%">🛑 Cancel Working Buys</button>
       </div>
@@ -7644,6 +7851,47 @@ function initApp() {
   loadPositions();
   loadOrders();
   loadWatchlist();
+  loadApprovals();
+}
+
+function approvalSafe(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
+async function loadApprovals() {
+  const el = document.getElementById('approvals-data');
+  if (!el) return;
+  try {
+    const r = await fetch('/api/rh-status');
+    const d = await r.json();
+    const rows = d.pendingOrders || [];
+    if (!rows.length) { el.innerHTML = '<div class="rh-empty">No decisions waiting for you</div>'; return; }
+    el.innerHTML = rows.map(row => {
+      const entry = row.kind === 'entry';
+      const label = entry ? 'BUY ENTRY' : 'SELL AT LOSS';
+      const detail = entry
+        ? row.quantity+'x up to $'+Number(row.limitPrice).toFixed(2)+' · est. $'+Number(row.estimatedNotional || row.quantity*row.limitPrice*100).toFixed(0)
+        : row.quantity+'x at $'+Number(row.limitPrice).toFixed(2)+' · est. net loss $'+Number(row.estimatedLossDollars || 0).toFixed(2)+' ('+Number(row.estimatedLossPct || 0).toFixed(1)+'%) · '+(row.reason || 'protective exit');
+      const controls = ${spectator ? "''" : "'<div style=\"display:flex;gap:6px\"><button class=\"rh-btn primary small\" onclick=\"approveDecision(\\\''+approvalSafe(row.id)+'\\\')\">Approve</button><button class=\"rh-btn danger small\" onclick=\"rejectDecision(\\\''+approvalSafe(row.id)+'\\\')\">Reject</button></div>'"};
+      return '<div class="rh-pending-item"><div><div class="sym">'+label+' · '+approvalSafe(row.ticker)+'</div><div class="detail">'+approvalSafe(row.contractKey)+'<br>'+approvalSafe(detail)+'</div></div>'+controls+'</div>';
+    }).join('');
+  } catch (error) {
+    el.innerHTML = '<div class="rh-empty">Approval status unavailable</div>';
+  }
+}
+
+async function approveDecision(id) {
+  const r = await fetch('/api/rh-approve/'+encodeURIComponent(id), { method: 'POST' });
+  const d = await r.json();
+  if (!r.ok) alert(d.error || 'Approval failed');
+  await loadApprovals();
+}
+
+async function rejectDecision(id) {
+  const r = await fetch('/api/rh-reject/'+encodeURIComponent(id), { method: 'POST' });
+  const d = await r.json();
+  if (!r.ok) alert(d.error || 'Rejection failed');
+  await loadApprovals();
 }
 
 async function loadAccount() {
@@ -7824,7 +8072,7 @@ async function killSwitch() {
 }
 
 // Auto-refresh every 30s
-setInterval(() => { loadAccount(); loadPositions(); loadOrders(); loadWatchlist(); }, 30000);
+setInterval(() => { loadAccount(); loadPositions(); loadOrders(); loadWatchlist(); loadApprovals(); }, 30000);
 </script>
 </body></html>`;
 }
@@ -8070,8 +8318,8 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
         ` : ""}
         <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Max Positions (blank = unlimited)</label>
         <input name="maxPositions" type="number" value="${cfg.maxPositions || ""}" placeholder="unlimited" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
-        <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Max Trade Size ($ Circuit Breaker)</label>
-        <input name="maxTradeSize" type="number" value="${cfg.maxTradeSize || 500}" placeholder="500" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
+        <label style="display:block;margin-bottom:8px;font-size:12px;color:#6b7280">Maximum order amount ($)</label>
+        <input name="maxTradeSize" type="number" value="${cfg.maxTradeSize || ""}" placeholder="Broker buying power" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;margin-bottom:12px;box-sizing:border-box">
         <div style="font-size:12px;font-weight:800;color:#3a3b42;margin:14px 0 8px">Live risk and halt controls</div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">
           <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">Planned loss at stop (% of equity)</label><input name="riskPerTradePct" type="number" step="0.05" min="0" value="${((cfg.riskPerTradePct ?? 0.005) * 100).toFixed(2)}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
@@ -8097,7 +8345,7 @@ function accountActionsHTML(acctId, { spectator = false } = {}) {
           ${(cfg.broker === "robinhood" || cfg.broker === "tradier") ? `<label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;font-weight:800;color:#1c1d22"><input type="checkbox" name="liveEntriesEnabled" ${cfg.liveEntriesEnabled === true ? "checked" : ""}> Live entries eligible (master entry switch)</label>` : ""}
           <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="useCashReserve" ${cfg.useCashReserve ? "checked" : ""}> Use cash reserve (50%→25% buffer)</label>
           <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="liveEntriesEnabled" ${cfg.liveEntriesEnabled ? "checked" : ""}> Allow new live entries</label>
-          <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="autoExecute" ${cfg.autoExecute ? "checked" : ""}> Auto-execute broker orders (full autonomy)</label>
+          <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;color:#3a3b42"><input type="checkbox" name="autoExecute" ${cfg.autoExecute ? "checked" : ""}> Arm broker transport (entry/loss approvals still required)</label>
           <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#3a3b42"><input type="checkbox" name="tradeWhenClosed" ${cfg.tradeWhenClosed ? "checked" : ""}> Trade when market closed (testing/sandbox)</label>
           ${cfg.broker === "tradier" ? `<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px">
             <div><label style="display:block;margin-bottom:6px;font-size:11px;color:#6b7280">0-cash spend limit ($)</label><input name="marginZeroCashSpendLimit" type="number" step="1" value="${cfg.marginZeroCashSpendLimit ?? DEFAULT_CONFIG.marginZeroCashSpendLimit}" style="width:100%;padding:8px;background:#f6f7f9;border:1px solid #d4d8e0;border-radius:6px;color:#1c1d22;box-sizing:border-box"></div>
@@ -9175,11 +9423,14 @@ function startDashboard(defaultAcct, apiKey) {
 
     // (TRADING_MODE toggle removed — broker is per-account via config.broker)
 
-    // The old in-process approval queue was never broker-backed and could not survive a restart.
-    // Fail closed instead of advertising controls that do not exist.
     if (req.method === "POST" && pathname === "/api/rh-approval") {
-      res.writeHead(410, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-      res.end(JSON.stringify({ error: "Manual approval queue retired; use the visible Live entries and Auto-execute settings" }));
+      const acct = accounts.get("robinhood");
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({
+        requireEntryApproval: acct?.config?.requireEntryApproval === true,
+        requireLossExitApproval: acct?.config?.requireLossExitApproval === true,
+        pending: acct ? pendingTradeApprovals(acct.state) : [],
+      }));
       return;
     }
 
@@ -9711,10 +9962,11 @@ function startDashboard(defaultAcct, apiKey) {
         watchlistName: RH_WATCHLIST_NAME,
         tradeMode: rhTradeMode({ broker: "robinhood" }),
         availableTools: robinhood.availableTools,
-        requireApproval: RH_REQUIRE_APPROVAL,
-        approvalSupported: false,
-        maxPositionDollars: RH_MAX_POSITION_DOLLARS,
-        pendingOrders: [],
+        requireApproval: true,
+        approvalSupported: true,
+        maxPositionDollars: Number.isFinite(RH_MAX_POSITION_DOLLARS) ? RH_MAX_POSITION_DOLLARS : null,
+        pendingOrders: accounts.get("robinhood")
+          ? pendingTradeApprovals(accounts.get("robinhood").state) : [],
       }));
       return;
     }
@@ -9734,16 +9986,29 @@ function startDashboard(defaultAcct, apiKey) {
       return;
     }
 
-    // Retired non-durable approval endpoints remain explicit errors for old clients.
     if (req.method === "POST" && pathname.startsWith("/api/rh-approve/")) {
-      res.writeHead(410, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-      res.end(JSON.stringify({ error: "Approval queue retired; no order was submitted" }));
+      const acct = accounts.get("robinhood");
+      const approvalId = decodeURIComponent(pathname.slice("/api/rh-approve/".length));
+      const result = acct ? approveTradeApproval(acct.state, approvalId) : { ok: false, reason: "Robinhood account unavailable" };
+      if (result.ok) {
+        saveAccountsStrict();
+        log(acct, `OPERATOR APPROVED ${result.approval.kind.toUpperCase()}: ${result.approval.ticker} ${result.approval.contractKey} — broker submission will revalidate price and buying power`);
+      }
+      res.writeHead(result.ok ? 200 : 409, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify(result.ok ? { ok: true, approval: result.approval } : { error: result.reason }));
       return;
     }
 
     if (req.method === "POST" && pathname.startsWith("/api/rh-reject/")) {
-      res.writeHead(410, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-      res.end(JSON.stringify({ error: "Approval queue retired; use cancel-working-buys for broker-backed orders" }));
+      const acct = accounts.get("robinhood");
+      const approvalId = decodeURIComponent(pathname.slice("/api/rh-reject/".length));
+      const result = acct ? rejectTradeApproval(acct.state, approvalId) : { ok: false, reason: "Robinhood account unavailable" };
+      if (result.ok) {
+        saveAccountsStrict();
+        log(acct, `OPERATOR REJECTED ${result.approval.kind.toUpperCase()}: ${result.approval.ticker} ${result.approval.contractKey}`);
+      }
+      res.writeHead(result.ok ? 200 : 409, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify(result.ok ? { ok: true, approval: result.approval } : { error: result.reason }));
       return;
     }
 
@@ -11798,6 +12063,28 @@ async function workRobinhoodEntryOrders(acct, now) {
     if (!m || !m.entryOrderPlacedAt || !m.entryOrderCtx) continue;
     const ctx = m.entryOrderCtx;
     const tickerU = (ctx.ticker || "").toUpperCase();
+    if (acct.config.requireEntryApproval === true && !m.operatorEntryApprovalId) {
+      acct._inflightTickers.add(tickerU);
+      // Migration boundary: never replay or leave resting an automation-owned buy that predates
+      // the durable approval ledger. Manual broker orders have no bot metadata and remain untouched.
+      if (!m.entryOrderId) {
+        if (!m.entryApprovalReplayBlockedLoggedAt
+            || now - m.entryApprovalReplayBlockedLoggedAt >= 15 * 60_000) {
+          m.entryApprovalReplayBlockedLoggedAt = now;
+          log(acct, `RH ENTRY APPROVAL: ambiguous pre-approval buy ${tickerU || occ} remains quarantined; replay is forbidden`);
+        }
+        continue;
+      }
+      if (!m.entryCancelRequestedAt) {
+        try {
+          await robinhood.cancelOptionOrder(m.entryOrderId);
+          m.entryCancelRequestedAt = now;
+          log(acct, `RH ENTRY APPROVAL: cancel requested for pre-approval buy ${tickerU} ${occ}`);
+        } catch (error) {
+          log(acct, `RH ENTRY APPROVAL: could not cancel pre-approval buy ${tickerU} — ${error.message}`);
+        }
+      }
+    }
     if (!m.entryOrderId) {
       acct._inflightTickers.add(tickerU);
       // Submission response was ambiguous. Retry the exact payload under the SAME broker idempotency
@@ -13594,6 +13881,24 @@ async function runCycle(acct, sharedQuotes, apiKey) {
     const result = cfg.broker === "robinhood"
       ? await withBrokerExecutionLane(acct, executeEntry)
       : await executeEntry();
+    if (result?.approvalPending) {
+      log(acct, `APPROVAL PENDING ${ticker}: ${result.reason}`);
+      dec.action = "APPROVAL";
+      dec.reason = result.reason;
+      if (jItem) { jItem.outcome = "approval-pending"; jItem.reason = result.reason; }
+      // Package ranking chose the strongest executable opportunity. Present that one decision to the
+      // operator instead of turning every lower-ranked candidate into approval noise.
+      break;
+    }
+    if (result?.approvalRejected) {
+      log(acct, `APPROVAL REJECTED ${ticker}: ${result.reason}`);
+      dec.action = "REJECTED";
+      dec.reason = result.reason;
+      if (jItem) { jItem.outcome = "approval-rejected"; jItem.reason = result.reason; }
+      // A rejection is a decision on the top-ranked package, not permission to substitute a
+      // lower-ranked opportunity in the same cycle.
+      break;
+    }
     if (result && result.skipped) {
       log(acct, `SKIP ${ticker}: ${result.reason}`);
       if (dec && (dec.action === "BUY CALL" || dec.action === "BUY PUT")) {
@@ -14250,7 +14555,10 @@ async function main() {
   if (rhOk) {
     await ensureRhWatchlist();
     const modeLabel = rhTradeMode({ broker: "robinhood" });
-    console.log(`  Robinhood: LIVE broker account ready (max: $${RH_MAX_POSITION_DOLLARS}/position, mode: ${modeLabel}${RH_AUTO_WATCHLIST ? `, auto-watchlist → "${RH_WATCHLIST_NAME}"` : ""})`);
+    const affordabilityLabel = Number.isFinite(RH_MAX_POSITION_DOLLARS)
+      ? `max: $${RH_MAX_POSITION_DOLLARS}/position`
+      : "affordability: current broker buying power";
+    console.log(`  Robinhood: LIVE broker account ready (${affordabilityLabel}, mode: ${modeLabel}${RH_AUTO_WATCHLIST ? `, auto-watchlist → "${RH_WATCHLIST_NAME}"` : ""})`);
   }
 
   // Initialize Tradier data + execution arm (primary market-data feed when connected)

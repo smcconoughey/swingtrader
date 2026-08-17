@@ -1,9 +1,8 @@
 /**
  * Live-broker config normalization.
  *
- * This layer backfills missing, visible controls only. Explicit settings are never silently
- * clamped or replaced: the dashboard shows them and the risk governor rejects invalid inputs with
- * a visible reason instead of running a different strategy than the operator selected.
+ * This layer backfills missing, visible controls. Versioned migrations may deliberately replace
+ * obsolete live defaults once; after migration, explicit settings remain operator-controlled.
  */
 
 export const CAPITAL_PRESERVATION_POLICY = Object.freeze({
@@ -36,6 +35,9 @@ export const LIVE_RISK_DEFAULTS = Object.freeze({
   maxDayTrades: CAPITAL_PRESERVATION_POLICY.maxDayTrades,
   minimumRewardRisk: 1.0,
   liveEntriesEnabled: true,
+  // Robinhood consumes these defaults directly; other live brokers ignore the approval fields.
+  requireEntryApproval: true,
+  requireLossExitApproval: true,
 });
 
 const finite = value => Number.isFinite(Number(value));
@@ -62,6 +64,47 @@ export function normalizeLiveRiskConfig(config = {}) {
 export function applyLiveRiskPolicy(account) {
   if (!account?.config || !["robinhood", "tradier"].includes(account.config.broker)) return [];
   const { config, changes } = normalizeLiveRiskConfig(account.config);
+  // One explicit Robinhood migration layered onto the pre-Jarvis analysis engine. It changes
+  // execution authority, sizing, and exits without replacing the older market-analysis gates.
+  if (account.config.broker === "robinhood" && account.config.traderCopilotVersion !== 3) {
+    const migration = {
+      traderCopilotVersion: 3,
+      requireEntryApproval: true,
+      requireLossExitApproval: true,
+      liveEntriesEnabled: true,
+      autoExecute: true,
+      portfolioHaltsEnabled: false,
+      entrySizingMode: "one_contract",
+      useCashReserve: false,
+      maxDayTrades: null,
+      maxPositions: null,
+      strategyPreset: "quicktp",
+      dailyObjectivePct: 0.10,
+      profitTarget: 0.12,
+      stopLoss: -0.20,
+      trim1Pct: 0.12,
+      trim2Pct: 0.12,
+      singleContractBankPct: 0.12,
+      minimumRewardRisk: 0.35,
+      exitMode: "quick_bank",
+      adaptiveProfitTarget: true,
+      adaptiveTargetMinPct: 0.10,
+      adaptiveTargetMaxPct: 0.15,
+      adaptiveTargetFallbackPct: 0.12,
+      adaptiveTargetReachRate: 0.65,
+      adaptiveTargetLookback: 20,
+      adaptiveTargetMinSamples: 5,
+      profitLockArmPct: 0.08,
+      peakGivebackMin: 0.025,
+      peakGivebackFrac: 0.25,
+      positionManagementMs: 5_000,
+      maxTradeSize: null,
+    };
+    for (const [key, value] of Object.entries(migration)) {
+      if (config[key] !== value) changes.push({ key, before: config[key], after: value });
+      config[key] = value;
+    }
+  }
   account.config = config;
   return changes;
 }
