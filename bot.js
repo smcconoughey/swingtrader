@@ -6375,6 +6375,73 @@ function dashboardHTML(acct, { spectator = false } = {}) {
       </div>`
     : `<div style="margin-bottom:8px;padding:9px 10px;background:#f6f7f9;border-radius:4px;font-size:11px;border-left:4px solid #8a909b;color:#8a909b">Today's Haiku tape score is not available yet. No score-based rule is being applied.</div>`;
 
+  const mainApprovalRows = cfg.broker === "robinhood"
+    ? (() => {
+        // This also expires stale rows before we show the active queue.
+        pendingTradeApprovals(state);
+        return (state.tradeApprovals || []).filter(row =>
+          (row.status === "pending" || row.status === "approved" || row.status === "executing")
+          && Number(row.expiresAt) > Date.now());
+      })()
+    : [];
+  const approvalHtmlSafe = value => String(value ?? "")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  const approvalItemHTML = row => {
+    const entry = row.kind === ENTRY_APPROVAL;
+    const status = row.status || "pending";
+    const statusLabel = status === "pending" ? "DECISION REQUIRED"
+      : status === "approved" ? "APPROVED · QUEUED"
+        : "SUBMITTING TO ROBINHOOD";
+    const statusClass = status === "pending" ? "waiting" : "approved";
+    const optionLabel = row.optionType
+      ? `${String(row.optionType).toUpperCase()}${Number(row.strike) > 0 ? ` $${Number(row.strike)}` : ""}${row.expirationDate ? ` · EXP ${row.expirationDate}` : ""}`
+      : "OPTION CONTRACT";
+    const currentLimit = Number(row.currentLimitPrice);
+    const approvedLimit = Number(row.limitPrice);
+    const priceMovement = Number.isFinite(currentLimit) && Math.abs(currentLimit - approvedLimit) >= 0.01
+      ? ` · latest qualifying limit $${currentLimit.toFixed(2)}` : "";
+    const primaryDetail = entry
+      ? `${row.quantity} contract${Number(row.quantity) === 1 ? "" : "s"} · pay no more than $${approvedLimit.toFixed(2)} · maximum debit $${Number(row.estimatedNotional || row.quantity * approvedLimit * 100).toFixed(2)}${priceMovement}`
+      : `${row.quantity} contract${Number(row.quantity) === 1 ? "" : "s"} · sell no lower than $${approvedLimit.toFixed(2)} · estimated net loss $${Number(row.estimatedLossDollars || 0).toFixed(2)} (${Number(row.estimatedLossPct || 0).toFixed(1)}%)${Number(row.entryPremium) > 0 ? ` · entry basis $${Number(row.entryPremium).toFixed(2)}` : ""}${priceMovement}`;
+    const rationale = entry
+      ? (row.thesis || "The setup passed the strategy, contract-quality, liquidity, risk, and affordability checks.")
+      : (row.reason || "Protective exit below cost basis");
+    const evidence = entry
+      ? `<span>Setup <b>${Number.isFinite(Number(row.setupQuality)) ? `${Number(row.setupQuality).toFixed(0)}/100` : "—"}</b></span><span>Model confidence <b>${Number.isFinite(Number(row.modelConfidence)) ? `${Number(row.modelConfidence).toFixed(0)}%` : "—"}</b></span>`
+      : `<span>Exit trigger <b>${approvalHtmlSafe(row.reasonCode || "protective")}</b></span>`;
+    const expiresAt = Number(row.expiresAt);
+    const expiresText = Number.isFinite(expiresAt)
+      ? `Expires ${new Date(expiresAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
+      : "Short-lived approval";
+    const controls = spectator || status !== "pending" ? "" : `<div class="trade-approval-actions">
+      <button type="button" class="trade-approval-btn approve" data-trade-approval-action="approve" data-trade-approval-id="${approvalHtmlSafe(row.id)}">Approve trade</button>
+      <button type="button" class="trade-approval-btn reject" data-trade-approval-action="reject" data-trade-approval-id="${approvalHtmlSafe(row.id)}">Reject</button>
+    </div>`;
+    return `<article class="trade-approval-item ${statusClass}">
+      <div class="trade-approval-copy">
+        <div class="trade-approval-heading"><span class="trade-approval-status ${statusClass}">${statusLabel}</span><strong>${entry ? "BUY TO OPEN" : "SELL AT LOSS"} · ${approvalHtmlSafe(row.ticker)}</strong></div>
+        <div class="trade-approval-contract">${approvalHtmlSafe(optionLabel)}</div>
+        <div class="trade-approval-occ">${approvalHtmlSafe(row.contractKey)}</div>
+        <div class="trade-approval-primary">${approvalHtmlSafe(primaryDetail)}</div>
+        <div class="trade-approval-evidence">${evidence}<span>${approvalHtmlSafe(expiresText)}</span></div>
+        <div class="trade-approval-rationale"><b>${entry ? "Why this trade:" : "Why exit now:"}</b> ${approvalHtmlSafe(rationale)}</div>
+      </div>
+      ${controls}
+    </article>`;
+  };
+  const mainApprovalItems = mainApprovalRows.length
+    ? mainApprovalRows.map(approvalItemHTML).join("")
+    : '<div class="trade-approval-empty">Nothing is waiting right now. When the strategy finds an entry—or proposes an exit below your cost basis—the exact decision will appear here.</div>';
+  const mainApprovalPanel = cfg.broker === "robinhood" ? `<section class="card trade-approval-panel" id="main-trade-approvals">
+    <div class="trade-approval-title-row">
+      <div><h2>Your Trade Approvals</h2><div class="trade-approval-subtitle">Entries and loss-making exits require your decision. Profitable exits remain automatic.</div></div>
+      <span class="trade-approval-count" id="main-trade-approval-count">${mainApprovalRows.filter(row => row.status === "pending").length} waiting</span>
+    </div>
+    <div id="main-trade-approval-message" class="trade-approval-message" aria-live="polite"></div>
+    <div id="main-trade-approval-items">${mainApprovalItems}</div>
+  </section>` : "";
+
   const llmBadge = spectator
     ? `<span class="llm-toggle" title="Read-only in spectator mode">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>`
     : `<span class="llm-toggle" onclick="fetch('/api/llm-provider',{method:'POST'}).then(()=>location.reload())" title="Click to switch LLM provider">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>`;
@@ -6694,6 +6761,33 @@ function dashboardHTML(acct, { spectator = false } = {}) {
   .acct-btn.delete:hover{border-color:#e8473f;color:#e8473f}
   .llm-toggle{color:#6a4df4;font-size:10px;cursor:pointer;padding:2px 8px;border:1px solid #6a4df440;border-radius:4px;transition:all .2s}
   .llm-toggle:hover{background:#6a4df420;border-color:#6a4df4;color:#6a4df4}
+  .trade-approval-panel{margin-bottom:16px;border:2px solid #f0b429;background:linear-gradient(135deg,#fffdf7 0%,#fff 70%);overflow:visible}
+  .trade-approval-title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:12px}
+  .trade-approval-title-row h2{color:#8a5400;margin-bottom:4px;font-size:13px}
+  .trade-approval-subtitle{color:#5f6672;font-size:12px;line-height:1.45}
+  .trade-approval-count{white-space:nowrap;background:#fff3cd;color:#8a5400;border:1px solid #f0b429;border-radius:999px;padding:4px 10px;font-size:11px;font-weight:800}
+  .trade-approval-message{display:none;margin-bottom:10px;padding:8px 10px;border-radius:6px;background:#eef8f1;color:#067a2f;font-size:12px;font-weight:650}
+  .trade-approval-message.error{display:block;background:#fff1f0;color:#b42318}
+  .trade-approval-message.success{display:block}
+  .trade-approval-item{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:14px;margin-top:10px;border:1px solid #e4e7ec;border-left:5px solid #f0b429;border-radius:9px;background:#fff}
+  .trade-approval-item.approved{border-left-color:#12a150;background:#f7fcf8}
+  .trade-approval-copy{min-width:0;flex:1}
+  .trade-approval-heading{display:flex;align-items:center;gap:8px;flex-wrap:wrap;color:#22252b;font-size:14px}
+  .trade-approval-status{display:inline-block;padding:3px 7px;border-radius:4px;background:#fff3cd;color:#8a5400;font-size:9px;font-weight:900;letter-spacing:.6px}
+  .trade-approval-status.approved{background:#dcfce7;color:#067a2f}
+  .trade-approval-contract{margin-top:7px;color:#22252b;font-size:13px;font-weight:750}
+  .trade-approval-occ{margin-top:2px;color:#747b86;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;overflow-wrap:anywhere}
+  .trade-approval-primary{margin-top:7px;color:#323740;font-size:12px;font-weight:700;line-height:1.45}
+  .trade-approval-evidence{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:6px;color:#667085;font-size:11px}
+  .trade-approval-evidence b{color:#333842}
+  .trade-approval-rationale{margin-top:8px;color:#535a65;font-size:11px;line-height:1.5;white-space:pre-line}
+  .trade-approval-actions{display:flex;gap:8px;flex:0 0 auto}
+  .trade-approval-btn{border-radius:7px;padding:10px 14px;font-family:inherit;font-size:12px;font-weight:700;cursor:pointer;transition:filter .15s,opacity .15s;white-space:nowrap}
+  .trade-approval-btn:hover{filter:brightness(.96)}
+  .trade-approval-btn:disabled{opacity:.55;cursor:wait}
+  .trade-approval-btn.approve{border:1px solid #07883a;background:#0aa447;color:#fff}
+  .trade-approval-btn.reject{border:1px solid #d92d20;background:#fff;color:#b42318}
+  .trade-approval-empty{padding:18px;border:1px dashed #d6dae1;border-radius:8px;background:#fafbfc;color:#747b86;font-size:12px;text-align:center;line-height:1.5}
   body{padding-left:max(20px,env(safe-area-inset-left));padding-right:max(20px,env(safe-area-inset-right));padding-top:max(20px,env(safe-area-inset-top))}
   /* Wide data tables scroll horizontally inside their card instead of breaking the layout */
   .card{overflow-x:auto;-webkit-overflow-scrolling:touch}
@@ -6708,6 +6802,9 @@ function dashboardHTML(acct, { spectator = false } = {}) {
     .global-stats{flex-wrap:wrap;gap:8px 14px}
     .acct-tab{min-width:84px;padding:6px 10px 5px}
     .acct-actions{flex-wrap:wrap}
+    .trade-approval-title-row,.trade-approval-item{align-items:stretch;flex-direction:column}
+    .trade-approval-actions{width:100%}
+    .trade-approval-btn{flex:1;padding:12px 10px}
     /* 16px inputs stop iOS from auto-zooming when a field is focused */
     .hint-form input{width:100%;margin-bottom:8px;font-size:16px}
     .hint-form button{width:100%}
@@ -6720,6 +6817,8 @@ ${strategyPresetHTML(acct.id, { spectator })}
 <h1>${acct.name || "Swing Trader"}</h1>
 ${spectator ? '<div style="margin:8px 0 12px;padding:8px 12px;border:1px solid #2f6fed40;background:#2f6fed12;color:#2f6fed;border-radius:8px;font-size:12px;font-weight:700">Spectator mode: read-only dashboard. Settings, broker controls, notifications, and AI prompts are disabled.</div>' : ''}
 <div class="sub">Capital $${STARTING_CASH.toLocaleString(undefined, { maximumFractionDigits: 0 })} → $${GOAL.toLocaleString()} Goal &nbsp;|&nbsp; <span class="market-badge ${dashboard.marketOpen ? "open" : "closed"}" id="mkt-badge">${dashboard.marketOpen ? "MARKET OPEN" : "MARKET CLOSED"}</span> &nbsp;|&nbsp; <span id="live-indicator" style="color:#00a843">LIVE</span> updates every 5s &nbsp;|&nbsp; <span id="pv-header">$${pv.toFixed(0)}</span> <span id="pnl-header" style="color:${pnlPct >= 0 ? '#00a843' : '#e8473f'}">(${pnlPct >= 0 ? '+' : ''}${pnlPct}%)</span> &nbsp;|&nbsp; <span style="color:${currentRegime.mode === 'risk-on' ? '#00a843' : currentRegime.mode === 'cautious' ? '#b07400' : '#e8473f'};font-size:10px">${currentRegime.mode.toUpperCase()}</span> &nbsp;|&nbsp; <span class="llm-toggle" onclick="fetch('/api/llm-provider',{method:'POST'}).then(()=>location.reload())" title="Click to switch LLM provider">🤖 ${getLLMLabel()}: ${claudeCallCount} calls · $${getClaudeCost().toFixed(3)}</span>${acct.paused ? ' &nbsp;|&nbsp; <span style="color:#e8473f;font-weight:bold">⏸ PAUSED</span>' : ''}</div>
+
+${mainApprovalPanel}
 
 <div class="grid">
   <div class="card">
@@ -7111,6 +7210,103 @@ function toggleAnalysis() {
 
 <script>
 let prevPrices = {};
+const mainApprovalReadOnly = ${spectator ? "true" : "false"};
+
+function mainApprovalSafe(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, function(ch) {
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch];
+  });
+}
+
+function mainApprovalItem(row) {
+  const entry = row.kind === 'entry';
+  const status = row.status || 'pending';
+  const statusLabel = status === 'pending' ? 'DECISION REQUIRED'
+    : status === 'approved' ? 'APPROVED · QUEUED' : 'SUBMITTING TO ROBINHOOD';
+  const statusClass = status === 'pending' ? 'waiting' : 'approved';
+  const strike = Number(row.strike) > 0 ? ' $' + Number(row.strike) : '';
+  const expiry = row.expirationDate ? ' · EXP ' + row.expirationDate : '';
+  const optionLabel = row.optionType ? String(row.optionType).toUpperCase() + strike + expiry : 'OPTION CONTRACT';
+  const approvedLimit = Number(row.limitPrice);
+  const currentLimit = Number(row.currentLimitPrice);
+  const priceMovement = Number.isFinite(currentLimit) && Math.abs(currentLimit - approvedLimit) >= 0.01
+    ? ' · latest qualifying limit $' + currentLimit.toFixed(2) : '';
+  const quantityLabel = row.quantity + ' contract' + (Number(row.quantity) === 1 ? '' : 's');
+  const primaryDetail = entry
+    ? quantityLabel + ' · pay no more than $' + approvedLimit.toFixed(2) + ' · maximum debit $' + Number(row.estimatedNotional || row.quantity * approvedLimit * 100).toFixed(2) + priceMovement
+    : quantityLabel + ' · sell no lower than $' + approvedLimit.toFixed(2) + ' · estimated net loss $' + Number(row.estimatedLossDollars || 0).toFixed(2) + ' (' + Number(row.estimatedLossPct || 0).toFixed(1) + '%)' + (Number(row.entryPremium) > 0 ? ' · entry basis $' + Number(row.entryPremium).toFixed(2) : '') + priceMovement;
+  const rationale = entry
+    ? (row.thesis || 'The setup passed the strategy, contract-quality, liquidity, risk, and affordability checks.')
+    : (row.reason || 'Protective exit below cost basis');
+  const evidence = entry
+    ? '<span>Setup <b>' + (Number.isFinite(Number(row.setupQuality)) ? Number(row.setupQuality).toFixed(0) + '/100' : '—') + '</b></span><span>Model confidence <b>' + (Number.isFinite(Number(row.modelConfidence)) ? Number(row.modelConfidence).toFixed(0) + '%' : '—') + '</b></span>'
+    : '<span>Exit trigger <b>' + mainApprovalSafe(row.reasonCode || 'protective') + '</b></span>';
+  const expiresAt = Number(row.expiresAt);
+  const expiresText = Number.isFinite(expiresAt)
+    ? 'Expires ' + new Date(expiresAt).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})
+    : 'Short-lived approval';
+  const controls = mainApprovalReadOnly || status !== 'pending' ? ''
+    : '<div class="trade-approval-actions"><button type="button" class="trade-approval-btn approve" data-trade-approval-action="approve" data-trade-approval-id="' + mainApprovalSafe(row.id) + '">Approve trade</button><button type="button" class="trade-approval-btn reject" data-trade-approval-action="reject" data-trade-approval-id="' + mainApprovalSafe(row.id) + '">Reject</button></div>';
+  return '<article class="trade-approval-item ' + statusClass + '"><div class="trade-approval-copy">'
+    + '<div class="trade-approval-heading"><span class="trade-approval-status ' + statusClass + '">' + statusLabel + '</span><strong>' + (entry ? 'BUY TO OPEN' : 'SELL AT LOSS') + ' · ' + mainApprovalSafe(row.ticker) + '</strong></div>'
+    + '<div class="trade-approval-contract">' + mainApprovalSafe(optionLabel) + '</div>'
+    + '<div class="trade-approval-occ">' + mainApprovalSafe(row.contractKey) + '</div>'
+    + '<div class="trade-approval-primary">' + mainApprovalSafe(primaryDetail) + '</div>'
+    + '<div class="trade-approval-evidence">' + evidence + '<span>' + mainApprovalSafe(expiresText) + '</span></div>'
+    + '<div class="trade-approval-rationale"><b>' + (entry ? 'Why this trade:' : 'Why exit now:') + '</b> ' + mainApprovalSafe(rationale) + '</div>'
+    + '</div>' + controls + '</article>';
+}
+
+async function loadMainTradeApprovals() {
+  const panel = document.getElementById('main-trade-approvals');
+  const items = document.getElementById('main-trade-approval-items');
+  const count = document.getElementById('main-trade-approval-count');
+  if (!panel || !items || !count) return;
+  try {
+    const response = await fetch('/api/rh-status');
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Approval status unavailable');
+    const rows = data.activeApprovals || data.pendingOrders || [];
+    const waiting = rows.filter(function(row) { return row.status === 'pending'; }).length;
+    count.textContent = waiting + ' waiting';
+    items.innerHTML = rows.length ? rows.map(mainApprovalItem).join('')
+      : '<div class="trade-approval-empty">Nothing is waiting right now. When the strategy finds an entry—or proposes an exit below your cost basis—the exact decision will appear here.</div>';
+  } catch (error) {
+    const message = document.getElementById('main-trade-approval-message');
+    if (message) { message.className = 'trade-approval-message error'; message.textContent = error.message; }
+  }
+}
+
+async function decideMainTradeApproval(id, action) {
+  const message = document.getElementById('main-trade-approval-message');
+  const buttons = Array.from(document.querySelectorAll('[data-trade-approval-id]')).filter(function(button) {
+    return button.dataset.tradeApprovalId === id;
+  });
+  buttons.forEach(function(button) { button.disabled = true; });
+  try {
+    const endpoint = action === 'approve' ? '/api/rh-approve/' : '/api/rh-reject/';
+    const response = await fetch(endpoint + encodeURIComponent(id), { method: 'POST' });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Decision could not be saved');
+    if (message) {
+      message.className = 'trade-approval-message success';
+      message.textContent = action === 'approve'
+        ? 'Approved. The order is queued for the next trading cycle and will be rechecked against the live price and buying power before submission.'
+        : 'Rejected. This exact proposal will not be submitted.';
+    }
+    await loadMainTradeApprovals();
+  } catch (error) {
+    buttons.forEach(function(button) { button.disabled = false; });
+    if (message) { message.className = 'trade-approval-message error'; message.textContent = error.message; }
+  }
+}
+
+document.addEventListener('click', function(event) {
+  const button = event.target.closest('[data-trade-approval-action]');
+  if (!button) return;
+  decideMainTradeApproval(button.dataset.tradeApprovalId, button.dataset.tradeApprovalAction);
+});
+
 async function pollLive() {
   try {
     const r = await fetch('/api/live?a=${acct.id}');
@@ -7142,8 +7338,9 @@ async function pollLive() {
     if (ind) { ind.style.opacity = '1'; setTimeout(() => ind.style.opacity = '.4', 200); }
   } catch(e) {}
 }
-setInterval(pollLive, 5000);
+setInterval(function() { pollLive(); loadMainTradeApprovals(); }, 5000);
 pollLive();
+loadMainTradeApprovals();
 </script>
 <script>
 function urlBase64ToUint8Array(b64) {
@@ -9951,6 +10148,13 @@ function startDashboard(defaultAcct, apiKey) {
 
     // ─── Robinhood: Get Status & Pending Orders ───
     if (pathname === "/api/rh-status") {
+      const approvalAccount = accounts.get("robinhood");
+      const pendingOrders = approvalAccount ? pendingTradeApprovals(approvalAccount.state) : [];
+      const activeApprovals = approvalAccount
+        ? (approvalAccount.state.tradeApprovals || []).filter(row =>
+            (row.status === "pending" || row.status === "approved" || row.status === "executing")
+            && Number(row.expiresAt) > Date.now())
+        : [];
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       res.end(JSON.stringify({
         connected: robinhood.isConnected,
@@ -9965,8 +10169,8 @@ function startDashboard(defaultAcct, apiKey) {
         requireApproval: true,
         approvalSupported: true,
         maxPositionDollars: Number.isFinite(RH_MAX_POSITION_DOLLARS) ? RH_MAX_POSITION_DOLLARS : null,
-        pendingOrders: accounts.get("robinhood")
-          ? pendingTradeApprovals(accounts.get("robinhood").state) : [],
+        pendingOrders,
+        activeApprovals,
       }));
       return;
     }
